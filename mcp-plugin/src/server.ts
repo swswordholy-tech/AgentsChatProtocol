@@ -41,12 +41,16 @@ function resolveProfilePath(): string {
   // 1. --profile <name> → ~/.agentchat/<name>.json
   if (cliArgs.profile) {
     const p = cliArgs.profile;
-    // 如果是完整路径则直接用，否则当作 profile 名
     return p.includes("/") || p.includes("\\") ? p : join(configDir, `${p}.json`);
   }
-  // 2. AGENTCHAT_PROFILE 环境变量（完整路径）
+  // 2. --name <name> → also used as profile name: ~/.agentchat/<name>.json
+  if (cliArgs.name) {
+    const safeName = cliArgs.name.replace(/[^a-zA-Z0-9_-]/g, "_");
+    return join(configDir, `${safeName}.json`);
+  }
+  // 3. AGENTCHAT_PROFILE 环境变量（完整路径）
   if (process.env.AGENTCHAT_PROFILE) return process.env.AGENTCHAT_PROFILE;
-  // 3. 默认
+  // 4. 默认
   return join(configDir, "profile.json");
 }
 
@@ -124,6 +128,31 @@ const CAPABILITIES = cliArgs.caps?.split(",") || profile.capabilities || ["claud
 if (cliArgs.name && profile.display_name !== cliArgs.name) {
   profile.display_name = cliArgs.name;
 }
+
+// Check claim status — show claim_url if not yet claimed
+if (profile.token && profile.token !== "dev-token") {
+  try {
+    const acctRes = await fetch(`${REST_URL}/api/account/${encodeURIComponent(AGENT_ID)}`);
+    if (acctRes.ok) {
+      const acct = await acctRes.json() as any;
+      // Check if owned
+      const ownerRes = await fetch(`${REST_URL}/api/contacts/list?account_id=${encodeURIComponent(AGENT_ID)}`);
+      // Show claim URL if agent exists
+      const claimUrl = `${REST_URL}/chat/${encodeURIComponent(AGENT_ID)}?key=${encodeURIComponent(profile.token)}`;
+      process.stderr.write(`[agentchat] Agent: ${acct.name || AGENT_ID} (${AGENT_ID})\n`);
+      process.stderr.write(`[agentchat] Claim URL: ${claimUrl}\n`);
+    }
+  } catch {}
+}
+
+// List available profiles
+try {
+  const files = require("fs").readdirSync(configDir).filter((f: string) => f.endsWith(".json"));
+  if (files.length > 1) {
+    process.stderr.write(`[agentchat] Available profiles: ${files.map((f: string) => f.replace(".json", "")).join(", ")}\n`);
+    process.stderr.write(`[agentchat] Switch with: --profile <name> or --name <name>\n`);
+  }
+} catch {}
 
 let ws: WebSocket | null = null;
 let sessionId: string | null = null;
