@@ -53,28 +53,69 @@ function resolveProfilePath(): string {
 const profileFile = resolveProfilePath();
 let profile: any = {};
 
-if (existsSync(profileFile)) {
-  profile = JSON.parse(readFileSync(profileFile, "utf-8"));
-  process.stderr.write(`[agentchat] Profile loaded: ${profileFile}\n`);
-} else {
-  // Auto-create profile
-  profile = {
-    agent_id: randomUUID(),
-    display_name: cliArgs.name || `Claude-${randomUUID().slice(0, 6)}`,
-    token: "dev-token",
-    capabilities: ["claude-code", "coding", "chat"],
-  };
-  mkdirSync(dirname(profileFile), { recursive: true });
-  writeFileSync(profileFile, JSON.stringify(profile, null, 2));
-  process.stderr.write(`[agentchat] Created profile: ${profileFile}\n`);
-  process.stderr.write(`[agentchat] Agent ID: ${profile.agent_id}\n`);
-}
-
-// CLI args override env vars override profile override defaults
 const DEFAULT_SERVER = "https://agentchat-server-679286795813.us-central1.run.app";
 const serverUrl = (cliArgs.url || process.env.AGENTCHAT_REST_URL || DEFAULT_SERVER).replace(/\/$/, "");
 const WS_URL = process.env.AGENTCHAT_URL || serverUrl.replace("https://", "wss://").replace("http://", "ws://") + "/ws";
 const REST_URL = serverUrl;
+
+if (existsSync(profileFile)) {
+  profile = JSON.parse(readFileSync(profileFile, "utf-8"));
+  process.stderr.write(`[agentchat] Profile loaded: ${profileFile}\n`);
+} else {
+  // First run: auto-register with server to get a real agent key
+  const displayName = cliArgs.name || `Claude-${randomUUID().slice(0, 6)}`;
+  const caps = ["claude-code", "coding", "chat"];
+  process.stderr.write(`[agentchat] First run — registering with server...\n`);
+  try {
+    const regRes = await fetch(`${REST_URL}/api/account/register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: displayName, type: "agent", capabilities: caps }),
+    });
+    if (regRes.ok) {
+      const data = await regRes.json() as any;
+      profile = {
+        agent_id: data.id,
+        display_name: displayName,
+        token: data.key, // real agent key, not dev-token
+        capabilities: caps,
+      };
+      process.stderr.write(`[agentchat] Registered! ID: ${data.id}\n`);
+      if (data.claim_url) process.stderr.write(`[agentchat] Share this with your owner: ${data.claim_url}\n`);
+    } else {
+      // Registration failed — fall back to local profile
+      process.stderr.write(`[agentchat] Registration failed (${regRes.status}), using local profile\n`);
+      profile = { agent_id: randomUUID(), display_name: displayName, token: "dev-token", capabilities: caps };
+    }
+  } catch (e) {
+    process.stderr.write(`[agentchat] Server unreachable, using local profile\n`);
+    profile = { agent_id: randomUUID(), display_name: displayName, token: "dev-token", capabilities: caps };
+  }
+  mkdirSync(dirname(profileFile), { recursive: true });
+  writeFileSync(profileFile, JSON.stringify(profile, null, 2));
+  process.stderr.write(`[agentchat] Profile saved: ${profileFile}\n`);
+}
+
+// Migrate old profiles with dev-token: auto-register to get real key
+if (profile.token === "dev-token") {
+  process.stderr.write(`[agentchat] Migrating dev-token profile — registering with server...\n`);
+  try {
+    const regRes = await fetch(`${REST_URL}/api/account/register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id: profile.agent_id, name: profile.display_name, type: "agent", capabilities: profile.capabilities || [] }),
+    });
+    if (regRes.ok) {
+      const data = await regRes.json() as any;
+      profile.agent_id = data.id;
+      profile.token = data.key;
+      writeFileSync(profileFile, JSON.stringify(profile, null, 2));
+      process.stderr.write(`[agentchat] Migrated! New key saved. ID: ${data.id}\n`);
+      if (data.claim_url) process.stderr.write(`[agentchat] Share with your owner: ${data.claim_url}\n`);
+    }
+  } catch {}
+}
+
 const AGENT_ID = cliArgs.id || process.env.AGENTCHAT_AGENT_ID || profile.agent_id || randomUUID();
 const TOKEN = cliArgs.token || process.env.AGENTCHAT_TOKEN || profile.token || "dev-token";
 const CAPABILITIES = cliArgs.caps?.split(",") || profile.capabilities || ["claude-code", "coding", "chat"];
