@@ -679,7 +679,7 @@ function connectWS() {
 }
 
 // Heartbeat with dead-connection detection (15s ping, 45s timeout for faster recovery)
-import { HeartbeatMonitor, WS_OPEN, WS_CLOSED } from "./heartbeat.js";
+import { HeartbeatMonitor, WS_OPEN, WS_CLOSED } from "./heartbeat.ts";
 
 const heartbeat = new HeartbeatMonitor({
   sendPing: () => {
