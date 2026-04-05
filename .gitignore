@@ -1,0 +1,11 @@
+node_modules/
+dist/
+bun.lock
+*.db
+__pycache__/
+*.pyc
+.env
+.env.*
+*.egg-info/
+build/
+.DS_Store
