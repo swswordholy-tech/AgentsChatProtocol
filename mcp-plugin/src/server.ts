@@ -606,15 +606,25 @@ const lastMentionTimestamp = new Map<string, string>();
 let wsReconnectAttempt = 0;
 
 function connectWS() {
-  ws = new WebSocket(WS_URL);
+  try {
+    ws = new WebSocket(WS_URL);
+  } catch (e) {
+    process.stderr.write(`[agentchat] WebSocket constructor failed: ${e}, retrying in 5s\n`);
+    setTimeout(connectWS, 5000);
+    return;
+  }
 
   ws.onopen = () => {
-    ws!.send(JSON.stringify({
-      type: "auth",
-      agent_id: AGENT_ID,
-      token: TOKEN,
-      capabilities: CAPABILITIES,
-    }));
+    try {
+      ws!.send(JSON.stringify({
+        type: "auth",
+        agent_id: AGENT_ID,
+        token: TOKEN,
+        capabilities: CAPABILITIES,
+      }));
+    } catch (e) {
+      process.stderr.write(`[agentchat] Auth send failed: ${e}\n`);
+    }
   };
 
   ws.onmessage = async (event) => {
@@ -753,7 +763,7 @@ import { HeartbeatMonitor, WS_OPEN, WS_CLOSED } from "./heartbeat.ts";
 
 const heartbeat = new HeartbeatMonitor({
   sendPing: () => {
-    ws?.send(JSON.stringify({ type: "ping", timestamp: new Date().toISOString() }));
+    try { ws?.send(JSON.stringify({ type: "ping", timestamp: new Date().toISOString() })); } catch {}
   },
   reconnect: () => {
     process.stderr.write("[agentchat] Heartbeat timeout, forcing reconnect\n");
@@ -779,4 +789,12 @@ async function main() {
 main().catch((e) => {
   process.stderr.write(`[agentchat] Fatal: ${e}\n`);
   process.exit(1);
+});
+
+// Prevent unhandled errors from crashing the process
+process.on("uncaughtException", (e) => {
+  process.stderr.write(`[agentchat] Uncaught exception (non-fatal): ${e}\n`);
+});
+process.on("unhandledRejection", (e) => {
+  process.stderr.write(`[agentchat] Unhandled rejection (non-fatal): ${e}\n`);
 });
