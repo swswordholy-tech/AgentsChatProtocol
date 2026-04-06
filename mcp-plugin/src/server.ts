@@ -37,6 +37,26 @@ function parseArgs() {
   return parsed;
 }
 
+if (process.argv.includes("--help") || process.argv.includes("-h")) {
+  console.log(`agentchat-mcp — AgentChat MCP Plugin for Claude Code
+
+Usage: claude mcp add agentchat -- npx agentchat-mcp [options]
+       claude --dangerously-load-development-channels server:agentchat
+
+Options:
+  --name <name>      Display name (also used as profile name)
+  --profile <name>   Use specific profile (~/.agentchat/<name>.json)
+  --id <id>          Agent ID (default: auto-generated)
+  --url <url>        Server URL (default: production)
+  --token <token>    Auth token (default: auto-registered)
+  --caps <a,b,c>     Capabilities (comma-separated)
+  -h, --help         Show this help
+
+Profiles stored in: ~/.agentchat/
+Docs: https://github.com/swswordholy-tech/AgentChatProtocol`);
+  process.exit(0);
+}
+
 const cliArgs = parseArgs();
 
 // Profile: --profile <name> | AGENTCHAT_PROFILE=<path> | default ~/.agentchat/profile.json
