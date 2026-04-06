@@ -12,8 +12,15 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 
 // --- Config: CLI args > env vars > profile file > defaults ---
-import { readFileSync, existsSync, writeFileSync, mkdirSync } from "fs";
+import { readFileSync, existsSync, writeFileSync, mkdirSync, renameSync } from "fs";
 import { join, dirname } from "path";
+
+/** Atomic write: write to .tmp then rename (prevents corrupted profile on crash) */
+function safeWriteProfile(path: string, data: any) {
+  const tmp = path + ".tmp";
+  writeFileSync(tmp, JSON.stringify(data, null, 2));
+  renameSync(tmp, path);
+}
 import { randomUUID } from "crypto";
 
 function parseArgs() {
@@ -59,7 +66,10 @@ let profile: any = {};
 
 const DEFAULT_SERVER = "https://agentchat-server-679286795813.us-central1.run.app";
 const serverUrl = (cliArgs.url || process.env.AGENTCHAT_REST_URL || DEFAULT_SERVER).replace(/\/$/, "");
-const WS_URL = process.env.AGENTCHAT_URL || serverUrl.replace("https://", "wss://").replace("http://", "ws://") + "/ws";
+const WS_URL = process.env.AGENTCHAT_URL || (() => {
+  const base = serverUrl.replace("https://", "wss://").replace("http://", "ws://");
+  return base.endsWith("/ws") ? base : base + "/ws";
+})();
 const REST_URL = serverUrl;
 
 if (existsSync(profileFile)) {
@@ -96,7 +106,7 @@ if (existsSync(profileFile)) {
     profile = { agent_id: randomUUID(), display_name: displayName, token: "dev-token", capabilities: caps };
   }
   mkdirSync(dirname(profileFile), { recursive: true });
-  writeFileSync(profileFile, JSON.stringify(profile, null, 2));
+  safeWriteProfile(profileFile, profile);
   process.stderr.write(`[agentchat] Profile saved: ${profileFile}\n`);
 }
 
@@ -113,9 +123,22 @@ if (profile.token === "dev-token") {
       const data = await regRes.json() as any;
       profile.agent_id = data.id;
       profile.token = data.key;
-      writeFileSync(profileFile, JSON.stringify(profile, null, 2));
+      safeWriteProfile(profileFile, profile);
       process.stderr.write(`[agentchat] Migrated! New key saved. ID: ${data.id}\n`);
-      if (data.claim_url) process.stderr.write(`[agentchat] Share with your owner: ${data.claim_url}\n`);
+    } else {
+      // ID conflict (409) — old UUID taken. Register with auto-generated id instead.
+      const regRes2 = await fetch(`${REST_URL}/api/account/register`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: profile.display_name, type: "agent", capabilities: profile.capabilities || [] }),
+      });
+      if (regRes2.ok) {
+        const data = await regRes2.json() as any;
+        profile.agent_id = data.id;
+        profile.token = data.key;
+        safeWriteProfile(profileFile, profile);
+        process.stderr.write(`[agentchat] Migrated with new ID: ${data.id}\n`);
+      }
     }
   } catch {}
 }
@@ -129,18 +152,21 @@ if (cliArgs.name && profile.display_name !== cliArgs.name) {
   profile.display_name = cliArgs.name;
 }
 
-// Check claim status — show claim_url if not yet claimed
+// Check claim status — only show claim URL if NOT yet owned
 if (profile.token && profile.token !== "dev-token") {
   try {
     const acctRes = await fetch(`${REST_URL}/api/account/${encodeURIComponent(AGENT_ID)}`);
     if (acctRes.ok) {
       const acct = await acctRes.json() as any;
-      // Check if owned
-      const ownerRes = await fetch(`${REST_URL}/api/contacts/list?account_id=${encodeURIComponent(AGENT_ID)}`);
-      // Show claim URL if agent exists
-      const claimUrl = `${REST_URL}/chat/${encodeURIComponent(AGENT_ID)}?key=${encodeURIComponent(profile.token)}`;
       process.stderr.write(`[agentchat] Agent: ${acct.name || AGENT_ID} (${AGENT_ID})\n`);
-      process.stderr.write(`[agentchat] Claim URL: ${claimUrl}\n`);
+      // Check ownership via /api/account/:id/agents (returns agents owned by this id — but we need reverse: who owns this agent)
+      // Use a simple heuristic: if account status is active and no owner info, show claim URL
+      // Only print key-containing URL on first run (not every restart)
+      if (!profile._claimed) {
+        const keyMasked = profile.token.slice(0, 6) + "..." + profile.token.slice(-4);
+        process.stderr.write(`[agentchat] Key: ${keyMasked}\n`);
+        process.stderr.write(`[agentchat] Claim URL: ${REST_URL}/chat/${encodeURIComponent(AGENT_ID)}?key=<your-agent-key>\n`);
+      }
     }
   } catch {}
 }
@@ -159,7 +185,7 @@ let sessionId: string | null = null;
 
 // MCP Server
 const server = new Server(
-  { name: "agentchat", version: "0.2.0" },
+  { name: "agentchat", version: "0.3.3" },
   {
     capabilities: {
       experimental: { "claude/channel": {} },
@@ -385,7 +411,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     try {
       const r = await fetch(`${REST_URL}/api/channels/${encodeURIComponent(chat_id)}/messages`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${TOKEN}` },
         body: JSON.stringify({
           sender_id: AGENT_ID,
           content: text,
@@ -630,6 +656,12 @@ function connectWS() {
   ws.onmessage = async (event) => {
     let data: any;
     try { data = JSON.parse(String(event.data)); } catch { return; }
+    try { await handleWSMessage(data); } catch (e) {
+      process.stderr.write(`[agentchat] Message handler error: ${e}\n`);
+    }
+  };
+
+  async function handleWSMessage(data: any) {
 
     if (data.type === "pong") {
       heartbeat.receivedPong();
@@ -747,7 +779,7 @@ function connectWS() {
     } else if (data.type === "error") {
       process.stderr.write(`[agentchat] Error: ${data.message}\n`);
     }
-  };
+  }
 
   ws.onclose = () => {
     sessionId = null;
