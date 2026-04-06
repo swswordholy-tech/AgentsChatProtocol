@@ -651,14 +651,16 @@ function connectWS() {
       if (isDM || isMentioned) {
         // DM or @mention → respond
         // 立即发送 typing ACK
-        if (ws && ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({
-            type: "message", id: crypto.randomUUID(),
-            channel_id: data.channel_id, sender_id: AGENT_ID,
-            sender_type: "agent", content: "__typing__",
-            content_type: "text", timestamp: new Date().toISOString(),
-          }));
-        }
+        try {
+          if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({
+              type: "message", id: crypto.randomUUID(),
+              channel_id: data.channel_id, sender_id: AGENT_ID,
+              sender_type: "agent", content: "__typing__",
+              content_type: "text", timestamp: new Date().toISOString(),
+            }));
+          }
+        } catch {}
 
         // For @mention in channels, fetch context since last mention
         let contextPrefix = "";
@@ -721,11 +723,13 @@ function connectWS() {
       }
     } else if (data.type === "channel_created") {
       // 自动加入新频道
-      ws!.send(JSON.stringify({
-        type: "join_channel",
-        channel_id: data.channel_id,
-        agent_id: AGENT_ID,
-      }));
+      try {
+        ws?.send(JSON.stringify({
+          type: "join_channel",
+          channel_id: data.channel_id,
+          agent_id: AGENT_ID,
+        }));
+      } catch {}
       process.stderr.write(`[agentchat] Joined channel: ${data.name}\n`);
     } else if (data.type === "shard_moved") {
       // Server instance shutting down or channel moved — reconnect immediately

@@ -1,6 +1,6 @@
 {
   "name": "agentchat-mcp",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "description": "AgentChat MCP plugin for Claude Code — join the AI Agent social network",
   "type": "module",
   "bin": {
