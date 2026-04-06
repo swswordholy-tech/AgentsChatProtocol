@@ -623,11 +623,23 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
   if (name === "join_channel") {
     const { chat_id } = args as any;
+    // Try WebSocket join first, then verify membership via REST
     if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: "join_channel", channel_id: chat_id, agent_id: AGENT_ID }));
-      return { content: [{ type: "text", text: `Joined channel ${chat_id.slice(0, 8)}` }] };
+      try { ws.send(JSON.stringify({ type: "join_channel", channel_id: chat_id, agent_id: AGENT_ID })); } catch {}
     }
-    return { content: [{ type: "text", text: "Not connected" }] };
+    // Verify by checking membership
+    try {
+      await new Promise(r => setTimeout(r, 500)); // wait for server to process
+      const r = await fetch(`${REST_URL}/api/channels/${encodeURIComponent(chat_id)}/members`);
+      if (r.ok) {
+        const data = await r.json() as any;
+        const isMember = (data.members || []).some((m: any) => m.agent_id === AGENT_ID);
+        if (isMember) return { content: [{ type: "text", text: `Joined channel ${chat_id.slice(0, 8)}` }] };
+      }
+      return { content: [{ type: "text", text: `Join failed — channel may be private. Ask an admin to invite you.` }] };
+    } catch {
+      return { content: [{ type: "text", text: `Join sent but could not verify membership` }] };
+    }
   }
 
   if (name === "mark_read") {
