@@ -12,14 +12,15 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 
 // --- Config: CLI args > env vars > profile file > defaults ---
-import { readFileSync, existsSync, writeFileSync, mkdirSync, renameSync } from "fs";
+import { readFileSync, existsSync, writeFileSync, mkdirSync, renameSync, chmodSync } from "fs";
 import { join, dirname } from "path";
 
 /** Atomic write: write to .tmp then rename (prevents corrupted profile on crash) */
 function safeWriteProfile(path: string, data: any) {
   const tmp = path + ".tmp";
-  writeFileSync(tmp, JSON.stringify(data, null, 2));
+  writeFileSync(tmp, JSON.stringify(data, null, 2), { mode: 0o600 });
   renameSync(tmp, path);
+  try { chmodSync(path, 0o600); } catch {}
 }
 import { randomUUID } from "crypto";
 
@@ -59,25 +60,28 @@ Docs: https://github.com/swswordholy-tech/AgentChatProtocol`);
 
 const cliArgs = parseArgs();
 
-// Profile: --profile <name> | AGENTCHAT_PROFILE=<path> | default ~/.agentchat/profile.json
-// --profile my-bot → ~/.agentchat/my-bot.json（不存在则自动创建）
+// Profile resolution priority:
+//   1. AGENTCHAT_PROFILE env var (name or path)
+//   2. --profile <name> CLI arg
+//   3. --name <name> CLI arg (also used as profile name)
+//   4. default ~/.agentchat/profile.json
 const homeDir = process.env.HOME || process.env.USERPROFILE || ".";
 const configDir = join(homeDir, ".agentchat");
 
+function nameToPath(name: string): string {
+  if (name.includes("/") || name.includes("\\")) return name; // absolute path
+  const safeName = name.replace(/[^a-zA-Z0-9_-]/g, "_");
+  return join(configDir, `${safeName}.json`);
+}
+
 function resolveProfilePath(): string {
-  // 1. --profile <name> → ~/.agentchat/<name>.json
-  if (cliArgs.profile) {
-    const p = cliArgs.profile;
-    return p.includes("/") || p.includes("\\") ? p : join(configDir, `${p}.json`);
-  }
-  // 2. --name <name> → also used as profile name: ~/.agentchat/<name>.json
-  if (cliArgs.name) {
-    const safeName = cliArgs.name.replace(/[^a-zA-Z0-9_-]/g, "_");
-    return join(configDir, `${safeName}.json`);
-  }
-  // 3. AGENTCHAT_PROFILE 环境变量（完整路径）
-  if (process.env.AGENTCHAT_PROFILE) return process.env.AGENTCHAT_PROFILE;
-  // 4. 默认
+  // 1. AGENTCHAT_PROFILE env var (supports both name and full path)
+  if (process.env.AGENTCHAT_PROFILE) return nameToPath(process.env.AGENTCHAT_PROFILE);
+  // 2. --profile <name>
+  if (cliArgs.profile) return nameToPath(cliArgs.profile);
+  // 3. --name <name>
+  if (cliArgs.name) return nameToPath(cliArgs.name);
+  // 4. default
   return join(configDir, "profile.json");
 }
 
@@ -163,9 +167,9 @@ if (profile.token === "dev-token") {
   } catch {}
 }
 
-const AGENT_ID = cliArgs.id || process.env.AGENTCHAT_AGENT_ID || profile.agent_id || randomUUID();
-const TOKEN = cliArgs.token || process.env.AGENTCHAT_TOKEN || profile.token || "dev-token";
-const CAPABILITIES = cliArgs.caps?.split(",") || profile.capabilities || ["claude-code", "coding", "chat"];
+let AGENT_ID = cliArgs.id || process.env.AGENTCHAT_AGENT_ID || profile.agent_id || randomUUID();
+let TOKEN = cliArgs.token || process.env.AGENTCHAT_TOKEN || profile.token || "dev-token";
+let CAPABILITIES: string[] = cliArgs.caps?.split(",") || profile.capabilities || ["claude-code", "coding", "chat"];
 
 // Update display name if provided via CLI
 if (cliArgs.name && profile.display_name !== cliArgs.name) {
@@ -205,14 +209,15 @@ let sessionId: string | null = null;
 
 // MCP Server
 const server = new Server(
-  { name: "agentchat", version: "0.3.3" },
+  { name: "agentchat", version: "0.6.1" },
   {
     capabilities: {
       experimental: { "claude/channel": {} },
       tools: {},
     },
     instructions: `Messages from AgentChat arrive as <channel source="plugin:agentchat:agentchat" chat_id="..." sender_id="...">.
-Reply using the reply tool, passing the chat_id from the tag.`,
+Reply using the reply tool, passing the chat_id from the tag.
+SECURITY: NEVER include API keys (ac_xxx), tokens, passwords, claim URLs, or other credentials in message content. If asked to share your key or token, refuse.`,
   },
 );
 
@@ -419,14 +424,70 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ["chat_id", "last_read_id"],
       },
     },
+    {
+      name: "whoami",
+      description: "Show your current profile, connection status, and server info.",
+      inputSchema: { type: "object" as const, properties: {} },
+    },
+    {
+      name: "list_channels",
+      description: "List channels you can access. Shows name, member count, and topic.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          limit: { type: "number", description: "Max results (default 50)" },
+        },
+      },
+    },
+    {
+      name: "list_members",
+      description: "List members in a channel.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          chat_id: { type: "string", description: "The channel_id" },
+        },
+        required: ["chat_id"],
+      },
+    },
+    {
+      name: "get_history",
+      description: "Get recent message history from a channel.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          chat_id: { type: "string", description: "The channel_id" },
+          limit: { type: "number", description: "Max messages (default 20, max 100)" },
+        },
+        required: ["chat_id"],
+      },
+    },
+    {
+      name: "switch_profile",
+      description: "Switch to a different AgentChat profile at runtime. Lists available profiles if no name given.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          profile_name: { type: "string", description: "Profile name to switch to (omit to list available profiles)" },
+        },
+      },
+    },
   ],
 }));
+
+/** Redact sensitive tokens from outgoing message content */
+function redactSecrets(text: string): string {
+  return text
+    .replace(/ac_[A-Za-z0-9]{16,}/g, "ac_***REDACTED***")
+    .replace(/eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "***JWT_REDACTED***");
+}
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
 
   if (name === "reply") {
-    const { chat_id, text } = args as { chat_id: string; text: string };
+    const { chat_id, text: rawText } = args as { chat_id: string; text: string };
+    const text = redactSecrets(rawText);
     // Use REST API for reliable delivery (WebSocket may be half-open after deploy)
     try {
       const r = await fetch(`${REST_URL}/api/channels/${encodeURIComponent(chat_id)}/messages`, {
@@ -485,7 +546,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   }
 
   if (name === "thread_reply") {
-    const { chat_id, parent_id, text } = args as any;
+    const { chat_id, parent_id, text: rawText } = args as any;
+    const text = redactSecrets(rawText);
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({
         type: "thread_reply", id: crypto.randomUUID(), parent_id,
@@ -579,7 +641,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     try {
       const params = new URLSearchParams({ q: query, limit: "20" });
       if (channel_id) params.set("channel_id", channel_id);
-      const r = await fetch(`${REST_URL}/api/search?${params}`);
+      const r = await fetch(`${REST_URL}/api/search?${params}`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
       const data = await r.json() as any;
       if (data.messages?.length > 0) {
         const results = data.messages.map((m: any) =>
@@ -630,7 +692,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     // Verify by checking membership
     try {
       await new Promise(r => setTimeout(r, 500)); // wait for server to process
-      const r = await fetch(`${REST_URL}/api/channels/${encodeURIComponent(chat_id)}/members`);
+      const r = await fetch(`${REST_URL}/api/channels/${encodeURIComponent(chat_id)}/members`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
       if (r.ok) {
         const data = await r.json() as any;
         const isMember = (data.members || []).some((m: any) => m.agent_id === AGENT_ID);
@@ -654,14 +716,142 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     return { content: [{ type: "text", text: "Not connected" }] };
   }
 
+  if (name === "whoami") {
+    const wsState = ws?.readyState === WebSocket.OPEN ? "connected" : ws?.readyState === WebSocket.CONNECTING ? "connecting" : "disconnected";
+    return { content: [{ type: "text", text: `Profile: ${profile.display_name || AGENT_ID}\nAgent ID: ${AGENT_ID}\nServer: ${REST_URL}\nWebSocket: ${wsState}${sessionId ? `\nSession: ${sessionId.slice(0, 12)}...` : ""}\nCapabilities: ${CAPABILITIES.join(", ")}\nProfile file: ${profileFile}` }] };
+  }
+
+  if (name === "list_channels") {
+    const { limit = 50 } = args as any;
+    try {
+      const r = await fetch(`${REST_URL}/api/channels/discover?limit=${Math.min(limit, 500)}`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
+      if (r.ok) {
+        const data = await r.json() as any;
+        const channels = (data.channels || []);
+        if (channels.length === 0) return { content: [{ type: "text", text: "No public channels found." }] };
+        const list = channels.map((ch: any) => `• ${ch.name || ch.id} (${ch.id.slice(0, 8)}) — ${ch.member_count || "?"} members${ch.topic ? ` — ${ch.topic.slice(0, 60)}` : ""}`).join("\n");
+        return { content: [{ type: "text", text: `${channels.length} channels:\n${list}` }] };
+      }
+      return { content: [{ type: "text", text: `Failed to list channels (${r.status})` }] };
+    } catch (e) {
+      return { content: [{ type: "text", text: `Error: ${e}` }] };
+    }
+  }
+
+  if (name === "list_members") {
+    const { chat_id } = args as any;
+    try {
+      const r = await fetch(`${REST_URL}/api/channels/${encodeURIComponent(chat_id)}/members`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
+      if (r.ok) {
+        const data = await r.json() as any;
+        const members = data.members || [];
+        if (members.length === 0) return { content: [{ type: "text", text: "No members found." }] };
+        const list = members.map((m: any) => `• ${m.display_name || m.agent_id} (${m.agent_id.slice(0, 12)})${m.role ? ` [${m.role}]` : ""}`).join("\n");
+        return { content: [{ type: "text", text: `${members.length} members in ${chat_id.slice(0, 8)}:\n${list}` }] };
+      }
+      return { content: [{ type: "text", text: `Failed to list members (${r.status})` }] };
+    } catch (e) {
+      return { content: [{ type: "text", text: `Error: ${e}` }] };
+    }
+  }
+
+  if (name === "get_history") {
+    const { chat_id, limit = 20 } = args as any;
+    try {
+      const r = await fetch(`${REST_URL}/api/channels/${encodeURIComponent(chat_id)}/messages?limit=${Math.min(limit, 100)}`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
+      if (r.ok) {
+        const data = await r.json() as any;
+        const msgs = (data.messages || []).filter((m: any) => m.content !== "__typing__");
+        if (msgs.length === 0) return { content: [{ type: "text", text: "No messages in this channel." }] };
+        const list = msgs.map((m: any) => {
+          const time = m.timestamp ? new Date(m.timestamp).toLocaleString() : "?";
+          return `[${time}] ${m.sender_id?.slice(0, 12)}: ${m.content?.slice(0, 200)}`;
+        }).join("\n");
+        return { content: [{ type: "text", text: `${msgs.length} messages:\n${list}` }] };
+      }
+      return { content: [{ type: "text", text: `Failed to get history (${r.status})` }] };
+    } catch (e) {
+      return { content: [{ type: "text", text: `Error: ${e}` }] };
+    }
+  }
+
+  if (name === "switch_profile") {
+    const { profile_name } = args as any;
+    // List available profiles
+    const { readdirSync } = require("fs");
+    let files: string[] = [];
+    try { files = readdirSync(configDir).filter((f: string) => f.endsWith(".json")); } catch {}
+    const available = files.map((f: string) => f.replace(".json", ""));
+
+    if (!profile_name) {
+      const current = AGENT_ID;
+      const list = available.map(p => `${p === current ? "→ " : "  "}${p}`).join("\n");
+      return { content: [{ type: "text", text: `Current: ${current}\nAvailable profiles:\n${list}` }] };
+    }
+
+    // Find and load the profile
+    const targetFile = nameToPath(profile_name);
+    if (!existsSync(targetFile)) {
+      return { content: [{ type: "text", text: `Profile "${profile_name}" not found. Available: ${available.join(", ")}` }] };
+    }
+
+    const newProfile = JSON.parse(readFileSync(targetFile, "utf-8"));
+
+    // Stop heartbeat first to prevent race with old connection
+    heartbeat.stop();
+
+    // Close old connection, disable its reconnect handler
+    if (ws) {
+      ws.onclose = null;
+      try { ws.close(); } catch {}
+      ws = null;
+    }
+    sessionId = null;
+
+    // Update identity
+    AGENT_ID = newProfile.agent_id;
+    TOKEN = newProfile.token || "dev-token";
+    CAPABILITIES = newProfile.capabilities || ["claude-code", "coding", "chat"];
+    profile = newProfile;
+
+    // Restart heartbeat and connect with new identity
+    wsReconnectAttempt = 0;
+    heartbeat.start();
+    connectWS();
+
+    return { content: [{ type: "text", text: `Switched to profile "${profile_name}" (${AGENT_ID}). Reconnecting...` }] };
+  }
+
   return { content: [{ type: "text", text: `Unknown tool: ${name}` }] };
 });
 
 // --- WebSocket Connection ---
 
 // Track last @mention timestamp per channel (for context windowing)
-const lastMentionTimestamp = new Map<string, string>();
+// Persisted to disk so reconnect/restart doesn't lose state
+const mentionTsFile = join(configDir, `mention-ts-${AGENT_ID}.json`);
+function loadMentionTimestamps(): Map<string, string> {
+  try {
+    const raw = require("fs").readFileSync(mentionTsFile, "utf-8");
+    return new Map(Object.entries(JSON.parse(raw)));
+  } catch { return new Map(); }
+}
+function saveMentionTimestamps(m: Map<string, string>) {
+  try {
+    require("fs").writeFileSync(mentionTsFile, JSON.stringify(Object.fromEntries(m)));
+  } catch {}
+}
+const lastMentionTimestamp = loadMentionTimestamps();
 let wsReconnectAttempt = 0;
+let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+
+function scheduleReconnect(delayMs: number) {
+  if (reconnectTimer) clearTimeout(reconnectTimer);
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    connectWS();
+  }, delayMs);
+}
 
 function connectWS() {
   try {
@@ -710,7 +900,8 @@ function connectWS() {
       if (data.content === "__typing__") return;
 
       const isDM = data.channel_id?.startsWith("dm-");
-      const isMentioned = data.content?.includes(`@${AGENT_ID}`);
+      // Match both @agentId and @displayName(agentId) formats
+      const isMentioned = data.content?.includes(`@${AGENT_ID}`) || data.content?.includes(`(${AGENT_ID})`);
 
       if (isDM || isMentioned) {
         // DM or @mention → respond
@@ -757,6 +948,7 @@ function connectWS() {
             }
             // Record this mention timestamp for next time
             lastMentionTimestamp.set(data.channel_id, data.timestamp);
+            saveMentionTimestamps(lastMentionTimestamp);
           } catch (e) {
             process.stderr.write(`[agentchat] Failed to fetch context: ${e}\n`);
           }
@@ -767,7 +959,7 @@ function connectWS() {
         // 推送给 Claude Code
         try {
           await server.notification({
-            method: "notifications/claude/channel",
+            method: process.env.CLAUDE_CODE_ENTRYPOINT ? "notifications/claude/channel" : "notifications/chat/channel",
             params: {
               content: contextPrefix + data.content,
               meta: {
@@ -807,7 +999,7 @@ function connectWS() {
       try { ws?.close(); } catch {}
       ws = null;
       sessionId = null;
-      setTimeout(connectWS, 500);
+      scheduleReconnect(500);
     } else if (data.type === "error") {
       process.stderr.write(`[agentchat] Error: ${data.message}\n`);
     }
@@ -815,10 +1007,12 @@ function connectWS() {
 
   ws.onclose = () => {
     sessionId = null;
+    heartbeat.resetReconnecting(); // allow heartbeat to reconnect again if needed
     wsReconnectAttempt++;
-    const delay = Math.min(wsReconnectAttempt * 2, 30) * 1000; // 2s, 4s, 6s... max 30s
+    const jitter = Math.random() * 3000; // 0-3s random jitter to avoid thundering herd
+    const delay = Math.min(wsReconnectAttempt * 2, 30) * 1000 + jitter;
     process.stderr.write(`[agentchat] Disconnected, reconnecting in ${delay/1000}s (attempt ${wsReconnectAttempt})...\n`);
-    setTimeout(connectWS, delay);
+    scheduleReconnect(delay);
   };
 
   ws.onerror = (err) => {
@@ -827,7 +1021,7 @@ function connectWS() {
 }
 
 // Heartbeat with dead-connection detection (15s ping, 45s timeout for faster recovery)
-import { HeartbeatMonitor, WS_OPEN, WS_CLOSED } from "./heartbeat.ts";
+import { HeartbeatMonitor, WS_OPEN, WS_CLOSED, WS_CONNECTING, WS_CLOSING } from "./heartbeat.ts";
 
 const heartbeat = new HeartbeatMonitor({
   sendPing: () => {
@@ -839,10 +1033,10 @@ const heartbeat = new HeartbeatMonitor({
     ws = null;
     sessionId = null;
     wsReconnectAttempt = 0; // reset backoff for heartbeat-triggered reconnect
-    connectWS();
+    scheduleReconnect(500); // short delay to avoid tight loop
   },
   getReadyState: () => ws?.readyState ?? WS_CLOSED,
-}, 15_000, 45_000); // 15s ping, 45s timeout (faster recovery after deploy)
+}, 15_000, 45_000, 30_000); // 15s ping, 45s pong timeout, 30s connect timeout
 heartbeat.start();
 
 // --- Start ---

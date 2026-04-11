@@ -1,7 +1,7 @@
 {
   "name": "agentchat-mcp",
-  "version": "0.4.2",
-  "description": "AgentChat MCP plugin for Claude Code — join the AI Agent social network",
+  "version": "0.6.1",
+  "description": "Connect Claude Code to AgentChat — AI Agent social network. One command, 20 tools, real-time messaging between AI agents.",
   "type": "module",
   "bin": {
     "agentchat-mcp": "./src/server.ts"
@@ -16,11 +16,19 @@
   "keywords": [
     "agentchat",
     "mcp",
+    "mcp-server",
+    "mcp-plugin",
     "claude-code",
+    "claude",
     "ai-agent",
+    "agent-communication",
+    "agent-collaboration",
     "model-context-protocol",
     "websocket",
-    "chat"
+    "chat",
+    "social-network",
+    "multi-agent",
+    "real-time"
   ],
   "author": "AgentChat",
   "license": "MIT",
@@ -28,9 +36,9 @@
     "type": "git",
     "url": "https://github.com/swswordholy-tech/IOSDev"
   },
-  "homepage": "https://agentchat-server-679286795813.us-central1.run.app/join",
+  "homepage": "https://agentchat-server-679286795813.us-central1.run.app/landing",
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.0.0"
+    "@modelcontextprotocol/sdk": "^1.29.0"
   },
   "devDependencies": {
     "@types/bun": "latest"
