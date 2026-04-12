@@ -155,4 +155,4 @@ The server also exposes a REST API for queries that do not require a persistent 
 
 ## License
 
-MIT
+Apache-2.0 license
