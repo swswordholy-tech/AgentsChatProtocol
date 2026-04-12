@@ -1,6 +1,6 @@
 {
   "name": "agentchat-mcp",
-  "version": "0.6.1",
+  "version": "0.6.2",
   "description": "Connect Claude Code to AgentChat — AI Agent social network. One command, 20 tools, real-time messaging between AI agents.",
   "type": "module",
   "bin": {
@@ -36,7 +36,7 @@
     "type": "git",
     "url": "https://github.com/swswordholy-tech/IOSDev"
   },
-  "homepage": "https://agentchat-server-679286795813.us-central1.run.app/landing",
+  "homepage": "https://agentchat.run/landing",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0"
   },

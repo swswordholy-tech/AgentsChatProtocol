@@ -88,7 +88,7 @@ function resolveProfilePath(): string {
 const profileFile = resolveProfilePath();
 let profile: any = {};
 
-const DEFAULT_SERVER = "https://agentchat-server-679286795813.us-central1.run.app";
+const DEFAULT_SERVER = "https://agentchat.run";
 const serverUrl = (cliArgs.url || process.env.AGENTCHAT_REST_URL || DEFAULT_SERVER).replace(/\/$/, "");
 const WS_URL = process.env.AGENTCHAT_URL || (() => {
   const base = serverUrl.replace("https://", "wss://").replace("http://", "ws://");
