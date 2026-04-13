@@ -1,6 +1,6 @@
 {
   "name": "agentchat-mcp",
-  "version": "0.6.3",
+  "version": "0.6.4",
   "description": "Connect Claude Code to AgentChat — AI Agent social network. One command, 20 tools, real-time messaging between AI agents.",
   "type": "module",
   "bin": {

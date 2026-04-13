@@ -429,6 +429,67 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: "hidden_identity_join",
+      description: "Join an active Hidden Identity (谁是卧底) game in its lobby phase. The game_id is typically shared in the host channel. You must already be a member of the game's host channel.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          game_id: { type: "string", description: "The game_id to join" },
+        },
+        required: ["game_id"],
+      },
+    },
+    {
+      name: "hidden_identity_get_secret",
+      description: "Fetch your own role and word in a Hidden Identity game you are playing. Returns {role: 'villager'|'spy', word: string}. 403 if you are not a player.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          game_id: { type: "string", description: "The game_id" },
+        },
+        required: ["game_id"],
+      },
+    },
+    {
+      name: "hidden_identity_vote",
+      description: "Cast your vote during the vote phase of a Hidden Identity game. Overwrites prior vote in the same round. 403 if you are not a player / are already eliminated / game is not in vote phase.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          game_id: { type: "string", description: "The game_id" },
+          target_id: { type: "string", description: "The player_id you are voting to eliminate" },
+          reason: { type: "string", description: "Optional short reason (sidecar, not broadcast)" },
+        },
+        required: ["game_id", "target_id"],
+      },
+    },
+    {
+      name: "hidden_identity_advance",
+      description: "Advance the Hidden Identity game phase (e.g. discuss → vote, vote → eliminate, eliminate → discuss for next round or reveal for terminal). Any player or admin can advance. Server validates transition and 409s on invalid.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          game_id: { type: "string", description: "The game_id" },
+          to: {
+            type: "string",
+            description: "Target phase. One of: discuss, vote, eliminate, reveal, finished",
+          },
+        },
+        required: ["game_id", "to"],
+      },
+    },
+    {
+      name: "hidden_identity_get_state",
+      description: "Fetch the public state of a Hidden Identity game: phase, round, player list (with is_eliminated), winner_team (after reveal).",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          game_id: { type: "string", description: "The game_id" },
+        },
+        required: ["game_id"],
+      },
+    },
+    {
       name: "mark_read",
       description: "Mark messages as read up to a given message ID.",
       inputSchema: {
@@ -749,6 +810,110 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return { content: [{ type: "text", text: `Leave sent via WS (REST unreachable: ${String(e?.message || e).slice(0, 60)})` }] };
       }
       return { content: [{ type: "text", text: `Leave failed — no connectivity` }] };
+    }
+  }
+
+  // ── Hidden Identity (谁是卧底) ────────────────────────────────────
+  // See docs/MCP-HIDDEN-IDENTITY-SCHEMA.md + spec/hidden-identity.md.
+  // Agents playing the game need tool access to join / fetch secret /
+  // vote / advance / inspect state. Without these, the game is driven
+  // only by humans and bots become decorative. These wrap the server
+  // REST endpoints 1:1; the dispatcher at spec/schema §WS broadcasts
+  // tells the agent _when_ to call (via meta on channel notifications).
+
+  if (name === "hidden_identity_join") {
+    const { game_id } = args as any;
+    try {
+      const r = await fetch(`${REST_URL}/api/hidden-identity/games/${encodeURIComponent(game_id)}/join`, {
+        method: "POST",
+        headers: { "Authorization": `Bearer ${TOKEN}`, "Content-Type": "application/json" },
+        body: "{}",
+      });
+      const data = await r.json().catch(() => ({})) as any;
+      if (r.ok) {
+        const count = data?.game?.player_ids?.length ?? data?.game?.players?.length ?? "?";
+        return { content: [{ type: "text", text: `Joined game ${String(game_id).slice(0, 8)} — ${count} players in lobby` }] };
+      }
+      return { content: [{ type: "text", text: `Join failed (${r.status}): ${String(data?.error || "").slice(0, 120)}` }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `Join failed: ${String(e?.message || e).slice(0, 80)}` }] };
+    }
+  }
+
+  if (name === "hidden_identity_get_secret") {
+    const { game_id } = args as any;
+    try {
+      const r = await fetch(`${REST_URL}/api/hidden-identity/games/${encodeURIComponent(game_id)}/secret`, {
+        headers: { "Authorization": `Bearer ${TOKEN}` },
+      });
+      const data = await r.json().catch(() => ({})) as any;
+      if (r.ok) {
+        return { content: [{ type: "text", text: `Your role: ${data.role}. Your word: ${data.word}. Do NOT reveal the word directly in discussion — describe it.` }] };
+      }
+      if (r.status === 403) return { content: [{ type: "text", text: `You are not a player in this game (403)` }] };
+      if (r.status === 404) return { content: [{ type: "text", text: `Game or secret not allocated yet (game may still be in lobby)` }] };
+      return { content: [{ type: "text", text: `Secret fetch failed (${r.status})` }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `Secret fetch failed: ${String(e?.message || e).slice(0, 80)}` }] };
+    }
+  }
+
+  if (name === "hidden_identity_vote") {
+    const { game_id, target_id, reason } = args as any;
+    try {
+      const body: any = { target_id };
+      if (typeof reason === "string" && reason) body.reason = reason;
+      const r = await fetch(`${REST_URL}/api/hidden-identity/games/${encodeURIComponent(game_id)}/vote`, {
+        method: "POST",
+        headers: { "Authorization": `Bearer ${TOKEN}`, "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const data = await r.json().catch(() => ({})) as any;
+      if (r.ok) {
+        return { content: [{ type: "text", text: `Vote cast against ${String(target_id).slice(0, 12)} in round ${data?.round}` }] };
+      }
+      return { content: [{ type: "text", text: `Vote failed (${r.status}): ${String(data?.error || "").slice(0, 120)}` }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `Vote failed: ${String(e?.message || e).slice(0, 80)}` }] };
+    }
+  }
+
+  if (name === "hidden_identity_advance") {
+    const { game_id, to } = args as any;
+    try {
+      const r = await fetch(`${REST_URL}/api/hidden-identity/games/${encodeURIComponent(game_id)}/advance`, {
+        method: "POST",
+        headers: { "Authorization": `Bearer ${TOKEN}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ to }),
+      });
+      const data = await r.json().catch(() => ({})) as any;
+      if (r.ok) {
+        return { content: [{ type: "text", text: `Phase advanced to ${data?.phase || to}, round ${data?.round ?? "?"}` }] };
+      }
+      if (r.status === 409) return { content: [{ type: "text", text: `Invalid transition to ${to} (409): ${String(data?.error || "").slice(0, 120)}` }] };
+      return { content: [{ type: "text", text: `Advance failed (${r.status}): ${String(data?.error || "").slice(0, 120)}` }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `Advance failed: ${String(e?.message || e).slice(0, 80)}` }] };
+    }
+  }
+
+  if (name === "hidden_identity_get_state") {
+    const { game_id } = args as any;
+    try {
+      const r = await fetch(`${REST_URL}/api/hidden-identity/games/${encodeURIComponent(game_id)}`, {
+        headers: { "Authorization": `Bearer ${TOKEN}` },
+      });
+      const data = await r.json().catch(() => ({})) as any;
+      if (r.ok) {
+        const g = data?.game || {};
+        const players = (g.players || []).map((p: any) => {
+          return `${p.display_name || p.player_id}${p.is_eliminated ? " (out)" : ""}`;
+        }).join(", ");
+        return { content: [{ type: "text", text: `Phase: ${g.phase}, Round: ${g.round}, Winner: ${g.winner_team || "—"}. Players: ${players}` }] };
+      }
+      return { content: [{ type: "text", text: `Game state fetch failed (${r.status})` }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `Game state fetch failed: ${String(e?.message || e).slice(0, 80)}` }] };
     }
   }
 
