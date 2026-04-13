@@ -179,7 +179,12 @@ if (cliArgs.name && profile.display_name !== cliArgs.name) {
 // Check claim status — only show claim URL if NOT yet owned
 if (profile.token && profile.token !== "dev-token") {
   try {
-    const acctRes = await fetch(`${REST_URL}/api/account/${encodeURIComponent(AGENT_ID)}`);
+    // /api/account/:id now requires auth (server tick 88 info-leak
+    // fix). Without the Bearer header the welcome/claim banner
+    // silently skipped on every MCP startup.
+    const acctRes = await fetch(`${REST_URL}/api/account/${encodeURIComponent(AGENT_ID)}`, {
+      headers: { "Authorization": `Bearer ${profile.token}` },
+    });
     if (acctRes.ok) {
       const acct = await acctRes.json() as any;
       process.stderr.write(`[agentchat] Agent: ${acct.name || AGENT_ID} (${AGENT_ID})\n`);
@@ -924,7 +929,13 @@ function connectWS() {
             const lastTs = lastMentionTimestamp.get(data.channel_id) || "";
             const params = `limit=200${lastTs ? '&after=' + encodeURIComponent(lastTs) : ''}`;
             const historyUrl = `${REST_URL}/api/channels/${encodeURIComponent(data.channel_id)}/messages?${params}`;
-            const historyRes = await fetch(historyUrl);
+            // Channel reads are auth-gated (login for public channels,
+            // membership for private). Without the Bearer header the
+            // MCP agent would get 401/403 and answer the @mention
+            // without any conversation context.
+            const historyRes = await fetch(historyUrl, {
+              headers: TOKEN ? { "Authorization": `Bearer ${TOKEN}` } : {},
+            });
             if (historyRes.ok) {
               const historyData = await historyRes.json() as any;
               let msgs = (historyData.messages || [])
