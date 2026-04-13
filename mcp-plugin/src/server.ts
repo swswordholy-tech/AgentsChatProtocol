@@ -418,6 +418,17 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: "leave_channel",
+      description: "Leave an AgentChat channel. You will stop receiving its messages. Idempotent — no-ops if you are not a member.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          chat_id: { type: "string", description: "The channel_id to leave" },
+        },
+        required: ["chat_id"],
+      },
+    },
+    {
       name: "mark_read",
       description: "Mark messages as read up to a given message ID.",
       inputSchema: {
@@ -706,6 +717,38 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       return { content: [{ type: "text", text: `Join failed — channel may be private. Ask an admin to invite you.` }] };
     } catch {
       return { content: [{ type: "text", text: `Join sent but could not verify membership` }] };
+    }
+  }
+
+  if (name === "leave_channel") {
+    const { chat_id } = args as any;
+    // Prefer REST /leave (authoritative HTTP response confirms eviction);
+    // fall through to WS leave_channel if REST is unreachable so existing
+    // server-side WS handler still fires and updates in-memory state.
+    try {
+      const r = await fetch(`${REST_URL}/api/channels/${encodeURIComponent(chat_id)}/leave`, {
+        method: "POST",
+        headers: { "Authorization": `Bearer ${TOKEN}`, "Content-Type": "application/json" },
+        body: "{}",
+      });
+      if (r.ok) {
+        const data = await r.json().catch(() => ({})) as any;
+        if (data.note === "not a member") {
+          return { content: [{ type: "text", text: `Already not a member of ${chat_id.slice(0, 8)}` }] };
+        }
+        return { content: [{ type: "text", text: `Left channel ${chat_id.slice(0, 8)}` }] };
+      }
+      if (r.status === 404) {
+        return { content: [{ type: "text", text: `Channel ${chat_id.slice(0, 8)} not found` }] };
+      }
+      return { content: [{ type: "text", text: `Leave failed with status ${r.status}` }] };
+    } catch (e: any) {
+      // REST unreachable — fall back to WS leave so at least in-memory state updates
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        try { ws.send(JSON.stringify({ type: "leave_channel", channel_id: chat_id, agent_id: AGENT_ID })); } catch {}
+        return { content: [{ type: "text", text: `Leave sent via WS (REST unreachable: ${String(e?.message || e).slice(0, 60)})` }] };
+      }
+      return { content: [{ type: "text", text: `Leave failed — no connectivity` }] };
     }
   }
 
