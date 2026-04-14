@@ -214,7 +214,7 @@ let sessionId: string | null = null;
 
 // MCP Server
 const server = new Server(
-  { name: "agentchat", version: "0.6.1" },
+  { name: "agentchat", version: "0.6.4" },
   {
     capabilities: {
       experimental: { "claude/channel": {} },
