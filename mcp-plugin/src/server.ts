@@ -6,6 +6,8 @@
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+import { createMcpExpressApp } from "@modelcontextprotocol/sdk/server/express.js";
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
@@ -34,6 +36,7 @@ function parseArgs() {
     else if (args[i] === "--token" && args[i + 1]) parsed.token = args[++i];
     else if (args[i] === "--caps" && args[i + 1]) parsed.caps = args[++i];
     else if (args[i] === "--profile" && args[i + 1]) parsed.profile = args[++i];
+    else if (args[i] === "--port" && args[i + 1]) parsed.port = args[++i];
   }
   return parsed;
 }
@@ -51,6 +54,7 @@ Options:
   --url <url>        Server URL (default: production)
   --token <token>    Auth token (default: auto-registered)
   --caps <a,b,c>     Capabilities (comma-separated)
+  --port <port>      Run as HTTP SSE Server on the specified port (e.g. 3000) instead of Stdio
   -h, --help         Show this help
 
 Profiles stored in: ~/.agentchat/
@@ -1288,12 +1292,48 @@ const heartbeat = new HeartbeatMonitor({
 heartbeat.start();
 
 // --- Start ---
-
 async function main() {
   connectWS();
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
-  process.stderr.write("[agentchat] MCP server started\n");
+  
+  if (cliArgs.port) {
+    const cors = (await import("cors")).default;
+    const port = parseInt(cliArgs.port, 10);
+    const app = createMcpExpressApp();
+    app.use(cors());
+
+    const transports = new Map<string, SSEServerTransport>();
+
+    app.get("/mcp", async (req, res) => {
+      const transport = new SSEServerTransport("/mcp/message", res as any);
+      await server.connect(transport);
+      transports.set(transport.sessionId, transport);
+      console.log(`[agentchat] Client connected via SSE (sessionId: ${transport.sessionId})`);
+      
+      req.on('close', () => {
+        console.log(`[agentchat] Client disconnected (sessionId: ${transport.sessionId})`);
+        transports.delete(transport.sessionId);
+        transport.close();
+      });
+    });
+
+    app.post("/mcp/message", async (req, res) => {
+      const sessionId = req.query.sessionId as string;
+      const transport = transports.get(sessionId);
+      if (!transport) {
+        res.status(404).send("Session not found");
+        return;
+      }
+      await transport.handlePostMessage(req as any, res as any);
+    });
+
+    app.listen(port, () => {
+      console.log(`[agentchat] MCP SSE server started on http://localhost:${port}/mcp`);
+    });
+  } else {
+    const transport = new StdioServerTransport();
+    await server.connect(transport);
+    process.stderr.write("[agentchat] MCP server started (Stdio)\n");
+  }
 }
 
 main().catch((e) => {
