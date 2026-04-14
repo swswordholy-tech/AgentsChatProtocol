@@ -214,7 +214,7 @@ let sessionId: string | null = null;
 
 // MCP Server
 const server = new Server(
-  { name: "agentchat", version: "0.6.4" },
+  { name: "agentchat", version: "0.6.5" },
   {
     capabilities: {
       experimental: { "claude/channel": {} },
@@ -1113,8 +1113,19 @@ function connectWS() {
       if (data.content === "__typing__") return;
 
       const isDM = data.channel_id?.startsWith("dm-");
-      // Match both @agentId and @displayName(agentId) formats
-      const isMentioned = data.content?.includes(`@${AGENT_ID}`) || data.content?.includes(`(${AGENT_ID})`);
+      // Match both `@<agentId>` and `@<displayName>(<agentId>)` formats.
+      // v0.6.1 used a loose `content.includes("(" + AGENT_ID + ")")` for the
+      // second case which fired on ANY text containing `(<agentId>)` —
+      // including system messages like "User joined: name (acc_xyz)" or
+      // moderation logs. Boss msg:fc8b9b1a — codex agent received messages
+      // it wasn't @-mentioned in, ate context window. Tighten the second
+      // clause to require an `@<displayName>` immediately before `(<id>)`.
+      const idEsc = (AGENT_ID || "").replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const displayMentionRe = idEsc ? new RegExp(`@\\S+\\(${idEsc}\\)`) : null;
+      const isMentioned = !!(
+        data.content?.includes(`@${AGENT_ID}`) ||
+        (displayMentionRe && displayMentionRe.test(data.content || ""))
+      );
 
       if (isDM || isMentioned) {
         // DM or @mention → respond
@@ -1135,7 +1146,12 @@ function connectWS() {
         if (!isDM && isMentioned) {
           try {
             const lastTs = lastMentionTimestamp.get(data.channel_id) || "";
-            const params = `limit=200${lastTs ? '&after=' + encodeURIComponent(lastTs) : ''}`;
+            // Cap the request size: 50 messages max, plus client-side byte
+            // and per-message-content trimming below. Boss msg:fc8b9b1a —
+            // long-silent agents would pull a 200-message backlog on first
+            // @mention, blowing up small-context models. 50 + 15KB +
+            // per-msg 2KB matches "recent conversation" without overshoot.
+            const params = `limit=50${lastTs ? '&after=' + encodeURIComponent(lastTs) : ''}`;
             const historyUrl = `${REST_URL}/api/channels/${encodeURIComponent(data.channel_id)}/messages?${params}`;
             // Channel reads are auth-gated (login for public channels,
             // membership for private). Without the Bearer header the
@@ -1148,21 +1164,34 @@ function connectWS() {
               const historyData = await historyRes.json() as any;
               let msgs = (historyData.messages || [])
                 .filter((m: any) => m.id !== data.id && m.content !== "__typing__");
-              // Size guard: max 50KB of context
+              // Cumulative byte cap (newest-first walk so we keep the most
+              // recent messages when total exceeds the budget). Per-message
+              // content also clipped to 2KB to defang occasional copy-paste
+              // walls of text — a single mega-message no longer eats the
+              // whole budget alone.
               let totalBytes = 0;
-              const maxBytes = 50_000;
+              const maxBytes = 15_000;
+              const maxPerMsg = 2_000;
               const trimmed: any[] = [];
               for (let i = msgs.length - 1; i >= 0; i--) {
-                const size = (msgs[i].content || "").length;
+                const raw = (msgs[i].content || "");
+                const clipped = raw.length > maxPerMsg
+                  ? raw.slice(0, maxPerMsg) + " …[truncated]"
+                  : raw;
+                const size = clipped.length;
                 if (totalBytes + size > maxBytes) break;
                 totalBytes += size;
-                trimmed.unshift(msgs[i]);
+                trimmed.unshift({ ...msgs[i], content: clipped });
               }
+              const truncatedMsgs = trimmed.length < msgs.length;
               if (trimmed.length > 0) {
                 const context = trimmed
                   .map((m: any) => `${m.sender_id}: ${m.content}`)
                   .join("\n");
-                contextPrefix = `[频道上下文 - 自上次 @mention 以来 ${trimmed.length} 条消息]\n${context}\n\n[你被 @mention 了，请回复]\n`;
+                const note = truncatedMsgs
+                  ? `[频道上下文 - 最近 ${trimmed.length} 条消息（更早的已截断保护上下文窗口）]`
+                  : `[频道上下文 - 自上次 @mention 以来 ${trimmed.length} 条消息]`;
+                contextPrefix = `${note}\n${context}\n\n[你被 @mention 了，请回复]\n`;
               }
             }
             // Record this mention timestamp for next time
