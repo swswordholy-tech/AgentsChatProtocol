@@ -218,7 +218,7 @@ let sessionId: string | null = null;
 
 // MCP Server
 const server = new Server(
-  { name: "agentchat", version: "0.6.5" },
+  { name: "agentchat", version: "0.6.6" },
   {
     capabilities: {
       experimental: { "claude/channel": {} },
@@ -610,7 +610,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         sender_id: AGENT_ID,
       }));
     }
-    return { content: [{ type: "text", text: "Typing indicator sent" }] };
+    return { content: [{ type: "text", text: "Typing indicator dispatched" }] };
   }
 
   if (name === "react") {
@@ -621,7 +621,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         sender_id: AGENT_ID, emoji, action: action || "add",
         timestamp: new Date().toISOString(),
       }));
-      return { content: [{ type: "text", text: `${action === "remove" ? "Removed" : "Added"} ${emoji} on message` }] };
+      return { content: [{ type: "text", text: `${action === "remove" ? "Removal" : "Addition"} of ${emoji} dispatched; verify in channel` }] };
     }
     return { content: [{ type: "text", text: "Not connected" }] };
   }
@@ -635,7 +635,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         channel_id: chat_id, sender_id: AGENT_ID, sender_type: "agent",
         content: text, timestamp: new Date().toISOString(),
       }));
-      return { content: [{ type: "text", text: `Replied to thread` }] };
+      return { content: [{ type: "text", text: `Thread reply dispatched; verify in channel` }] };
     }
     return { content: [{ type: "text", text: "Not connected" }] };
   }
@@ -647,7 +647,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         type: "pin", message_id, channel_id: chat_id,
         sender_id: AGENT_ID, action: action || "pin",
       }));
-      return { content: [{ type: "text", text: `Message ${action === "unpin" ? "unpinned" : "pinned"}` }] };
+      return { content: [{ type: "text", text: `${action === "unpin" ? "Unpin" : "Pin"} dispatched; server may reject (admin only)` }] };
     }
     return { content: [{ type: "text", text: "Not connected" }] };
   }
@@ -659,7 +659,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         type: "edit_message", message_id, channel_id: chat_id,
         sender_id: AGENT_ID, new_content, timestamp: new Date().toISOString(),
       }));
-      return { content: [{ type: "text", text: "Message edited" }] };
+      return { content: [{ type: "text", text: "Edit dispatched; server may reject (must be original sender, within edit window)" }] };
     }
     return { content: [{ type: "text", text: "Not connected" }] };
   }
@@ -670,7 +670,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       ws.send(JSON.stringify({
         type: "delete_message", message_id, channel_id: chat_id, sender_id: AGENT_ID,
       }));
-      return { content: [{ type: "text", text: "Message deleted" }] };
+      return { content: [{ type: "text", text: "Delete dispatched; server may reject (must be original sender)" }] };
     }
     return { content: [{ type: "text", text: "Not connected" }] };
   }
@@ -681,7 +681,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       ws.send(JSON.stringify({
         type: "set_status", sender_id: AGENT_ID, status_text, status_emoji,
       }));
-      return { content: [{ type: "text", text: `Status set: ${status_emoji || ''} ${status_text}` }] };
+      return { content: [{ type: "text", text: `Status update dispatched: ${status_emoji || ''} ${status_text}` }] };
     }
     return { content: [{ type: "text", text: "Not connected" }] };
   }
@@ -690,7 +690,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { chat_id } = args as any;
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ type: "archive_channel", channel_id: chat_id, sender_id: AGENT_ID }));
-      return { content: [{ type: "text", text: `Channel archived (read-only)` }] };
+      return { content: [{ type: "text", text: `Archive dispatched; server may reject (admin only — channel goes read-only on success)` }] };
     }
     return { content: [{ type: "text", text: "Not connected" }] };
   }
@@ -699,7 +699,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { chat_id, topic } = args as any;
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ type: "set_topic", channel_id: chat_id, sender_id: AGENT_ID, topic }));
-      return { content: [{ type: "text", text: `Topic set: ${topic.slice(0,50)}` }] };
+      return { content: [{ type: "text", text: `Topic update dispatched; server may reject (admin only): ${topic.slice(0,50)}` }] };
     }
     return { content: [{ type: "text", text: "Not connected" }] };
   }
@@ -712,7 +712,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         source_channel_id, target_channel_id, message_id,
         sender_id: AGENT_ID, timestamp: new Date().toISOString(),
       }));
-      return { content: [{ type: "text", text: `Forwarded message to channel ${target_channel_id.slice(0,8)}` }] };
+      return { content: [{ type: "text", text: `Forward dispatched to ${target_channel_id.slice(0,8)}; server may reject (must be member of both channels)` }] };
     }
     return { content: [{ type: "text", text: "Not connected" }] };
   }
@@ -743,7 +743,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         type: "vote", proposal_id, voter_id: AGENT_ID,
         voter_type: "agent", decision, reason,
       }));
-      return { content: [{ type: "text", text: `Voted ${decision} on proposal ${proposal_id.slice(0, 8)}` }] };
+      return { content: [{ type: "text", text: `Vote '${decision}' dispatched for proposal ${proposal_id.slice(0, 8)}; server may reject (invalid proposal_id or expired)` }] };
     }
     return { content: [{ type: "text", text: "Not connected" }] };
   }
@@ -759,7 +759,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         expires_at: new Date(Date.now() + 86400_000).toISOString(),
         timestamp: new Date().toISOString(),
       }));
-      return { content: [{ type: "text", text: `Proposal created: ${title} (ID: ${proposalId.slice(0, 8)})` }] };
+      return { content: [{ type: "text", text: `Proposal '${title}' dispatched (client-generated ID ${proposalId.slice(0, 8)}); server may reject — verify via next inbound event` }] };
     }
     return { content: [{ type: "text", text: "Not connected" }] };
   }
@@ -928,7 +928,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         type: "read_receipt", channel_id: chat_id,
         sender_id: AGENT_ID, last_read_id, timestamp: new Date().toISOString(),
       }));
-      return { content: [{ type: "text", text: `Marked read up to ${last_read_id.slice(0, 8)}` }] };
+      return { content: [{ type: "text", text: `Read cursor update dispatched (up to ${last_read_id.slice(0, 8)})` }] };
     }
     return { content: [{ type: "text", text: "Not connected" }] };
   }
