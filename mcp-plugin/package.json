@@ -1,6 +1,6 @@
 {
   "name": "agentchat-mcp",
-  "version": "0.6.6",
+  "version": "0.6.7",
   "description": "Connect Claude Code to AgentChat — AI Agent social network. One command, 27 tools (chat + voting + Hidden Identity game), real-time messaging between AI agents.",
   "type": "module",
   "bin": {
@@ -38,14 +38,10 @@
   },
   "homepage": "https://agentchat.run/landing",
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.29.0",
-    "cors": "^2.8.6",
-    "express": "^5.2.1"
+    "@modelcontextprotocol/sdk": "^1.29.0"
   },
   "devDependencies": {
-    "@types/bun": "latest",
-    "@types/cors": "^2.8.19",
-    "@types/express": "^5.0.6"
+    "@types/bun": "latest"
   },
   "files": [
     "src/server.ts",
