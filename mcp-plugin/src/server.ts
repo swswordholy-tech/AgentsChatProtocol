@@ -559,6 +559,64 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: "okr_list",
+      description: "List all OKR Objectives with their KeyResults and Tasks as a tree. Use filters to narrow by owner / status / horizon. Returns JSON.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          owner: { type: "string", description: "Filter by owner agent/account id" },
+          status: { type: "string", enum: ["active", "done", "abandoned"], description: "Filter by objective status" },
+          horizon: { type: "string", enum: ["week", "month", "Q"], description: "Filter by planning horizon" },
+        },
+      },
+    },
+    {
+      name: "okr_create_objective",
+      description: "Create a new OKR Objective. Team is flat by default (no parent_id). Any authed caller can create; root Objectives (no parent) are audit-logged. owner defaults to caller.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          title: { type: "string", description: "Objective title (max 200 chars)" },
+          horizon: { type: "string", enum: ["week", "month", "Q"], description: "Planning horizon" },
+          owner: { type: "string", description: "Owner agent/account id (default: caller)" },
+          parent_id: { type: "string", description: "Optional parent Objective id for hierarchical OKRs (max 3 layers deep)" },
+          due: { type: "string", description: "ISO-8601 due date (e.g. 2026-05-19)" },
+        },
+        required: ["title", "horizon"],
+      },
+    },
+    {
+      name: "okr_add_task",
+      description: "Add a Task under an Objective. Tasks attach to Objectives, optionally cross-reference KRs they advance via contributes_to[]. Caller must own the Objective (or be admin).",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          objective_id: { type: "string", description: "Parent Objective id" },
+          title: { type: "string", description: "Task title (max 200 chars)" },
+          assignee: { type: "string", description: "Agent/account id to assign the task to" },
+          contributes_to: { type: "array", items: { type: "string" }, description: "Optional KR ids this task advances" },
+          due: { type: "string", description: "ISO-8601 due date" },
+        },
+        required: ["objective_id", "title", "assignee"],
+      },
+    },
+    {
+      name: "okr_update_task",
+      description: "Update a Task — change status, assignee, block/unblock, add blocker info. Caller must be the assignee, Objective owner, or admin. Reassign (changing assignee) is owner/admin-only.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          task_id: { type: "string", description: "Task id to update" },
+          status: { type: "string", enum: ["todo", "doing", "done", "blocked"], description: "New status" },
+          assignee: { type: "string", description: "Re-assign to another agent (owner/admin only)" },
+          blocked_reason: { type: "string", description: "Why is this task blocked (max 500 chars)" },
+          blocker_agent: { type: "string", description: "Which agent is blocking this task" },
+          due: { type: "string", description: "ISO-8601 due date" },
+        },
+        required: ["task_id"],
+      },
+    },
+    {
       name: "switch_profile",
       description: "Switch to a different AgentChat profile at runtime. Lists available profiles if no name given.",
       inputSchema: {
@@ -1052,6 +1110,96 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     connectWS();
 
     return { content: [{ type: "text", text: `Switched to profile "${profile_name}" (${AGENT_ID}). Reconnecting...` }] };
+  }
+
+  // OKR v0.1 tools — dogfood the OKR system without dropping to curl.
+  // Maps 1:1 to the server-side routes shipped in commit 5229aab
+  // (projects/AgentChat/Server/src/okr.ts + index.ts dispatch block).
+  if (name === "okr_list") {
+    const { owner, status, horizon } = args as { owner?: string; status?: string; horizon?: string };
+    const qs = new URLSearchParams();
+    if (owner) qs.set("owner", owner);
+    if (status) qs.set("status", status);
+    if (horizon) qs.set("horizon", horizon);
+    const url = `${REST_URL}/api/okr/objectives${qs.toString() ? "?" + qs.toString() : ""}`;
+    try {
+      const r = await fetch(url, { headers: { "Authorization": `Bearer ${TOKEN}` } });
+      if (!r.ok) {
+        const err = await r.text();
+        return { content: [{ type: "text", text: `okr_list failed (${r.status}): ${err.slice(0, 120)}` }] };
+      }
+      const data = await r.json() as any;
+      return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `okr_list network error: ${String(e?.message || e).slice(0, 120)}` }] };
+    }
+  }
+
+  if (name === "okr_create_objective") {
+    const { title, horizon, owner, parent_id, due } = args as { title: string; horizon: string; owner?: string; parent_id?: string; due?: string };
+    const body: Record<string, unknown> = { title, horizon };
+    if (owner) body.owner = owner;
+    if (parent_id) body.parent_id = parent_id;
+    if (due) body.due = due;
+    try {
+      const r = await fetch(`${REST_URL}/api/okr/objectives`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${TOKEN}` },
+        body: JSON.stringify(body),
+      });
+      const text = await r.text();
+      if (!r.ok) {
+        return { content: [{ type: "text", text: `okr_create_objective failed (${r.status}): ${text.slice(0, 160)}` }] };
+      }
+      return { content: [{ type: "text", text: `Created: ${text}` }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `okr_create_objective network error: ${String(e?.message || e).slice(0, 120)}` }] };
+    }
+  }
+
+  if (name === "okr_add_task") {
+    const { objective_id, title, assignee, contributes_to, due } = args as { objective_id: string; title: string; assignee: string; contributes_to?: string[]; due?: string };
+    const body: Record<string, unknown> = { title, assignee };
+    if (Array.isArray(contributes_to) && contributes_to.length > 0) body.contributes_to = contributes_to;
+    if (due) body.due = due;
+    try {
+      const r = await fetch(`${REST_URL}/api/okr/objectives/${encodeURIComponent(objective_id)}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${TOKEN}` },
+        body: JSON.stringify(body),
+      });
+      const text = await r.text();
+      if (!r.ok) {
+        return { content: [{ type: "text", text: `okr_add_task failed (${r.status}): ${text.slice(0, 160)}` }] };
+      }
+      return { content: [{ type: "text", text: `Added: ${text}` }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `okr_add_task network error: ${String(e?.message || e).slice(0, 120)}` }] };
+    }
+  }
+
+  if (name === "okr_update_task") {
+    const { task_id, status, assignee, blocked_reason, blocker_agent, due } = args as { task_id: string; status?: string; assignee?: string; blocked_reason?: string; blocker_agent?: string; due?: string };
+    const patch: Record<string, unknown> = {};
+    if (status) patch.status = status;
+    if (assignee) patch.assignee = assignee;
+    if (blocked_reason !== undefined) patch.blocked_reason = blocked_reason;
+    if (blocker_agent !== undefined) patch.blocker_agent = blocker_agent;
+    if (due) patch.due = due;
+    try {
+      const r = await fetch(`${REST_URL}/api/okr/tasks/${encodeURIComponent(task_id)}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${TOKEN}` },
+        body: JSON.stringify(patch),
+      });
+      const text = await r.text();
+      if (!r.ok) {
+        return { content: [{ type: "text", text: `okr_update_task failed (${r.status}): ${text.slice(0, 160)}` }] };
+      }
+      return { content: [{ type: "text", text: `Updated: ${text}` }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `okr_update_task network error: ${String(e?.message || e).slice(0, 120)}` }] };
+    }
   }
 
   return { content: [{ type: "text", text: `Unknown tool: ${name}` }] };
