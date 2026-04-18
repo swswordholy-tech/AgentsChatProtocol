@@ -617,6 +617,47 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: "okr_add_kr",
+      description: "Add a KeyResult under an Objective. KRs are the measurable outcomes an Objective promises. metric_type picks the progress shape — count (N of M), bool (done/not), percent (0-100). Caller must own the Objective or be admin.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          objective_id: { type: "string", description: "Parent Objective id" },
+          title: { type: "string", description: "KR title (max 200 chars)" },
+          metric_type: { type: "string", enum: ["count", "bool", "percent"], description: "How progress is measured" },
+          current: { type: "number", description: "Starting value (default 0)" },
+          target: { type: "number", description: "Target value. For bool must be 0 or 1. For percent ≤100." },
+          risk_level: { type: "string", enum: ["green", "yellow", "red"], description: "Optional self-assessed risk indicator" },
+        },
+        required: ["objective_id", "title", "metric_type", "target"],
+      },
+    },
+    {
+      name: "okr_set_kr_progress",
+      description: "Update a KR's current value (progress ping) and optionally risk_level. Allowed for the Objective owner, an admin, or any task assignee whose task contributes_to this KR (self-report path). Unthrottled — progress updates are expected to be frequent during a sprint.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          kr_id: { type: "string", description: "KR id to update" },
+          current: { type: "number", description: "New current value. bool: 0/1 only. percent: ≤100." },
+          risk_level: { type: "string", enum: ["green", "yellow", "red"], description: "Update risk self-assessment" },
+        },
+        required: ["kr_id", "current"],
+      },
+    },
+    {
+      name: "okr_add_task_comment",
+      description: "Add a short comment to a Task. Any authed team member can comment (team-transparency design). Rate-limited to 30/min per caller; content capped at 2000 chars; history capped at 200 comments per task (oldest drop).",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          task_id: { type: "string", description: "Task id" },
+          text: { type: "string", description: "Comment text (max 2000 chars)" },
+        },
+        required: ["task_id", "text"],
+      },
+    },
+    {
       name: "switch_profile",
       description: "Switch to a different AgentChat profile at runtime. Lists available profiles if no name given.",
       inputSchema: {
@@ -1199,6 +1240,66 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       return { content: [{ type: "text", text: `Updated: ${text}` }] };
     } catch (e: any) {
       return { content: [{ type: "text", text: `okr_update_task network error: ${String(e?.message || e).slice(0, 120)}` }] };
+    }
+  }
+
+  if (name === "okr_add_kr") {
+    const { objective_id, title, metric_type, current, target, risk_level } = args as { objective_id: string; title: string; metric_type: string; current?: number; target: number; risk_level?: string };
+    const body: Record<string, unknown> = { title, metric_type, target };
+    if (typeof current === "number") body.current = current;
+    if (risk_level) body.risk_level = risk_level;
+    try {
+      const r = await fetch(`${REST_URL}/api/okr/objectives/${encodeURIComponent(objective_id)}/krs`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${TOKEN}` },
+        body: JSON.stringify(body),
+      });
+      const text = await r.text();
+      if (!r.ok) {
+        return { content: [{ type: "text", text: `okr_add_kr failed (${r.status}): ${text.slice(0, 160)}` }] };
+      }
+      return { content: [{ type: "text", text: `Added: ${text}` }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `okr_add_kr network error: ${String(e?.message || e).slice(0, 120)}` }] };
+    }
+  }
+
+  if (name === "okr_set_kr_progress") {
+    const { kr_id, current, risk_level } = args as { kr_id: string; current: number; risk_level?: string };
+    const body: Record<string, unknown> = { current };
+    if (risk_level) body.risk_level = risk_level;
+    try {
+      const r = await fetch(`${REST_URL}/api/okr/krs/${encodeURIComponent(kr_id)}/progress`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${TOKEN}` },
+        body: JSON.stringify(body),
+      });
+      const text = await r.text();
+      if (!r.ok) {
+        return { content: [{ type: "text", text: `okr_set_kr_progress failed (${r.status}): ${text.slice(0, 160)}` }] };
+      }
+      return { content: [{ type: "text", text: `Updated: ${text}` }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `okr_set_kr_progress network error: ${String(e?.message || e).slice(0, 120)}` }] };
+    }
+  }
+
+  if (name === "okr_add_task_comment") {
+    const { task_id, text: rawText } = args as { task_id: string; text: string };
+    const text = redactSecrets(rawText);
+    try {
+      const r = await fetch(`${REST_URL}/api/okr/tasks/${encodeURIComponent(task_id)}/comments`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${TOKEN}` },
+        body: JSON.stringify({ text }),
+      });
+      const body = await r.text();
+      if (!r.ok) {
+        return { content: [{ type: "text", text: `okr_add_task_comment failed (${r.status}): ${body.slice(0, 160)}` }] };
+      }
+      return { content: [{ type: "text", text: `Commented: ${body}` }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `okr_add_task_comment network error: ${String(e?.message || e).slice(0, 120)}` }] };
     }
   }
 
