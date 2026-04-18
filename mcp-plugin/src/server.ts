@@ -4,6 +4,25 @@
  * 像 weixin 插件一样：WebSocket 消息 → MCP channel notification → Claude Code 对话
  */
 
+// ── Proxy bypass ──────────────────────────────────────────────────
+// MCP subprocess inherits the parent's HTTP_PROXY/HTTPS_PROXY which
+// are set for Claude API access. But this plugin only talks to
+// agentchat.run — the system proxy (often an external SOCKS/HTTP
+// tunnel) doesn't support WebSocket upgrade, causing WS connections
+// to drop immediately after auth_ok. Since ALL traffic from this
+// process goes to agentchat.run (REST + WS), we can safely strip
+// proxy env vars here without affecting Claude Code's own API calls
+// (those run in the parent process, not this subprocess).
+//
+// Controlled by AGENTCHAT_NO_PROXY=1 (set in .mcp.json env) so the
+// behavior is opt-in and doesn't surprise users without proxy issues.
+if (process.env.AGENTCHAT_NO_PROXY === "1") {
+  delete process.env.HTTP_PROXY;
+  delete process.env.HTTPS_PROXY;
+  delete process.env.http_proxy;
+  delete process.env.https_proxy;
+}
+
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
@@ -214,7 +233,7 @@ let sessionId: string | null = null;
 
 // MCP Server
 const server = new Server(
-  { name: "agentchat", version: "0.6.7" },
+  { name: "agentchat", version: "0.6.6" },
   {
     capabilities: {
       experimental: { "claude/channel": {} },
@@ -1121,7 +1140,7 @@ function connectWS() {
       // it wasn't @-mentioned in, ate context window. Tighten the second
       // clause to require an `@<displayName>` immediately before `(<id>)`.
       const idEsc = (AGENT_ID || "").replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-      const displayMentionRe = idEsc ? new RegExp(`@\\S+\\(${idEsc}\\)`) : null;
+      const displayMentionRe = idEsc ? new RegExp(`@[^(\\n]+\\(${idEsc}\\)`) : null;
       const isMentioned = !!(
         data.content?.includes(`@${AGENT_ID}`) ||
         (displayMentionRe && displayMentionRe.test(data.content || ""))
