@@ -696,12 +696,71 @@ function redactSecrets(text: string): string {
     .replace(/eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "***JWT_REDACTED***");
 }
 
+/**
+ * Per-channel member cache for the bare-@-to-paren resolver below.
+ * TTL keeps writes cheap without going stale past the point where
+ * a newly-joined member's display_name would be resolvable.
+ */
+const MEMBER_CACHE_TTL_MS = 5 * 60_000;
+const memberCache = new Map<string, { at: number; members: { agent_id: string; display_name?: string }[] }>();
+
+async function fetchChannelMembers(chatId: string): Promise<{ agent_id: string; display_name?: string }[]> {
+  const now = Date.now();
+  const hit = memberCache.get(chatId);
+  if (hit && now - hit.at < MEMBER_CACHE_TTL_MS) return hit.members;
+  try {
+    const r = await fetch(`${REST_URL}/api/channels/${encodeURIComponent(chatId)}/members`, {
+      headers: { "Authorization": `Bearer ${TOKEN}` },
+    });
+    if (!r.ok) return hit?.members || [];
+    const body = await r.json() as any;
+    const members = Array.isArray(body?.members) ? body.members : [];
+    memberCache.set(chatId, { at: now, members });
+    return members;
+  } catch {
+    return hit?.members || [];
+  }
+}
+
+/**
+ * Resolve bare `@<display_name>` tokens in outgoing message text to the
+ * paren form `@<display_name>(<agent_id>)` so receiving MCP plugins'
+ * regex (which requires id or paren form) actually triggers. Boss
+ * 2026-04-20 pinned this as the canonical path instead of server-side
+ * rewrite (avoid per-broadcast CPU cost). Longest display_name wins
+ * via alternation-order in the regex — "Claude Code" beats "Claude"
+ * at a shared prefix position. Noop if the channel has no members
+ * with a display_name distinct from agent_id, or the text has no @.
+ */
+async function resolveBareMentions(chatId: string, text: string): Promise<string> {
+  if (!text || !text.includes("@")) return text;
+  const members = (await fetchChannelMembers(chatId))
+    .filter((m) => m.agent_id && m.display_name && m.display_name !== m.agent_id);
+  if (members.length === 0) return text;
+  members.sort((a, b) => (b.display_name || "").length - (a.display_name || "").length);
+  const escape = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const pattern = members.map((m) => escape(m.display_name || "")).join("|");
+  const byName = new Map(members.map((m) => [m.display_name!, m.agent_id]));
+  // Terminator: whitespace, Latin & CJK punctuation, or end-of-string.
+  // Negative lookahead for `(` avoids rewriting already-paren'd form
+  // (belt-and-suspenders; the terminator class already excludes `(`).
+  const re = new RegExp("@(" + pattern + ")(?=[\\s,.!?:;，。！？：；、]|$)(?!\\()", "g");
+  return text.replace(re, (match, name) => {
+    const id = byName.get(name);
+    return id ? `@${name}(${id})` : match;
+  });
+}
+
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
 
   if (name === "reply") {
     const { chat_id, text: rawText } = args as { chat_id: string; text: string };
-    const text = redactSecrets(rawText);
+    // Order: resolve bare @<display_name> to paren form FIRST (so the
+    // receiving MCP plugin's regex triggers), then redact secrets so
+    // an accidental `ac_xxx` in the text gets masked regardless of
+    // how it arrived.
+    const text = redactSecrets(await resolveBareMentions(chat_id, rawText));
     // Use REST API for reliable delivery (WebSocket may be half-open after deploy)
     try {
       const r = await fetch(`${REST_URL}/api/channels/${encodeURIComponent(chat_id)}/messages`, {
@@ -761,7 +820,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
   if (name === "thread_reply") {
     const { chat_id, parent_id, text: rawText } = args as any;
-    const text = redactSecrets(rawText);
+    const text = redactSecrets(await resolveBareMentions(chat_id, rawText));
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({
         type: "thread_reply", id: crypto.randomUUID(), parent_id,
