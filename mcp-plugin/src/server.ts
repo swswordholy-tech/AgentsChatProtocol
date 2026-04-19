@@ -1372,6 +1372,10 @@ function saveMentionTimestamps(m: Map<string, string>) {
 const lastMentionTimestamp = loadMentionTimestamps();
 let wsReconnectAttempt = 0;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+/** Flipped true when the server sends shard_moved (planned drain).
+ *  ws.onclose checks + clears it so the close is treated as a clean
+ *  hop, not a failure that advances the exponential backoff. */
+let isPlannedReconnect = false;
 
 function scheduleReconnect(delayMs: number) {
   if (reconnectTimer) clearTimeout(reconnectTimer);
@@ -1551,14 +1555,22 @@ function connectWS() {
       } catch {}
       process.stderr.write(`[agentchat] Joined channel: ${data.name}\n`);
     } else if (data.type === "shard_moved") {
-      // Server instance shutting down or channel moved — reconnect immediately
+      // Server instance shutting down or channel moved — reconnect
+      // immediately. This is a PLANNED disconnect: the server is
+      // giving us heads-up to move. Mark it so the upcoming
+      // ws.onclose doesn't treat this as a failure that increments
+      // wsReconnectAttempt / stretches the exponential backoff. When
+      // the server does a rolling deploy (several pods closing in
+      // sequence), without this flag each shard_moved would push the
+      // next reconnect 2s, 4s, 6s ... further out even though each
+      // is a clean planned event.
       process.stderr.write(`[agentchat] Shard moved, reconnecting...\n`);
       if (data.redirect_url) {
-        // Update WS_URL to point to new instance
         const newUrl = data.redirect_url.replace(/^https/, "wss").replace(/^http/, "ws") + "/ws";
         process.stderr.write(`[agentchat] Redirecting to: ${newUrl}\n`);
         // Note: for simplicity we reconnect to original URL and let /api/shard handle routing
       }
+      isPlannedReconnect = true;
       try { ws?.close(); } catch {}
       ws = null;
       sessionId = null;
@@ -1568,13 +1580,23 @@ function connectWS() {
     }
   }
 
-  ws.onclose = () => {
+  ws.onclose = (event) => {
     sessionId = null;
     heartbeat.resetReconnecting(); // allow heartbeat to reconnect again if needed
+    // Planned reconnect (server-initiated shard_moved): reset backoff
+    // and reconnect fast, don't count this against exponential delay.
+    if (isPlannedReconnect) {
+      isPlannedReconnect = false;
+      wsReconnectAttempt = 0;
+      // A concurrent scheduleReconnect(500) from the shard_moved
+      // handler has already been queued — don't double-schedule.
+      process.stderr.write(`[agentchat] Planned close (code=${(event as any)?.code ?? "?"}), reconnect in 0.5s\n`);
+      return;
+    }
     wsReconnectAttempt++;
     const jitter = Math.random() * 3000; // 0-3s random jitter to avoid thundering herd
     const delay = Math.min(wsReconnectAttempt * 2, 30) * 1000 + jitter;
-    process.stderr.write(`[agentchat] Disconnected, reconnecting in ${delay/1000}s (attempt ${wsReconnectAttempt})...\n`);
+    process.stderr.write(`[agentchat] Disconnected (code=${(event as any)?.code ?? "?"}), reconnecting in ${Math.round(delay/100)/10}s (attempt ${wsReconnectAttempt})...\n`);
     scheduleReconnect(delay);
   };
 
