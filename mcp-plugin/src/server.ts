@@ -658,6 +658,25 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: "okr_set_links",
+      description: "Attach docs / narrative to an Objective, KR, or Task. Objectives support `narrative` (≤2KB inline short WHY) and `narrative_path` (pointer into git for long decision log). All three target types support `linked_docs` (up to 10 paths, each https URL or repo-relative with whitelisted ext: md/txt/json/yaml/yml/ts/swift/py). Pass null / empty string / [] to clear a field. Omit a field to leave it unchanged. Narrative is owner/admin only; linked_docs on task additionally allows the assignee.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          target_type: { type: "string", enum: ["objective", "kr", "task"], description: "What we're attaching links to" },
+          target_id: { type: "string", description: "Id of the objective / kr / task" },
+          narrative: { type: "string", description: "Inline short WHY for Objective (≤2KB). Pass empty string to clear. Objective-only — passing on kr/task returns 400." },
+          narrative_path: { type: "string", description: "Path to long-form decision doc in git (e.g. docs/okr/obj_xxx.md). Pass empty string to clear. Objective-only." },
+          linked_docs: {
+            type: "array",
+            items: { type: "string" },
+            description: "Deliverable artifacts. Each entry: https URL OR repo-relative path with whitelisted extension. Pass [] to clear.",
+          },
+        },
+        required: ["target_type", "target_id"],
+      },
+    },
+    {
       name: "switch_profile",
       description: "Switch to a different AgentChat profile at runtime. Lists available profiles if no name given.",
       inputSchema: {
@@ -1300,6 +1319,34 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       return { content: [{ type: "text", text: `Commented: ${body}` }] };
     } catch (e: any) {
       return { content: [{ type: "text", text: `okr_add_task_comment network error: ${String(e?.message || e).slice(0, 120)}` }] };
+    }
+  }
+
+  if (name === "okr_set_links") {
+    const { target_type, target_id, narrative, narrative_path, linked_docs } = args as {
+      target_type: "objective" | "kr" | "task";
+      target_id: string;
+      narrative?: string;
+      narrative_path?: string;
+      linked_docs?: string[];
+    };
+    const body: Record<string, unknown> = {};
+    if (narrative !== undefined) body.narrative = narrative;
+    if (narrative_path !== undefined) body.narrative_path = narrative_path;
+    if (linked_docs !== undefined) body.linked_docs = linked_docs;
+    try {
+      const r = await fetch(`${REST_URL}/api/okr/links/${encodeURIComponent(target_type)}/${encodeURIComponent(target_id)}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${TOKEN}` },
+        body: JSON.stringify(body),
+      });
+      const text = await r.text();
+      if (!r.ok) {
+        return { content: [{ type: "text", text: `okr_set_links failed (${r.status}): ${text.slice(0, 200)}` }] };
+      }
+      return { content: [{ type: "text", text: `Updated: ${text}` }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `okr_set_links network error: ${String(e?.message || e).slice(0, 120)}` }] };
     }
   }
 
