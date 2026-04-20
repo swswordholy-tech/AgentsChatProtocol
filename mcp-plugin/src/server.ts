@@ -587,7 +587,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "okr_add_task",
-      description: "Add a Task under an Objective. Tasks attach to Objectives, optionally cross-reference KRs they advance via contributes_to[]. Caller must own the Objective (or be admin).",
+      description: "Add a Task under an Objective. Tasks attach to Objectives, optionally cross-reference KRs they advance via contributes_to[]. Caller must own the Objective (or be admin). v0.7.5: depends_on[] lets you express 'this task waits on those'; cycles are rejected by the server.",
       inputSchema: {
         type: "object" as const,
         properties: {
@@ -595,6 +595,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           title: { type: "string", description: "Task title (max 200 chars)" },
           assignee: { type: "string", description: "Agent/account id to assign the task to" },
           contributes_to: { type: "array", items: { type: "string" }, description: "Optional KR ids this task advances" },
+          depends_on: { type: "array", items: { type: "string" }, description: "Optional task ids this task waits on. Same-objective only. Max 20 direct deps. Server rejects cycles." },
           due: { type: "string", description: "ISO-8601 due date" },
         },
         required: ["objective_id", "title", "assignee"],
@@ -602,7 +603,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "okr_update_task",
-      description: "Update a Task — change status, assignee, block/unblock, add blocker info. Caller must be the assignee, Objective owner, or admin. Reassign (changing assignee) is owner/admin-only.",
+      description: "Update a Task — change status, assignee, block/unblock, add blocker info, adjust dependencies. Caller must be the assignee, Objective owner, or admin. Reassign is owner/admin-only. v0.7.5: pass depends_on:[] to clear, or a new array to replace; server rejects cycles.",
       inputSchema: {
         type: "object" as const,
         properties: {
@@ -611,7 +612,30 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           assignee: { type: "string", description: "Re-assign to another agent (owner/admin only)" },
           blocked_reason: { type: "string", description: "Why is this task blocked (max 500 chars)" },
           blocker_agent: { type: "string", description: "Which agent is blocking this task" },
+          depends_on: { type: "array", items: { type: "string" }, description: "Replacement dependency list (same-objective only, max 20, no cycles). Pass empty array to clear." },
           due: { type: "string", description: "ISO-8601 due date" },
+        },
+        required: ["task_id"],
+      },
+    },
+    {
+      name: "okr_task_blockers",
+      description: "Return the transitive closure of tasks this task waits on (via depends_on). Useful to know what must finish before this task can start. Read-only, no rate limit.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          task_id: { type: "string", description: "Task id whose blockers to resolve" },
+        },
+        required: ["task_id"],
+      },
+    },
+    {
+      name: "okr_task_blocks",
+      description: "Return the tasks that directly list this task in their depends_on (1-hop reverse lookup). Useful to know who's waiting on you. Read-only, no rate limit.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          task_id: { type: "string", description: "Task id whose downstream waiters to resolve" },
         },
         required: ["task_id"],
       },
@@ -1277,9 +1301,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   }
 
   if (name === "okr_add_task") {
-    const { objective_id, title, assignee, contributes_to, due } = args as { objective_id: string; title: string; assignee: string; contributes_to?: string[]; due?: string };
+    const { objective_id, title, assignee, contributes_to, depends_on, due } = args as { objective_id: string; title: string; assignee: string; contributes_to?: string[]; depends_on?: string[]; due?: string };
     const body: Record<string, unknown> = { title, assignee };
     if (Array.isArray(contributes_to) && contributes_to.length > 0) body.contributes_to = contributes_to;
+    if (Array.isArray(depends_on) && depends_on.length > 0) body.depends_on = depends_on;
     if (due) body.due = due;
     try {
       const r = await fetch(`${REST_URL}/api/okr/objectives/${encodeURIComponent(objective_id)}/tasks`, {
@@ -1298,12 +1323,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   }
 
   if (name === "okr_update_task") {
-    const { task_id, status, assignee, blocked_reason, blocker_agent, due } = args as { task_id: string; status?: string; assignee?: string; blocked_reason?: string; blocker_agent?: string; due?: string };
+    const { task_id, status, assignee, blocked_reason, blocker_agent, depends_on, due } = args as { task_id: string; status?: string; assignee?: string; blocked_reason?: string; blocker_agent?: string; depends_on?: string[]; due?: string };
     const patch: Record<string, unknown> = {};
     if (status) patch.status = status;
     if (assignee) patch.assignee = assignee;
     if (blocked_reason !== undefined) patch.blocked_reason = blocked_reason;
     if (blocker_agent !== undefined) patch.blocker_agent = blocker_agent;
+    if (Array.isArray(depends_on)) patch.depends_on = depends_on;
     if (due) patch.due = due;
     try {
       const r = await fetch(`${REST_URL}/api/okr/tasks/${encodeURIComponent(task_id)}`, {
@@ -1318,6 +1344,23 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       return { content: [{ type: "text", text: `Updated: ${text}` }] };
     } catch (e: any) {
       return { content: [{ type: "text", text: `okr_update_task network error: ${String(e?.message || e).slice(0, 120)}` }] };
+    }
+  }
+
+  if (name === "okr_task_blockers" || name === "okr_task_blocks") {
+    const { task_id } = args as { task_id: string };
+    const path = name === "okr_task_blockers" ? "blockers" : "blocks";
+    try {
+      const r = await fetch(`${REST_URL}/api/okr/tasks/${encodeURIComponent(task_id)}/${path}`, {
+        headers: { "Authorization": `Bearer ${TOKEN}` },
+      });
+      const text = await r.text();
+      if (!r.ok) {
+        return { content: [{ type: "text", text: `${name} failed (${r.status}): ${text.slice(0, 160)}` }] };
+      }
+      return { content: [{ type: "text", text }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `${name} network error: ${String(e?.message || e).slice(0, 120)}` }] };
     }
   }
 
