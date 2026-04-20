@@ -1510,6 +1510,42 @@ function saveMentionTimestamps(m: Map<string, string>) {
   } catch {}
 }
 const lastMentionTimestamp = loadMentionTimestamps();
+
+// Task #119: track the last-seen message timestamp per channel so a
+// reconnect can backfill messages the WS missed. Separate from
+// mention-ts because mention-ts only advances on mentions — we need
+// all messages (including non-mention ones) to compute the correct
+// backfill cursor. Persisted to disk: plugin restart resumes from
+// where it left off.
+//
+// Bug this fixes: even without a visible WS disconnect, Redis
+// ac:ch:* subscribe can briefly miss a broadcast (subscriber rebuild
+// window, transient network hiccup). Claude Code log 2026-04-20
+// 12:49 showed boss's @-mention never firing notifications/claude/
+// channel for claude-code-live even though my gcloud had no
+// disconnect event — so the "reconnect" trigger alone doesn't
+// cover this class. Backfill runs on every auth_ok whether first
+// connect or reconnect; if we missed anything, we find it.
+const lastSeenMessageTsFile = join(configDir, `last-seen-msg-ts-${AGENT_ID}.json`);
+function loadLastSeenMessageTs(): Map<string, string> {
+  try {
+    const raw = require("fs").readFileSync(lastSeenMessageTsFile, "utf-8");
+    return new Map(Object.entries(JSON.parse(raw)));
+  } catch { return new Map(); }
+}
+function saveLastSeenMessageTs(m: Map<string, string>) {
+  try {
+    require("fs").writeFileSync(lastSeenMessageTsFile, JSON.stringify(Object.fromEntries(m)));
+  } catch {}
+}
+const lastSeenMessageTs = loadLastSeenMessageTs();
+// Channels we believe we're a member of. Populated from
+// `channel_created` events on auth_ok. Used as the backfill target set.
+const knownChannels = new Set<string>();
+// Task #119: exposed handler reference so backfillAllChannels (module-
+// scope) can reuse connectWS's handleWSMessage closure without
+// duplicating the mention/notification gate logic.
+let currentHandleWSMessage: ((data: any) => Promise<void>) | null = null;
 let wsReconnectAttempt = 0;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 /** Flipped true when the server sends shard_moved (planned drain).
@@ -1523,6 +1559,64 @@ function scheduleReconnect(delayMs: number) {
     reconnectTimer = null;
     connectWS();
   }, delayMs);
+}
+
+/**
+ * Task #119: fetch any channel messages that arrived while the WS
+ * was unreliable or down. Invoked 2s after every auth_ok — covers
+ * both cold start (empty cursors = no backfill) and reconnect
+ * (cursor points to last-seen, REST returns the gap).
+ *
+ * Iterates channels we believe we're in (populated from the
+ * channel_created events that follow auth_ok). For each, GETs
+ * /api/channels/:id/messages?after=<lastSeenTs> and re-injects
+ * every message through handleWSMessage — same code path as live
+ * delivery, so @mention detection + notification emission go
+ * through the same gate. Self-messages are filtered by the handler
+ * (sender_id !== AGENT_ID).
+ *
+ * Deduplication happens naturally: the message-handler's timestamp
+ * compare advances lastSeenMessageTs monotonically; any message
+ * that the live WS ALSO delivers concurrently will match on the
+ * next poll and be skipped (timestamp <= prev).
+ */
+async function backfillAllChannels(): Promise<void> {
+  if (knownChannels.size === 0) return;
+  for (const channelId of knownChannels) {
+    try {
+      const after = lastSeenMessageTs.get(channelId);
+      const params = after ? `?after=${encodeURIComponent(after)}&limit=50` : `?limit=1`;
+      const url = `${REST_URL}/api/channels/${encodeURIComponent(channelId)}/messages${params}`;
+      const res = await fetch(url, {
+        headers: TOKEN ? { "Authorization": `Bearer ${TOKEN}` } : {},
+      });
+      if (!res.ok) continue;
+      const data = await res.json() as { messages?: any[] };
+      const msgs = data.messages || [];
+      // Filter out self-messages upfront (faster than re-entering the
+      // handler just to bail) and typing placeholders (plugin ignores
+      // them anyway).
+      const replay = msgs.filter((m: any) =>
+        m && m.sender_id !== AGENT_ID && m.content !== "__typing__");
+      if (replay.length === 0) continue;
+      process.stderr.write(`[agentchat] Backfill ${channelId.slice(0, 12)}: ${replay.length} missed msg(s)\n`);
+      // Sort ascending so replay order matches live chronology —
+      // lastSeenMessageTs advances monotonically.
+      replay.sort((a: any, b: any) => String(a.timestamp).localeCompare(String(b.timestamp)));
+      for (const m of replay) {
+        try {
+          // Wrap as a `message` envelope to match ws.onmessage shape.
+          if (currentHandleWSMessage) {
+            await currentHandleWSMessage({ ...m, type: "message" });
+          }
+        } catch (e) {
+          process.stderr.write(`[agentchat] Backfill replay error: ${e}\n`);
+        }
+      }
+    } catch (e) {
+      process.stderr.write(`[agentchat] Backfill fetch failed for ${channelId.slice(0, 12)}: ${e}\n`);
+    }
+  }
 }
 
 function connectWS() {
@@ -1555,6 +1649,7 @@ function connectWS() {
     }
   };
 
+  currentHandleWSMessage = handleWSMessage;
   async function handleWSMessage(data: any) {
 
     if (data.type === "pong") {
@@ -1567,9 +1662,32 @@ function connectWS() {
       wsReconnectAttempt = 0; // reset backoff on successful auth
       heartbeat.receivedPong(); // treat auth_ok as alive signal
       process.stderr.write(`[agentchat] Connected as ${AGENT_ID}\n`);
+      // Task #119: fire a backfill 2s after auth_ok to pick up any
+      // messages that arrived while the WS was down or that the Redis
+      // ac:ch:* subscribe happened to miss. Delay gives the server
+      // time to emit channel_created for each joined channel so
+      // knownChannels is populated. backfillAllChannels does the
+      // per-channel REST fetch and re-injects each missed message
+      // through handleWSMessage so @mention detection + notification
+      // path is identical to live delivery — no divergent code paths.
+      setTimeout(() => { void backfillAllChannels(); }, 2000);
     } else if (data.type === "message" && data.sender_id !== AGENT_ID) {
       // 跳过 typing 状态消息
       if (data.content === "__typing__") return;
+
+      // Task #119: record the timestamp so a future auth_ok backfill
+      // knows where to resume. Only advance forward (defensive against
+      // out-of-order delivery from Redis subscribe vs REST backfill
+      // replay). Persist periodically — not every message to avoid
+      // disk thrash, but at least on every received chat message since
+      // this file is tiny (one row per channel).
+      if (typeof data.channel_id === "string" && typeof data.timestamp === "string") {
+        const prev = lastSeenMessageTs.get(data.channel_id) || "";
+        if (data.timestamp > prev) {
+          lastSeenMessageTs.set(data.channel_id, data.timestamp);
+          saveLastSeenMessageTs(lastSeenMessageTs);
+        }
+      }
 
       const isDM = data.channel_id?.startsWith("dm-");
       // Match both `@<agentId>` and `@<displayName>(<agentId>)` formats.
@@ -1694,6 +1812,8 @@ function connectWS() {
         }));
       } catch {}
       process.stderr.write(`[agentchat] Joined channel: ${data.name}\n`);
+      // Task #119: track channel id for reconnect backfill target set.
+      if (typeof data.channel_id === "string") knownChannels.add(data.channel_id);
     } else if (data.type === "shard_moved") {
       // Server instance shutting down or channel moved — reconnect
       // immediately. This is a PLANNED disconnect: the server is
