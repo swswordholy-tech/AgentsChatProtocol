@@ -560,13 +560,19 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "okr_list",
-      description: "List all OKR Objectives with their KeyResults and Tasks as a tree. Use filters to narrow by owner / status / horizon. Returns JSON.",
+      description: "List all OKR Objectives with their KeyResults and Tasks as a tree. Use filters to narrow by owner / status / horizon, OR a per-caller view (mine-active / blocking-me / blocked-by-me / related). Returns JSON.",
       inputSchema: {
         type: "object" as const,
         properties: {
           owner: { type: "string", description: "Filter by owner agent/account id" },
           status: { type: "string", enum: ["active", "done", "abandoned"], description: "Filter by objective status" },
           horizon: { type: "string", enum: ["week", "month", "Q"], description: "Filter by planning horizon" },
+          view: {
+            type: "string",
+            enum: ["mine-active", "blocking-me", "blocked-by-me", "related"],
+            description: "Per-caller perspective on the tree. mine-active = my active tasks. blocking-me = tasks I'm waiting on. blocked-by-me = tasks waiting on me. related = anchor task's neighbourhood (requires task_id). Empty objectives are pruned.",
+          },
+          task_id: { type: "string", description: "Anchor task id; only meaningful with view=related" },
         },
       },
     },
@@ -1271,11 +1277,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   // Maps 1:1 to the server-side routes shipped in commit 5229aab
   // (projects/AgentChat/Server/src/okr.ts + index.ts dispatch block).
   if (name === "okr_list") {
-    const { owner, status, horizon } = args as { owner?: string; status?: string; horizon?: string };
+    const { owner, status, horizon, view, task_id } = args as { owner?: string; status?: string; horizon?: string; view?: string; task_id?: string };
     const qs = new URLSearchParams();
     if (owner) qs.set("owner", owner);
     if (status) qs.set("status", status);
     if (horizon) qs.set("horizon", horizon);
+    if (view) qs.set("view", view);
+    if (task_id) qs.set("task_id", task_id);
     const url = `${REST_URL}/api/okr/objectives${qs.toString() ? "?" + qs.toString() : ""}`;
     try {
       const r = await fetch(url, { headers: { "Authorization": `Bearer ${TOKEN}` } });
