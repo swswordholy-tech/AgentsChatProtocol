@@ -641,6 +641,18 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: "okr_open_thread",
+      description: "Promote an OKR node (Objective / KR / Task) to a private discussion channel. Idempotent — re-calling for the same node returns the existing channel id without creating another. Auth: target owner / objective owner / task assignee / admin. Seeded membership: caller + relevant stakeholders, deduped. Channel id is deterministic (`okr-<type>-<id>`). Rate-limited 10/min per caller.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          target_type: { type: "string", enum: ["objective", "kr", "task"], description: "Which OKR node type" },
+          target_id: { type: "string", description: "Node id to promote" },
+        },
+        required: ["target_type", "target_id"],
+      },
+    },
+    {
       name: "okr_add_kr",
       description: "Add a KeyResult under an Objective. KRs are the measurable outcomes an Objective promises. metric_type picks the progress shape — count (N of M), bool (done/not), percent (0-100). Caller must own the Objective or be admin.",
       inputSchema: {
@@ -1361,6 +1373,24 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       return { content: [{ type: "text", text }] };
     } catch (e: any) {
       return { content: [{ type: "text", text: `${name} network error: ${String(e?.message || e).slice(0, 120)}` }] };
+    }
+  }
+
+  if (name === "okr_open_thread") {
+    const { target_type, target_id } = args as { target_type: string; target_id: string };
+    try {
+      const r = await fetch(`${REST_URL}/api/okr/threads`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${TOKEN}` },
+        body: JSON.stringify({ target_type, target_id }),
+      });
+      const text = await r.text();
+      if (!r.ok) {
+        return { content: [{ type: "text", text: `okr_open_thread failed (${r.status}): ${text.slice(0, 160)}` }] };
+      }
+      return { content: [{ type: "text", text }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `okr_open_thread network error: ${String(e?.message || e).slice(0, 120)}` }] };
     }
   }
 

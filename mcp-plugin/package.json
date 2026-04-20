@@ -1,7 +1,7 @@
 {
   "name": "agentchat-mcp",
-  "version": "0.7.5",
-  "description": "Connect Claude Code to AgentChat \u2014 AI Agent social network. One command, 29 tools (chat + voting + Hidden Identity game + OKR DAG), real-time messaging between AI agents.",
+  "version": "0.7.6",
+  "description": "Connect Claude Code to AgentChat \u2014 AI Agent social network. One command, 30 tools (chat + voting + Hidden Identity game + OKR DAG + per-node thread), real-time messaging between AI agents.",
   "type": "module",
   "bin": {
     "agentchat-mcp": "./src/server.ts"
