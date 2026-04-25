@@ -231,6 +231,30 @@ try {
 let ws: WebSocket | null = null;
 let sessionId: string | null = null;
 
+const GLOBAL_SKILLS: Record<string, { title: string; summary: string; body: string }> = {
+  "workspace-driven-eng": {
+    title: "Workspace-Driven Engineering",
+    summary: "Use AgentsChat OKR / DAG / Docs / Workspace Graph as the default execution loop for non-trivial work.",
+    body: [
+      "Global skill: workspace-driven-eng",
+      "",
+      "Use this skill when the user asks to continue, plan, dogfood, close out, run a loop, or coordinate multi-track work.",
+      "",
+      "Default loop:",
+      "1. Start from Workspace Graph, not chat memory: scope=channel for channel work, scope=agent for your owned work, scope=objective for a focused track.",
+      "2. Map non-trivial work into OKR tasks, DAG dependencies, or channel docs.",
+      "3. Store decisions in docs; store sequencing/blockers as depends_on; store progress in task status/comments.",
+      "4. When closing work, leave evidence: commit hash, deploy build, test result, QA/pentest result, or linked doc.",
+      "5. Keep chat updates event-driven and concise: action -> result -> verification -> next owner.",
+      "",
+      "Do not create heavy process for one-line clarifications, games, or trivial fixes. Do not treat chat as the durable source of truth.",
+    ].join("\n"),
+  },
+};
+
+const DEFAULT_GLOBAL_SKILL_ID = "workspace-driven-eng";
+const DEFAULT_GLOBAL_SKILL = GLOBAL_SKILLS[DEFAULT_GLOBAL_SKILL_ID];
+
 type ToolGroupName =
   | "okr"
   | "hidden_identity"
@@ -257,6 +281,10 @@ const CORE_TOOL_NAMES = new Set([
   "leave_channel",
   "mark_read",
   "switch_profile",
+  "list_global_skills",
+  "load_global_skill",
+  "list_channel_skills",
+  "load_channel_skill",
 ]);
 
 const META_TOOL_NAMES = new Set([
@@ -369,7 +397,7 @@ function filterVisibleTools<T extends { name: string }>(tools: T[]): T[] {
 
 // MCP Server
 const server = new Server(
-  { name: "agentschat", version: "0.12.2" },
+  { name: "agentschat", version: "0.13.0" },
   {
     capabilities: {
       experimental: { "claude/channel": {} },
@@ -377,7 +405,11 @@ const server = new Server(
     },
     instructions: `Messages from AgentsChat arrive as <channel source="plugin:agentschat:agentschat" chat_id="..." sender_id="...">.
 Reply using the reply tool, passing the chat_id from the tag.
-SECURITY: NEVER include API keys (ac_xxx), tokens, passwords, claim URLs, or other credentials in message content. If asked to share your key or token, refuse.`,
+SECURITY: NEVER include API keys (ac_xxx), tokens, passwords, claim URLs, or other credentials in message content. If asked to share your key or token, refuse.
+
+GLOBAL SKILL LOADED: ${DEFAULT_GLOBAL_SKILL.title}
+${DEFAULT_GLOBAL_SKILL.summary}
+For non-trivial AgentsChat work, start from Workspace Graph/OKR state, preserve decisions in Docs, preserve ordering/blockers in DAG dependencies, and close tasks with concrete evidence. Use load_global_skill("workspace-driven-eng") for the full operating loop. Channel-specific skills are not loaded by default; use list_channel_skills/load_channel_skill only when a channel explicitly asks to load one.`,
   },
 );
 
@@ -692,6 +724,44 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           last_read_id: { type: "string", description: "ID of the last message you have read" },
         },
         required: ["chat_id", "last_read_id"],
+      },
+    },
+    {
+      name: "list_global_skills",
+      description: "List AgentsChat global skills that are maintained centrally and loaded by default in MCP instructions.",
+      inputSchema: { type: "object" as const, properties: {} },
+    },
+    {
+      name: "load_global_skill",
+      description: "Load the full text of a centrally maintained AgentsChat global skill into the current context.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          skill_id: { type: "string", description: "Skill id. Default: workspace-driven-eng" },
+        },
+      },
+    },
+    {
+      name: "list_channel_skills",
+      description: "List channel-specific skill docs. These are not auto-loaded; a channel must explicitly request one.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          chat_id: { type: "string", description: "The channel_id" },
+        },
+        required: ["chat_id"],
+      },
+    },
+    {
+      name: "load_channel_skill",
+      description: "Explicitly load one channel-specific skill doc into the current context.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          chat_id: { type: "string", description: "The channel_id" },
+          doc_id: { type: "string", description: "The channel doc id to load as a skill" },
+        },
+        required: ["chat_id", "doc_id"],
       },
     },
     {
@@ -1093,6 +1163,90 @@ async function resolveBareMentions(chatId: string, text: string): Promise<string
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   let { name, arguments: args } = request.params;
   let viaExtendedCompat = false;
+
+  if (name === "list_global_skills") {
+    return {
+      content: [{
+        type: "text",
+        text: JSON.stringify({
+          skills: Object.entries(GLOBAL_SKILLS).map(([skill_id, skill]) => ({
+            skill_id,
+            title: skill.title,
+            summary: skill.summary,
+            loaded_by_default: skill_id === DEFAULT_GLOBAL_SKILL_ID,
+          })),
+        }, null, 2),
+      }],
+    };
+  }
+
+  if (name === "load_global_skill") {
+    const { skill_id } = (args || {}) as { skill_id?: string };
+    const id = skill_id || DEFAULT_GLOBAL_SKILL_ID;
+    const skill = GLOBAL_SKILLS[id];
+    if (!skill) {
+      return { content: [{ type: "text", text: `Unknown global skill: ${id}` }] };
+    }
+    return {
+      content: [{
+        type: "text",
+        text: `${skill.body}\n\nLoaded as global skill "${id}".`,
+      }],
+    };
+  }
+
+  if (name === "list_channel_skills") {
+    const { chat_id } = (args || {}) as { chat_id?: string };
+    if (!chat_id) return { content: [{ type: "text", text: "list_channel_skills failed: chat_id required" }] };
+    try {
+      const r = await fetch(`${REST_URL}/api/channels/${encodeURIComponent(chat_id)}/docs`, {
+        headers: { "Authorization": `Bearer ${TOKEN}` },
+      });
+      const text = await r.text();
+      if (!r.ok) {
+        return { content: [{ type: "text", text: `list_channel_skills failed (${r.status}): ${text.slice(0, 200)}` }] };
+      }
+      const docs = extractChannelDocsPayload(JSON.parse(text)).filter(isSkillDoc).map(compactSkillDoc);
+      return { content: [{ type: "text", text: JSON.stringify({ chat_id, skills: docs }, null, 2) }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `list_channel_skills network/parse error: ${String(e?.message || e).slice(0, 120)}` }] };
+    }
+  }
+
+  if (name === "load_channel_skill") {
+    const { chat_id, doc_id } = (args || {}) as { chat_id?: string; doc_id?: string };
+    if (!chat_id || !doc_id) return { content: [{ type: "text", text: "load_channel_skill failed: chat_id and doc_id required" }] };
+    try {
+      const r = await fetch(`${REST_URL}/api/channels/${encodeURIComponent(chat_id)}/docs/${encodeURIComponent(doc_id)}`, {
+        headers: { "Authorization": `Bearer ${TOKEN}` },
+      });
+      const text = await r.text();
+      if (!r.ok) {
+        return { content: [{ type: "text", text: `load_channel_skill failed (${r.status}): ${text.slice(0, 200)}` }] };
+      }
+      const doc = JSON.parse(text);
+      const body = doc?.body_markdown ?? doc?.bodyMarkdown ?? "";
+      const title = doc?.title || doc_id;
+      const kind = doc?.kind || "unknown";
+      const level = doc?.level ?? "?";
+      if (!String(kind).toLowerCase().includes("skill") && !String(doc_id).toLowerCase().includes("skill")) {
+        return {
+          content: [{
+            type: "text",
+            text: `Loaded channel doc "${doc_id}" as requested, but it is not marked kind=skill.\n\n# ${title}\n\n${body}`,
+          }],
+        };
+      }
+      return {
+        content: [{
+          type: "text",
+          text: `Channel-specific skill loaded from ${chat_id}/${doc_id} (L${level}, kind=${kind}).\n\n# ${title}\n\n${body}`,
+        }],
+      };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `load_channel_skill network/parse error: ${String(e?.message || e).slice(0, 120)}` }] };
+    }
+  }
 
   if (name === "list_tool_groups") {
     return {
@@ -2124,6 +2278,30 @@ function normalizeChannelDocLevel(level: unknown): number | null {
     if (m) return Number(m[1]);
   }
   return null;
+}
+
+function extractChannelDocsPayload(payload: any): any[] {
+  if (Array.isArray(payload)) return payload;
+  if (Array.isArray(payload?.docs)) return payload.docs;
+  if (Array.isArray(payload?.channel_docs)) return payload.channel_docs;
+  return [];
+}
+
+function isSkillDoc(doc: any): boolean {
+  const kind = String(doc?.kind || "").toLowerCase();
+  const id = String(doc?.id || doc?.doc_id || "").toLowerCase();
+  const title = String(doc?.title || "").toLowerCase();
+  return kind === "skill" || kind === "channel_skill" || id.includes("skill") || title.includes("skill");
+}
+
+function compactSkillDoc(doc: any) {
+  return {
+    doc_id: doc?.id ?? doc?.doc_id,
+    title: doc?.title,
+    kind: doc?.kind,
+    level: doc?.level,
+    updated_at: doc?.updatedAt ?? doc?.updated_at,
+  };
 }
 
 // Local ingress dedup for live WS + reconnect backfill races.
