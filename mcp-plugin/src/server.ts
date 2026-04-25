@@ -400,7 +400,7 @@ function filterVisibleTools<T extends { name: string }>(tools: T[]): T[] {
 
 // MCP Server
 const server = new Server(
-  { name: "agentschat", version: "0.13.1" },
+  { name: "agentschat", version: "0.14.2" },
   {
     capabilities: {
       experimental: { "claude/channel": {} },
@@ -1669,8 +1669,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       });
       const data = await r.json().catch(() => ({})) as any;
       if (r.ok) {
+        const channelId = data?.game?.channel_id || data?.game?.channelId || await fetchHiddenIdentityChannelId(game_id);
+        if (typeof channelId === "string") activateHiddenIdentityGame(game_id, channelId);
         const count = data?.game?.player_ids?.length ?? data?.game?.players?.length ?? "?";
-        return { content: [{ type: "text", text: `Joined game ${String(game_id).slice(0, 8)} — ${count} players in lobby` }] };
+        const activeNote = channelId ? ` HI active mode enabled for channel ${String(channelId).slice(0, 8)}.` : "";
+        return { content: [{ type: "text", text: `Joined game ${String(game_id).slice(0, 8)} — ${count} players in lobby.${activeNote}` }] };
       }
       return { content: [{ type: "text", text: `Join failed (${r.status}): ${String(data?.error || "").slice(0, 120)}` }] };
     } catch (e: any) {
@@ -2369,6 +2372,80 @@ function parseSkillFrontmatter(md: string): { metadata: Record<string, string>; 
   return { metadata, body };
 }
 
+// Hidden Identity active-player mode lives entirely in the MCP client.
+// When this agent joins a game, it temporarily surfaces all messages from
+// that game's channel even without an @mention, so players can follow live
+// descriptions/discussion. The server remains the game-state authority; this
+// local mode is bounded by both reveal/finished detection and a hard TTL.
+type ActiveHiddenIdentityGame = {
+  gameId: string;
+  channelId: string;
+  expiresAt: number;
+};
+const activeHiddenIdentityGames = new Map<string, ActiveHiddenIdentityGame>(); // game_id -> state
+const HI_ACTIVE_TTL_MS = 60 * 60 * 1000;
+
+function pruneActiveHiddenIdentityGames(now = Date.now()) {
+  for (const [gameId, state] of activeHiddenIdentityGames) {
+    if (state.expiresAt <= now) {
+      activeHiddenIdentityGames.delete(gameId);
+      process.stderr.write(`[agentchat] HI active mode expired game=${gameId.slice(0, 8)} channel=${state.channelId.slice(0, 12)}\n`);
+    }
+  }
+}
+
+function activateHiddenIdentityGame(gameId: string, channelId?: string) {
+  if (!gameId || !channelId) return;
+  activeHiddenIdentityGames.set(gameId, {
+    gameId,
+    channelId,
+    expiresAt: Date.now() + HI_ACTIVE_TTL_MS,
+  });
+  process.stderr.write(`[agentchat] HI active mode ON game=${gameId.slice(0, 8)} channel=${channelId.slice(0, 12)} ttl=${Math.round(HI_ACTIVE_TTL_MS / 60000)}m\n`);
+}
+
+async function fetchHiddenIdentityChannelId(gameId: string): Promise<string | undefined> {
+  try {
+    const r = await fetch(`${REST_URL}/api/hidden-identity/games/${encodeURIComponent(gameId)}`, {
+      headers: { "Authorization": `Bearer ${TOKEN}` },
+    });
+    if (!r.ok) return undefined;
+    const data = await r.json().catch(() => ({})) as any;
+    const g = data?.game || {};
+    const channelId = g.channel_id || g.channelId;
+    return typeof channelId === "string" ? channelId : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function activeHiddenIdentityForChannel(channelId: string | undefined): ActiveHiddenIdentityGame | null {
+  if (!channelId) return null;
+  pruneActiveHiddenIdentityGames();
+  for (const state of activeHiddenIdentityGames.values()) {
+    if (state.channelId === channelId) return state;
+  }
+  return null;
+}
+
+function clearActiveHiddenIdentityGame(gameId: string, reason: string) {
+  const state = activeHiddenIdentityGames.get(gameId);
+  if (!state) return;
+  activeHiddenIdentityGames.delete(gameId);
+  process.stderr.write(`[agentchat] HI active mode OFF game=${gameId.slice(0, 8)} reason=${reason}\n`);
+}
+
+function clearFinishedHiddenIdentityGamesFromMessage(data: any) {
+  const content = String(data?.content || "");
+  if (!content) return;
+  for (const gameId of [...activeHiddenIdentityGames.keys()]) {
+    if (!content.includes(gameId)) continue;
+    if (/\b(reveal|finished)\b/i.test(content) || /Game over|游戏结束|villagers won|spies won|平民获胜|卧底获胜/i.test(content)) {
+      clearActiveHiddenIdentityGame(gameId, "finished_message");
+    }
+  }
+}
+
 // Local ingress dedup for live WS + reconnect backfill races.
 //
 // `lastSeenMessageTs` is a cursor, not message identity. A reconnect can
@@ -2525,6 +2602,9 @@ function connectWS() {
       heartbeat.receivedPong();
       return;
     }
+    if ((data.type === "hidden_identity.reveal" || data.type === "hidden_identity.finished") && typeof data.game_id === "string") {
+      clearActiveHiddenIdentityGame(data.game_id, data.type);
+    }
 
     if (data.type === "auth_ok") {
       sessionId = data.session_id;
@@ -2576,20 +2656,23 @@ function connectWS() {
         data.content?.includes(`@${AGENT_ID}`) ||
         (displayMentionRe && displayMentionRe.test(data.content || ""))
       );
+      const activeHi = activeHiddenIdentityForChannel(data.channel_id);
 
-      if (isDM || isMentioned) {
+      if (isDM || isMentioned || activeHi) {
         // DM or @mention → respond
         // 立即发送 typing ACK
-        try {
-          if (ws && ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({
-              type: "message", id: crypto.randomUUID(),
-              channel_id: data.channel_id, sender_id: AGENT_ID,
-              sender_type: "agent", content: "__typing__",
-              content_type: "text", timestamp: new Date().toISOString(),
-            }));
-          }
-        } catch {}
+        if (isDM || isMentioned) {
+          try {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+              ws.send(JSON.stringify({
+                type: "message", id: crypto.randomUUID(),
+                channel_id: data.channel_id, sender_id: AGENT_ID,
+                sender_type: "agent", content: "__typing__",
+                content_type: "text", timestamp: new Date().toISOString(),
+              }));
+            }
+          } catch {}
+        }
 
         // For @mention in channels, fetch context since last mention
         let contextPrefix = "";
@@ -2651,8 +2734,11 @@ function connectWS() {
             process.stderr.write(`[agentchat] Failed to fetch context: ${e}\n`);
           }
         }
+        if (!isDM && !isMentioned && activeHi) {
+          contextPrefix = `[HI游戏进行中 - 你是 game ${activeHi.gameId.slice(0, 8)} 的上桌玩家；此消息无需 @mention 也被实时推送。只在轮到你行动、需要讨论或需要投票时回复，否则可以旁观。]\n`;
+        }
 
-        process.stderr.write(`[agentchat] ${isDM ? 'DM' : '@mention'} from ${data.sender_id.slice(0, 8)}: ${data.content.slice(0, 50)}\n`);
+        process.stderr.write(`[agentchat] ${isDM ? 'DM' : isMentioned ? '@mention' : 'HI-active'} from ${data.sender_id.slice(0, 8)}: ${data.content.slice(0, 50)}\n`);
 
         // 推送给 Claude Code
         try {
@@ -2671,6 +2757,7 @@ function connectWS() {
         } catch (notifErr) {
           process.stderr.write(`[agentchat] Notification FAILED: ${notifErr}\n`);
         }
+        if (activeHi) clearFinishedHiddenIdentityGamesFromMessage(data);
       } else {
         // Channel message without @mention → silent (just log)
         process.stderr.write(`[agentchat] [silent] ${data.sender_id.slice(0, 8)} in ${data.channel_id.slice(0, 12)}: ${data.content.slice(0, 30)}\n`);

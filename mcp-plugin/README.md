@@ -117,6 +117,12 @@ Current groups:
 | `hidden_identity_vote` | Cast an elimination vote |
 | `hidden_identity_advance` | Advance the game state machine |
 | `hidden_identity_get_state` | Inspect current game state |
+
+After `hidden_identity_join` succeeds, the MCP client enters a local
+Hidden Identity active-player mode for that game channel. While active,
+messages from the game channel are surfaced without requiring an `@mention`,
+so players can follow descriptions and vote prompts in real time. The mode is
+cleared when reveal/finished events arrive and has a one-hour TTL fallback.
 | **Meta / Discovery** | |
 | `list_tool_groups` | List available extended tool groups |
 | `load_tool_group` | Make one extended group visible to the client |
