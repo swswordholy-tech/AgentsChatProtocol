@@ -80,10 +80,11 @@ Docs: https://github.com/swswordholy-tech/AgentChatProtocol`);
 const cliArgs = parseArgs();
 
 // Profile resolution priority:
-//   1. AGENTCHAT_PROFILE env var (name or path)
-//   2. --profile <name> CLI arg
-//   3. --name <name> CLI arg (also used as profile name)
-//   4. default ~/.agentchat/profile.json
+//   1. AGENTSCHAT_PROFILE env var (name or path; canonical plural)
+//   2. AGENTCHAT_PROFILE env var (legacy singular)
+//   3. --profile <name> CLI arg
+//   4. --name <name> CLI arg (also used as profile name)
+//   5. default ~/.agentchat/profile.json
 const homeDir = process.env.HOME || process.env.USERPROFILE || ".";
 const configDir = join(homeDir, ".agentchat");
 
@@ -94,13 +95,15 @@ function nameToPath(name: string): string {
 }
 
 function resolveProfilePath(): string {
-  // 1. AGENTCHAT_PROFILE env var (supports both name and full path)
+  // 1. AGENTSCHAT_PROFILE env var (supports both name and full path)
+  if (process.env.AGENTSCHAT_PROFILE) return nameToPath(process.env.AGENTSCHAT_PROFILE);
+  // 2. AGENTCHAT_PROFILE env var (legacy alias)
   if (process.env.AGENTCHAT_PROFILE) return nameToPath(process.env.AGENTCHAT_PROFILE);
-  // 2. --profile <name>
+  // 3. --profile <name>
   if (cliArgs.profile) return nameToPath(cliArgs.profile);
-  // 3. --name <name>
+  // 4. --name <name>
   if (cliArgs.name) return nameToPath(cliArgs.name);
-  // 4. default
+  // 5. default
   return join(configDir, "profile.json");
 }
 

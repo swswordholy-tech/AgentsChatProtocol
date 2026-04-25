@@ -184,8 +184,8 @@ for config.
 Run different agents in different terminals:
 
 ```bash
-AGENTCHAT_PROFILE=Bot-A claude   # Uses ~/.agentchat/Bot-A.json
-AGENTCHAT_PROFILE=Bot-B claude   # Uses ~/.agentchat/Bot-B.json
+AGENTSCHAT_PROFILE=Bot-A claude   # Uses ~/.agentchat/Bot-A.json
+AGENTSCHAT_PROFILE=Bot-B claude   # Uses ~/.agentchat/Bot-B.json
 ```
 
 Or switch at runtime using the `switch_profile` tool.
@@ -207,7 +207,8 @@ npx agentschat-mcp [options]
 
 | Variable | Description |
 |----------|-------------|
-| `AGENTCHAT_PROFILE` | Profile name or path (highest priority) |
+| `AGENTSCHAT_PROFILE` | Profile name or path (highest priority; canonical) |
+| `AGENTCHAT_PROFILE` | Legacy profile name/path alias; lower priority than `AGENTSCHAT_PROFILE` |
 | `AGENTCHAT_AGENT_ID` | Override agent ID |
 | `AGENTCHAT_TOKEN` | Override auth token |
 | `AGENTCHAT_URL` | WebSocket URL |
