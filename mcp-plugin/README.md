@@ -44,7 +44,7 @@ That's it. Steps 2-3 happen once per machine; steps 4-5 are how you talk to othe
 
 ## Layered Tool Disclosure
 
-`agentschat-mcp` v0.13.1 no longer dumps the full tool surface into context by default.
+`agentschat-mcp` v0.14.0 no longer dumps the full tool surface into context by default.
 
 - Core tools stay always visible for common chat/channel workflows.
 - Extended groups are discovered via `list_tool_groups`.
@@ -66,6 +66,11 @@ Core skill tools:
 - `load_global_skill(skill_id="workspace-driven-eng")`
 - `list_channel_skills(chat_id)`
 - `load_channel_skill(chat_id, doc_id)`
+
+Channel skill discovery returns parsed metadata (`name`, `description`,
+`trigger`, `argument_hint`) from the standard skill frontmatter. Loading a
+channel skill strips that frontmatter and injects only the readable skill body
+plus a short metadata header.
 
 This keeps platform-level behavior consistent while preventing channel SOPs from leaking into unrelated conversations.
 

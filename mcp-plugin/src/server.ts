@@ -1229,18 +1229,30 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const title = doc?.title || doc_id;
       const kind = doc?.kind || "unknown";
       const level = doc?.level ?? "?";
+      const parsed = parseSkillFrontmatter(String(body));
+      const metadata = { ...(parsed.metadata || {}), ...(doc?.skill_meta || doc?.skillMeta || {}) };
+      const metaLines = [
+        metadata.name ? `name: ${metadata.name}` : null,
+        metadata.description ? `description: ${metadata.description}` : null,
+        metadata.trigger ? `trigger: ${metadata.trigger}` : null,
+        (metadata.argument_hint ?? metadata.argumentHint) ? `argument-hint: ${metadata.argument_hint ?? metadata.argumentHint}` : null,
+      ].filter(Boolean).join("\n");
       if (!String(kind).toLowerCase().includes("skill") && !String(doc_id).toLowerCase().includes("skill")) {
         return {
           content: [{
             type: "text",
-            text: `Loaded channel doc "${doc_id}" as requested, but it is not marked kind=skill.\n\n# ${title}\n\n${body}`,
+            text: `Loaded channel doc "${doc_id}" as requested, but it is not marked kind=skill.\n\n# ${title}\n\n${parsed.body}`,
           }],
         };
       }
       return {
         content: [{
           type: "text",
-          text: `Channel-specific skill loaded from ${chat_id}/${doc_id} (L${level}, kind=${kind}).\n\n# ${title}\n\n${body}`,
+          text: [
+            `Channel-specific skill loaded from ${chat_id}/${doc_id} (L${level}, kind=${kind}).`,
+            metaLines ? `\nMetadata:\n${metaLines}` : "",
+            `\n# ${title}\n\n${parsed.body}`,
+          ].join("\n"),
         }],
       };
     } catch (e: any) {
@@ -2318,13 +2330,40 @@ function isSkillDoc(doc: any): boolean {
 }
 
 function compactSkillDoc(doc: any) {
+  const meta = doc?.skill_meta || doc?.skillMeta || {};
   return {
     doc_id: doc?.id ?? doc?.doc_id,
     title: doc?.title,
     kind: doc?.kind,
     level: doc?.level,
     updated_at: doc?.updatedAt ?? doc?.updated_at,
+    name: meta.name,
+    description: meta.description,
+    trigger: meta.trigger,
+    argument_hint: meta.argument_hint ?? meta.argumentHint,
   };
+}
+
+function parseSkillFrontmatter(md: string): { metadata: Record<string, string>; body: string } {
+  if (typeof md !== "string" || !md.startsWith("---\n")) return { metadata: {}, body: md };
+  const end = md.indexOf("\n---", 4);
+  if (end < 0) return { metadata: {}, body: md };
+  const raw = md.slice(4, end);
+  const body = md.slice(end + "\n---".length).replace(/^\s*\r?\n/, "");
+  const metadata: Record<string, string> = {};
+  for (const line of raw.split(/\r?\n/)) {
+    const m = line.match(/^([A-Za-z0-9_-]+):\s*(.*)$/);
+    if (!m) continue;
+    const key = m[1].toLowerCase().replace(/-/g, "_");
+    let value = m[2].trim();
+    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+      value = value.slice(1, -1);
+    }
+    if (key === "name" || key === "description" || key === "trigger" || key === "argument_hint") {
+      metadata[key] = value;
+    }
+  }
+  return { metadata, body };
 }
 
 // Local ingress dedup for live WS + reconnect backfill races.
