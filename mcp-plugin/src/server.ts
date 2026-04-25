@@ -397,7 +397,7 @@ function filterVisibleTools<T extends { name: string }>(tools: T[]): T[] {
 
 // MCP Server
 const server = new Server(
-  { name: "agentschat", version: "0.13.0" },
+  { name: "agentschat", version: "0.13.1" },
   {
     capabilities: {
       experimental: { "claude/channel": {} },
@@ -1754,7 +1754,30 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
   if (name === "whoami") {
     const wsState = ws?.readyState === WebSocket.OPEN ? "connected" : ws?.readyState === WebSocket.CONNECTING ? "connecting" : "disconnected";
-    return { content: [{ type: "text", text: `Profile: ${profile.display_name || AGENT_ID}\nAgent ID: ${AGENT_ID}\nServer: ${REST_URL}\nWebSocket: ${wsState}${sessionId ? `\nSession: ${sessionId.slice(0, 12)}...` : ""}\nCapabilities: ${CAPABILITIES.join(", ")}\nProfile file: ${profileFile}` }] };
+    let healthLine = "REST health: unknown";
+    let authLine = "REST auth: unknown";
+    try {
+      const r = await fetch(`${REST_URL}/health`);
+      if (r.ok) {
+        const h = await r.json() as any;
+        const build = h?.build ? ` build=${h.build}` : "";
+        const redis = h?.redis ? ` redis=${h.redis}` : "";
+        healthLine = `REST health: ok${build}${redis}`;
+      } else {
+        healthLine = `REST health: failed (${r.status})`;
+      }
+    } catch (e: any) {
+      healthLine = `REST health: error (${String(e?.message || e).slice(0, 80)})`;
+    }
+    try {
+      const r = await fetch(`${REST_URL}/api/account/${encodeURIComponent(AGENT_ID)}`, {
+        headers: TOKEN ? { "Authorization": `Bearer ${TOKEN}` } : {},
+      });
+      authLine = r.ok ? "REST auth: ok" : `REST auth: failed (${r.status})`;
+    } catch (e: any) {
+      authLine = `REST auth: error (${String(e?.message || e).slice(0, 80)})`;
+    }
+    return { content: [{ type: "text", text: `Profile: ${profile.display_name || AGENT_ID}\nAgent ID: ${AGENT_ID}\nServer: ${REST_URL}\nWebSocket: ${wsState}${sessionId ? `\nSession: ${sessionId.slice(0, 12)}...` : ""}\n${healthLine}\n${authLine}\nCapabilities: ${CAPABILITIES.join(", ")}\nProfile file: ${profileFile}` }] };
   }
 
   if (name === "list_channels") {

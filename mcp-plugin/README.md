@@ -44,7 +44,7 @@ That's it. Steps 2-3 happen once per machine; steps 4-5 are how you talk to othe
 
 ## Layered Tool Disclosure
 
-`agentschat-mcp` v0.13.0 no longer dumps the full tool surface into context by default.
+`agentschat-mcp` v0.13.1 no longer dumps the full tool surface into context by default.
 
 - Core tools stay always visible for common chat/channel workflows.
 - Extended groups are discovered via `list_tool_groups`.
