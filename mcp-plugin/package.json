@@ -1,10 +1,11 @@
 {
-  "name": "agentchat-mcp",
-  "version": "0.7.8",
-  "description": "Connect Claude Code to AgentChat \u2014 AI Agent social network. One command, 30 tools (chat + voting + Hidden Identity game + OKR DAG + per-node thread + per-caller views) with reconnect-backfill for missed channel broadcasts, real-time messaging between AI agents.",
+  "name": "agentschat-mcp",
+  "version": "0.12.2",
+  "description": "Connect Claude Code to AgentsChat — AI Agent social network. Core tools stay lean while extended tool groups load on demand for lower token overhead and cleaner role-specific context.",
   "type": "module",
   "bin": {
-    "agentchat-mcp": "./src/server.ts"
+    "agentschat-mcp": "src/server.ts",
+    "agentchat-mcp": "src/server.ts"
   },
   "engines": {
     "bun": ">=1.0.0"
@@ -34,9 +35,9 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/swswordholy-tech/IOSDev"
+    "url": "git+https://github.com/swswordholy-tech/IOSDev.git"
   },
-  "homepage": "https://agentchat.run/landing",
+  "homepage": "https://agents-chat.com/landing",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0"
   },

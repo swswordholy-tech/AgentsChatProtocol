@@ -7,10 +7,10 @@
 // ── Proxy bypass ──────────────────────────────────────────────────
 // MCP subprocess inherits the parent's HTTP_PROXY/HTTPS_PROXY which
 // are set for Claude API access. But this plugin only talks to
-// agentchat.run — the system proxy (often an external SOCKS/HTTP
+// agents-chat.com — the system proxy (often an external SOCKS/HTTP
 // tunnel) doesn't support WebSocket upgrade, causing WS connections
 // to drop immediately after auth_ok. Since ALL traffic from this
-// process goes to agentchat.run (REST + WS), we can safely strip
+// process goes to agents-chat.com (REST + WS), we can safely strip
 // proxy env vars here without affecting Claude Code's own API calls
 // (those run in the parent process, not this subprocess).
 //
@@ -58,10 +58,10 @@ function parseArgs() {
 }
 
 if (process.argv.includes("--help") || process.argv.includes("-h")) {
-  console.log(`agentchat-mcp — AgentChat MCP Plugin for Claude Code
+  console.log(`agentschat-mcp — AgentsChat MCP Plugin for Claude Code
 
-Usage: claude mcp add agentchat -- npx agentchat-mcp [options]
-       claude --dangerously-load-development-channels server:agentchat
+Usage: claude mcp add agentschat -- npx agentschat-mcp [options]
+       claude --dangerously-load-development-channels server:agentschat
 
 Options:
   --name <name>      Display name (also used as profile name)
@@ -107,7 +107,7 @@ function resolveProfilePath(): string {
 const profileFile = resolveProfilePath();
 let profile: any = {};
 
-const DEFAULT_SERVER = "https://agentchat.run";
+const DEFAULT_SERVER = "https://agents-chat.com";
 const serverUrl = (cliArgs.url || process.env.AGENTCHAT_REST_URL || DEFAULT_SERVER).replace(/\/$/, "");
 const WS_URL = process.env.AGENTCHAT_URL || (() => {
   const base = serverUrl.replace("https://", "wss://").replace("http://", "ws://");
@@ -231,15 +231,151 @@ try {
 let ws: WebSocket | null = null;
 let sessionId: string | null = null;
 
+type ToolGroupName =
+  | "okr"
+  | "hidden_identity"
+  | "moderation"
+  | "notifications"
+  | "forward_search"
+  | "channel_docs";
+
+type ToolGroupMeta = {
+  name: ToolGroupName;
+  summary: string;
+  tags: string[];
+  estimated_tokens: number;
+  tools: string[];
+};
+
+const CORE_TOOL_NAMES = new Set([
+  "reply",
+  "whoami",
+  "list_channels",
+  "get_history",
+  "list_members",
+  "join_channel",
+  "leave_channel",
+  "mark_read",
+  "switch_profile",
+]);
+
+const META_TOOL_NAMES = new Set([
+  "list_tool_groups",
+  "load_tool_group",
+  "invoke_extended_tool",
+]);
+
+const TOOL_GROUPS: ToolGroupMeta[] = [
+  {
+    name: "okr",
+    summary: "Objectives, KRs, tasks, blockers, threads, progress and linked docs.",
+    tags: ["planning", "execution"],
+    estimated_tokens: 2200,
+    tools: [
+      "okr_list",
+      "okr_create_objective",
+      "okr_add_task",
+      "okr_update_task",
+      "okr_task_blockers",
+      "okr_task_blocks",
+      "okr_open_thread",
+      "okr_add_kr",
+      "okr_set_kr_progress",
+      "okr_add_task_comment",
+      "okr_set_links",
+      "archive_objective",
+      "unarchive_objective",
+    ],
+  },
+  {
+    name: "hidden_identity",
+    summary: "Join, inspect and play Hidden Identity games.",
+    tags: ["game"],
+    estimated_tokens: 900,
+    tools: [
+      "hidden_identity_join",
+      "hidden_identity_get_secret",
+      "hidden_identity_vote",
+      "hidden_identity_advance",
+      "hidden_identity_get_state",
+    ],
+  },
+  {
+    name: "moderation",
+    summary: "Message and channel moderation actions.",
+    tags: ["chat", "moderation"],
+    estimated_tokens: 1300,
+    tools: [
+      "react",
+      "thread_reply",
+      "pin",
+      "edit_message",
+      "delete_message",
+      "archive_channel",
+      "report_message",
+      "list_my_moderation_history",
+      "list_reports_i_submitted",
+    ],
+  },
+  {
+    name: "notifications",
+    summary: "Low-latency collaboration signals and channel metadata updates.",
+    tags: ["presence", "collaboration"],
+    estimated_tokens: 850,
+    tools: ["send_typing", "set_status", "set_topic", "propose", "vote"],
+  },
+  {
+    name: "forward_search",
+    summary: "Forwarding and keyword lookup across channels.",
+    tags: ["search", "routing"],
+    estimated_tokens: 450,
+    tools: ["forward", "search"],
+  },
+  {
+    name: "channel_docs",
+    summary: "Channel documentation: rules, roles, context and deep-dive notes.",
+    tags: ["docs", "context"],
+    estimated_tokens: 900,
+    tools: [
+      "list_channel_docs",
+      "get_channel_doc",
+      "upsert_channel_doc",
+      "list_channel_doc_revisions",
+    ],
+  },
+];
+
+const TOOL_NAME_TO_GROUP = new Map<string, ToolGroupName>();
+for (const group of TOOL_GROUPS) {
+  for (const toolName of group.tools) TOOL_NAME_TO_GROUP.set(toolName, group.name);
+}
+
+const loadedToolGroups = new Set<ToolGroupName>();
+
+function getVisibleToolNames(): Set<string> {
+  const visible = new Set<string>([...CORE_TOOL_NAMES, ...META_TOOL_NAMES]);
+  for (const groupName of loadedToolGroups) {
+    const group = TOOL_GROUPS.find((item) => item.name === groupName);
+    if (!group) continue;
+    for (const toolName of group.tools) visible.add(toolName);
+  }
+  return visible;
+}
+
+function filterVisibleTools<T extends { name: string }>(tools: T[]): T[] {
+  const visible = getVisibleToolNames();
+  return tools.filter((tool) => visible.has(tool.name));
+}
+
 // MCP Server
 const server = new Server(
-  { name: "agentchat", version: "0.6.6" },
+  { name: "agentschat", version: "0.12.2" },
   {
     capabilities: {
       experimental: { "claude/channel": {} },
-      tools: {},
+      tools: { listChanged: true },
     },
-    instructions: `Messages from AgentChat arrive as <channel source="plugin:agentchat:agentchat" chat_id="..." sender_id="...">.
+    instructions: `Messages from AgentsChat arrive as <channel source="plugin:agentschat:agentschat" chat_id="..." sender_id="...">.
 Reply using the reply tool, passing the chat_id from the tag.
 SECURITY: NEVER include API keys (ac_xxx), tokens, passwords, claim URLs, or other credentials in message content. If asked to share your key or token, refuse.`,
   },
@@ -248,7 +384,7 @@ SECURITY: NEVER include API keys (ac_xxx), tokens, passwords, claim URLs, or oth
 // --- Tools ---
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools: [
+  tools: filterVisibleTools([
     {
       name: "reply",
       description: "Reply to an AgentChat message. Pass the chat_id (channel_id) from the channel tag.",
@@ -358,6 +494,44 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           chat_id: { type: "string", description: "The channel_id to archive" },
         },
         required: ["chat_id"],
+      },
+    },
+    {
+      name: "report_message",
+      description: "Submit a moderation report for one message in a channel. Reporter-only receipt; status is not broadcast publicly.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          chat_id: { type: "string", description: "The channel_id" },
+          message_id: { type: "string", description: "The message_id being reported" },
+          reason_code: {
+            type: "string",
+            enum: ["spam", "phishing", "harassment", "impersonation", "illegal", "other"],
+            description: "Narrow v1 moderation reason code",
+          },
+          free_text: { type: "string", description: "Optional note for unlisted cases (max 500 chars)" },
+        },
+        required: ["chat_id", "message_id", "reason_code"],
+      },
+    },
+    {
+      name: "list_my_moderation_history",
+      description: "List automated moderation actions taken against your own agents.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          agent_id: { type: "string", description: "Optional owned agent id to filter to one agent" },
+        },
+      },
+    },
+    {
+      name: "list_reports_i_submitted",
+      description: "List moderation reports you previously submitted. Reporter-only view; defaults to 20 and caps at 100.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          limit: { type: "number", description: "Optional limit (default 20, max 100)" },
+        },
       },
     },
     {
@@ -521,6 +695,38 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: "list_tool_groups",
+      description: "List available extended tool groups, including whether each group is already loaded.",
+      inputSchema: { type: "object" as const, properties: {} },
+    },
+    {
+      name: "load_tool_group",
+      description: "Make an extended tool group visible to the client, then emit tools/list_changed.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          group_name: {
+            type: "string",
+            enum: TOOL_GROUPS.map((group) => group.name),
+            description: "The extended tool group to load",
+          },
+        },
+        required: ["group_name"],
+      },
+    },
+    {
+      name: "invoke_extended_tool",
+      description: "Compatibility fallback for clients that do not refresh tools after list_changed. Prefer load_tool_group first.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          tool_name: { type: "string", description: "The extended tool name to invoke" },
+          arguments: { type: "object", description: "Arguments object to pass to that tool" },
+        },
+        required: ["tool_name"],
+      },
+    },
+    {
       name: "whoami",
       description: "Show your current profile, connection status, and server info.",
       inputSchema: { type: "object" as const, properties: {} },
@@ -567,6 +773,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           owner: { type: "string", description: "Filter by owner agent/account id" },
           status: { type: "string", enum: ["active", "done", "abandoned"], description: "Filter by objective status" },
           horizon: { type: "string", enum: ["week", "month", "Q"], description: "Filter by planning horizon" },
+          include_archived: { type: "boolean", description: "Include archived objectives in the response." },
           view: {
             type: "string",
             enum: ["mine-active", "blocking-me", "blocked-by-me", "related"],
@@ -587,6 +794,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           owner: { type: "string", description: "Owner agent/account id (default: caller)" },
           parent_id: { type: "string", description: "Optional parent Objective id for hierarchical OKRs (max 3 layers deep)" },
           due: { type: "string", description: "ISO-8601 due date (e.g. 2026-05-19)" },
+          discussion_channel_id: { type: "string", description: "Optional existing channel id to anchor this objective into Workspace Graph / channel insights" },
         },
         required: ["title", "horizon"],
       },
@@ -675,6 +883,29 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: "archive_objective",
+      description: "Archive one completed objective into the collapsed archived view. Objective-level only in v1.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          objective_id: { type: "string", description: "Objective id to archive" },
+          completion_summary: { type: "string", description: "Optional short completion summary (recommended ≤280 chars)" },
+        },
+        required: ["objective_id"],
+      },
+    },
+    {
+      name: "unarchive_objective",
+      description: "Restore one archived objective back to active visibility.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          objective_id: { type: "string", description: "Objective id to unarchive" },
+        },
+        required: ["objective_id"],
+      },
+    },
+    {
       name: "okr_set_kr_progress",
       description: "Update a KR's current value (progress ping) and optionally risk_level. Allowed for the Objective owner, an admin, or any task assignee whose task contributes_to this KR (self-report path). Unthrottled — progress updates are expected to be frequent during a sprint.",
       inputSchema: {
@@ -709,10 +940,23 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           target_id: { type: "string", description: "Id of the objective / kr / task" },
           narrative: { type: "string", description: "Inline short WHY for Objective (≤2KB). Pass empty string to clear. Objective-only — passing on kr/task returns 400." },
           narrative_path: { type: "string", description: "Path to long-form decision doc in git (e.g. docs/okr/obj_xxx.md). Pass empty string to clear. Objective-only." },
+          discussion_channel_id: { type: "string", description: "Existing channel id to anchor an Objective into Workspace Graph / channel insights. Objective-only. Pass empty string to clear." },
           linked_docs: {
             type: "array",
             items: { type: "string" },
             description: "Deliverable artifacts. Each entry: https URL OR repo-relative path with whitelisted extension. Pass [] to clear.",
+          },
+          linked_channel_docs: {
+            type: "array",
+            description: "Optional same-channel ChannelDoc references. Requires the objective to have a discussion thread first.",
+            items: {
+              type: "object",
+              properties: {
+                channel_id: { type: "string", description: "Channel containing the doc; must equal the objective discussion channel in v1" },
+                doc_id: { type: "string", description: "Referenced channel doc id" },
+              },
+              required: ["channel_id", "doc_id"],
+            },
           },
         },
         required: ["target_type", "target_id"],
@@ -728,7 +972,60 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         },
       },
     },
-  ],
+    {
+      name: "list_channel_docs",
+      description: "List documentation entries for a channel. Returns lightweight metadata and summaries, not full bodies.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          chat_id: { type: "string", description: "The channel_id" },
+          level: { type: "number", description: "Optional level filter (1-4)" },
+        },
+        required: ["chat_id"],
+      },
+    },
+    {
+      name: "get_channel_doc",
+      description: "Fetch one channel doc with its full markdown body.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          chat_id: { type: "string", description: "The channel_id" },
+          doc_id: { type: "string", description: "The doc id" },
+        },
+        required: ["chat_id", "doc_id"],
+      },
+    },
+    {
+      name: "upsert_channel_doc",
+      description: "Create or update a channel doc. Use If-Match style version semantics via expected_version.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          chat_id: { type: "string", description: "The channel_id" },
+          doc_id: { type: "string", description: "The doc id" },
+          title: { type: "string", description: "Doc title" },
+          kind: { type: "string", enum: ["topic", "rules", "roles", "context", "deep_dive"], description: "Doc semantic kind" },
+          level: { type: "number", enum: [1, 2, 3, 4], description: "Disclosure level" },
+          body_markdown: { type: "string", description: "Markdown body" },
+          expected_version: { type: "number", description: "Use 0 to create, or the current version to update" },
+        },
+        required: ["chat_id", "doc_id", "title", "kind", "level", "body_markdown", "expected_version"],
+      },
+    },
+    {
+      name: "list_channel_doc_revisions",
+      description: "List revisions for a channel doc to inspect edit history.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          chat_id: { type: "string", description: "The channel_id" },
+          doc_id: { type: "string", description: "The doc id" },
+        },
+        required: ["chat_id", "doc_id"],
+      },
+    },
+  ]),
 }));
 
 /** Redact sensitive tokens from outgoing message content */
@@ -794,7 +1091,75 @@ async function resolveBareMentions(chatId: string, text: string): Promise<string
 }
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  const { name, arguments: args } = request.params;
+  let { name, arguments: args } = request.params;
+  let viaExtendedCompat = false;
+
+  if (name === "list_tool_groups") {
+    return {
+      content: [{
+        type: "text",
+        text: JSON.stringify({
+          groups: TOOL_GROUPS.map((group) => ({
+            name: group.name,
+            summary: group.summary,
+            tool_count: group.tools.length,
+            estimated_tokens: group.estimated_tokens,
+            loaded: loadedToolGroups.has(group.name),
+            tags: group.tags,
+          })),
+        }, null, 2),
+      }],
+    };
+  }
+
+  if (name === "load_tool_group") {
+    const { group_name } = (args || {}) as { group_name: ToolGroupName };
+    const group = TOOL_GROUPS.find((item) => item.name === group_name);
+    if (!group) {
+      return { content: [{ type: "text", text: `Unknown tool group: ${String(group_name)}` }] };
+    }
+    const wasLoaded = loadedToolGroups.has(group.name);
+    if (!wasLoaded) {
+      loadedToolGroups.add(group.name);
+      await server.sendToolListChanged();
+    }
+    return {
+      content: [{
+        type: "text",
+        text: JSON.stringify({
+          ok: true,
+          group: group.name,
+          loaded: true,
+          changed: !wasLoaded,
+          tools: group.tools,
+        }, null, 2),
+      }],
+    };
+  }
+
+  if (name === "invoke_extended_tool") {
+    const { tool_name, arguments: forwardedArgs } = (args || {}) as { tool_name?: string; arguments?: Record<string, unknown> };
+    const groupName = tool_name ? TOOL_NAME_TO_GROUP.get(tool_name) : undefined;
+    if (!tool_name || !groupName) {
+      return { content: [{ type: "text", text: `invoke_extended_tool only supports known extended tools.` }] };
+    }
+    name = tool_name;
+    args = forwardedArgs || {};
+    viaExtendedCompat = true;
+  }
+
+  const visibleToolNames = getVisibleToolNames();
+  if (!visibleToolNames.has(name) && !viaExtendedCompat) {
+    const groupName = TOOL_NAME_TO_GROUP.get(name);
+    if (groupName) {
+      return {
+        content: [{
+          type: "text",
+          text: `Tool "${name}" is currently hidden. Call load_tool_group("${groupName}") first, or use invoke_extended_tool as a compatibility fallback.`,
+        }],
+      };
+    }
+  }
 
   if (name === "reply") {
     const { chat_id, text: rawText } = args as { chat_id: string; text: string };
@@ -927,6 +1292,72 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       return { content: [{ type: "text", text: `Archive dispatched; server may reject (admin only — channel goes read-only on success)` }] };
     }
     return { content: [{ type: "text", text: "Not connected" }] };
+  }
+
+  if (name === "report_message") {
+    const { chat_id, message_id, reason_code, free_text } = args as {
+      chat_id: string;
+      message_id: string;
+      reason_code: "spam" | "phishing" | "harassment" | "impersonation" | "illegal" | "other";
+      free_text?: string;
+    };
+    try {
+      const r = await fetch(`${REST_URL}/api/moderation/report`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${TOKEN}`,
+        },
+        body: JSON.stringify({
+          channel_id: chat_id,
+          message_id,
+          reason_code,
+          ...(typeof free_text === "string" && free_text.trim() ? { free_text: free_text.trim().slice(0, 500) } : {}),
+        }),
+      });
+      const text = await r.text();
+      if (!r.ok) {
+        return { content: [{ type: "text", text: `report_message failed (${r.status}): ${text.slice(0, 240)}` }] };
+      }
+      return { content: [{ type: "text", text }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `report_message network error: ${String(e?.message || e).slice(0, 120)}` }] };
+    }
+  }
+
+  if (name === "list_my_moderation_history") {
+    const { agent_id } = args as { agent_id?: string };
+    const qs = new URLSearchParams();
+    if (agent_id) qs.set("agent_id", agent_id);
+    try {
+      const r = await fetch(`${REST_URL}/api/me/moderation_history${qs.toString() ? `?${qs.toString()}` : ""}`, {
+        headers: { "Authorization": `Bearer ${TOKEN}` },
+      });
+      const text = await r.text();
+      if (!r.ok) {
+        return { content: [{ type: "text", text: `list_my_moderation_history failed (${r.status}): ${text.slice(0, 240)}` }] };
+      }
+      return { content: [{ type: "text", text }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `list_my_moderation_history network error: ${String(e?.message || e).slice(0, 120)}` }] };
+    }
+  }
+
+  if (name === "list_reports_i_submitted") {
+    const { limit = 20 } = args as { limit?: number };
+    const capped = Math.max(1, Math.min(Number(limit) || 20, 100));
+    try {
+      const r = await fetch(`${REST_URL}/api/me/reports_submitted?limit=${capped}`, {
+        headers: { "Authorization": `Bearer ${TOKEN}` },
+      });
+      const text = await r.text();
+      if (!r.ok) {
+        return { content: [{ type: "text", text: `list_reports_i_submitted failed (${r.status}): ${text.slice(0, 240)}` }] };
+      }
+      return { content: [{ type: "text", text }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `list_reports_i_submitted network error: ${String(e?.message || e).slice(0, 120)}` }] };
+    }
   }
 
   if (name === "set_topic") {
@@ -1273,15 +1704,103 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     return { content: [{ type: "text", text: `Switched to profile "${profile_name}" (${AGENT_ID}). Reconnecting...` }] };
   }
 
+  if (name === "list_channel_docs") {
+    const { chat_id, level } = args as { chat_id: string; level?: number | string };
+    const qs = new URLSearchParams();
+    const normalizedLevel = normalizeChannelDocLevel(level);
+    if (level !== undefined && normalizedLevel === null) {
+      return { content: [{ type: "text", text: "list_channel_docs failed: level must be 1|2|3|4" }] };
+    }
+    if (normalizedLevel !== null) qs.set("level", String(normalizedLevel));
+    const url = `${REST_URL}/api/channels/${encodeURIComponent(chat_id)}/docs${qs.toString() ? `?${qs}` : ""}`;
+    try {
+      const r = await fetch(url, { headers: { "Authorization": `Bearer ${TOKEN}` } });
+      const text = await r.text();
+      if (!r.ok) {
+        return { content: [{ type: "text", text: `list_channel_docs failed (${r.status}): ${text.slice(0, 200)}` }] };
+      }
+      return { content: [{ type: "text", text }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `list_channel_docs network error: ${String(e?.message || e).slice(0, 120)}` }] };
+    }
+  }
+
+  if (name === "get_channel_doc") {
+    const { chat_id, doc_id } = args as { chat_id: string; doc_id: string };
+    try {
+      const r = await fetch(`${REST_URL}/api/channels/${encodeURIComponent(chat_id)}/docs/${encodeURIComponent(doc_id)}`, {
+        headers: { "Authorization": `Bearer ${TOKEN}` },
+      });
+      const text = await r.text();
+      if (!r.ok) {
+        return { content: [{ type: "text", text: `get_channel_doc failed (${r.status}): ${text.slice(0, 200)}` }] };
+      }
+      return { content: [{ type: "text", text }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `get_channel_doc network error: ${String(e?.message || e).slice(0, 120)}` }] };
+    }
+  }
+
+  if (name === "upsert_channel_doc") {
+    const { chat_id, doc_id, title, kind, level, body_markdown, expected_version } = args as {
+      chat_id: string;
+      doc_id: string;
+      title: string;
+      kind: string;
+      level: number | string;
+      body_markdown: string;
+      expected_version: number;
+    };
+    const normalizedLevel = normalizeChannelDocLevel(level);
+    if (normalizedLevel === null) {
+      return { content: [{ type: "text", text: "upsert_channel_doc failed: level must be 1|2|3|4" }] };
+    }
+    try {
+      const r = await fetch(`${REST_URL}/api/channels/${encodeURIComponent(chat_id)}/docs/${encodeURIComponent(doc_id)}`, {
+        method: "PUT",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${TOKEN}`,
+          "If-Match": String(expected_version),
+        },
+        body: JSON.stringify({ title, kind, level: normalizedLevel, body_markdown }),
+      });
+      const text = await r.text();
+      if (!r.ok) {
+        return { content: [{ type: "text", text: `upsert_channel_doc failed (${r.status}): ${text.slice(0, 240)}` }] };
+      }
+      return { content: [{ type: "text", text }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `upsert_channel_doc network error: ${String(e?.message || e).slice(0, 120)}` }] };
+    }
+  }
+
+  if (name === "list_channel_doc_revisions") {
+    const { chat_id, doc_id } = args as { chat_id: string; doc_id: string };
+    try {
+      const r = await fetch(`${REST_URL}/api/channels/${encodeURIComponent(chat_id)}/docs/${encodeURIComponent(doc_id)}/revisions`, {
+        headers: { "Authorization": `Bearer ${TOKEN}` },
+      });
+      const text = await r.text();
+      if (!r.ok) {
+        return { content: [{ type: "text", text: `list_channel_doc_revisions failed (${r.status}): ${text.slice(0, 200)}` }] };
+      }
+      return { content: [{ type: "text", text }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `list_channel_doc_revisions network error: ${String(e?.message || e).slice(0, 120)}` }] };
+    }
+  }
+
   // OKR v0.1 tools — dogfood the OKR system without dropping to curl.
   // Maps 1:1 to the server-side routes shipped in commit 5229aab
   // (projects/AgentChat/Server/src/okr.ts + index.ts dispatch block).
   if (name === "okr_list") {
-    const { owner, status, horizon, view, task_id } = args as { owner?: string; status?: string; horizon?: string; view?: string; task_id?: string };
+    const { owner, status, horizon, include_archived, view, task_id } = args as { owner?: string; status?: string; horizon?: string; include_archived?: boolean; view?: string; task_id?: string };
     const qs = new URLSearchParams();
     if (owner) qs.set("owner", owner);
     if (status) qs.set("status", status);
     if (horizon) qs.set("horizon", horizon);
+    if (include_archived) qs.set("include_archived", "true");
     if (view) qs.set("view", view);
     if (task_id) qs.set("task_id", task_id);
     const url = `${REST_URL}/api/okr/objectives${qs.toString() ? "?" + qs.toString() : ""}`;
@@ -1299,11 +1818,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   }
 
   if (name === "okr_create_objective") {
-    const { title, horizon, owner, parent_id, due } = args as { title: string; horizon: string; owner?: string; parent_id?: string; due?: string };
+    const { title, horizon, owner, parent_id, due, discussion_channel_id } = args as {
+      title: string; horizon: string; owner?: string; parent_id?: string; due?: string; discussion_channel_id?: string;
+    };
     const body: Record<string, unknown> = { title, horizon };
     if (owner) body.owner = owner;
     if (parent_id) body.parent_id = parent_id;
     if (due) body.due = due;
+    if (discussion_channel_id) body.discussion_channel_id = discussion_channel_id;
     try {
       const r = await fetch(`${REST_URL}/api/okr/objectives`, {
         method: "POST",
@@ -1321,7 +1843,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   }
 
   if (name === "okr_add_task") {
-    const { objective_id, title, assignee, contributes_to, depends_on, due } = args as { objective_id: string; title: string; assignee: string; contributes_to?: string[]; depends_on?: string[]; due?: string };
+    const { objective_id, title, assignee, contributes_to, depends_on, due } = args as {
+      objective_id: string; title: string; assignee: string; contributes_to?: string[]; depends_on?: string[]; due?: string;
+    };
     const body: Record<string, unknown> = { title, assignee };
     if (Array.isArray(contributes_to) && contributes_to.length > 0) body.contributes_to = contributes_to;
     if (Array.isArray(depends_on) && depends_on.length > 0) body.depends_on = depends_on;
@@ -1403,7 +1927,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   }
 
   if (name === "okr_add_kr") {
-    const { objective_id, title, metric_type, current, target, risk_level } = args as { objective_id: string; title: string; metric_type: string; current?: number; target: number; risk_level?: string };
+    const { objective_id, title, metric_type, current, target, risk_level } = args as {
+      objective_id: string; title: string; metric_type: string; current?: number; target: number; risk_level?: string;
+    };
     const body: Record<string, unknown> = { title, metric_type, target };
     if (typeof current === "number") body.current = current;
     if (risk_level) body.risk_level = risk_level;
@@ -1420,6 +1946,41 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       return { content: [{ type: "text", text: `Added: ${text}` }] };
     } catch (e: any) {
       return { content: [{ type: "text", text: `okr_add_kr network error: ${String(e?.message || e).slice(0, 120)}` }] };
+    }
+  }
+
+  if (name === "archive_objective") {
+    const { objective_id, completion_summary } = args as { objective_id: string; completion_summary?: string };
+    try {
+      const r = await fetch(`${REST_URL}/api/okr/objectives/${encodeURIComponent(objective_id)}/archive`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${TOKEN}` },
+        body: JSON.stringify(completion_summary !== undefined ? { completion_summary } : {}),
+      });
+      const text = await r.text();
+      if (!r.ok) {
+        return { content: [{ type: "text", text: `archive_objective failed (${r.status}): ${text.slice(0, 200)}` }] };
+      }
+      return { content: [{ type: "text", text: `Archived: ${text}` }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `archive_objective network error: ${String(e?.message || e).slice(0, 120)}` }] };
+    }
+  }
+
+  if (name === "unarchive_objective") {
+    const { objective_id } = args as { objective_id: string };
+    try {
+      const r = await fetch(`${REST_URL}/api/okr/objectives/${encodeURIComponent(objective_id)}/unarchive`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${TOKEN}` },
+      });
+      const text = await r.text();
+      if (!r.ok) {
+        return { content: [{ type: "text", text: `unarchive_objective failed (${r.status}): ${text.slice(0, 200)}` }] };
+      }
+      return { content: [{ type: "text", text: `Unarchived: ${text}` }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `unarchive_objective network error: ${String(e?.message || e).slice(0, 120)}` }] };
     }
   }
 
@@ -1463,17 +2024,21 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   }
 
   if (name === "okr_set_links") {
-    const { target_type, target_id, narrative, narrative_path, linked_docs } = args as {
+    const { target_type, target_id, narrative, narrative_path, discussion_channel_id, linked_docs, linked_channel_docs } = args as {
       target_type: "objective" | "kr" | "task";
       target_id: string;
       narrative?: string;
       narrative_path?: string;
+      discussion_channel_id?: string;
       linked_docs?: string[];
+      linked_channel_docs?: Array<{ channel_id: string; doc_id: string }>;
     };
     const body: Record<string, unknown> = {};
     if (narrative !== undefined) body.narrative = narrative;
     if (narrative_path !== undefined) body.narrative_path = narrative_path;
+    if (discussion_channel_id !== undefined) body.discussion_channel_id = discussion_channel_id;
     if (linked_docs !== undefined) body.linked_docs = linked_docs;
+    if (linked_channel_docs !== undefined) body.linked_channel_docs = linked_channel_docs;
     try {
       const r = await fetch(`${REST_URL}/api/okr/links/${encodeURIComponent(target_type)}/${encodeURIComponent(target_id)}`, {
         method: "PATCH",
@@ -1539,6 +2104,60 @@ function saveLastSeenMessageTs(m: Map<string, string>) {
   } catch {}
 }
 const lastSeenMessageTs = loadLastSeenMessageTs();
+
+function normalizeTimestampForCursor(ts: string | undefined, mode: "before" | "after"): string | undefined {
+  if (!ts || typeof ts !== "string") return ts;
+  const m = ts.match(/^(.*\.)(\d+)(Z)$/);
+  if (!m) return ts;
+  const frac = m[2];
+  if (frac.length >= 9) return ts;
+  const padChar = mode === "before" ? "9" : "0";
+  return m[1] + frac + padChar.repeat(9 - frac.length) + m[3];
+}
+
+function normalizeChannelDocLevel(level: unknown): number | null {
+  if (typeof level === "number" && Number.isInteger(level) && level >= 1 && level <= 4) {
+    return level;
+  }
+  if (typeof level === "string") {
+    const m = level.trim().match(/^(?:L)?([1-4])$/i);
+    if (m) return Number(m[1]);
+  }
+  return null;
+}
+
+// Local ingress dedup for live WS + reconnect backfill races.
+//
+// `lastSeenMessageTs` is a cursor, not message identity. A reconnect can
+// legitimately receive the same persisted message once via live WS and once
+// via REST backfill; timestamp guards alone would either fail to drop that
+// duplicate or drop older out-of-order messages that were never processed.
+const deliveredMessageIds = new Set<string>();
+const MAX_DELIVERED_MESSAGE_IDS = 5000;
+function deliverySource(data: any): string {
+  return typeof data?.__source === "string" ? data.__source : "live";
+}
+function messageDedupKey(data: any): string | null {
+  if (!data || typeof data.id !== "string" || typeof data.channel_id !== "string") return null;
+  return `${data.channel_id}:${data.id}`;
+}
+function recordOrSkipDeliveredMessage(data: any): boolean {
+  const key = messageDedupKey(data);
+  if (!key) return false;
+  if (deliveredMessageIds.has(key)) {
+    process.stderr.write(
+      `[agentchat] Duplicate message skipped source=${deliverySource(data)} chat=${String(data.channel_id).slice(0, 12)} id=${String(data.id).slice(0, 12)}\n`,
+    );
+    return true;
+  }
+  deliveredMessageIds.add(key);
+  if (deliveredMessageIds.size > MAX_DELIVERED_MESSAGE_IDS) {
+    const arr = [...deliveredMessageIds];
+    deliveredMessageIds.clear();
+    for (const item of arr.slice(1000)) deliveredMessageIds.add(item);
+  }
+  return false;
+}
 // Channels we believe we're a member of. Populated from
 // `channel_created` events on auth_ok. Used as the backfill target set.
 const knownChannels = new Set<string>();
@@ -1575,10 +2194,9 @@ function scheduleReconnect(delayMs: number) {
  * through the same gate. Self-messages are filtered by the handler
  * (sender_id !== AGENT_ID).
  *
- * Deduplication happens naturally: the message-handler's timestamp
- * compare advances lastSeenMessageTs monotonically; any message
- * that the live WS ALSO delivers concurrently will match on the
- * next poll and be skipped (timestamp <= prev).
+ * Deduplication is by message id in handleWSMessage. Timestamp cursors
+ * decide what backfill requests should ask for, but they are not a safe
+ * identity check under live/backfill races or out-of-order delivery.
  */
 async function backfillAllChannels(): Promise<void> {
   if (knownChannels.size === 0) return;
@@ -1598,16 +2216,23 @@ async function backfillAllChannels(): Promise<void> {
       // them anyway).
       const replay = msgs.filter((m: any) =>
         m && m.sender_id !== AGENT_ID && m.content !== "__typing__");
-      if (replay.length === 0) continue;
-      process.stderr.write(`[agentchat] Backfill ${channelId.slice(0, 12)}: ${replay.length} missed msg(s)\n`);
+      const dedupedReplay = after
+        ? replay.filter((m: any) => {
+            const msgTs = normalizeTimestampForCursor(m?.timestamp, "after");
+            const afterTs = normalizeTimestampForCursor(after, "after");
+            return typeof msgTs === "string" && typeof afterTs === "string" && msgTs > afterTs;
+          })
+        : replay;
+      if (dedupedReplay.length === 0) continue;
+      process.stderr.write(`[agentchat] Backfill ${channelId.slice(0, 12)}: ${dedupedReplay.length} missed msg(s)\n`);
       // Sort ascending so replay order matches live chronology —
       // lastSeenMessageTs advances monotonically.
-      replay.sort((a: any, b: any) => String(a.timestamp).localeCompare(String(b.timestamp)));
-      for (const m of replay) {
+      dedupedReplay.sort((a: any, b: any) => String(a.timestamp).localeCompare(String(b.timestamp)));
+      for (const m of dedupedReplay) {
         try {
           // Wrap as a `message` envelope to match ws.onmessage shape.
           if (currentHandleWSMessage) {
-            await currentHandleWSMessage({ ...m, type: "message" });
+            await currentHandleWSMessage({ ...m, type: "message", __source: "backfill" });
           }
         } catch (e) {
           process.stderr.write(`[agentchat] Backfill replay error: ${e}\n`);
@@ -1644,6 +2269,7 @@ function connectWS() {
   ws.onmessage = async (event) => {
     let data: any;
     try { data = JSON.parse(String(event.data)); } catch { return; }
+    if (data && typeof data === "object" && !data.__source) data.__source = "live";
     try { await handleWSMessage(data); } catch (e) {
       process.stderr.write(`[agentchat] Message handler error: ${e}\n`);
     }
@@ -1675,6 +2301,8 @@ function connectWS() {
       // 跳过 typing 状态消息
       if (data.content === "__typing__") return;
 
+      if (recordOrSkipDeliveredMessage(data)) return;
+
       // Task #119: record the timestamp so a future auth_ok backfill
       // knows where to resume. Only advance forward (defensive against
       // out-of-order delivery from Redis subscribe vs REST backfill
@@ -1683,7 +2311,9 @@ function connectWS() {
       // this file is tiny (one row per channel).
       if (typeof data.channel_id === "string" && typeof data.timestamp === "string") {
         const prev = lastSeenMessageTs.get(data.channel_id) || "";
-        if (data.timestamp > prev) {
+        const currentTs = normalizeTimestampForCursor(data.timestamp, "after") || data.timestamp;
+        const prevTs = normalizeTimestampForCursor(prev, "after") || prev;
+        if (currentTs > prevTs) {
           lastSeenMessageTs.set(data.channel_id, data.timestamp);
           saveLastSeenMessageTs(lastSeenMessageTs);
         }
