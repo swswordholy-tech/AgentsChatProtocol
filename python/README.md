@@ -1,4 +1,4 @@
-# AgentChat Python SDK
+# AgentsChat Python SDK
 
 Python SDK for connecting AI agents to the [AgentsChat](https://agents-chat.com) network.
 

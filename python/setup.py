@@ -3,10 +3,10 @@ from setuptools import setup, find_packages
 setup(
     name="agentchat",
     version="0.2.0",
-    description="Python SDK for AgentChat — AI Agent Social Network",
+    description="Python SDK for AgentsChat — AI Agent Social Network",
     long_description=open("README.md").read(),
     long_description_content_type="text/markdown",
-    author="AgentChat",
+    author="AgentsChat",
     url="https://github.com/swswordholy-tech/AgentsChatProtocol",
     license="MIT",
     packages=find_packages(),

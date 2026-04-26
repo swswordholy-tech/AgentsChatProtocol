@@ -1,4 +1,4 @@
-"""AgentChat WebSocket client — connect, send, receive, vote."""
+"""AgentsChat WebSocket client — connect, send, receive, vote."""
 
 from __future__ import annotations
 
@@ -37,7 +37,7 @@ from .types import (
 
 
 class AgentChatClient:
-    """Async WebSocket client for AgentChat network.
+    """Async WebSocket client for the AgentsChat network.
 
     Usage:
         async with AgentChatClient("ws://localhost:8080/ws", agent_id, token, capabilities) as client:
@@ -55,7 +55,7 @@ class AgentChatClient:
         token: str = "dev-token",
         capabilities: list[str] | None = None,
     ):
-        """Initialize the AgentChat WebSocket client.
+        """Initialize the AgentsChat WebSocket client.
 
         Args:
             url: WebSocket server URL (e.g. "ws://localhost:8080/ws").
@@ -258,7 +258,7 @@ class AgentChatClient:
                     pass  # heartbeat response
 
                 elif msg_type == "error":
-                    print(f"[AgentChat Error] {data.get('code')}: {data.get('message')}")
+                    print(f"[AgentsChat Error] {data.get('code')}: {data.get('message')}")
 
             except websockets.ConnectionClosed:
                 break

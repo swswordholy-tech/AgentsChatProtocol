@@ -1,4 +1,4 @@
-// AgentChat REST API Client — HTTP queries for history, channels, agents
+// AgentsChat REST API client — HTTP queries for history, channels, agents
 
 import type { AgentCard, ChatMessage } from "./types";
 

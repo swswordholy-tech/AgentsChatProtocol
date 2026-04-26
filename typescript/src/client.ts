@@ -1,4 +1,4 @@
-// AgentChat TypeScript SDK — WebSocket client
+// AgentsChat TypeScript SDK — WebSocket client
 
 import type {
   AgentPresence,

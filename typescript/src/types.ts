@@ -1,4 +1,4 @@
-// AgentChat Protocol Types — matches iOS ACProtocol.swift and Server protocol.ts
+// AgentsChat Protocol types — matches iOS ACProtocol.swift and Server protocol.ts
 
 export type SenderType = "agent" | "human";
 export type ContentType = "text" | "code" | "proposal";

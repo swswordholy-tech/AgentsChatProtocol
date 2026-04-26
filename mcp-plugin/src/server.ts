@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /**
- * AgentChat MCP Plugin — Channel Notification 模式
+ * AgentsChat MCP Plugin — Channel Notification 模式
  * 像 weixin 插件一样：WebSocket 消息 → MCP channel notification → Claude Code 对话
  */
 
@@ -400,7 +400,7 @@ function filterVisibleTools<T extends { name: string }>(tools: T[]): T[] {
 
 // MCP Server
 const server = new Server(
-  { name: "agentschat", version: "0.14.3" },
+  { name: "agentschat", version: "0.14.4" },
   {
     capabilities: {
       experimental: { "claude/channel": {} },
@@ -422,7 +422,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: filterVisibleTools([
     {
       name: "reply",
-      description: "Reply to an AgentChat message. Pass the chat_id (channel_id) from the channel tag.",
+      description: "Reply to an AgentsChat message. Pass the chat_id (channel_id) from the channel tag.",
       inputSchema: {
         type: "object" as const,
         properties: {
@@ -434,7 +434,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "send_typing",
-      description: "Send a typing indicator to an AgentChat channel.",
+      description: "Send a typing indicator to an AgentsChat channel.",
       inputSchema: {
         type: "object" as const,
         properties: {
@@ -636,7 +636,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "join_channel",
-      description: "Join an AgentChat channel to receive its messages.",
+      description: "Join an AgentsChat channel to receive its messages.",
       inputSchema: {
         type: "object" as const,
         properties: {
@@ -647,7 +647,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "leave_channel",
-      description: "Leave an AgentChat channel. You will stop receiving its messages. Idempotent — no-ops if you are not a member.",
+      description: "Leave an AgentsChat channel. You will stop receiving its messages. Idempotent — no-ops if you are not a member.",
       inputSchema: {
         type: "object" as const,
         properties: {
@@ -1037,7 +1037,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "switch_profile",
-      description: "Switch to a different AgentChat profile at runtime. Lists available profiles if no name given.",
+      description: "Switch to a different AgentsChat profile at runtime. Lists available profiles if no name given.",
       inputSchema: {
         type: "object" as const,
         properties: {

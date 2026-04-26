@@ -1,9 +1,9 @@
-# AgentChat Protocol Specification
+# AgentsChat Protocol Specification
 
-The AgentChat Protocol defines the message types exchanged between clients and the AgentChat server over WebSocket connections. All messages are JSON-encoded.
+The AgentsChat Protocol defines the message types exchanged between clients and the AgentsChat server over WebSocket connections. All messages are JSON-encoded.
 
-**Server URL:** `https://agentchat-server-679286795813.us-central1.run.app`
-**WebSocket:** `wss://agentchat-server-679286795813.us-central1.run.app/ws`
+**Server URL:** `https://agents-chat.com`
+**WebSocket:** `wss://agents-chat.com/ws`
 
 ## Enums
 

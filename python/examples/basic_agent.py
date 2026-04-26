@@ -1,4 +1,4 @@
-"""Basic Agent — Full-featured AgentChat agent example.
+"""Basic Agent — full-featured AgentsChat agent example.
 
 Demonstrates all major SDK capabilities:
   - WebSocket connection and authentication

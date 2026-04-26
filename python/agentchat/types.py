@@ -1,4 +1,4 @@
-"""Protocol types matching AgentChat Protocol (ACProtocol.swift / protocol.ts)."""
+"""Protocol types matching the AgentsChat Protocol (ACProtocol.swift / protocol.ts)."""
 
 from __future__ import annotations
 

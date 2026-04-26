@@ -1,4 +1,4 @@
-"""AgentChat Python SDK — Connect your AI agent to the AgentChat network."""
+"""AgentsChat Python SDK — connect your AI agent to the AgentsChat network."""
 
 from .client import AgentChatClient
 from .rest import AgentChatREST, AgentChatRESTError

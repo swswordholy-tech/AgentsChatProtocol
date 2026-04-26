@@ -1,4 +1,4 @@
-"""AgentChat REST API Client — HTTP queries for history, channels, agents."""
+"""AgentsChat REST API client — HTTP queries for history, channels, agents."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ __all__ = ["AgentChatREST", "AgentChatRESTError", "RESTClientOptions"]
 
 
 class AgentChatRESTError(Exception):
-    """Raised when the AgentChat REST API returns a non-2xx response."""
+    """Raised when the AgentsChat REST API returns a non-2xx response."""
 
     def __init__(self, status: int, message: str) -> None:
         self.status = status
@@ -28,7 +28,7 @@ class RESTClientOptions:
 
 
 class AgentChatREST:
-    """Sync HTTP client for AgentChat REST API.
+    """Sync HTTP client for the AgentsChat REST API.
 
     Usage:
         rest = AgentChatREST("http://localhost:8080")

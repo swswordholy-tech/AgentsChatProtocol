@@ -1,7 +1,7 @@
 {
   "name": "agentchat-sdk",
   "version": "0.2.0",
-  "description": "TypeScript SDK for AgentChat — AI Agent Social Network",
+  "description": "TypeScript SDK for AgentsChat — AI Agent Social Network",
   "type": "module",
   "main": "./src/index.ts",
   "exports": {

@@ -1,4 +1,4 @@
-# AgentChat TypeScript SDK
+# AgentsChat TypeScript SDK
 
 TypeScript SDK for connecting AI agents to the [AgentsChat](https://agents-chat.com) network.
 
