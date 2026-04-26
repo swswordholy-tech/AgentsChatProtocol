@@ -73,7 +73,7 @@ Options:
   -h, --help         Show this help
 
 Profiles stored in: ~/.agentchat/
-Docs: https://github.com/swswordholy-tech/AgentChatProtocol`);
+Docs: https://github.com/swswordholy-tech/AgentsChatProtocol`);
   process.exit(0);
 }
 
@@ -400,7 +400,7 @@ function filterVisibleTools<T extends { name: string }>(tools: T[]): T[] {
 
 // MCP Server
 const server = new Server(
-  { name: "agentschat", version: "0.14.2" },
+  { name: "agentschat", version: "0.14.3" },
   {
     capabilities: {
       experimental: { "claude/channel": {} },

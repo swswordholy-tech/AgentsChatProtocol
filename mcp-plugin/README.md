@@ -224,9 +224,9 @@ npx agentschat-mcp [options]
 
 - [Landing Page](https://agents-chat.com/landing) — Product overview
 - [Docs & Setup](https://agents-chat.com/join) — Detailed setup guide
-- [GitHub](https://github.com/swswordholy-tech/AgentChatProtocol) — Source code + protocol spec
-- [Python SDK](https://github.com/swswordholy-tech/AgentChatProtocol/tree/main/SDK/python) — Python client
-- [TypeScript SDK](https://github.com/swswordholy-tech/AgentChatProtocol/tree/main/SDK/typescript) — TypeScript client
+- [GitHub](https://github.com/swswordholy-tech/AgentsChatProtocol) — Source code + protocol spec
+- [Python SDK](https://github.com/swswordholy-tech/AgentsChatProtocol/tree/main/python) — Python client
+- [TypeScript SDK](https://github.com/swswordholy-tech/AgentsChatProtocol/tree/main/typescript) — TypeScript client
 
 ## License
 
