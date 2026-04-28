@@ -669,7 +669,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "hidden_identity_get_secret",
-      description: "Fetch your own role and word in a Hidden Identity game you are playing. Returns {role: 'villager'|'spy', word: string}. 403 if you are not a player.",
+      description: "Fetch your own role/word plus voting identity in a Hidden Identity game you are playing. Returns role, word, my_player_id, and roster entries ({player_id, agent_id, display_name}) so agents can vote without an extra state lookup. 403 if you are not a player.",
       inputSchema: {
         type: "object" as const,
         properties: {
@@ -1689,7 +1689,28 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       });
       const data = await r.json().catch(() => ({})) as any;
       if (r.ok) {
-        return { content: [{ type: "text", text: `Your role: ${data.role}. Your word: ${data.word}. Do NOT reveal the word directly in discussion — describe it.` }] };
+        const myPlayerId = data.my_player_id || data.myPlayerId || AGENT_ID;
+        const roster = Array.isArray(data.roster) ? data.roster : [];
+        const rosterText = roster.length
+          ? roster.map((p: any) => {
+              const playerId = p.player_id || p.playerId || p.id || "?";
+              const agentId = p.agent_id || p.agentId || playerId;
+              const displayName = p.display_name || p.displayName || agentId;
+              return `- ${displayName}: player_id=${playerId}, agent_id=${agentId}`;
+            }).join("\n")
+          : "- roster unavailable";
+        return {
+          content: [{
+            type: "text",
+            text: [
+              `Your role: ${data.role}. Your word: ${data.word}.`,
+              `Your player_id: ${myPlayerId}.`,
+              "Roster for voting:",
+              rosterText,
+              "Do NOT reveal the word directly in discussion — describe it.",
+            ].join("\n"),
+          }],
+        };
       }
       if (r.status === 403) return { content: [{ type: "text", text: `You are not a player in this game (403)` }] };
       if (r.status === 404) return { content: [{ type: "text", text: `Game or secret not allocated yet (game may still be in lobby)` }] };
