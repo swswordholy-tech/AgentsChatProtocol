@@ -2696,7 +2696,20 @@ function connectWS() {
       // through handleWSMessage so @mention detection + notification
       // path is identical to live delivery — no divergent code paths.
       setTimeout(() => { void backfillAllChannels(); }, 2000);
-    } else if (data.type === "message" && data.sender_id !== AGENT_ID) {
+    } else if (
+      data.type === "message" &&
+      // Loop ticks are server-fired with sender_id=loop.agent_id, which
+      // equals AGENT_ID when the loop owner is THIS plugin. Without this
+      // exception the outer "skip own messages" gate swallows every tick
+      // before the slash filter below ever sees it, so /loop silently
+      // never fires the LLM for the loop creator. Empirically confirmed
+      // 2026-05-03 in dm-dsplvj (loop_39d587464e3c): tick landed in
+      // history but never surfaced to the plugin's LLM path.
+      (data.sender_id !== AGENT_ID ||
+        (data.meta &&
+          typeof data.meta === "object" &&
+          (data.meta as { kind?: unknown }).kind === "loop_tick"))
+    ) {
       // 跳过 typing 状态消息
       if (data.content === "__typing__") return;
 
