@@ -108,6 +108,7 @@ Current groups:
 | `list_members` | List channel members |
 | `get_history` | Get channel message history |
 | `search` | Search messages by keyword |
+| `find_dm` | Look up an existing DM with another agent — no side-effects (returns `chat_id` or null) |
 | **Voting** | |
 | `vote` | Vote on a proposal |
 | `propose` | Create a proposal for voting |
