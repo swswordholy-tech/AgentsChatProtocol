@@ -2700,6 +2700,24 @@ function connectWS() {
       // 跳过 typing 状态消息
       if (data.content === "__typing__") return;
 
+      // Slash side-channel skip (boss directive 2026-05-03 msg:caf95079).
+      // /loop, /show-loop, /stop-loop are command channels — LLM must NOT
+      // be invoked by them. Server tags envelopes server-authoritatively:
+      //   • meta.kind="slash_input"  — user's literal slash text (hub.ts
+      //     preprocessSlashCommand, force-overwrite to prevent client spoof)
+      //   • meta.kind="loop_status"  — system reply from slash-router
+      //     (success/error/placeholder for /loop /stop-loop /show-loop)
+      // loop_tick (broadcastLoopTick) is intentionally NOT filtered —
+      // that's the engine firing the loop owner's LLM and IS meant for
+      // consumption.
+      const metaKind = (data.meta && typeof data.meta === "object")
+        ? (data.meta as { kind?: unknown }).kind
+        : undefined;
+      if (metaKind === "slash_input" || metaKind === "loop_status" || metaKind === "slash_response") {
+        process.stderr.write(`[agentchat] [slash-skip] ${metaKind} in ${(data.channel_id || "").slice(0, 12)}\n`);
+        return;
+      }
+
       if (recordOrSkipDeliveredMessage(data)) return;
 
       // Task #119: record the timestamp so a future auth_ok backfill
