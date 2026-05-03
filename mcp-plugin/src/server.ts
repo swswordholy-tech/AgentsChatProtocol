@@ -278,6 +278,7 @@ const CORE_TOOL_NAMES = new Set([
   "reply",
   "whoami",
   "list_channels",
+  "find_dm",
   "get_history",
   "list_members",
   "join_channel",
@@ -812,6 +813,17 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         properties: {
           limit: { type: "number", description: "Max results (default 50)" },
         },
+      },
+    },
+    {
+      name: "find_dm",
+      description: "Look up the existing direct-message channel between you and another agent. Lookup-only — does not create. Returns chat_id of the DM if it exists, or null. Use this to address-route slash commands like /loop that only work in DMs.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          target_agent_id: { type: "string", description: "The other agent's ID" },
+        },
+        required: ["target_agent_id"],
       },
     },
     {
@@ -1833,6 +1845,49 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       return { content: [{ type: "text", text: `Failed to list channels (${r.status})` }] };
     } catch (e) {
       return { content: [{ type: "text", text: `Error: ${e}` }] };
+    }
+  }
+
+  if (name === "find_dm") {
+    const { target_agent_id } = args as any;
+    if (!target_agent_id || typeof target_agent_id !== "string") {
+      return { content: [{ type: "text", text: "Error: target_agent_id required" }] };
+    }
+    if (target_agent_id === AGENT_ID) {
+      return { content: [{ type: "text", text: JSON.stringify({ chat_id: null, reason: "cannot DM yourself" }) }] };
+    }
+    try {
+      // /api/channels/mine returns the caller's joined channels (including
+      // DMs). DM channel ids are deterministic on iOS but the source of
+      // truth for "does this DM exist between us" is server membership,
+      // so we list + filter rather than replay the hash.
+      const r = await fetch(`${REST_URL}/api/channels/mine`, {
+        headers: { "Authorization": `Bearer ${TOKEN}` },
+      });
+      if (!r.ok) {
+        return { content: [{ type: "text", text: `Failed (${r.status})` }] };
+      }
+      const data = await r.json() as any;
+      const channels = Array.isArray(data?.channels) ? data.channels : [];
+      // /mine returns metadata but not member rosters; need a per-channel
+      // members fetch only for the type=direct candidates.
+      for (const ch of channels) {
+        if (ch?.type !== "direct") continue;
+        try {
+          const mr = await fetch(`${REST_URL}/api/channels/${encodeURIComponent(ch.id)}/members`, {
+            headers: { "Authorization": `Bearer ${TOKEN}` },
+          });
+          if (!mr.ok) continue;
+          const md = await mr.json() as any;
+          const memberIds = (md?.members || []).map((m: any) => m?.agent_id).filter(Boolean);
+          if (memberIds.length === 2 && memberIds.includes(AGENT_ID) && memberIds.includes(target_agent_id)) {
+            return { content: [{ type: "text", text: JSON.stringify({ chat_id: ch.id, name: ch.name || null }) }] };
+          }
+        } catch {}
+      }
+      return { content: [{ type: "text", text: JSON.stringify({ chat_id: null }) }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `Error: ${String(e?.message || e).slice(0, 120)}` }] };
     }
   }
 
