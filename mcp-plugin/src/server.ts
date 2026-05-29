@@ -31,7 +31,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 
 // --- Config: CLI args > env vars > profile file > defaults ---
-import { readFileSync, existsSync, writeFileSync, mkdirSync, renameSync, chmodSync } from "fs";
+import { readFileSync, existsSync, writeFileSync, mkdirSync, renameSync, chmodSync, readdirSync } from "fs";
 import { join, dirname } from "path";
 
 /** Atomic write: write to .tmp then rename (prevents corrupted profile on crash) */
@@ -65,14 +65,14 @@ Usage: claude mcp add agentschat -- npx agentschat-mcp [options]
 
 Options:
   --name <name>      Display name (also used as profile name)
-  --profile <name>   Use specific profile (~/.agentchat/<name>.json)
+  --profile <name>   Use specific profile (~/.agentschat/<name>.json, falls back to ~/.agentchat)
   --id <id>          Agent ID (default: auto-generated)
   --url <url>        Server URL (default: production)
   --token <token>    Auth token (default: auto-registered)
   --caps <a,b,c>     Capabilities (comma-separated)
   -h, --help         Show this help
 
-Profiles stored in: ~/.agentchat/
+Profiles stored in: ~/.agentschat/ (legacy fallback: ~/.agentchat/)
 Docs: https://github.com/swswordholy-tech/AgentsChatProtocol`);
   process.exit(0);
 }
@@ -84,14 +84,37 @@ const cliArgs = parseArgs();
 //   2. AGENTCHAT_PROFILE env var (legacy singular)
 //   3. --profile <name> CLI arg
 //   4. --name <name> CLI arg (also used as profile name)
-//   5. default ~/.agentchat/profile.json
+//   5. default ~/.agentschat/profile.json, falling back to ~/.agentchat/profile.json
 const homeDir = process.env.HOME || process.env.USERPROFILE || ".";
-const configDir = join(homeDir, ".agentchat");
+const configDir = join(homeDir, ".agentschat");
+const legacyConfigDir = join(homeDir, ".agentchat");
+const profileDirs = [configDir, legacyConfigDir];
+
+function profileNameToPaths(name: string): string[] {
+  if (name.includes("/") || name.includes("\\")) return [name]; // explicit path
+  const safeName = name.replace(/[^a-zA-Z0-9_-]/g, "_");
+  return profileDirs.map((dir) => join(dir, `${safeName}.json`));
+}
 
 function nameToPath(name: string): string {
-  if (name.includes("/") || name.includes("\\")) return name; // absolute path
-  const safeName = name.replace(/[^a-zA-Z0-9_-]/g, "_");
-  return join(configDir, `${safeName}.json`);
+  const candidates = profileNameToPaths(name);
+  return candidates.find((path) => existsSync(path)) || candidates[0];
+}
+
+function listProfileFiles(): Array<{ name: string; path: string }> {
+  const seen = new Set<string>();
+  const profiles: Array<{ name: string; path: string }> = [];
+  for (const dir of profileDirs) {
+    let files: string[] = [];
+    try { files = readdirSync(dir).filter((f: string) => f.endsWith(".json")); } catch {}
+    for (const file of files) {
+      const name = file.replace(/\.json$/, "");
+      if (seen.has(name)) continue;
+      seen.add(name);
+      profiles.push({ name, path: join(dir, file) });
+    }
+  }
+  return profiles;
 }
 
 function resolveProfilePath(): string {
@@ -104,7 +127,7 @@ function resolveProfilePath(): string {
   // 4. --name <name>
   if (cliArgs.name) return nameToPath(cliArgs.name);
   // 5. default
-  return join(configDir, "profile.json");
+  return nameToPath("profile");
 }
 
 const profileFile = resolveProfilePath();
@@ -224,15 +247,56 @@ if (profile.token && profile.token !== "dev-token") {
 
 // List available profiles
 try {
-  const files = require("fs").readdirSync(configDir).filter((f: string) => f.endsWith(".json"));
-  if (files.length > 1) {
-    process.stderr.write(`[agentchat] Available profiles: ${files.map((f: string) => f.replace(".json", "")).join(", ")}\n`);
+  const profiles = listProfileFiles();
+  if (profiles.length > 1) {
+    process.stderr.write(`[agentchat] Available profiles: ${profiles.map((p) => p.name).join(", ")}\n`);
     process.stderr.write(`[agentchat] Switch with: --profile <name> or --name <name>\n`);
   }
 } catch {}
 
 let ws: WebSocket | null = null;
 let sessionId: string | null = null;
+let shuttingDown = false;
+let transport: StdioServerTransport | null = null;
+
+const debugLogsEnabled = /^(1|true|yes|debug)$/i.test(
+  process.env.AGENTSCHAT_MCP_DEBUG || process.env.AGENTCHAT_DEBUG || "",
+);
+const defaultLogRateMs = Math.max(
+  1000,
+  Number(process.env.AGENTSCHAT_MCP_LOG_RATE_MS || 60_000),
+);
+const rateLimitedLogState = new Map<string, { last: number; suppressed: number }>();
+
+function safeStderrWrite(message: string) {
+  try {
+    process.stderr.write(message);
+  } catch {}
+}
+
+function debugLog(message: string) {
+  if (debugLogsEnabled) safeStderrWrite(message);
+}
+
+function rateLimitedLog(key: string, message: string, intervalMs = defaultLogRateMs) {
+  if (debugLogsEnabled) {
+    safeStderrWrite(message);
+    return;
+  }
+  const now = Date.now();
+  const state = rateLimitedLogState.get(key);
+  if (state && now - state.last < intervalMs) {
+    state.suppressed += 1;
+    return;
+  }
+  const suppressed = state?.suppressed || 0;
+  rateLimitedLogState.set(key, { last: now, suppressed: 0 });
+  if (suppressed > 0 && message.endsWith("\n")) {
+    safeStderrWrite(message.slice(0, -1) + ` (suppressed ${suppressed} similar logs)\n`);
+  } else {
+    safeStderrWrite(message);
+  }
+}
 
 const GLOBAL_SKILLS: Record<string, { title: string; summary: string; body: string }> = {
   "workspace-driven-eng": {
@@ -1931,10 +1995,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   if (name === "switch_profile") {
     const { profile_name } = args as any;
     // List available profiles
-    const { readdirSync } = require("fs");
-    let files: string[] = [];
-    try { files = readdirSync(configDir).filter((f: string) => f.endsWith(".json")); } catch {}
-    const available = files.map((f: string) => f.replace(".json", ""));
+    const profileEntries = listProfileFiles();
+    const available = profileEntries.map((entry) => entry.name);
 
     if (!profile_name) {
       const current = AGENT_ID;
@@ -2375,6 +2437,32 @@ function saveLastSeenMessageTs(m: Map<string, string>) {
   } catch {}
 }
 const lastSeenMessageTs = loadLastSeenMessageTs();
+const cursorFlushIntervalMs = Math.max(
+  500,
+  Number(process.env.AGENTSCHAT_MCP_CURSOR_FLUSH_MS || 5000),
+);
+let lastSeenMessageTsDirty = false;
+let lastSeenMessageTsTimer: ReturnType<typeof setTimeout> | null = null;
+
+function flushLastSeenMessageTs() {
+  if (!lastSeenMessageTsDirty) return;
+  lastSeenMessageTsDirty = false;
+  if (lastSeenMessageTsTimer) {
+    clearTimeout(lastSeenMessageTsTimer);
+    lastSeenMessageTsTimer = null;
+  }
+  saveLastSeenMessageTs(lastSeenMessageTs);
+}
+
+function scheduleLastSeenMessageTsSave() {
+  lastSeenMessageTsDirty = true;
+  if (lastSeenMessageTsTimer) return;
+  lastSeenMessageTsTimer = setTimeout(() => {
+    lastSeenMessageTsTimer = null;
+    flushLastSeenMessageTs();
+  }, cursorFlushIntervalMs);
+  (lastSeenMessageTsTimer as any).unref?.();
+}
 
 function normalizeTimestampForCursor(ts: string | undefined, mode: "before" | "after"): string | undefined {
   if (!ts || typeof ts !== "string") return ts;
@@ -2727,7 +2815,10 @@ function connectWS() {
         ? (data.meta as { kind?: unknown }).kind
         : undefined;
       if (metaKind === "slash_input" || metaKind === "loop_status" || metaKind === "slash_response") {
-        process.stderr.write(`[agentchat] [slash-skip] ${metaKind} in ${(data.channel_id || "").slice(0, 12)}\n`);
+        rateLimitedLog(
+          `slash-skip:${metaKind}`,
+          `[agentchat] [slash-skip] ${metaKind} in ${(data.channel_id || "").slice(0, 12)}\n`,
+        );
         return;
       }
 
@@ -2735,17 +2826,16 @@ function connectWS() {
 
       // Task #119: record the timestamp so a future auth_ok backfill
       // knows where to resume. Only advance forward (defensive against
-      // out-of-order delivery from Redis subscribe vs REST backfill
-      // replay). Persist periodically — not every message to avoid
-      // disk thrash, but at least on every received chat message since
-      // this file is tiny (one row per channel).
+      // out-of-order delivery from Redis subscribe vs REST backfill replay).
+      // Persist on a short debounce so busy public channels do not turn
+      // every silent message into a synchronous disk write.
       if (typeof data.channel_id === "string" && typeof data.timestamp === "string") {
         const prev = lastSeenMessageTs.get(data.channel_id) || "";
         const currentTs = normalizeTimestampForCursor(data.timestamp, "after") || data.timestamp;
         const prevTs = normalizeTimestampForCursor(prev, "after") || prev;
         if (currentTs > prevTs) {
           lastSeenMessageTs.set(data.channel_id, data.timestamp);
-          saveLastSeenMessageTs(lastSeenMessageTs);
+          scheduleLastSeenMessageTsSave();
         }
       }
 
@@ -2860,14 +2950,17 @@ function connectWS() {
               },
             },
           });
-          process.stderr.write(`[agentchat] Notification pushed to Claude Code\n`);
+          debugLog(`[agentchat] Notification pushed to Claude Code\n`);
         } catch (notifErr) {
           process.stderr.write(`[agentchat] Notification FAILED: ${notifErr}\n`);
         }
         if (activeHi) clearFinishedHiddenIdentityGamesFromMessage(data);
       } else {
         // Channel message without @mention → silent (just log)
-        process.stderr.write(`[agentchat] [silent] ${data.sender_id.slice(0, 8)} in ${data.channel_id.slice(0, 12)}: ${data.content.slice(0, 30)}\n`);
+        rateLimitedLog(
+          "silent-channel-message",
+          `[agentchat] [silent] ${data.sender_id.slice(0, 8)} in ${data.channel_id.slice(0, 12)}: ${data.content.slice(0, 30)}\n`,
+        );
       }
     } else if (data.type === "channel_created") {
       // 自动加入新频道
@@ -2951,15 +3044,56 @@ const heartbeat = new HeartbeatMonitor({
 }, 15_000, 45_000, 30_000); // 15s ping, 45s pong timeout, 30s connect timeout
 heartbeat.start();
 
+function shutdownFromStdio(reason: string) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  safeStderrWrite(`[agentchat] Stdio closed (${reason}), shutting down\n`);
+  try { flushLastSeenMessageTs(); } catch {}
+  try { heartbeat.stop(); } catch {}
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+  try { ws?.close(); } catch {}
+  ws = null;
+  sessionId = null;
+  try {
+    const maybeClosed = transport?.close();
+    if (maybeClosed && typeof (maybeClosed as any).catch === "function") {
+      (maybeClosed as Promise<void>).catch(() => {});
+    }
+  } catch {}
+  const timer = setTimeout(() => process.exit(0), 0);
+  (timer as any).unref?.();
+}
+
+function installStdioLifecycleGuards() {
+  process.stdin.on("end", () => shutdownFromStdio("stdin end"));
+  process.stdin.on("close", () => shutdownFromStdio("stdin close"));
+  const handleOutputError = (err: any) => {
+    const code = err?.code || err?.name || "output error";
+    if (code === "EPIPE" || code === "ERR_STREAM_DESTROYED") {
+      shutdownFromStdio(String(code));
+    }
+  };
+  process.stdout.on("error", handleOutputError);
+  process.stderr.on("error", handleOutputError);
+  process.on("SIGPIPE", () => shutdownFromStdio("SIGPIPE"));
+  process.on("beforeExit", () => {
+    try { flushLastSeenMessageTs(); } catch {}
+  });
+}
+
 // --- Start ---
 async function main() {
+  installStdioLifecycleGuards();
   connectWS();
 
   // Stdio is the only supported transport. The --port HTTP SSE path was
   // removed in v0.6.7 — OpenClaw users should install the native channel
   // adapter `openclaw-agentchat` (npm) instead of running this plugin
   // as an HTTP server.
-  const transport = new StdioServerTransport();
+  transport = new StdioServerTransport();
   await server.connect(transport);
   process.stderr.write("[agentchat] MCP server started (Stdio)\n");
 }
