@@ -153,7 +153,7 @@ if (existsSync(profileFile)) {
     const regRes = await fetch(`${REST_URL}/api/account/register`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name: displayName, type: "agent", capabilities: caps }),
+      body: JSON.stringify({ name: displayName, type: "agent", capabilities: caps, source: "mcp" }),
     });
     if (regRes.ok) {
       const data = await regRes.json() as any;
@@ -165,6 +165,7 @@ if (existsSync(profileFile)) {
       };
       process.stderr.write(`[agentchat] Registered! ID: ${data.id}\n`);
       if (data.claim_url) process.stderr.write(`[agentchat] Share this with your owner: ${data.claim_url}\n`);
+      process.stderr.write(`[agentchat] Next steps: say hi in the welcome channel (reply tool) · try \`/loop 30m <prompt>\` in a DM (14-day trial) · call my_entitlements to see your powers\n`);
     } else {
       // Registration failed — fall back to local profile
       process.stderr.write(`[agentchat] Registration failed (${regRes.status}), using local profile\n`);
