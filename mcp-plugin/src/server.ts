@@ -353,6 +353,8 @@ const CORE_TOOL_NAMES = new Set([
   "load_global_skill",
   "list_channel_skills",
   "load_channel_skill",
+  "list_loops",
+  "my_entitlements",
 ]);
 
 const META_TOOL_NAMES = new Set([
@@ -889,6 +891,16 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         },
         required: ["target_agent_id"],
       },
+    },
+    {
+      name: "list_loops",
+      description: "List YOUR /loop records (server-side scheduler). Use after creating a loop to VERIFY it registered — slash replies are filtered off your context, so creation is otherwise blind. Shows loop_id, channel, interval, mode (okr_wake/static), next tick.",
+      inputSchema: { type: "object" as const, properties: {} },
+    },
+    {
+      name: "my_entitlements",
+      description: "Your tier (free/vip/lifetime, resolved through your owner account) and every server-enforced gate with live used/cap counts: loops (vip-gated?), owned agents, public channels. Check loops.allowed BEFORE /loop to avoid a blind vip-required rejection.",
+      inputSchema: { type: "object" as const, properties: {} },
     },
     {
       name: "list_members",
@@ -1950,6 +1962,35 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         } catch {}
       }
       return { content: [{ type: "text", text: JSON.stringify({ chat_id: null }) }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `Error: ${String(e?.message || e).slice(0, 120)}` }] };
+    }
+  }
+
+  if (name === "list_loops") {
+    try {
+      const r = await fetch(`${REST_URL}/api/loops/mine`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
+      if (!r.ok) return { content: [{ type: "text", text: `Failed (${r.status})` }] };
+      const data = await r.json() as any;
+      const loops = Array.isArray(data?.loops) ? data.loops : [];
+      if (loops.length === 0) return { content: [{ type: "text", text: "No loops registered for you." }] };
+      const lines = loops.map((l: any) => {
+        const mode = l.mode === "okr_wake" ? `okr_wake → ${l.objective_id}${Array.isArray(l.target_agents) && l.target_agents.length ? ` @[${l.target_agents.join(", ")}]` : ""}` : "static";
+        const nextIn = typeof l.next_tick_ms === "number" ? Math.max(0, Math.round((l.next_tick_ms - Date.now()) / 60000)) : "?";
+        return `• ${l.loop_id} | ch ${String(l.channel_id).slice(0, 16)} | every ${Math.round(l.interval_ms / 60000)}m | ${mode} | next ~${nextIn}m`;
+      }).join("\n");
+      return { content: [{ type: "text", text: `${loops.length} loop(s):\n${lines}` }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `Error: ${String(e?.message || e).slice(0, 120)}` }] };
+    }
+  }
+
+  if (name === "my_entitlements") {
+    try {
+      const r = await fetch(`${REST_URL}/api/me/entitlements`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
+      if (!r.ok) return { content: [{ type: "text", text: `Failed (${r.status})` }] };
+      const data = await r.json() as any;
+      return { content: [{ type: "text", text: JSON.stringify(data) }] };
     } catch (e: any) {
       return { content: [{ type: "text", text: `Error: ${String(e?.message || e).slice(0, 120)}` }] };
     }
