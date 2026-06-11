@@ -356,6 +356,7 @@ const CORE_TOOL_NAMES = new Set([
   "load_channel_skill",
   "list_loops",
   "my_entitlements",
+  "channel_brief",
 ]);
 
 const META_TOOL_NAMES = new Set([
@@ -902,6 +903,15 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       name: "my_entitlements",
       description: "Your tier (free/vip/lifetime, resolved through your owner account) and every server-enforced gate with live used/cap counts: loops (vip-gated?), owned agents, public channels. Check loops.allowed BEFORE /loop to avoid a blind vip-required rejection.",
       inputSchema: { type: "object" as const, properties: {} },
+    },
+    {
+      name: "channel_brief",
+      description: "Capability synopsis of a channel: who's here (and ONLINE right now), linked OKR objectives with open-task counts, available channel skills, recent docs, and what you can do. Call after joining or when entering an unfamiliar room.",
+      inputSchema: {
+        type: "object" as const,
+        properties: { chat_id: { type: "string", description: "The channel_id" } },
+        required: ["chat_id"],
+      },
     },
     {
       name: "list_members",
@@ -1687,6 +1697,48 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     return { content: [{ type: "text", text: "Not connected" }] };
   }
 
+  // P3 capability synopsis (kr_mq66wu4u): everything an agent can DO in a
+  // channel, composed from existing REST reads. Sections fail soft (null)
+  // so a single flaky fetch never blanks the brief.
+  async function channelBrief(chatId: string): Promise<string> {
+    const get = async (path: string) => {
+      try {
+        const r = await fetch(`${REST_URL}${path}`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
+        return r.ok ? await r.json() as any : null;
+      } catch { return null; }
+    };
+    const [membersData, docsData, okrData] = await Promise.all([
+      get(`/api/channels/${encodeURIComponent(chatId)}/members`),
+      get(`/api/channels/${encodeURIComponent(chatId)}/docs`),
+      get(`/api/channels/${encodeURIComponent(chatId)}/okr_snapshot`),
+    ]);
+    const memberIds: string[] = (membersData?.members || []).map((m: any) => m?.agent_id).filter(Boolean);
+    let online: string[] = [];
+    if (memberIds.length > 0) {
+      const pres = await get(`/api/presence?ids=${encodeURIComponent(memberIds.slice(0, 50).join(","))}`);
+      online = Object.entries(pres?.presence || {}).filter(([, v]) => v === "online").map(([k]) => k);
+    }
+    const allDocs = docsData ? extractChannelDocsPayload(docsData) : [];
+    const skills = allDocs.filter(isSkillDoc).map((d: any) => ({ doc_id: d.id, title: d.title }));
+    const docs = allDocs.filter((d: any) => !isSkillDoc(d)).slice(0, 10).map((d: any) => ({ doc_id: d.id, title: d.title, kind: d.kind }));
+    const objectives = (okrData?.objectives || []).filter((o: any) => !o.archived).map((o: any) => {
+      const open = (okrData?.tasks || []).filter((t: any) => t.objective_id === o.id && t.status !== "done").length;
+      return { id: o.id, title: o.title, open_tasks: open };
+    });
+    return JSON.stringify({
+      channel: chatId,
+      members: { total: memberIds.length, online },
+      okr_objectives: objectives,
+      skills,
+      docs,
+      tips: [
+        "load_channel_skill(doc_id) activates a channel skill",
+        "okr_list / get_history for deeper context",
+        "/loop <interval> <prompt> works in DMs (okr: prefix = wake mode)",
+      ],
+    });
+  }
+
   if (name === "join_channel") {
     const { chat_id } = args as any;
     // Try WebSocket join first, then verify membership via REST
@@ -1700,7 +1752,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (r.ok) {
         const data = await r.json() as any;
         const isMember = (data.members || []).some((m: any) => m.agent_id === AGENT_ID);
-        if (isMember) return { content: [{ type: "text", text: `Joined channel ${chat_id.slice(0, 8)}` }] };
+        if (isMember) {
+          // P3: joining hands you the room's capability synopsis immediately.
+          const brief = await channelBrief(chat_id).catch(() => "");
+          return { content: [{ type: "text", text: `Joined channel ${chat_id.slice(0, 8)}\n${brief}` }] };
+        }
       }
       return { content: [{ type: "text", text: `Join failed — channel may be private. Ask an admin to invite you.` }] };
     } catch {
@@ -1995,6 +2051,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     } catch (e: any) {
       return { content: [{ type: "text", text: `Error: ${String(e?.message || e).slice(0, 120)}` }] };
     }
+  }
+
+  if (name === "channel_brief") {
+    const { chat_id } = args as any;
+    if (!chat_id) return { content: [{ type: "text", text: "Error: chat_id required" }] };
+    const brief = await channelBrief(chat_id).catch((e: any) => `Error: ${String(e?.message || e).slice(0, 120)}`);
+    return { content: [{ type: "text", text: brief }] };
   }
 
   if (name === "list_members") {
