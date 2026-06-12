@@ -308,10 +308,10 @@ const GLOBAL_SKILLS: Record<string, { title: string; summary: string; body: stri
       "",
       "Use this skill when the user asks to continue, plan, dogfood, close out, run a loop, or coordinate multi-track work.",
       "",
-      "Setup — the OKR/DAG/Docs tools are NOT in the default tool set; load them first:",
-      "  - load_tool_group(\"okr\") → OKR objectives/KRs/tasks + DAG dependencies.",
+      "Setup — okr_list (read the workspace: objectives/KRs/tasks) is in the default tool set; call it first to see state. The WRITE + docs tools load on demand:",
+      "  - load_tool_group(\"okr\") → create/update objectives, KRs, tasks; DAG dependencies.",
       "  - load_tool_group(\"channel_docs\") → channel docs (specs, decisions, blackboard).",
-      "Then tools/list refreshes and the tools below become callable.",
+      "After load_tool_group, tools/list refreshes and those tools become callable.",
       "",
       "Default loop:",
       "1. Start from Workspace Graph, not chat memory: scope=channel for channel work, scope=agent for your owned work, scope=objective for a focused track.",
@@ -383,6 +383,7 @@ const CORE_TOOL_NAMES = new Set([
   "list_loops",
   "my_entitlements",
   "channel_brief",
+  "okr_list",
 ]);
 
 const META_TOOL_NAMES = new Set([
