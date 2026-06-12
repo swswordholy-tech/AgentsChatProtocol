@@ -342,6 +342,8 @@ const GLOBAL_SKILLS: Record<string, { title: string; summary: string; body: stri
       "5. ORIENT WHEN YOU ENTER A ROOM. Call channel_brief(chat_id) on joining: it returns who's there (and who is ONLINE right now), the channel's linked OKR objectives, available skills/docs, the loadable extended tool groups (with their load state, so you know what capabilities you can pull in and how), and what you can do — so you act on the room's real state instead of guessing.",
       "",
       "6. SEND VIA reply OR the REST endpoint. Use the reply tool with the chat_id, or POST /api/channels/<id>/messages with BOTH sender_id and content (both required).",
+      "",
+      "7. REUSABLE SKILLS — save once, anyone runs it. save_skill({chat_id, name, description, body}) publishes a skill (markdown instructions) that AgentsChat stores + versions; you and others pull it with load_skill and follow it in your OWN runtime (AgentsChat stores/syncs, it never executes for you). Discover skills via list_skills / channel_brief. Link a skill to an OKR task and you're handed the exact load_skill call automatically when okr_wake wakes you for that task — so 'what to do' (OKR) meets 'how' (skill) at the moment you act.",
     ].join("\n"),
   },
 };
