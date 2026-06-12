@@ -851,31 +851,31 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "save_skill",
-      description: "Save/publish a reusable skill to a channel so other agents (and future-you) can load it. AgentsChat persists + versions it; you and others CONSUME it via load_skill in your own runtime. Pass chat_id + name + description + body (the markdown instructions an agent follows). Reuse the same doc_id (or name) to update in place. Returns the exact load_skill call others use. You must be a member of chat_id; default level 3 means any member can save.",
+      description: "Save/publish a reusable skill that AgentsChat persists + versions; you and others CONSUME it via load_skill/sync_skill in your own runtime. Two scopes: pass chat_id → CHANNEL skill (shared in that channel); OMIT chat_id → PERSONAL skill, namespaced to your owner and shared across ALL your agents (a flat name that follows you). Pass name + description + body (the markdown instructions). Reuse the same name/doc_id to update in place.",
       inputSchema: {
         type: "object" as const,
         properties: {
-          chat_id: { type: "string", description: "Channel to save the skill into (you must be a member)" },
+          chat_id: { type: "string", description: "Channel to save into (CHANNEL skill). OMIT for a PERSONAL skill (per-owner, follows you across agents)." },
           name: { type: "string", description: "Skill name (short)" },
           description: { type: "string", description: "One line: what it does / when to use it" },
           body: { type: "string", description: "The skill content in markdown — the instructions an agent follows" },
-          doc_id: { type: "string", description: "Optional stable id (default: a slug of name). Reuse to update an existing skill." },
-          level: { type: "number", description: "Doc tier 1-4 (default 3 = any member may write; 1-2 require channel admin)" },
+          doc_id: { type: "string", description: "Optional stable id/slug (default: a slug of name). Reuse to update." },
+          level: { type: "number", description: "CHANNEL only: doc tier 1-4 (default 3 = any member may write; 1-2 require channel admin)" },
         },
-        required: ["chat_id", "name", "description"],
+        required: ["name", "description"],
       },
     },
     {
       name: "sync_skill",
-      description: "Lazy-sync a channel skill to a local file, fetching the body ONLY if your local copy is missing or stale (version-aware). Cheap: it checks the skill's current version via the docs list (no body) and SKIPS the download when you already have that version — 'have it + version matches → use directly, else sync then use'. Returns the local path; read that file to run the skill in your own runtime.",
+      description: "Lazy-sync a skill to a local file, fetching the body ONLY if your local copy is missing or stale (version-aware). Cheap: checks the current version (no body) and SKIPS the download when you already have it — 'have it + version matches → use directly, else sync then use'. Two scopes: pass name → a PERSONAL skill (per-owner); pass chat_id + doc_id → a CHANNEL skill. Returns the local path; read that file to run the skill in your own runtime.",
       inputSchema: {
         type: "object" as const,
         properties: {
-          chat_id: { type: "string", description: "The skill's channel id" },
-          doc_id: { type: "string", description: "The skill's doc id" },
+          name: { type: "string", description: "PERSONAL skill name (per-owner). Use this OR chat_id+doc_id." },
+          chat_id: { type: "string", description: "CHANNEL skill's channel id (paired with doc_id)" },
+          doc_id: { type: "string", description: "CHANNEL skill's doc id (paired with chat_id)" },
           dir: { type: "string", description: "Optional local dir to sync into (default ~/.agentchat/skills)" },
         },
-        required: ["chat_id", "doc_id"],
       },
     },
     {
@@ -1329,6 +1329,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         out.channel_skills_error = `network/parse error: ${String(e?.message || e).slice(0, 120)}`;
       }
     }
+    // Personal skills (per-owner, follow you across agents). sync_skill(name=…) / load via GET /api/skills/:name.
+    try {
+      const pr = await fetch(`${REST_URL}/api/skills`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
+      if (pr.ok) out.personal_skills = (JSON.parse(await pr.text()).skills) || [];
+    } catch { /* best-effort */ }
     return { content: [{ type: "text", text: JSON.stringify(out, null, 2) }] };
   }
 
@@ -1385,16 +1390,33 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
   if (name === "save_skill") {
     const a = (args || {}) as { chat_id?: string; name?: string; description?: string; body?: string; doc_id?: string; level?: number };
-    if (!a.chat_id || !a.name || !a.description) {
-      return { content: [{ type: "text", text: "save_skill needs chat_id, name, and description (body is the markdown the skill contains)." }] };
+    if (!a.name || !a.description) {
+      return { content: [{ type: "text", text: "save_skill needs name + description (body is the skill markdown). Pass chat_id for a CHANNEL skill, or OMIT chat_id for a PERSONAL skill that follows you across all your agents." }] };
     }
-    // Stable doc id: caller-supplied, else a slug of the name.
-    const slug = String(a.name).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 48) || "skill";
-    const docId = (a.doc_id && String(a.doc_id).trim()) || `skill-${slug}`;
     // Skill markdown = YAML frontmatter (name, description) + body — the exact
-    // shape parseSkillFrontmatter + the kind=channel_skill validator expect.
+    // shape parseSkillFrontmatter + the skill validators expect.
     const oneLine = (s: string) => String(s).replace(/\r?\n/g, " ").slice(0, 480);
     const md = `---\nname: ${oneLine(a.name)}\ndescription: ${oneLine(a.description)}\n---\n\n${a.body || ""}`;
+    // PERSONAL skill (no chat_id): per-owner store, shared across YOUR agents.
+    if (!a.chat_id) {
+      const pslug = String(a.doc_id || a.name).toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^[^a-z0-9]+/, "").replace(/[^a-z0-9]+$/, "").slice(0, 64) || "skill";
+      try {
+        const r = await fetch(`${REST_URL}/api/skills/${encodeURIComponent(pslug)}`, {
+          method: "PUT",
+          headers: { "Authorization": `Bearer ${TOKEN}`, "Content-Type": "application/json" },
+          body: JSON.stringify({ body_markdown: md }),
+        });
+        const text = await r.text();
+        if (!r.ok) return { content: [{ type: "text", text: `save_skill (personal) failed (${r.status}): ${text.slice(0, 240)}` }] };
+        const resp = JSON.parse(text);
+        return { content: [{ type: "text", text: `Saved PERSONAL skill "${a.name}" as "${pslug}" (v${resp.version}) — shared across all your agents. Pull/refresh: sync_skill(name="${pslug}"); list: list_skills.` }] };
+      } catch (e: any) {
+        return { content: [{ type: "text", text: `save_skill (personal) network error: ${String(e?.message || e).slice(0, 120)}` }] };
+      }
+    }
+    // CHANNEL skill (chat_id given). Stable doc id: caller-supplied, else slug of name.
+    const slug = String(a.name).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 48) || "skill";
+    const docId = (a.doc_id && String(a.doc_id).trim()) || `skill-${slug}`;
     const level = (typeof a.level === "number" && a.level >= 1 && a.level <= 4) ? a.level : 3; // 3 = member-writable
     try {
       // If-Match: fetch current version (0 = create). The doc store uses
@@ -1422,13 +1444,40 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   }
 
   if (name === "sync_skill") {
-    const a = (args || {}) as { chat_id?: string; doc_id?: string; dir?: string };
-    if (!a.chat_id || !a.doc_id) {
-      return { content: [{ type: "text", text: "sync_skill needs chat_id + doc_id (the skill's channel + doc)." }] };
-    }
+    const a = (args || {}) as { chat_id?: string; doc_id?: string; name?: string; dir?: string };
     const home = process.env.HOME || process.env.USERPROFILE || ".";
     const cacheDir = (a.dir && String(a.dir).trim()) || `${home}/.agentchat/skills`;
     const safe = (s: string) => String(s).replace(/[^A-Za-z0-9_.-]/g, "_");
+    // PERSONAL skill: sync_skill({name}) — version from GET /api/skills (cheap,
+    // no body), body from GET /api/skills/:name only when missing/stale.
+    if (a.name && !a.chat_id) {
+      const pBase = `${cacheDir}/personal__${safe(a.name)}`;
+      const pMd = `${pBase}.md`; const pMeta = `${pBase}.json`;
+      try {
+        const listR = await fetch(`${REST_URL}/api/skills`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
+        if (!listR.ok) return { content: [{ type: "text", text: `sync_skill (personal): list failed (${listR.status})` }] };
+        const meta = (JSON.parse(await listR.text()).skills || []).find((s: any) => s.name === a.name);
+        if (!meta) return { content: [{ type: "text", text: `sync_skill: personal skill "${a.name}" not found (save it with save_skill — no chat_id).` }] };
+        const currentVersion = Number(meta.version ?? 0);
+        let cachedVersion: number | null = null;
+        try { cachedVersion = Number(JSON.parse(await Bun.file(pMeta).text()).version); } catch {}
+        if (cachedVersion !== null && cachedVersion === currentVersion) {
+          return { content: [{ type: "text", text: `up-to-date: personal skill "${a.name}" v${currentVersion} already at ${pMd} — no download. Read that file to run it.` }] };
+        }
+        const bodyR = await fetch(`${REST_URL}/api/skills/${encodeURIComponent(a.name)}`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
+        if (!bodyR.ok) return { content: [{ type: "text", text: `sync_skill (personal): body fetch failed (${bodyR.status})` }] };
+        const doc = JSON.parse(await bodyR.text());
+        await Bun.write(pMd, String(doc?.body_markdown ?? ""));
+        await Bun.write(pMeta, JSON.stringify({ version: currentVersion, name: a.name, syncedAt: new Date().toISOString() }));
+        return { content: [{ type: "text", text: `synced personal skill "${a.name}" v${currentVersion} → ${pMd} (was ${cachedVersion === null ? "missing" : `stale v${cachedVersion}`}). Read that file to run it.` }] };
+      } catch (e: any) {
+        return { content: [{ type: "text", text: `sync_skill (personal) error: ${String(e?.message || e).slice(0, 140)}` }] };
+      }
+    }
+    // CHANNEL skill: chat_id + doc_id.
+    if (!a.chat_id || !a.doc_id) {
+      return { content: [{ type: "text", text: "sync_skill needs (chat_id + doc_id) for a CHANNEL skill, or (name) for a PERSONAL skill." }] };
+    }
     const base = `${cacheDir}/${safe(a.chat_id)}__${safe(a.doc_id)}`;
     const mdPath = `${base}.md`;
     const metaPath = `${base}.json`;
