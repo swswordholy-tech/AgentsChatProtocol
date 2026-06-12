@@ -381,6 +381,7 @@ const CORE_TOOL_NAMES = new Set([
   "list_skills",
   "load_skill",
   "save_skill",
+  "sync_skill",
   "list_loops",
   "my_entitlements",
   "channel_brief",
@@ -862,6 +863,19 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           level: { type: "number", description: "Doc tier 1-4 (default 3 = any member may write; 1-2 require channel admin)" },
         },
         required: ["chat_id", "name", "description"],
+      },
+    },
+    {
+      name: "sync_skill",
+      description: "Lazy-sync a channel skill to a local file, fetching the body ONLY if your local copy is missing or stale (version-aware). Cheap: it checks the skill's current version via the docs list (no body) and SKIPS the download when you already have that version — 'have it + version matches → use directly, else sync then use'. Returns the local path; read that file to run the skill in your own runtime.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          chat_id: { type: "string", description: "The skill's channel id" },
+          doc_id: { type: "string", description: "The skill's doc id" },
+          dir: { type: "string", description: "Optional local dir to sync into (default ~/.agentchat/skills)" },
+        },
+        required: ["chat_id", "doc_id"],
       },
     },
     {
@@ -1404,6 +1418,47 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       return { content: [{ type: "text", text: `${verb} skill "${a.name}" → ${a.chat_id}/${docId} (L${level}). Others load it with: load_skill(chat_id="${a.chat_id}", doc_id="${docId}") — discoverable via list_skills(chat_id="${a.chat_id}").` }] };
     } catch (e: any) {
       return { content: [{ type: "text", text: `save_skill network error: ${String(e?.message || e).slice(0, 120)}` }] };
+    }
+  }
+
+  if (name === "sync_skill") {
+    const a = (args || {}) as { chat_id?: string; doc_id?: string; dir?: string };
+    if (!a.chat_id || !a.doc_id) {
+      return { content: [{ type: "text", text: "sync_skill needs chat_id + doc_id (the skill's channel + doc)." }] };
+    }
+    const home = process.env.HOME || process.env.USERPROFILE || ".";
+    const cacheDir = (a.dir && String(a.dir).trim()) || `${home}/.agentchat/skills`;
+    const safe = (s: string) => String(s).replace(/[^A-Za-z0-9_.-]/g, "_");
+    const base = `${cacheDir}/${safe(a.chat_id)}__${safe(a.doc_id)}`;
+    const mdPath = `${base}.md`;
+    const metaPath = `${base}.json`;
+    try {
+      // 1. Cheap version check: docs-list returns each doc's version WITHOUT the
+      // body, so "is my local copy current?" costs one light call.
+      const listR = await fetch(`${REST_URL}/api/channels/${encodeURIComponent(a.chat_id)}/docs`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
+      if (!listR.ok) return { content: [{ type: "text", text: `sync_skill: docs-list failed (${listR.status})` }] };
+      const docs = extractChannelDocsPayload(JSON.parse(await listR.text()));
+      const meta = docs.find((d: any) => (d?.id ?? d?.doc_id) === a.doc_id);
+      if (!meta) return { content: [{ type: "text", text: `sync_skill: skill "${a.doc_id}" not found in channel ${a.chat_id}` }] };
+      const currentVersion = Number(meta.version ?? 0);
+      // 2. Local cache check — skip the body fetch if we already have this version.
+      let cachedVersion: number | null = null;
+      try { cachedVersion = Number(JSON.parse(await Bun.file(metaPath).text()).version); } catch {}
+      if (cachedVersion !== null && cachedVersion === currentVersion) {
+        return { content: [{ type: "text", text: `up-to-date: "${a.doc_id}" v${currentVersion} already at ${mdPath} — no download. Read that file to run it.` }] };
+      }
+      // 3. Missing/stale → fetch the body (the only expensive call, on the cold path).
+      const docR = await fetch(`${REST_URL}/api/channels/${encodeURIComponent(a.chat_id)}/docs/${encodeURIComponent(a.doc_id)}`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
+      if (!docR.ok) return { content: [{ type: "text", text: `sync_skill: fetch body failed (${docR.status})` }] };
+      const doc = JSON.parse(await docR.text());
+      const body = String(doc?.body_markdown ?? doc?.bodyMarkdown ?? "");
+      // 4. Write the local mirror + version sidecar.
+      await Bun.write(mdPath, body);
+      await Bun.write(metaPath, JSON.stringify({ version: currentVersion, title: doc?.title, doc_id: a.doc_id, chat_id: a.chat_id, syncedAt: new Date().toISOString() }));
+      const was = cachedVersion === null ? "missing" : `stale v${cachedVersion}`;
+      return { content: [{ type: "text", text: `synced "${doc?.title || a.doc_id}" v${currentVersion} → ${mdPath} (was ${was}). Read that file to run it in your runtime.` }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `sync_skill error: ${String(e?.message || e).slice(0, 140)}` }] };
     }
   }
 
