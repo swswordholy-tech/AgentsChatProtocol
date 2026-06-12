@@ -378,6 +378,7 @@ const CORE_TOOL_NAMES = new Set([
   "switch_profile",
   "list_skills",
   "load_skill",
+  "save_skill",
   "list_loops",
   "my_entitlements",
   "channel_brief",
@@ -843,6 +844,22 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           chat_id: { type: "string", description: "Channel id (for a channel skill, paired with doc_id)" },
           doc_id: { type: "string", description: "Channel doc id to load as a skill (paired with chat_id)" },
         },
+      },
+    },
+    {
+      name: "save_skill",
+      description: "Save/publish a reusable skill to a channel so other agents (and future-you) can load it. AgentsChat persists + versions it; you and others CONSUME it via load_skill in your own runtime. Pass chat_id + name + description + body (the markdown instructions an agent follows). Reuse the same doc_id (or name) to update in place. Returns the exact load_skill call others use. You must be a member of chat_id; default level 3 means any member can save.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          chat_id: { type: "string", description: "Channel to save the skill into (you must be a member)" },
+          name: { type: "string", description: "Skill name (short)" },
+          description: { type: "string", description: "One line: what it does / when to use it" },
+          body: { type: "string", description: "The skill content in markdown — the instructions an agent follows" },
+          doc_id: { type: "string", description: "Optional stable id (default: a slug of name). Reuse to update an existing skill." },
+          level: { type: "number", description: "Doc tier 1-4 (default 3 = any member may write; 1-2 require channel admin)" },
+        },
+        required: ["chat_id", "name", "description"],
       },
     },
     {
@@ -1348,6 +1365,44 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       return { content: [{ type: "text", text: `Unknown global skill: ${id}` }] };
     }
     return { content: [{ type: "text", text: `${skill.body}\n\nLoaded as global skill "${id}".` }] };
+  }
+
+  if (name === "save_skill") {
+    const a = (args || {}) as { chat_id?: string; name?: string; description?: string; body?: string; doc_id?: string; level?: number };
+    if (!a.chat_id || !a.name || !a.description) {
+      return { content: [{ type: "text", text: "save_skill needs chat_id, name, and description (body is the markdown the skill contains)." }] };
+    }
+    // Stable doc id: caller-supplied, else a slug of the name.
+    const slug = String(a.name).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 48) || "skill";
+    const docId = (a.doc_id && String(a.doc_id).trim()) || `skill-${slug}`;
+    // Skill markdown = YAML frontmatter (name, description) + body — the exact
+    // shape parseSkillFrontmatter + the kind=channel_skill validator expect.
+    const oneLine = (s: string) => String(s).replace(/\r?\n/g, " ").slice(0, 480);
+    const md = `---\nname: ${oneLine(a.name)}\ndescription: ${oneLine(a.description)}\n---\n\n${a.body || ""}`;
+    const level = (typeof a.level === "number" && a.level >= 1 && a.level <= 4) ? a.level : 3; // 3 = member-writable
+    try {
+      // If-Match: fetch current version (0 = create). The doc store uses
+      // optimistic concurrency; "0" creates, current version updates.
+      let ifMatch = "0";
+      const cur = await fetch(`${REST_URL}/api/channels/${encodeURIComponent(a.chat_id)}/docs/${encodeURIComponent(docId)}`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
+      if (cur.ok) {
+        const curDoc = await cur.json().catch(() => null) as any;
+        if (curDoc && curDoc.version != null) ifMatch = String(curDoc.version);
+      }
+      const r = await fetch(`${REST_URL}/api/channels/${encodeURIComponent(a.chat_id)}/docs/${encodeURIComponent(docId)}`, {
+        method: "PUT",
+        headers: { "Authorization": `Bearer ${TOKEN}`, "Content-Type": "application/json", "If-Match": ifMatch },
+        body: JSON.stringify({ kind: "channel_skill", level, title: a.name, body_markdown: md }),
+      });
+      const text = await r.text();
+      if (!r.ok) {
+        return { content: [{ type: "text", text: `save_skill failed (${r.status}): ${text.slice(0, 240)}` }] };
+      }
+      const verb = ifMatch === "0" ? "Saved" : "Updated";
+      return { content: [{ type: "text", text: `${verb} skill "${a.name}" → ${a.chat_id}/${docId} (L${level}). Others load it with: load_skill(chat_id="${a.chat_id}", doc_id="${docId}") — discoverable via list_skills(chat_id="${a.chat_id}").` }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `save_skill network error: ${String(e?.message || e).slice(0, 120)}` }] };
+    }
   }
 
   if (name === "list_tool_groups") {
