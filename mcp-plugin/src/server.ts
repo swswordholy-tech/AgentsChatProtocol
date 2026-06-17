@@ -386,6 +386,8 @@ const CORE_TOOL_NAMES = new Set([
   "my_entitlements",
   "channel_brief",
   "okr_list",
+  "load_memory",
+  "save_memory",
 ]);
 
 const META_TOOL_NAMES = new Set([
@@ -863,6 +865,29 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           level: { type: "number", description: "CHANNEL only: doc tier 1-4 (default 3 = any member may write; 1-2 require channel admin)" },
         },
         required: ["name", "description"],
+      },
+    },
+    {
+      name: "load_memory",
+      description: "Restore YOUR persisted memory (keyed by your agent_id; same key → same memory across restarts). Call ONCE at the start of a fresh session. NO args → your memory INDEX (each doc's name + one-line description, no bodies) — scan it, then load what you need. With name → that doc's full body. IDEMPOTENT: if you've ALREADY loaded your memory this session (it's in your context), do NOT call again — re-loading only duplicates context. After a compaction that dropped it, call again to restore.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          name: { type: "string", description: "A specific memory doc to load in full (omit to get the lean index of all your memory docs)" },
+        },
+      },
+    },
+    {
+      name: "save_memory",
+      description: "Persist a memory doc under YOUR agent_id so a future fresh instance (same key) restores it via load_memory. Pass name (slug) + body (freeform markdown — your notes/state/lessons) + optional description (one-line index hook; auto-summarized if omitted). Reuse the same name to update in place (version bumps). 256KB/doc, 20 docs/agent. Tip: keep a lean top-level 'index' doc pointing to finer docs (progressive disclosure — load the index first, expand on demand).",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          name: { type: "string", description: "Memory doc name/slug (e.g. 'index', 'context', 'lessons'). Reuse to update." },
+          body: { type: "string", description: "The memory content in markdown (freeform)." },
+          description: { type: "string", description: "Optional one-line index hook; auto-summarized from body if omitted." },
+        },
+        required: ["name", "body"],
       },
     },
     {
@@ -1386,6 +1411,46 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       return { content: [{ type: "text", text: `Unknown global skill: ${id}` }] };
     }
     return { content: [{ type: "text", text: `${skill.body}\n\nLoaded as global skill "${id}".` }] };
+  }
+
+  if (name === "save_memory") {
+    const a = (args || {}) as { name?: string; body?: string; description?: string };
+    if (!a.name || !a.body) {
+      return { content: [{ type: "text", text: "save_memory needs name (slug) + body (markdown). Optional description (one-line index hook)." }] };
+    }
+    try {
+      const r = await fetch(`${REST_URL}/api/memory/${encodeURIComponent(a.name)}`, {
+        method: "PUT",
+        headers: { "Authorization": `Bearer ${TOKEN}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ body_markdown: a.body, description: a.description }),
+      });
+      const text = await r.text();
+      if (!r.ok) return { content: [{ type: "text", text: `save_memory failed (${r.status}): ${text.slice(0, 240)}` }] };
+      const resp = JSON.parse(text);
+      return { content: [{ type: "text", text: `Saved memory "${resp.name}" (v${resp.version}, ${resp.bytes}B) under your agent_id. Restore later: load_memory (index) → load_memory("${resp.name}").` }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `save_memory network error: ${String(e?.message || e).slice(0, 120)}` }] };
+    }
+  }
+
+  if (name === "load_memory") {
+    const a = (args || {}) as { name?: string };
+    try {
+      const path = a.name ? `/api/memory/${encodeURIComponent(a.name)}` : `/api/memory`;
+      const r = await fetch(`${REST_URL}${path}`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
+      const text = await r.text();
+      if (!r.ok) return { content: [{ type: "text", text: `load_memory failed (${r.status}): ${text.slice(0, 240)}` }] };
+      const resp = JSON.parse(text);
+      if (a.name) {
+        return { content: [{ type: "text", text: `# memory: ${resp.name} (v${resp.version})\n\n${resp.body_markdown || ""}` }] };
+      }
+      const items = Array.isArray(resp.memories) ? resp.memories : [];
+      if (items.length === 0) return { content: [{ type: "text", text: "No stored memory yet. Use save_memory to persist your context (e.g. an 'index' doc + finer docs)." }] };
+      const idx = items.map((m: any) => `- ${m.name}${m.description ? ` — ${m.description}` : ""}`).join("\n");
+      return { content: [{ type: "text", text: `Your memory index (${items.length} docs). Load one in full with load_memory("<name>"):\n\n${idx}` }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `load_memory network error: ${String(e?.message || e).slice(0, 120)}` }] };
+    }
   }
 
   if (name === "save_skill") {
