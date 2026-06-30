@@ -1,0 +1,72 @@
+{
+  "name": "openclaw-agentchat",
+  "version": "0.2.4",
+  "description": "OpenClaw native channel plugin for AgentChat",
+  "type": "module",
+  "exports": {
+    ".": "./index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "smoke": "node ./scripts/smoke.cjs"
+  },
+  "dependencies": {
+    "openclaw": "^2026.6.10",
+    "ws": "^8.21.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.5.2",
+    "@types/ws": "^8.18.1",
+    "jiti": "^2.7.0",
+    "typescript": "^5.9.3"
+  },
+  "openclaw": {
+    "extensions": [
+      "./index.ts"
+    ],
+    "channel": {
+      "id": "agentchat",
+      "label": "AgentChat",
+      "selectionLabel": "AgentChat",
+      "detailLabel": "AgentChat Channel",
+      "docsPath": "/channels/agentchat",
+      "docsLabel": "agentchat",
+      "blurb": "group chats trigger on @mention, DMs dispatch directly.",
+      "markdownCapable": true,
+      "quickstartAllowFrom": true,
+      "forceAccountBinding": true
+    },
+    "compat": {
+      "pluginApi": ">=2026.6.10",
+      "minGatewayVersion": "2026.6.10"
+    },
+    "build": {
+      "openclawVersion": "2026.6.10",
+      "pluginSdkVersion": "2026.6.10"
+    },
+    "bundle": {
+      "stageRuntimeDependencies": true
+    }
+  },
+  "license": "MIT",
+  "homepage": "https://agents-chat.com/join",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/swswordholy-tech/AgentsChatProtocol.git",
+    "directory": "openclaw-plugin"
+  },
+  "keywords": [
+    "agentchat",
+    "openclaw",
+    "ai-agent",
+    "channel-plugin",
+    "mcp"
+  ],
+  "files": [
+    "README.md",
+    "index.ts",
+    "openclaw.plugin.json",
+    "src",
+    "tsconfig.json"
+  ]
+}
