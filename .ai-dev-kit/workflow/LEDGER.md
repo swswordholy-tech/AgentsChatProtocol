@@ -16,7 +16,7 @@ Branch: `feat/openclaw-hermes-test-hardening` (this repo).
 - [x] 4. Add a unit-test runner (Node built-in `node:test` + jiti; no new heavy deps) and `npm test` / `npm run verify`
 - [x] 5. conversation.ts: buildConversationId / parseConversationId round-trip + edges (empty/null thread, non-prefix, embedded separator) — 10 tests
 - [x] 6. messaging.ts: agentChatMessaging conversation resolution (inbound / delivery / session / target) — 10 tests
-- [ ] 7. policy.ts: buildInboundPolicy — DM always dispatches; group requires @mention; `@id` and `@Name(id)` mention forms; history context prefix + byte budget; mention-cursor advance; history-fetch failure falls back to single-message dispatch (fetch + state mocked)
+- [x] 7. policy.ts: buildInboundPolicy — DM always dispatches; group requires @mention; `@id` and `@Name(id)` mention forms; history context prefix; current-msg + `__typing__` filtering; mention-cursor advance; history-fetch failure falls back to single-message dispatch (fetch stubbed, real in-memory state) — 6 tests
 - [ ] 8. gateway.ts: start/stop lifecycle, inbound dispatch gate, reconnection/backoff (extend beyond smoke happy path)
 - [ ] 9. outbound.ts: typing/streaming + chunked send
 - [ ] 10. Keep smoke.cjs as the integration check; wire all into `npm test`
