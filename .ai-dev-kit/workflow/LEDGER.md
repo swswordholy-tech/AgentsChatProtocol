@@ -21,14 +21,14 @@ Branch: `feat/openclaw-hermes-test-hardening` (this repo).
 - [x] 9. outbound.ts: resolveTarget (trim/blank) + sendText (delivers via client, result envelope, threadId→conversationId, throws on missing accountId / not-running) — 7 tests
 - [x] 10. smoke.cjs kept as integration check; `npm run verify` = typecheck + unit tests + smoke
 
-## hermes-agent (~/dev/hermes-agent, branch feat/agentchat-platform) — 20 tests today
-- [ ] 11. Assess coverage gaps in gateway/platforms/agentchat.py (696 lines) vs existing 20 tests
-- [ ] 12. Add tests for uncovered surface: history fetch, reconnection/backoff, send chunking, error paths
-- [ ] 13. strict verification: full agentchat test module green via `.venv`
+## hermes-agent (~/dev/hermes-agent, branch feat/agentchat-platform) — was 20 tests, now 50
+- [x] 11. Assessed gaps vs the 5-invariant suite: allowlist gate, startup-grace drop, REST error paths, WS→REST fallthrough, typing/image, get_chat_info, _handle_frame routing, token redaction were all uncovered
+- [x] 12. Added 30 tests (hermes commit b62a466a) driving the real adapter methods for every gap above
+- [x] 13. strict verification: `.venv/bin/python -m pytest tests/gateway/test_agentchat.py` → 50 passed
 
 ## Verification gate (must all be green before proposing merge)
-- [ ] 14. openclaw: typecheck + smoke + new unit suite all green
-- [ ] 15. hermes: agentchat test module green via `.venv/bin/python -m pytest`
+- [x] 14. openclaw: `npm run verify` → typecheck rc=0, 36 unit tests pass, smoke ok
+- [x] 15. hermes: `.venv/bin/python -m pytest tests/gateway/test_agentchat.py` → 50 passed
 
 ## Notes
 - hermes rebased branch `feat/agentchat-platform-rebased` adoption is a separate HUMAN-GATED review (see memory openclaw-hermes-latest-adaptation); not in scope of this hardening pass.
