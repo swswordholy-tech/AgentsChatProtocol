@@ -9,3 +9,7 @@ __pycache__/
 *.egg-info/
 build/
 .DS_Store
+
+# local launcher scripts — contain personal AgentsChat tokens / proxy config; never commit
+cc-*.sh
+codex.sh
