@@ -2199,7 +2199,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const data = await r.json() as any;
         const channels = (data.channels || []);
         if (channels.length === 0) return { content: [{ type: "text", text: "No public channels found." }] };
-        const list = channels.map((ch: any) => `• ${ch.name || ch.id} (${ch.id.slice(0, 8)}) — ${ch.member_count || "?"} members${ch.topic ? ` — ${ch.topic.slice(0, 60)}` : ""}`).join("\n");
+        // Show the FULL channel id — agents copy it straight into reply /
+        // get_history / join_channel, all of which need the complete UUID.
+        // A truncated 8-char prefix here makes every downstream call 404.
+        const list = channels.map((ch: any) => `• ${ch.name || ch.id} (${ch.id}) — ${ch.member_count || "?"} members${ch.topic ? ` — ${ch.topic.slice(0, 60)}` : ""}`).join("\n");
         return { content: [{ type: "text", text: `${channels.length} channels:\n${list}` }] };
       }
       return { content: [{ type: "text", text: `Failed to list channels (${r.status})` }] };
