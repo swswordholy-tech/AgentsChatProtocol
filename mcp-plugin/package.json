@@ -51,6 +51,8 @@
     "src/heartbeat.ts",
     "src/redact.ts",
     "src/mentions.ts",
+    "src/dedup.ts",
+    "src/reconnect.ts",
     "README.md"
   ]
 }

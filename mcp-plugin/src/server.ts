@@ -27,6 +27,8 @@ import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { redactSecrets } from "./redact.ts";
 import { matchesMention } from "./mentions.ts";
+import { messageDedupKey, MessageDedup } from "./dedup.ts";
+import { computeReconnectDelay } from "./reconnect.ts";
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
@@ -2986,31 +2988,22 @@ function clearFinishedHiddenIdentityGamesFromMessage(data: any) {
 // legitimately receive the same persisted message once via live WS and once
 // via REST backfill; timestamp guards alone would either fail to drop that
 // duplicate or drop older out-of-order messages that were never processed.
-const deliveredMessageIds = new Set<string>();
-const MAX_DELIVERED_MESSAGE_IDS = 5000;
+// Dedup core (key derivation + bounded set) lives in ./dedup.ts; this file
+// keeps the thin logging wrapper so call sites and stderr output are unchanged.
+const messageDedup = new MessageDedup();
 function deliverySource(data: any): string {
   return typeof data?.__source === "string" ? data.__source : "live";
-}
-function messageDedupKey(data: any): string | null {
-  if (!data || typeof data.id !== "string" || typeof data.channel_id !== "string") return null;
-  return `${data.channel_id}:${data.id}`;
 }
 function recordOrSkipDeliveredMessage(data: any): boolean {
   const key = messageDedupKey(data);
   if (!key) return false;
-  if (deliveredMessageIds.has(key)) {
+  const skip = messageDedup.recordOrSkip(key);
+  if (skip) {
     process.stderr.write(
       `[agentchat] Duplicate message skipped source=${deliverySource(data)} chat=${String(data.channel_id).slice(0, 12)} id=${String(data.id).slice(0, 12)}\n`,
     );
-    return true;
   }
-  deliveredMessageIds.add(key);
-  if (deliveredMessageIds.size > MAX_DELIVERED_MESSAGE_IDS) {
-    const arr = [...deliveredMessageIds];
-    deliveredMessageIds.clear();
-    for (const item of arr.slice(1000)) deliveredMessageIds.add(item);
-  }
-  return false;
+  return skip;
 }
 // Channels we believe we're a member of. Populated from
 // `channel_created` events on auth_ok. Used as the backfill target set.
@@ -3402,8 +3395,7 @@ function connectWS() {
     // handler and self-schedule a fast reconnect, so there is no
     // isPlannedReconnect flag to consume and no fast/slow ambiguity.
     wsReconnectAttempt++;
-    const jitter = Math.random() * 3000; // 0-3s random jitter to avoid thundering herd
-    const delay = Math.min(wsReconnectAttempt * 2, 30) * 1000 + jitter;
+    const delay = computeReconnectDelay(wsReconnectAttempt);
     process.stderr.write(`[agentchat] Disconnected (code=${(event as any)?.code ?? "?"}), reconnecting in ${Math.round(delay/100)/10}s (attempt ${wsReconnectAttempt})...\n`);
     scheduleReconnect(delay);
   };

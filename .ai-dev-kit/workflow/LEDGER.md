@@ -64,9 +64,14 @@ orphan/duplicate connections) + untracked timers + missing planned-reconnect fla
 - [x] F6. CORRECTNESS: no-cursor backfill now SEEDS the cursor from the newest message and skips
       replay (no stale DM/@mention surfaced as a live notification); honors 'empty cursor = no backfill'.
 - [ ] F7. PACKAGING (HIGH): fix broken documented install (bin ships raw TS + bun shebang vs npx docs).
-- [~] F8. Extract+test helpers: [x] isMentioned → src/mentions.ts + 7 tests (guards the documented
-      false-positive). Remaining: computeReconnectDelay, dedup (recordOrSkip), bare-mention rewrite,
-      redactSecrets already done in F2.
+- [x] F8. Extract+test the stability/correctness-critical helpers into testable modules:
+      [x] redactSecrets → src/redact.ts (F2, 6 tests)
+      [x] isMentioned → src/mentions.ts (7 tests, guards the documented false-positive)
+      [x] MessageDedup + messageDedupKey → src/dedup.ts (4 tests: key derivation, dup detection, eviction)
+      [x] computeReconnectDelay → src/reconnect.ts (3 tests: attempt scaling, 30s cap, jitter bound)
+      [x] HeartbeatMonitor.tick() → tests/heartbeat.test.ts (F2, 7 tests)
+      Lower-value extractions deferred: resolveBareMentions rewrite, normalizeTimestampForCursor,
+      backfill replay filter, profile-path resolution. Total mcp unit tests now 27.
 - [~] F9. Sweep medium/low:
       [x] mark_read + set_topic + forward + vote: validate required string args BEFORE dispatch
           (was: send malformed frame, then .slice() throws after the side effect fired).
