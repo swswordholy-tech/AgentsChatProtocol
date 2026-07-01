@@ -33,3 +33,32 @@ Branch: `feat/openclaw-hermes-test-hardening` (this repo).
 ## Notes
 - hermes rebased branch `feat/agentchat-platform-rebased` adoption is a separate HUMAN-GATED review (see memory openclaw-hermes-latest-adaptation); not in scope of this hardening pass.
 - Run hermes tests with the project `.venv` (system python3.14 lacks pytest-xdist that pyproject `addopts -n` needs).
+
+---
+
+# MCP access-layer hardening (branch feat/mcp-access-hardening, 2026-07-02)
+
+Scope: ONLY the mcp-plugin (agentschat-mcp) protocol/access layer — server.ts (3447L) +
+heartbeat.ts. AgentsChat backend hub = another agent. openclaw/hermes already done.
+
+Audit: 6-lens ultracode workflow → **40 verified findings** (1 false positive) in
+`.ai-dev-kit/workflow/findings.jsonl`. Dominant theme: socket-lifecycle fragility
+(onopen/onmessage/onclose reference the module-global `ws` with no instance guard →
+orphan/duplicate connections) + untracked timers + missing planned-reconnect flag.
+
+## Fix progress
+- [x] F1. Security (was HIGH): edit_message now redacts secrets + validates new_content
+      (was the one outbound path bypassing redactSecrets). server.ts + new src/redact.ts.
+- [x] F2. Test infra: `bun test` wired; redactSecrets extracted to src/redact.ts (added to
+      package.json `files`); tests/redact.test.ts (6) + tests/heartbeat.test.ts (7). 13 pass.
+- [ ] F3. STABILITY (HIGH, top priority): single-socket instance guard in connectWS — capture
+      socket locally, early-return from onopen/onmessage/onclose when `ws !== socket`; null old
+      onclose before close in heartbeat.reconnect + shard_moved (mirror switchIdentity:2355).
+- [ ] F4. STABILITY: route constructor-retry (3071) + all reconnects through one tracked timer;
+      OPEN-socket guard in scheduleReconnect; track/clear backfill timer; shuttingDown guard.
+- [ ] F5. STABILITY: prune knownChannels + lastSeenMessageTs on leave; skip dead channels in backfill.
+- [ ] F6. CORRECTNESS: no-cursor backfill seeds cursor WITHOUT replaying stale DM/@mention as live.
+- [ ] F7. PACKAGING (HIGH): fix broken documented install (bin ships raw TS + bun shebang vs npx docs).
+- [ ] F8. Extract+test computeReconnectDelay / isMentioned / dedup / bare-mention rewrite (test-plan).
+- [ ] F9. Sweep medium/low: mark_read+set_topic+forward+vote send-before-validate; claim_url stderr
+      leak; thread_reply inbound drop; typing-as-message; set_status redaction; limit coercion; etc.

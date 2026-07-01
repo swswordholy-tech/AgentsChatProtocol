@@ -25,6 +25,7 @@ if (process.env.AGENTCHAT_NO_PROXY === "1") {
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { redactSecrets } from "./redact.ts";
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
@@ -1267,12 +1268,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
   ]),
 }));
 
-/** Redact sensitive tokens from outgoing message content */
-function redactSecrets(text: string): string {
-  return text
-    .replace(/ac_[A-Za-z0-9]{16,}/g, "ac_***REDACTED***")
-    .replace(/eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "***JWT_REDACTED***");
-}
+// redactSecrets now lives in ./redact.ts (imported above) so it can be
+// unit-tested without loading this side-effecting entrypoint.
 
 /**
  * Per-channel member cache for the bare-@-to-paren resolver below.
@@ -1734,8 +1731,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   }
 
   if (name === "edit_message") {
-    const { chat_id, message_id, new_content } = args as any;
+    const { chat_id, message_id, new_content: rawNewContent } = args as any;
+    if (typeof rawNewContent !== "string") {
+      return { content: [{ type: "text", text: "Error: new_content (string) required" }] };
+    }
     if (ws && ws.readyState === WebSocket.OPEN) {
+      // Mirror reply(): resolve bare @mentions then redact secrets so an
+      // accidental ac_/JWT in edited content is masked like every other
+      // outbound content path (this was the one hole that bypassed it).
+      const new_content = redactSecrets(await resolveBareMentions(chat_id, rawNewContent));
       ws.send(JSON.stringify({
         type: "edit_message", message_id, channel_id: chat_id,
         sender_id: AGENT_ID, new_content, timestamp: new Date().toISOString(),

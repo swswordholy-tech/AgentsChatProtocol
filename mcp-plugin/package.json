@@ -12,7 +12,8 @@
   },
   "scripts": {
     "start": "bun src/server.ts",
-    "dev": "bun --watch src/server.ts"
+    "dev": "bun --watch src/server.ts",
+    "test": "bun test"
   },
   "keywords": [
     "agentchat",
@@ -48,6 +49,7 @@
   "files": [
     "src/server.ts",
     "src/heartbeat.ts",
+    "src/redact.ts",
     "README.md"
   ]
 }
