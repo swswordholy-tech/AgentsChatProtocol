@@ -2353,6 +2353,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     // Stop heartbeat first to prevent race with old connection
     heartbeat.stop();
+    // Cancel any pending backfill / reconnect from the old identity.
+    if (backfillTimer) { clearTimeout(backfillTimer); backfillTimer = null; }
+    if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
 
     // Close old connection, disable its reconnect handler
     if (ws) {
@@ -2990,12 +2993,11 @@ const knownChannels = new Set<string>();
 let currentHandleWSMessage: ((data: any) => Promise<void>) | null = null;
 let wsReconnectAttempt = 0;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-/** Flipped true when the server sends shard_moved (planned drain).
- *  ws.onclose checks + clears it so the close is treated as a clean
- *  hop, not a failure that advances the exponential backoff. */
-let isPlannedReconnect = false;
+// Tracked so shutdown / switchIdentity can cancel a pending auth_ok backfill.
+let backfillTimer: ReturnType<typeof setTimeout> | null = null;
 
 function scheduleReconnect(delayMs: number) {
+  if (shuttingDown) return; // don't resurrect the socket after shutdown
   if (reconnectTimer) clearTimeout(reconnectTimer);
   reconnectTimer = setTimeout(() => {
     reconnectTimer = null;
@@ -3068,17 +3070,29 @@ async function backfillAllChannels(): Promise<void> {
 }
 
 function connectWS() {
+  // Don't spin up a new socket after stdio shutdown — a stray reconnect
+  // timer must never resurrect the connection.
+  if (shuttingDown) return;
+
+  // Capture THIS socket locally. Every handler below guards on
+  // `ws !== socket`, so a superseded socket (e.g. a dead-TCP connection
+  // whose close event is delayed past the point a replacement is already
+  // live) can never clobber the current session or schedule a duplicate
+  // reconnect — the root cause of the orphan/double-connection race.
+  let socket: WebSocket;
   try {
-    ws = new WebSocket(WS_URL);
+    socket = new WebSocket(WS_URL);
+    ws = socket;
   } catch (e) {
     process.stderr.write(`[agentchat] WebSocket constructor failed: ${e}, retrying in 5s\n`);
-    setTimeout(connectWS, 5000);
+    scheduleReconnect(5000); // route through the single tracked timer
     return;
   }
 
   ws.onopen = () => {
+    if (ws !== socket) return; // superseded by a newer socket
     try {
-      ws!.send(JSON.stringify({
+      socket.send(JSON.stringify({
         type: "auth",
         agent_id: AGENT_ID,
         token: TOKEN,
@@ -3090,6 +3104,7 @@ function connectWS() {
   };
 
   ws.onmessage = async (event) => {
+    if (ws !== socket) return; // ignore late frames from a superseded socket
     let data: any;
     try { data = JSON.parse(String(event.data)); } catch { return; }
     if (data && typeof data === "object" && !data.__source) data.__source = "live";
@@ -3122,7 +3137,11 @@ function connectWS() {
       // per-channel REST fetch and re-injects each missed message
       // through handleWSMessage so @mention detection + notification
       // path is identical to live delivery — no divergent code paths.
-      setTimeout(() => { void backfillAllChannels(); }, 2000);
+      if (backfillTimer) clearTimeout(backfillTimer);
+      backfillTimer = setTimeout(() => {
+        backfillTimer = null;
+        if (!shuttingDown) void backfillAllChannels();
+      }, 2000);
     } else if (
       data.type === "message" &&
       // Loop ticks are server-fired with sender_id=loop.agent_id, which
@@ -3314,25 +3333,21 @@ function connectWS() {
       // Task #119: track channel id for reconnect backfill target set.
       if (typeof data.channel_id === "string") knownChannels.add(data.channel_id);
     } else if (data.type === "shard_moved") {
-      // Server instance shutting down or channel moved — reconnect
-      // immediately. This is a PLANNED disconnect: the server is
-      // giving us heads-up to move. Mark it so the upcoming
-      // ws.onclose doesn't treat this as a failure that increments
-      // wsReconnectAttempt / stretches the exponential backoff. When
-      // the server does a rolling deploy (several pods closing in
-      // sequence), without this flag each shard_moved would push the
-      // next reconnect 2s, 4s, 6s ... further out even though each
-      // is a clean planned event.
+      // Server instance shutting down or channel moved — a PLANNED hop.
+      // Detach the socket's onclose so it can't also run the unplanned
+      // backoff path, reset the backoff counter, and fast-reconnect. This
+      // keeps a rolling deploy (several pods closing in sequence) from
+      // pushing each successive reconnect 2s, 4s, 6s ... further out.
       process.stderr.write(`[agentchat] Shard moved, reconnecting...\n`);
       if (data.redirect_url) {
         const newUrl = data.redirect_url.replace(/^https/, "wss").replace(/^http/, "ws") + "/ws";
         process.stderr.write(`[agentchat] Redirecting to: ${newUrl}\n`);
         // Note: for simplicity we reconnect to original URL and let /api/shard handle routing
       }
-      isPlannedReconnect = true;
-      try { ws?.close(); } catch {}
+      if (ws) { ws.onclose = null; try { ws.close(); } catch {} }
       ws = null;
       sessionId = null;
+      wsReconnectAttempt = 0;
       scheduleReconnect(500);
     } else if (data.type === "error") {
       process.stderr.write(`[agentchat] Error: ${data.message}\n`);
@@ -3340,18 +3355,13 @@ function connectWS() {
   }
 
   ws.onclose = (event) => {
+    if (ws !== socket) return; // a superseded socket's delayed close — leave live state alone
     sessionId = null;
     heartbeat.resetReconnecting(); // allow heartbeat to reconnect again if needed
-    // Planned reconnect (server-initiated shard_moved): reset backoff
-    // and reconnect fast, don't count this against exponential delay.
-    if (isPlannedReconnect) {
-      isPlannedReconnect = false;
-      wsReconnectAttempt = 0;
-      // A concurrent scheduleReconnect(500) from the shard_moved
-      // handler has already been queued — don't double-schedule.
-      process.stderr.write(`[agentchat] Planned close (code=${(event as any)?.code ?? "?"}), reconnect in 0.5s\n`);
-      return;
-    }
+    // Only genuine UNPLANNED drops reach here now. Planned paths
+    // (shard_moved / heartbeat.reconnect / switchIdentity) detach this
+    // handler and self-schedule a fast reconnect, so there is no
+    // isPlannedReconnect flag to consume and no fast/slow ambiguity.
     wsReconnectAttempt++;
     const jitter = Math.random() * 3000; // 0-3s random jitter to avoid thundering herd
     const delay = Math.min(wsReconnectAttempt * 2, 30) * 1000 + jitter;
@@ -3360,6 +3370,7 @@ function connectWS() {
   };
 
   ws.onerror = (err) => {
+    if (ws !== socket) return;
     process.stderr.write(`[agentchat] WebSocket error: ${err}\n`);
   };
 }
@@ -3373,7 +3384,9 @@ const heartbeat = new HeartbeatMonitor({
   },
   reconnect: () => {
     process.stderr.write("[agentchat] Heartbeat timeout, forcing reconnect\n");
-    try { ws?.close(); } catch {}
+    // Detach onclose so the forced close doesn't also run the unplanned
+    // backoff path and downgrade this fast 500ms recovery to 2-5s.
+    if (ws) { ws.onclose = null; try { ws.close(); } catch {} }
     ws = null;
     sessionId = null;
     wsReconnectAttempt = 0; // reset backoff for heartbeat-triggered reconnect
@@ -3392,6 +3405,10 @@ function shutdownFromStdio(reason: string) {
   if (reconnectTimer) {
     clearTimeout(reconnectTimer);
     reconnectTimer = null;
+  }
+  if (backfillTimer) {
+    clearTimeout(backfillTimer);
+    backfillTimer = null;
   }
   try { ws?.close(); } catch {}
   ws = null;

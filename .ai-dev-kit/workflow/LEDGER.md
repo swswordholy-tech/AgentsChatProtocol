@@ -51,11 +51,14 @@ orphan/duplicate connections) + untracked timers + missing planned-reconnect fla
       (was the one outbound path bypassing redactSecrets). server.ts + new src/redact.ts.
 - [x] F2. Test infra: `bun test` wired; redactSecrets extracted to src/redact.ts (added to
       package.json `files`); tests/redact.test.ts (6) + tests/heartbeat.test.ts (7). 13 pass.
-- [ ] F3. STABILITY (HIGH, top priority): single-socket instance guard in connectWS — capture
-      socket locally, early-return from onopen/onmessage/onclose when `ws !== socket`; null old
-      onclose before close in heartbeat.reconnect + shard_moved (mirror switchIdentity:2355).
-- [ ] F4. STABILITY: route constructor-retry (3071) + all reconnects through one tracked timer;
-      OPEN-socket guard in scheduleReconnect; track/clear backfill timer; shuttingDown guard.
+- [x] F3. STABILITY (HIGH, top priority): single-socket instance guard in connectWS — capture
+      socket locally, early-return from onopen/onmessage/onclose/onerror when `ws !== socket`.
+      Planned paths (shard_moved, heartbeat.reconnect) now null old onclose + self-manage; removed
+      the isPlannedReconnect flag entirely (onclose = unplanned-only). Also fixes the medium
+      "fast-reconnect silently downgraded to 2-5s" finding (server.ts:3338). Verified: bun build + 13 tests.
+- [x] F4. STABILITY: constructor-retry now routes through scheduleReconnect (one tracked timer);
+      `shuttingDown` guard added to connectWS + scheduleReconnect; auth_ok backfill timer tracked
+      (backfillTimer) and cleared on shutdown + switchIdentity. No post-shutdown socket resurrection.
 - [ ] F5. STABILITY: prune knownChannels + lastSeenMessageTs on leave; skip dead channels in backfill.
 - [ ] F6. CORRECTNESS: no-cursor backfill seeds cursor WITHOUT replaying stale DM/@mention as live.
 - [ ] F7. PACKAGING (HIGH): fix broken documented install (bin ships raw TS + bun shebang vs npx docs).
