@@ -67,5 +67,16 @@ orphan/duplicate connections) + untracked timers + missing planned-reconnect fla
 - [~] F8. Extract+test helpers: [x] isMentioned → src/mentions.ts + 7 tests (guards the documented
       false-positive). Remaining: computeReconnectDelay, dedup (recordOrSkip), bare-mention rewrite,
       redactSecrets already done in F2.
-- [ ] F9. Sweep medium/low: mark_read+set_topic+forward+vote send-before-validate; claim_url stderr
-      leak; thread_reply inbound drop; typing-as-message; set_status redaction; limit coercion; etc.
+- [~] F9. Sweep medium/low:
+      [x] mark_read + set_topic + forward + vote: validate required string args BEFORE dispatch
+          (was: send malformed frame, then .slice() throws after the side effect fired).
+      [x] thread_reply inbound: routed through the message @mention/notification/cursor path
+          (was silently dropped → thread @mentions invisible).
+      [x] set_status: redactSecrets on status_text (another content path that bypassed the mask).
+      [x] search: validate non-empty query + check r.ok before json() (was sending "undefined",
+          swallowing non-2xx into a generic error).
+      [~] claim_url stderr (167): KEPT by design — it is the sole first-run delivery channel of the
+          owner claim URL to the human; masking the key would break the claim flow. Documented, not a leak to fix.
+      [ ] remaining: typing-as-message frame; limit coercion (get_history/list_channels); null-guard
+          inbound content/sender_id slice; byte-vs-char mention budget; channelBrief >50 member truncation;
+          redactSecrets password/?key= patterns; isError:true on tool failures; handler-registry refactor.

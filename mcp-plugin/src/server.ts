@@ -1765,7 +1765,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { status_text, status_emoji } = args as any;
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({
-        type: "set_status", sender_id: AGENT_ID, status_text, status_emoji,
+        type: "set_status", sender_id: AGENT_ID,
+        status_text: typeof status_text === "string" ? redactSecrets(status_text) : status_text,
+        status_emoji,
       }));
       return { content: [{ type: "text", text: `Status update dispatched: ${status_emoji || ''} ${status_text}` }] };
     }
@@ -1849,6 +1851,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
   if (name === "set_topic") {
     const { chat_id, topic } = args as any;
+    if (typeof chat_id !== "string" || typeof topic !== "string") {
+      return { content: [{ type: "text", text: "Error: chat_id and topic (strings) required" }] };
+    }
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ type: "set_topic", channel_id: chat_id, sender_id: AGENT_ID, topic }));
       return { content: [{ type: "text", text: `Topic update dispatched; server may reject (admin only): ${topic.slice(0,50)}` }] };
@@ -1858,6 +1863,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
   if (name === "forward") {
     const { source_channel_id, target_channel_id, message_id } = args as any;
+    if (typeof target_channel_id !== "string" || typeof message_id !== "string") {
+      return { content: [{ type: "text", text: "Error: target_channel_id and message_id (strings) required" }] };
+    }
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({
         type: "forward", id: crypto.randomUUID(),
@@ -1871,10 +1879,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
   if (name === "search") {
     const { query, channel_id } = args as any;
+    if (typeof query !== "string" || query.length === 0) {
+      return { content: [{ type: "text", text: "Error: query (non-empty string) required" }] };
+    }
     try {
       const params = new URLSearchParams({ q: query, limit: "20" });
       if (channel_id) params.set("channel_id", channel_id);
       const r = await fetch(`${REST_URL}/api/search?${params}`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
+      if (!r.ok) {
+        return { content: [{ type: "text", text: `Search failed (${r.status})` }] };
+      }
       const data = await r.json() as any;
       if (data.messages?.length > 0) {
         const results = data.messages.map((m: any) =>
@@ -1890,6 +1904,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
   if (name === "vote") {
     const { proposal_id, decision, reason } = args as any;
+    if (typeof proposal_id !== "string" || typeof decision !== "string") {
+      return { content: [{ type: "text", text: "Error: proposal_id and decision (strings) required" }] };
+    }
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({
         type: "vote", proposal_id, voter_id: AGENT_ID,
@@ -2165,6 +2182,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
   if (name === "mark_read") {
     const { chat_id, last_read_id } = args as any;
+    if (typeof chat_id !== "string" || typeof last_read_id !== "string") {
+      return { content: [{ type: "text", text: "Error: chat_id and last_read_id (strings) required" }] };
+    }
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({
         type: "read_receipt", channel_id: chat_id,
@@ -3168,7 +3188,10 @@ function connectWS() {
         if (!shuttingDown) void backfillAllChannels();
       }, 2000);
     } else if (
-      data.type === "message" &&
+      // thread_reply is a bidirectional protocol frame (Server -> Client too).
+      // Route it through the same @mention / notification / cursor path as a
+      // plain message, otherwise thread @mentions are silently invisible.
+      (data.type === "message" || data.type === "thread_reply") &&
       // Loop ticks are server-fired with sender_id=loop.agent_id, which
       // equals AGENT_ID when the loop owner is THIS plugin. Without this
       // exception the outer "skip own messages" gate swallows every tick
