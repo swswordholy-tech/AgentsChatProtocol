@@ -26,6 +26,7 @@ if (process.env.AGENTCHAT_NO_PROXY === "1") {
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { redactSecrets } from "./redact.ts";
+import { matchesMention } from "./mentions.ts";
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
@@ -2007,6 +2008,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         body: "{}",
       });
       if (r.ok) {
+        // Prune so knownChannels / lastSeenMessageTs don't grow unbounded and
+        // turn every reconnect backfill into a serial REST fetch over channels
+        // we've already left.
+        knownChannels.delete(chat_id);
+        if (lastSeenMessageTs.delete(chat_id)) scheduleLastSeenMessageTsSave();
         const data = await r.json().catch(() => ({})) as any;
         if (data.note === "not a member") {
           return { content: [{ type: "text", text: `Already not a member of ${chat_id.slice(0, 8)}` }] };
@@ -2021,6 +2027,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       // REST unreachable — fall back to WS leave so at least in-memory state updates
       if (ws && ws.readyState === WebSocket.OPEN) {
         try { ws.send(JSON.stringify({ type: "leave_channel", channel_id: chat_id, agent_id: AGENT_ID })); } catch {}
+        knownChannels.delete(chat_id);
+        if (lastSeenMessageTs.delete(chat_id)) scheduleLastSeenMessageTsSave();
         return { content: [{ type: "text", text: `Leave sent via WS (REST unreachable: ${String(e?.message || e).slice(0, 60)})` }] };
       }
       return { content: [{ type: "text", text: `Leave failed — no connectivity` }] };
@@ -3036,6 +3044,23 @@ async function backfillAllChannels(): Promise<void> {
       if (!res.ok) continue;
       const data = await res.json() as { messages?: any[] };
       const msgs = data.messages || [];
+      // No cursor yet (cold start / freshly joined channel): DON'T replay —
+      // seed the cursor from the newest message so later backfills fetch only
+      // genuinely new messages. Replaying here would surface a possibly
+      // hours-old DM/@mention as a live notification (contract: empty cursor
+      // = no backfill).
+      if (!after) {
+        let newestTs = "";
+        for (const m of msgs) {
+          const t = String(m?.timestamp || "");
+          if (t > newestTs) newestTs = t;
+        }
+        if (newestTs) {
+          lastSeenMessageTs.set(channelId, newestTs);
+          scheduleLastSeenMessageTsSave();
+        }
+        continue;
+      }
       // Filter out self-messages upfront (faster than re-entering the
       // handler just to bail) and typing placeholders (plugin ignores
       // them anyway).
@@ -3198,19 +3223,10 @@ function connectWS() {
       }
 
       const isDM = data.channel_id?.startsWith("dm-");
-      // Match both `@<agentId>` and `@<displayName>(<agentId>)` formats.
-      // v0.6.1 used a loose `content.includes("(" + AGENT_ID + ")")` for the
-      // second case which fired on ANY text containing `(<agentId>)` —
-      // including system messages like "User joined: name (acc_xyz)" or
-      // moderation logs. Boss msg:fc8b9b1a — codex agent received messages
-      // it wasn't @-mentioned in, ate context window. Tighten the second
-      // clause to require an `@<displayName>` immediately before `(<id>)`.
-      const idEsc = (AGENT_ID || "").replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-      const displayMentionRe = idEsc ? new RegExp(`@[^(\\n]+\\(${idEsc}\\)`) : null;
-      const isMentioned = !!(
-        data.content?.includes(`@${AGENT_ID}`) ||
-        (displayMentionRe && displayMentionRe.test(data.content || ""))
-      );
+      // Match `@<agentId>` and `@<displayName>(<agentId>)`; see matchesMention
+      // (mentions.ts) for why the second clause must not fire on incidental
+      // `(<id>)` substrings like "User joined: name (acc_xyz)".
+      const isMentioned = matchesMention(data.content || "", AGENT_ID || "");
       const activeHi = activeHiddenIdentityForChannel(data.channel_id);
 
       if (isDM || isMentioned || activeHi) {

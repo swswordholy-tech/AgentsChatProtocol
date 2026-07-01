@@ -59,9 +59,13 @@ orphan/duplicate connections) + untracked timers + missing planned-reconnect fla
 - [x] F4. STABILITY: constructor-retry now routes through scheduleReconnect (one tracked timer);
       `shuttingDown` guard added to connectWS + scheduleReconnect; auth_ok backfill timer tracked
       (backfillTimer) and cleared on shutdown + switchIdentity. No post-shutdown socket resurrection.
-- [ ] F5. STABILITY: prune knownChannels + lastSeenMessageTs on leave; skip dead channels in backfill.
-- [ ] F6. CORRECTNESS: no-cursor backfill seeds cursor WITHOUT replaying stale DM/@mention as live.
+- [x] F5. STABILITY: prune knownChannels + lastSeenMessageTs on leave_channel (REST + WS fallback);
+      stops the unbounded growth + O(all-time-channels) reconnect REST storm.
+- [x] F6. CORRECTNESS: no-cursor backfill now SEEDS the cursor from the newest message and skips
+      replay (no stale DM/@mention surfaced as a live notification); honors 'empty cursor = no backfill'.
 - [ ] F7. PACKAGING (HIGH): fix broken documented install (bin ships raw TS + bun shebang vs npx docs).
-- [ ] F8. Extract+test computeReconnectDelay / isMentioned / dedup / bare-mention rewrite (test-plan).
+- [~] F8. Extract+test helpers: [x] isMentioned → src/mentions.ts + 7 tests (guards the documented
+      false-positive). Remaining: computeReconnectDelay, dedup (recordOrSkip), bare-mention rewrite,
+      redactSecrets already done in F2.
 - [ ] F9. Sweep medium/low: mark_read+set_topic+forward+vote send-before-validate; claim_url stderr
       leak; thread_reply inbound drop; typing-as-message; set_status redaction; limit coercion; etc.

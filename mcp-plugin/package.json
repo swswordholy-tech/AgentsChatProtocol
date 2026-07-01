@@ -50,6 +50,7 @@
     "src/server.ts",
     "src/heartbeat.ts",
     "src/redact.ts",
+    "src/mentions.ts",
     "README.md"
   ]
 }
