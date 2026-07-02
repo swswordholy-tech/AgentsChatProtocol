@@ -1101,6 +1101,8 @@ const ALL_TOOL_DEFS = [
             description: "Per-caller perspective on the tree. mine-active = my active tasks. blocking-me = tasks I'm waiting on. blocked-by-me = tasks waiting on me. related = anchor task's neighbourhood (requires task_id). Empty objectives are pruned.",
           },
           task_id: { type: "string", description: "Anchor task id; only meaningful with view=related" },
+          shape: { type: "string", enum: ["summary"], description: "shape=summary returns a compact scan view (KR one-liners + task rollups, only doing/blocked expanded) — far fewer tokens. Drill into one objective with objective_id for the full subtree." },
+          objective_id: { type: "string", description: "Return the full subtree (KRs + tasks + comments) for a single objective." },
         },
       },
     },
@@ -1476,7 +1478,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const pr = await apiFetch(`${REST_URL}/api/skills`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
       if (pr.ok) out.personal_skills = (JSON.parse(await pr.text()).skills) || [];
     } catch { /* best-effort */ }
-    return { content: [{ type: "text", text: JSON.stringify(out, null, 2) }] };
+    return { content: [{ type: "text", text: JSON.stringify(out) }] };
   }
 
   if (name === "load_skill") {
@@ -2622,7 +2624,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   // Maps 1:1 to the server-side routes shipped in commit 5229aab
   // (projects/AgentChat/Server/src/okr.ts + index.ts dispatch block).
   if (name === "okr_list") {
-    const { owner, status, horizon, include_archived, view, task_id } = args as { owner?: string; status?: string; horizon?: string; include_archived?: boolean; view?: string; task_id?: string };
+    const { owner, status, horizon, include_archived, view, task_id, shape, objective_id } = args as { owner?: string; status?: string; horizon?: string; include_archived?: boolean; view?: string; task_id?: string; shape?: string; objective_id?: string };
     const qs = new URLSearchParams();
     if (owner) qs.set("owner", owner);
     if (status) qs.set("status", status);
@@ -2630,6 +2632,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     if (include_archived) qs.set("include_archived", "true");
     if (view) qs.set("view", view);
     if (task_id) qs.set("task_id", task_id);
+    if (shape) qs.set("shape", shape);
+    if (objective_id) qs.set("objective_id", objective_id);
     const url = `${REST_URL}/api/okr/objectives${qs.toString() ? "?" + qs.toString() : ""}`;
     try {
       const r = await apiFetch(url, { headers: { "Authorization": `Bearer ${TOKEN}` } });
@@ -2638,7 +2642,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return { content: [{ type: "text", text: `okr_list failed (${r.status}): ${err.slice(0, 120)}` }], isError: true };
       }
       const data = await r.json() as any;
-      return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+      return { content: [{ type: "text", text: JSON.stringify(data) }] };
     } catch (e: any) {
       return { content: [{ type: "text", text: `okr_list network error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
     }
