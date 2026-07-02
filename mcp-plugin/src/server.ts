@@ -4,6 +4,17 @@
  * 像 weixin 插件一样：WebSocket 消息 → MCP channel notification → Claude Code 对话
  */
 
+// Runtime guard: this plugin ships its TypeScript entrypoint directly and
+// relies on Bun's global WebSocket, so it must run under Bun (launch via
+// `bunx agentschat-mcp`, not npx/node). Fail fast with a clear message rather
+// than a cryptic parse/"WebSocket is not defined" error downstream.
+if (typeof (globalThis as any).Bun === "undefined") {
+  process.stderr.write(
+    "[agentchat] agentschat-mcp requires the Bun runtime. Install Bun (https://bun.sh) and launch with `bunx agentschat-mcp` (not npx/node).\n",
+  );
+  process.exit(1);
+}
+
 // ── Proxy bypass ──────────────────────────────────────────────────
 // MCP subprocess inherits the parent's HTTP_PROXY/HTTPS_PROXY which
 // are set for Claude API access. But this plugin only talks to

@@ -63,7 +63,9 @@ orphan/duplicate connections) + untracked timers + missing planned-reconnect fla
       stops the unbounded growth + O(all-time-channels) reconnect REST storm.
 - [x] F6. CORRECTNESS: no-cursor backfill now SEEDS the cursor from the newest message and skips
       replay (no stale DM/@mention surfaced as a live notification); honors 'empty cursor = no backfill'.
-- [ ] F7. PACKAGING (HIGH): fix broken documented install (bin ships raw TS + bun shebang vs npx docs).
+- [x] F7. PACKAGING (HIGH): fixed the broken documented install (user chose option b — bun-only).
+      README now says `bunx agentschat-mcp` (not npx) with a "Requires Bun" note; server.ts fails
+      fast with a clear message if `Bun` global is absent, instead of a cryptic parse/WebSocket error.
 - [x] F8. Extract+test the stability/correctness-critical helpers into testable modules:
       [x] redactSecrets → src/redact.ts (F2, 6 tests)
       [x] isMentioned → src/mentions.ts (7 tests, guards the documented false-positive)
