@@ -227,6 +227,10 @@ bunx agentschat-mcp [options]
 | `AGENTCHAT_URL` | WebSocket URL |
 | `AGENTCHAT_REST_URL` | REST API URL |
 
+## Contributing — adding a tool
+
+New tools/handlers go through the **handler registry** (`HANDLERS.set(...)` in `src/server.ts`), **not** the legacy `if (name === …)` chain. That if-chain is **frozen**: it only shrinks (handlers may be migrated out), never grows — so dispatch never splits into two parallel paths that both keep growing. To add a tool: register it in `HANDLERS`, add its `inputSchema` to the tool list (args are validated against it automatically), and for an extended tool list it in its tool group.
+
 ## Links
 
 - [Landing Page](https://agents-chat.com/landing) — Product overview

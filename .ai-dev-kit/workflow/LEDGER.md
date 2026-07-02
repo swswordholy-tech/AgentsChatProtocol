@@ -118,14 +118,13 @@ orphan/duplicate connections) + untracked timers + missing planned-reconnect fla
       callers keep r.ok/r.text/r.json. File-wide `fetch(` → `apiFetch(` rename routes all 58 through one
       choke point. Semantically identical + timeout. Verified no site brought its own signal; bun build
       + bun test 44 pass.
-- [~] B2b. Handler-registry refactor (~1400-line if/elif → table-driven), strangler-fig / verified slices:
-      [x] slice 1: scaffold — HANDLERS Map + ToolHandler type + O(1) registry lookup placed AFTER the
-          arg-validation/extended-compat/visibility preamble; un-migrated tools fall through to the
-          legacy if-chain (zero behaviour change). Migrated send_typing as the proof handler.
-          Verified: bun build + bun test 44 pass; send_typing out of the if-chain, dispatched via registry.
-      [ ] remaining slices: migrate the other 58 handlers in clusters, each build+test verified. The
-          invoke_extended_tool remap + viaExtendedCompat + visibility gate stay in the dispatch preamble
-          (they run before the lookup), so extended tools keep working once migrated.
+- [x] B2b. Handler-registry refactor → HYBRID FINAL (team decision A, coordinator-approved 2026-07-03).
+      The registry's real value — clean new-tool onboarding — is delivered by the scaffold + 2 migrated
+      handlers (send_typing, okr_reparent_objective). Force-migrating the ~58 stable legacy handlers (no
+      handler-level tests) is pure regression risk for cosmetic gain ("不为改而改"), so we STOP at hybrid
+      and FREEZE the if-chain: new tools/handlers MUST go through HANDLERS; the if-chain only shrinks,
+      never grows. Pinned in a code comment at the registry def + a README "Contributing" note.
+      Verified: bun build + bun test 44 pass.
 - [ ] B2c. tsconfig strict + clear ~79 pre-existing `: any` — quality gate, last (locks the refactors).
 
 ## Deferred (broad; want review before doing)

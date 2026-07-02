@@ -1427,12 +1427,19 @@ async function resolveBareMentions(chatId: string, text: string): Promise<string
   });
 }
 
-// ── Tool handler registry (strangler-fig migration off the if-chain) ──────────
+// ── Tool handler registry ─────────────────────────────────────────────────────
+// FROZEN IF-CHAIN POLICY (team decision 2026-07-03): every NEW tool/handler MUST
+// be registered here via HANDLERS.set(...). The legacy if-chain in the CallTool
+// handler below is FROZEN — it only SHRINKS (handlers may be migrated out of it),
+// never GROWS. Rationale: force-migrating the ~58 stable legacy handlers with no
+// handler-level tests is pure regression risk for cosmetic gain ("不为改而改");
+// the registry's real value (clean new-tool onboarding) is already delivered, so
+// we keep the hybrid but forbid the if-chain from growing a second time.
+//
 // Handlers registered here are dispatched O(1) in the CallTool handler below,
-// after the arg-validation + extended-compat + visibility preamble; any tool not
-// yet migrated falls through to the legacy if-chain. Handlers close over module
-// state (ws, TOKEN, apiFetch, AGENT_ID, …) exactly as the inline blocks did, and
-// are populated at module load. Migrating in verified slices, not a big-bang.
+// after the arg-validation + extended-compat + visibility preamble. They close
+// over module state (ws, TOKEN, apiFetch, AGENT_ID, …) exactly as the inline
+// blocks did, and are populated at module load.
 type ToolHandler = (args: any, name: string, request: any) => Promise<{ content: any[]; isError?: boolean }>;
 const HANDLERS = new Map<string, ToolHandler>();
 
@@ -1801,8 +1808,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
   }
 
-  // Registry dispatch: a migrated handler is looked up O(1) here; any tool not
-  // yet migrated falls through to the legacy if-chain below (strangler-fig).
+  // Registry dispatch: registered handlers (all NEW tools) are looked up O(1)
+  // here; stable legacy tools fall through to the FROZEN if-chain below. New
+  // handlers MUST be added to HANDLERS — see the frozen-if-chain policy at its def.
   {
     const registered = HANDLERS.get(name);
     if (registered) return await registered(args, name, request);
