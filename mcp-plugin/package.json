@@ -54,6 +54,7 @@
     "src/dedup.ts",
     "src/reconnect.ts",
     "src/timestamps.ts",
+    "src/argcheck.ts",
     "README.md"
   ]
 }

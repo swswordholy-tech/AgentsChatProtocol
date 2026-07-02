@@ -41,6 +41,7 @@ import { matchesMention } from "./mentions.ts";
 import { messageDedupKey, MessageDedup } from "./dedup.ts";
 import { computeReconnectDelay } from "./reconnect.ts";
 import { normalizeTimestampForCursor } from "./timestamps.ts";
+import { validateToolArgs } from "./argcheck.ts";
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
@@ -534,8 +535,7 @@ For non-trivial AgentsChat work, start from Workspace Graph/OKR state, preserve 
 
 // --- Tools ---
 
-server.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools: filterVisibleTools([
+const ALL_TOOL_DEFS = [
     {
       name: "reply",
       description: "Reply to an AgentsChat message. Pass the chat_id (channel_id) from the channel tag.",
@@ -1280,8 +1280,13 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ["chat_id", "doc_id"],
       },
     },
-  ]),
-}));
+];
+server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: filterVisibleTools(ALL_TOOL_DEFS) }));
+// Runtime input-validation registry: tool name → its declared inputSchema.
+// Consulted at dispatch to reject contract-violating args with a clear isError (B1b).
+const TOOL_INPUT_SCHEMAS: Map<string, any> = new Map(
+  (ALL_TOOL_DEFS as any[]).map((t) => [t.name, t.inputSchema]),
+);
 
 // redactSecrets now lives in ./redact.ts (imported above) so it can be
 // unit-tested without loading this side-effecting entrypoint.
@@ -1349,6 +1354,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   // SDK error, so the calling agent always learns the call failed. Explicit
   // error returns below carry isError:true individually.
   try {
+    // Validate args against the tool's declared inputSchema (required present +
+    // declared types) before any side effect. Permissive: unknown tools and
+    // undeclared fields pass through; only contract violations are rejected.
+    if (TOOL_INPUT_SCHEMAS.has(name)) {
+      const argErr = validateToolArgs(TOOL_INPUT_SCHEMAS.get(name), args);
+      if (argErr) return { content: [{ type: "text", text: `${name}: ${argErr}` }], isError: true };
+    }
 
   if (name === "list_skills") {
     const { chat_id } = (args || {}) as { chat_id?: string };

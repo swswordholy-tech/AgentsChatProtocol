@@ -102,12 +102,17 @@ orphan/duplicate connections) + untracked timers + missing planned-reconnect fla
       isError:true. Applied via a reviewed single-line transform gated on strong error markers;
       diff reviewed line-by-line → reverted 5 false positives (WS "dispatched" success acks matched
       on must-be/invalid/cannot). Verified: bun build (brace balance) + bun test 33 pass + full diff review.
+- [x] B1b. zod/入参校验 全量: instead of hand-writing 60 schemas (drift-prone), extract the inline
+      tools/list array to `const ALL_TOOL_DEFS` and reuse each tool's ALREADY-DECLARED inputSchema.
+      New pure module src/argcheck.ts::validateToolArgs(schema, args) checks required-present +
+      declared primitive types; permissive (unknown tools + undeclared props pass → cannot break a
+      valid call). Wired at dispatch top (before side effects) → contract violation returns a clear
+      isError. Covers all 60 defined tools (incl. extended okr/moderation/etc.). 11 unit tests.
+      Verified: bun build + bun test 44 pass.
 
 ## Deferred (structural / broad — NOT surgical "polish"; higher risk, want review)
 - Handler-registry refactor of the ~1400-line CallToolRequestSchema if/elif chain (MEDIUM quality).
 - Shared fetch helper for the ~58 raw fetch() call sites (MEDIUM quality).
-- Blanket runtime arg-validation (zod) for all `args as {...}` casts (partially mitigated by the
-  per-handler guards added in F9-1).
 - tsconfig.json + strict typecheck script — would surface ~79 pre-existing `: any` / TS errors that
   must be resolved first; out of scope for a polish pass.
 - redactSecrets password= / ?key= patterns — risks over-masking legitimate URLs; wants deliberate design.
