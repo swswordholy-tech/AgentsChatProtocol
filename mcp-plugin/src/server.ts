@@ -1344,6 +1344,11 @@ async function resolveBareMentions(chatId: string, text: string): Promise<string
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   let { name, arguments: args } = request.params;
   let viaExtendedCompat = false;
+  // Central failure boundary: any handler that throws (network, JSON, ws.send,
+  // unexpected shape) becomes an isError result instead of a silent/opaque
+  // SDK error, so the calling agent always learns the call failed. Explicit
+  // error returns below carry isError:true individually.
+  try {
 
   if (name === "list_skills") {
     const { chat_id } = (args || {}) as { chat_id?: string };
@@ -1384,7 +1389,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         });
         const text = await r.text();
         if (!r.ok) {
-          return { content: [{ type: "text", text: `load_skill (channel) failed (${r.status}): ${text.slice(0, 200)}` }] };
+          return { content: [{ type: "text", text: `load_skill (channel) failed (${r.status}): ${text.slice(0, 200)}` }], isError: true };
         }
         const doc = JSON.parse(text);
         const body = doc?.body_markdown ?? doc?.bodyMarkdown ?? "";
@@ -1413,14 +1418,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           }],
         };
       } catch (e: any) {
-        return { content: [{ type: "text", text: `load_skill (channel) network/parse error: ${String(e?.message || e).slice(0, 120)}` }] };
+        return { content: [{ type: "text", text: `load_skill (channel) network/parse error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
       }
     }
     // GLOBAL skill: skill_id (default workspace-driven-eng).
     const id = skill_id || DEFAULT_GLOBAL_SKILL_ID;
     const skill = GLOBAL_SKILLS[id];
     if (!skill) {
-      return { content: [{ type: "text", text: `Unknown global skill: ${id}` }] };
+      return { content: [{ type: "text", text: `Unknown global skill: ${id}` }], isError: true };
     }
     return { content: [{ type: "text", text: `${skill.body}\n\nLoaded as global skill "${id}".` }] };
   }
@@ -1428,7 +1433,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   if (name === "save_memory") {
     const a = (args || {}) as { name?: string; body?: string; description?: string };
     if (!a.name || !a.body) {
-      return { content: [{ type: "text", text: "save_memory needs name (slug) + body (markdown). Optional description (one-line index hook)." }] };
+      return { content: [{ type: "text", text: "save_memory needs name (slug) + body (markdown). Optional description (one-line index hook)." }], isError: true };
     }
     try {
       const r = await fetch(`${REST_URL}/api/memory/${encodeURIComponent(a.name)}`, {
@@ -1437,11 +1442,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         body: JSON.stringify({ body_markdown: a.body, description: a.description }),
       });
       const text = await r.text();
-      if (!r.ok) return { content: [{ type: "text", text: `save_memory failed (${r.status}): ${text.slice(0, 240)}` }] };
+      if (!r.ok) return { content: [{ type: "text", text: `save_memory failed (${r.status}): ${text.slice(0, 240)}` }], isError: true };
       const resp = JSON.parse(text);
       return { content: [{ type: "text", text: `Saved memory "${resp.name}" (v${resp.version}, ${resp.bytes}B) under your agent_id. Restore later: load_memory (index) → load_memory("${resp.name}").` }] };
     } catch (e: any) {
-      return { content: [{ type: "text", text: `save_memory network error: ${String(e?.message || e).slice(0, 120)}` }] };
+      return { content: [{ type: "text", text: `save_memory network error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
     }
   }
 
@@ -1451,7 +1456,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const path = a.name ? `/api/memory/${encodeURIComponent(a.name)}` : `/api/memory`;
       const r = await fetch(`${REST_URL}${path}`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
       const text = await r.text();
-      if (!r.ok) return { content: [{ type: "text", text: `load_memory failed (${r.status}): ${text.slice(0, 240)}` }] };
+      if (!r.ok) return { content: [{ type: "text", text: `load_memory failed (${r.status}): ${text.slice(0, 240)}` }], isError: true };
       const resp = JSON.parse(text);
       if (a.name) {
         return { content: [{ type: "text", text: `# memory: ${resp.name} (v${resp.version})\n\n${resp.body_markdown || ""}` }] };
@@ -1461,14 +1466,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const idx = items.map((m: any) => `- ${m.name}${m.description ? ` — ${m.description}` : ""}`).join("\n");
       return { content: [{ type: "text", text: `Your memory index (${items.length} docs). Load one in full with load_memory("<name>"):\n\n${idx}` }] };
     } catch (e: any) {
-      return { content: [{ type: "text", text: `load_memory network error: ${String(e?.message || e).slice(0, 120)}` }] };
+      return { content: [{ type: "text", text: `load_memory network error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
     }
   }
 
   if (name === "save_skill") {
     const a = (args || {}) as { chat_id?: string; name?: string; description?: string; body?: string; doc_id?: string; level?: number };
     if (!a.name || !a.description) {
-      return { content: [{ type: "text", text: "save_skill needs name + description (body is the skill markdown). Pass chat_id for a CHANNEL skill, or OMIT chat_id for a PERSONAL skill that follows you across all your agents." }] };
+      return { content: [{ type: "text", text: "save_skill needs name + description (body is the skill markdown). Pass chat_id for a CHANNEL skill, or OMIT chat_id for a PERSONAL skill that follows you across all your agents." }], isError: true };
     }
     // Skill markdown = YAML frontmatter (name, description) + body — the exact
     // shape parseSkillFrontmatter + the skill validators expect.
@@ -1484,11 +1489,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           body: JSON.stringify({ body_markdown: md }),
         });
         const text = await r.text();
-        if (!r.ok) return { content: [{ type: "text", text: `save_skill (personal) failed (${r.status}): ${text.slice(0, 240)}` }] };
+        if (!r.ok) return { content: [{ type: "text", text: `save_skill (personal) failed (${r.status}): ${text.slice(0, 240)}` }], isError: true };
         const resp = JSON.parse(text);
         return { content: [{ type: "text", text: `Saved PERSONAL skill "${a.name}" as "${pslug}" (v${resp.version}) — shared across all your agents. Pull/refresh: sync_skill(name="${pslug}"); list: list_skills.` }] };
       } catch (e: any) {
-        return { content: [{ type: "text", text: `save_skill (personal) network error: ${String(e?.message || e).slice(0, 120)}` }] };
+        return { content: [{ type: "text", text: `save_skill (personal) network error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
       }
     }
     // CHANNEL skill (chat_id given). Stable doc id: caller-supplied, else slug of name.
@@ -1511,12 +1516,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       });
       const text = await r.text();
       if (!r.ok) {
-        return { content: [{ type: "text", text: `save_skill failed (${r.status}): ${text.slice(0, 240)}` }] };
+        return { content: [{ type: "text", text: `save_skill failed (${r.status}): ${text.slice(0, 240)}` }], isError: true };
       }
       const verb = ifMatch === "0" ? "Saved" : "Updated";
       return { content: [{ type: "text", text: `${verb} skill "${a.name}" → ${a.chat_id}/${docId} (L${level}). Others load it with: load_skill(chat_id="${a.chat_id}", doc_id="${docId}") — discoverable via list_skills(chat_id="${a.chat_id}").` }] };
     } catch (e: any) {
-      return { content: [{ type: "text", text: `save_skill network error: ${String(e?.message || e).slice(0, 120)}` }] };
+      return { content: [{ type: "text", text: `save_skill network error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
     }
   }
 
@@ -1532,9 +1537,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const pMd = `${pBase}.md`; const pMeta = `${pBase}.json`;
       try {
         const listR = await fetch(`${REST_URL}/api/skills`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
-        if (!listR.ok) return { content: [{ type: "text", text: `sync_skill (personal): list failed (${listR.status})` }] };
+        if (!listR.ok) return { content: [{ type: "text", text: `sync_skill (personal): list failed (${listR.status})` }], isError: true };
         const meta = (JSON.parse(await listR.text()).skills || []).find((s: any) => s.name === a.name);
-        if (!meta) return { content: [{ type: "text", text: `sync_skill: personal skill "${a.name}" not found (save it with save_skill — no chat_id).` }] };
+        if (!meta) return { content: [{ type: "text", text: `sync_skill: personal skill "${a.name}" not found (save it with save_skill — no chat_id).` }], isError: true };
         const currentVersion = Number(meta.version ?? 0);
         let cachedVersion: number | null = null;
         try { cachedVersion = Number(JSON.parse(await Bun.file(pMeta).text()).version); } catch {}
@@ -1542,18 +1547,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           return { content: [{ type: "text", text: `up-to-date: personal skill "${a.name}" v${currentVersion} already at ${pMd} — no download. Read that file to run it.` }] };
         }
         const bodyR = await fetch(`${REST_URL}/api/skills/${encodeURIComponent(a.name)}`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
-        if (!bodyR.ok) return { content: [{ type: "text", text: `sync_skill (personal): body fetch failed (${bodyR.status})` }] };
+        if (!bodyR.ok) return { content: [{ type: "text", text: `sync_skill (personal): body fetch failed (${bodyR.status})` }], isError: true };
         const doc = JSON.parse(await bodyR.text());
         await Bun.write(pMd, String(doc?.body_markdown ?? ""));
         await Bun.write(pMeta, JSON.stringify({ version: currentVersion, name: a.name, syncedAt: new Date().toISOString() }));
         return { content: [{ type: "text", text: `synced personal skill "${a.name}" v${currentVersion} → ${pMd} (was ${cachedVersion === null ? "missing" : `stale v${cachedVersion}`}). Read that file to run it.` }] };
       } catch (e: any) {
-        return { content: [{ type: "text", text: `sync_skill (personal) error: ${String(e?.message || e).slice(0, 140)}` }] };
+        return { content: [{ type: "text", text: `sync_skill (personal) error: ${String(e?.message || e).slice(0, 140)}` }], isError: true };
       }
     }
     // CHANNEL skill: chat_id + doc_id.
     if (!a.chat_id || !a.doc_id) {
-      return { content: [{ type: "text", text: "sync_skill needs (chat_id + doc_id) for a CHANNEL skill, or (name) for a PERSONAL skill." }] };
+      return { content: [{ type: "text", text: "sync_skill needs (chat_id + doc_id) for a CHANNEL skill, or (name) for a PERSONAL skill." }], isError: true };
     }
     const base = `${cacheDir}/${safe(a.chat_id)}__${safe(a.doc_id)}`;
     const mdPath = `${base}.md`;
@@ -1562,10 +1567,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       // 1. Cheap version check: docs-list returns each doc's version WITHOUT the
       // body, so "is my local copy current?" costs one light call.
       const listR = await fetch(`${REST_URL}/api/channels/${encodeURIComponent(a.chat_id)}/docs`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
-      if (!listR.ok) return { content: [{ type: "text", text: `sync_skill: docs-list failed (${listR.status})` }] };
+      if (!listR.ok) return { content: [{ type: "text", text: `sync_skill: docs-list failed (${listR.status})` }], isError: true };
       const docs = extractChannelDocsPayload(JSON.parse(await listR.text()));
       const meta = docs.find((d: any) => (d?.id ?? d?.doc_id) === a.doc_id);
-      if (!meta) return { content: [{ type: "text", text: `sync_skill: skill "${a.doc_id}" not found in channel ${a.chat_id}` }] };
+      if (!meta) return { content: [{ type: "text", text: `sync_skill: skill "${a.doc_id}" not found in channel ${a.chat_id}` }], isError: true };
       const currentVersion = Number(meta.version ?? 0);
       // 2. Local cache check — skip the body fetch if we already have this version.
       let cachedVersion: number | null = null;
@@ -1575,7 +1580,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
       // 3. Missing/stale → fetch the body (the only expensive call, on the cold path).
       const docR = await fetch(`${REST_URL}/api/channels/${encodeURIComponent(a.chat_id)}/docs/${encodeURIComponent(a.doc_id)}`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
-      if (!docR.ok) return { content: [{ type: "text", text: `sync_skill: fetch body failed (${docR.status})` }] };
+      if (!docR.ok) return { content: [{ type: "text", text: `sync_skill: fetch body failed (${docR.status})` }], isError: true };
       const doc = JSON.parse(await docR.text());
       const body = String(doc?.body_markdown ?? doc?.bodyMarkdown ?? "");
       // 4. Write the local mirror + version sidecar.
@@ -1584,7 +1589,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const was = cachedVersion === null ? "missing" : `stale v${cachedVersion}`;
       return { content: [{ type: "text", text: `synced "${doc?.title || a.doc_id}" v${currentVersion} → ${mdPath} (was ${was}). Read that file to run it in your runtime.` }] };
     } catch (e: any) {
-      return { content: [{ type: "text", text: `sync_skill error: ${String(e?.message || e).slice(0, 140)}` }] };
+      return { content: [{ type: "text", text: `sync_skill error: ${String(e?.message || e).slice(0, 140)}` }], isError: true };
     }
   }
 
@@ -1610,7 +1615,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { group_name } = (args || {}) as { group_name: ToolGroupName };
     const group = TOOL_GROUPS.find((item) => item.name === group_name);
     if (!group) {
-      return { content: [{ type: "text", text: `Unknown tool group: ${String(group_name)}` }] };
+      return { content: [{ type: "text", text: `Unknown tool group: ${String(group_name)}` }], isError: true };
     }
     const wasLoaded = loadedToolGroups.has(group.name);
     if (!wasLoaded) {
@@ -1635,7 +1640,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { tool_name, arguments: forwardedArgs } = (args || {}) as { tool_name?: string; arguments?: Record<string, unknown> };
     const groupName = tool_name ? TOOL_NAME_TO_GROUP.get(tool_name) : undefined;
     if (!tool_name || !groupName) {
-      return { content: [{ type: "text", text: `invoke_extended_tool only supports known extended tools.` }] };
+      return { content: [{ type: "text", text: `invoke_extended_tool only supports known extended tools.` }], isError: true };
     }
     name = tool_name;
     args = forwardedArgs || {};
@@ -1820,11 +1825,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       });
       const text = await r.text();
       if (!r.ok) {
-        return { content: [{ type: "text", text: `report_message failed (${r.status}): ${text.slice(0, 240)}` }] };
+        return { content: [{ type: "text", text: `report_message failed (${r.status}): ${text.slice(0, 240)}` }], isError: true };
       }
       return { content: [{ type: "text", text }] };
     } catch (e: any) {
-      return { content: [{ type: "text", text: `report_message network error: ${String(e?.message || e).slice(0, 120)}` }] };
+      return { content: [{ type: "text", text: `report_message network error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
     }
   }
 
@@ -1838,11 +1843,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       });
       const text = await r.text();
       if (!r.ok) {
-        return { content: [{ type: "text", text: `list_my_moderation_history failed (${r.status}): ${text.slice(0, 240)}` }] };
+        return { content: [{ type: "text", text: `list_my_moderation_history failed (${r.status}): ${text.slice(0, 240)}` }], isError: true };
       }
       return { content: [{ type: "text", text }] };
     } catch (e: any) {
-      return { content: [{ type: "text", text: `list_my_moderation_history network error: ${String(e?.message || e).slice(0, 120)}` }] };
+      return { content: [{ type: "text", text: `list_my_moderation_history network error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
     }
   }
 
@@ -1855,11 +1860,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       });
       const text = await r.text();
       if (!r.ok) {
-        return { content: [{ type: "text", text: `list_reports_i_submitted failed (${r.status}): ${text.slice(0, 240)}` }] };
+        return { content: [{ type: "text", text: `list_reports_i_submitted failed (${r.status}): ${text.slice(0, 240)}` }], isError: true };
       }
       return { content: [{ type: "text", text }] };
     } catch (e: any) {
-      return { content: [{ type: "text", text: `list_reports_i_submitted network error: ${String(e?.message || e).slice(0, 120)}` }] };
+      return { content: [{ type: "text", text: `list_reports_i_submitted network error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
     }
   }
 
@@ -1901,7 +1906,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (channel_id) params.set("channel_id", channel_id);
       const r = await fetch(`${REST_URL}/api/search?${params}`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
       if (!r.ok) {
-        return { content: [{ type: "text", text: `Search failed (${r.status})` }] };
+        return { content: [{ type: "text", text: `Search failed (${r.status})` }], isError: true };
       }
       const data = await r.json() as any;
       if (data.messages?.length > 0) {
@@ -2060,7 +2065,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return { content: [{ type: "text", text: `Left channel ${chat_id.slice(0, 8)}` }] };
       }
       if (r.status === 404) {
-        return { content: [{ type: "text", text: `Channel ${chat_id.slice(0, 8)} not found` }] };
+        return { content: [{ type: "text", text: `Channel ${chat_id.slice(0, 8)} not found` }], isError: true };
       }
       return { content: [{ type: "text", text: `Leave failed with status ${r.status}` }] };
     } catch (e: any) {
@@ -2099,7 +2104,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const activeNote = channelId ? ` HI active mode enabled for channel ${String(channelId).slice(0, 8)}.` : "";
         return { content: [{ type: "text", text: `Joined game ${String(game_id).slice(0, 8)} — ${count} players in lobby.${activeNote}` }] };
       }
-      return { content: [{ type: "text", text: `Join failed (${r.status}): ${String(data?.error || "").slice(0, 120)}` }] };
+      return { content: [{ type: "text", text: `Join failed (${r.status}): ${String(data?.error || "").slice(0, 120)}` }], isError: true };
     } catch (e: any) {
       return { content: [{ type: "text", text: `Join failed: ${String(e?.message || e).slice(0, 80)}` }] };
     }
@@ -2138,7 +2143,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
       if (r.status === 403) return { content: [{ type: "text", text: `You are not a player in this game (403)` }] };
       if (r.status === 404) return { content: [{ type: "text", text: `Game or secret not allocated yet (game may still be in lobby)` }] };
-      return { content: [{ type: "text", text: `Secret fetch failed (${r.status})` }] };
+      return { content: [{ type: "text", text: `Secret fetch failed (${r.status})` }], isError: true };
     } catch (e: any) {
       return { content: [{ type: "text", text: `Secret fetch failed: ${String(e?.message || e).slice(0, 80)}` }] };
     }
@@ -2158,7 +2163,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (r.ok) {
         return { content: [{ type: "text", text: `Vote cast against ${String(target_id).slice(0, 12)} in round ${data?.round}` }] };
       }
-      return { content: [{ type: "text", text: `Vote failed (${r.status}): ${String(data?.error || "").slice(0, 120)}` }] };
+      return { content: [{ type: "text", text: `Vote failed (${r.status}): ${String(data?.error || "").slice(0, 120)}` }], isError: true };
     } catch (e: any) {
       return { content: [{ type: "text", text: `Vote failed: ${String(e?.message || e).slice(0, 80)}` }] };
     }
@@ -2176,8 +2181,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (r.ok) {
         return { content: [{ type: "text", text: `Phase advanced to ${data?.phase || to}, round ${data?.round ?? "?"}` }] };
       }
-      if (r.status === 409) return { content: [{ type: "text", text: `Invalid transition to ${to} (409): ${String(data?.error || "").slice(0, 120)}` }] };
-      return { content: [{ type: "text", text: `Advance failed (${r.status}): ${String(data?.error || "").slice(0, 120)}` }] };
+      if (r.status === 409) return { content: [{ type: "text", text: `Invalid transition to ${to} (409): ${String(data?.error || "").slice(0, 120)}` }], isError: true };
+      return { content: [{ type: "text", text: `Advance failed (${r.status}): ${String(data?.error || "").slice(0, 120)}` }], isError: true };
     } catch (e: any) {
       return { content: [{ type: "text", text: `Advance failed: ${String(e?.message || e).slice(0, 80)}` }] };
     }
@@ -2197,7 +2202,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }).join(", ");
         return { content: [{ type: "text", text: `Phase: ${g.phase}, Round: ${g.round}, Winner: ${g.winner_team || "—"}. Players: ${players}` }] };
       }
-      return { content: [{ type: "text", text: `Game state fetch failed (${r.status})` }] };
+      return { content: [{ type: "text", text: `Game state fetch failed (${r.status})` }], isError: true };
     } catch (e: any) {
       return { content: [{ type: "text", text: `Game state fetch failed: ${String(e?.message || e).slice(0, 80)}` }] };
     }
@@ -2397,7 +2402,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     // Find and load the profile
     const targetFile = nameToPath(profile_name);
     if (!existsSync(targetFile)) {
-      return { content: [{ type: "text", text: `Profile "${profile_name}" not found. Available: ${available.join(", ")}` }] };
+      return { content: [{ type: "text", text: `Profile "${profile_name}" not found. Available: ${available.join(", ")}` }], isError: true };
     }
 
     const newProfile = JSON.parse(readFileSync(targetFile, "utf-8"));
@@ -2435,7 +2440,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const qs = new URLSearchParams();
     const normalizedLevel = normalizeChannelDocLevel(level);
     if (level !== undefined && normalizedLevel === null) {
-      return { content: [{ type: "text", text: "list_channel_docs failed: level must be 1|2|3|4" }] };
+      return { content: [{ type: "text", text: "list_channel_docs failed: level must be 1|2|3|4" }], isError: true };
     }
     if (normalizedLevel !== null) qs.set("level", String(normalizedLevel));
     const url = `${REST_URL}/api/channels/${encodeURIComponent(chat_id)}/docs${qs.toString() ? `?${qs}` : ""}`;
@@ -2443,11 +2448,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const r = await fetch(url, { headers: { "Authorization": `Bearer ${TOKEN}` } });
       const text = await r.text();
       if (!r.ok) {
-        return { content: [{ type: "text", text: `list_channel_docs failed (${r.status}): ${text.slice(0, 200)}` }] };
+        return { content: [{ type: "text", text: `list_channel_docs failed (${r.status}): ${text.slice(0, 200)}` }], isError: true };
       }
       return { content: [{ type: "text", text }] };
     } catch (e: any) {
-      return { content: [{ type: "text", text: `list_channel_docs network error: ${String(e?.message || e).slice(0, 120)}` }] };
+      return { content: [{ type: "text", text: `list_channel_docs network error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
     }
   }
 
@@ -2459,11 +2464,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       });
       const text = await r.text();
       if (!r.ok) {
-        return { content: [{ type: "text", text: `get_channel_doc failed (${r.status}): ${text.slice(0, 200)}` }] };
+        return { content: [{ type: "text", text: `get_channel_doc failed (${r.status}): ${text.slice(0, 200)}` }], isError: true };
       }
       return { content: [{ type: "text", text }] };
     } catch (e: any) {
-      return { content: [{ type: "text", text: `get_channel_doc network error: ${String(e?.message || e).slice(0, 120)}` }] };
+      return { content: [{ type: "text", text: `get_channel_doc network error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
     }
   }
 
@@ -2479,7 +2484,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     };
     const normalizedLevel = normalizeChannelDocLevel(level);
     if (normalizedLevel === null) {
-      return { content: [{ type: "text", text: "upsert_channel_doc failed: level must be 1|2|3|4" }] };
+      return { content: [{ type: "text", text: "upsert_channel_doc failed: level must be 1|2|3|4" }], isError: true };
     }
     try {
       const r = await fetch(`${REST_URL}/api/channels/${encodeURIComponent(chat_id)}/docs/${encodeURIComponent(doc_id)}`, {
@@ -2493,11 +2498,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       });
       const text = await r.text();
       if (!r.ok) {
-        return { content: [{ type: "text", text: `upsert_channel_doc failed (${r.status}): ${text.slice(0, 240)}` }] };
+        return { content: [{ type: "text", text: `upsert_channel_doc failed (${r.status}): ${text.slice(0, 240)}` }], isError: true };
       }
       return { content: [{ type: "text", text }] };
     } catch (e: any) {
-      return { content: [{ type: "text", text: `upsert_channel_doc network error: ${String(e?.message || e).slice(0, 120)}` }] };
+      return { content: [{ type: "text", text: `upsert_channel_doc network error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
     }
   }
 
@@ -2509,11 +2514,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       });
       const text = await r.text();
       if (!r.ok) {
-        return { content: [{ type: "text", text: `list_channel_doc_revisions failed (${r.status}): ${text.slice(0, 200)}` }] };
+        return { content: [{ type: "text", text: `list_channel_doc_revisions failed (${r.status}): ${text.slice(0, 200)}` }], isError: true };
       }
       return { content: [{ type: "text", text }] };
     } catch (e: any) {
-      return { content: [{ type: "text", text: `list_channel_doc_revisions network error: ${String(e?.message || e).slice(0, 120)}` }] };
+      return { content: [{ type: "text", text: `list_channel_doc_revisions network error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
     }
   }
 
@@ -2534,12 +2539,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const r = await fetch(url, { headers: { "Authorization": `Bearer ${TOKEN}` } });
       if (!r.ok) {
         const err = await r.text();
-        return { content: [{ type: "text", text: `okr_list failed (${r.status}): ${err.slice(0, 120)}` }] };
+        return { content: [{ type: "text", text: `okr_list failed (${r.status}): ${err.slice(0, 120)}` }], isError: true };
       }
       const data = await r.json() as any;
       return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
     } catch (e: any) {
-      return { content: [{ type: "text", text: `okr_list network error: ${String(e?.message || e).slice(0, 120)}` }] };
+      return { content: [{ type: "text", text: `okr_list network error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
     }
   }
 
@@ -2560,11 +2565,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       });
       const text = await r.text();
       if (!r.ok) {
-        return { content: [{ type: "text", text: `okr_create_objective failed (${r.status}): ${text.slice(0, 160)}` }] };
+        return { content: [{ type: "text", text: `okr_create_objective failed (${r.status}): ${text.slice(0, 160)}` }], isError: true };
       }
       return { content: [{ type: "text", text: `Created: ${text}` }] };
     } catch (e: any) {
-      return { content: [{ type: "text", text: `okr_create_objective network error: ${String(e?.message || e).slice(0, 120)}` }] };
+      return { content: [{ type: "text", text: `okr_create_objective network error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
     }
   }
 
@@ -2584,11 +2589,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       });
       const text = await r.text();
       if (!r.ok) {
-        return { content: [{ type: "text", text: `okr_add_task failed (${r.status}): ${text.slice(0, 160)}` }] };
+        return { content: [{ type: "text", text: `okr_add_task failed (${r.status}): ${text.slice(0, 160)}` }], isError: true };
       }
       return { content: [{ type: "text", text: `Added: ${text}` }] };
     } catch (e: any) {
-      return { content: [{ type: "text", text: `okr_add_task network error: ${String(e?.message || e).slice(0, 120)}` }] };
+      return { content: [{ type: "text", text: `okr_add_task network error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
     }
   }
 
@@ -2609,11 +2614,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       });
       const text = await r.text();
       if (!r.ok) {
-        return { content: [{ type: "text", text: `okr_update_task failed (${r.status}): ${text.slice(0, 160)}` }] };
+        return { content: [{ type: "text", text: `okr_update_task failed (${r.status}): ${text.slice(0, 160)}` }], isError: true };
       }
       return { content: [{ type: "text", text: `Updated: ${text}` }] };
     } catch (e: any) {
-      return { content: [{ type: "text", text: `okr_update_task network error: ${String(e?.message || e).slice(0, 120)}` }] };
+      return { content: [{ type: "text", text: `okr_update_task network error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
     }
   }
 
@@ -2626,11 +2631,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       });
       const text = await r.text();
       if (!r.ok) {
-        return { content: [{ type: "text", text: `${name} failed (${r.status}): ${text.slice(0, 160)}` }] };
+        return { content: [{ type: "text", text: `${name} failed (${r.status}): ${text.slice(0, 160)}` }], isError: true };
       }
       return { content: [{ type: "text", text }] };
     } catch (e: any) {
-      return { content: [{ type: "text", text: `${name} network error: ${String(e?.message || e).slice(0, 120)}` }] };
+      return { content: [{ type: "text", text: `${name} network error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
     }
   }
 
@@ -2644,11 +2649,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       });
       const text = await r.text();
       if (!r.ok) {
-        return { content: [{ type: "text", text: `okr_open_thread failed (${r.status}): ${text.slice(0, 160)}` }] };
+        return { content: [{ type: "text", text: `okr_open_thread failed (${r.status}): ${text.slice(0, 160)}` }], isError: true };
       }
       return { content: [{ type: "text", text }] };
     } catch (e: any) {
-      return { content: [{ type: "text", text: `okr_open_thread network error: ${String(e?.message || e).slice(0, 120)}` }] };
+      return { content: [{ type: "text", text: `okr_open_thread network error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
     }
   }
 
@@ -2667,11 +2672,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       });
       const text = await r.text();
       if (!r.ok) {
-        return { content: [{ type: "text", text: `okr_add_kr failed (${r.status}): ${text.slice(0, 160)}` }] };
+        return { content: [{ type: "text", text: `okr_add_kr failed (${r.status}): ${text.slice(0, 160)}` }], isError: true };
       }
       return { content: [{ type: "text", text: `Added: ${text}` }] };
     } catch (e: any) {
-      return { content: [{ type: "text", text: `okr_add_kr network error: ${String(e?.message || e).slice(0, 120)}` }] };
+      return { content: [{ type: "text", text: `okr_add_kr network error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
     }
   }
 
@@ -2685,11 +2690,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       });
       const text = await r.text();
       if (!r.ok) {
-        return { content: [{ type: "text", text: `archive_objective failed (${r.status}): ${text.slice(0, 200)}` }] };
+        return { content: [{ type: "text", text: `archive_objective failed (${r.status}): ${text.slice(0, 200)}` }], isError: true };
       }
       return { content: [{ type: "text", text: `Archived: ${text}` }] };
     } catch (e: any) {
-      return { content: [{ type: "text", text: `archive_objective network error: ${String(e?.message || e).slice(0, 120)}` }] };
+      return { content: [{ type: "text", text: `archive_objective network error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
     }
   }
 
@@ -2702,11 +2707,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       });
       const text = await r.text();
       if (!r.ok) {
-        return { content: [{ type: "text", text: `unarchive_objective failed (${r.status}): ${text.slice(0, 200)}` }] };
+        return { content: [{ type: "text", text: `unarchive_objective failed (${r.status}): ${text.slice(0, 200)}` }], isError: true };
       }
       return { content: [{ type: "text", text: `Unarchived: ${text}` }] };
     } catch (e: any) {
-      return { content: [{ type: "text", text: `unarchive_objective network error: ${String(e?.message || e).slice(0, 120)}` }] };
+      return { content: [{ type: "text", text: `unarchive_objective network error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
     }
   }
 
@@ -2722,11 +2727,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       });
       const text = await r.text();
       if (!r.ok) {
-        return { content: [{ type: "text", text: `okr_set_kr_progress failed (${r.status}): ${text.slice(0, 160)}` }] };
+        return { content: [{ type: "text", text: `okr_set_kr_progress failed (${r.status}): ${text.slice(0, 160)}` }], isError: true };
       }
       return { content: [{ type: "text", text: `Updated: ${text}` }] };
     } catch (e: any) {
-      return { content: [{ type: "text", text: `okr_set_kr_progress network error: ${String(e?.message || e).slice(0, 120)}` }] };
+      return { content: [{ type: "text", text: `okr_set_kr_progress network error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
     }
   }
 
@@ -2741,11 +2746,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       });
       const body = await r.text();
       if (!r.ok) {
-        return { content: [{ type: "text", text: `okr_add_task_comment failed (${r.status}): ${body.slice(0, 160)}` }] };
+        return { content: [{ type: "text", text: `okr_add_task_comment failed (${r.status}): ${body.slice(0, 160)}` }], isError: true };
       }
       return { content: [{ type: "text", text: `Commented: ${body}` }] };
     } catch (e: any) {
-      return { content: [{ type: "text", text: `okr_add_task_comment network error: ${String(e?.message || e).slice(0, 120)}` }] };
+      return { content: [{ type: "text", text: `okr_add_task_comment network error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
     }
   }
 
@@ -2773,15 +2778,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       });
       const text = await r.text();
       if (!r.ok) {
-        return { content: [{ type: "text", text: `okr_set_links failed (${r.status}): ${text.slice(0, 200)}` }] };
+        return { content: [{ type: "text", text: `okr_set_links failed (${r.status}): ${text.slice(0, 200)}` }], isError: true };
       }
       return { content: [{ type: "text", text: `Updated: ${text}` }] };
     } catch (e: any) {
-      return { content: [{ type: "text", text: `okr_set_links network error: ${String(e?.message || e).slice(0, 120)}` }] };
+      return { content: [{ type: "text", text: `okr_set_links network error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
     }
   }
 
-  return { content: [{ type: "text", text: `Unknown tool: ${name}` }] };
+  return { content: [{ type: "text", text: `Unknown tool: ${name}` }], isError: true };
+  } catch (e: any) {
+    return { content: [{ type: "text", text: `${name} failed: ${String(e?.message || e).slice(0, 300)}` }], isError: true };
+  }
 });
 
 // --- WebSocket Connection ---

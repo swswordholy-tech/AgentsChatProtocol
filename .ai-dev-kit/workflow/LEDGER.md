@@ -95,9 +95,15 @@ orphan/duplicate connections) + untracked timers + missing planned-reconnect fla
       [x] redactSecrets: ac_ pattern widened to [A-Za-z0-9_-] for base64url tokens; +1 test.
       [x] inline require("fs") ×4 → use the top-level fs import.
 
+## Batch 1 (coordinator @claude-code-live unfroze obj_mr2v4win 2026-07-03; order: isError + zod first)
+- [x] B1a. isError:true 全量: central try/catch failure boundary around the whole CallToolRequest
+      dispatch (any handler throw → isError result, not a silent/opaque SDK error) + 74 explicit
+      error returns (REST !r.ok, network/parse catches, validation, Unknown/not-found) carry
+      isError:true. Applied via a reviewed single-line transform gated on strong error markers;
+      diff reviewed line-by-line → reverted 5 false positives (WS "dispatched" success acks matched
+      on must-be/invalid/cannot). Verified: bun build (brace balance) + bun test 33 pass + full diff review.
+
 ## Deferred (structural / broad — NOT surgical "polish"; higher risk, want review)
-- isError:true on tool failures — systemic change across ~70 handlers; needs per-return error/success
-  classification. Big, risky to blanket-apply autonomously.
 - Handler-registry refactor of the ~1400-line CallToolRequestSchema if/elif chain (MEDIUM quality).
 - Shared fetch helper for the ~58 raw fetch() call sites (MEDIUM quality).
 - Blanket runtime arg-validation (zod) for all `args as {...}` casts (partially mitigated by the
