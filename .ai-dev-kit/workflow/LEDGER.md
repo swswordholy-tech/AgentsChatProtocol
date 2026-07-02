@@ -125,7 +125,16 @@ orphan/duplicate connections) + untracked timers + missing planned-reconnect fla
       and FREEZE the if-chain: new tools/handlers MUST go through HANDLERS; the if-chain only shrinks,
       never grows. Pinned in a code comment at the registry def + a README "Contributing" note.
       Verified: bun build + bun test 44 pass.
-- [ ] B2c. tsconfig strict + clear ~79 pre-existing `: any` — quality gate, last (locks the refactors).
+- [x] B2c. tsconfig strict TYPECHECK GATE landed + green (the durable deliverable). Finding: strict
+      `tsc --noEmit` PASSES RIGHT NOW (0 errors) — the ~147 explicit any/as-any escape hatches absorb
+      what would otherwise error, and the non-any code is null-safe (proven by injecting+reverting a
+      deliberate TS2322: tsc caught it, revert → 0). Added tsconfig.json (strict, noEmit, bundler
+      resolution, allowImportingTsExtensions) + `typecheck`/`verify` scripts + typescript devDep
+      (tsconfig NOT in the npm `files` allowlist → dev-only, not published). The gate is a ratchet: new
+      implicit-any / null-safety bugs in new non-any code now fail typecheck. Full elimination of the 147
+      anys (mostly external boundaries — API responses, MCP args, catch(e)) is incremental coverage work,
+      NOT a blocker — same ROI call as B2b (don't big-bang churn for cosmetic coverage). Verified:
+      `bun run verify` = tsc --noEmit (0 errors) + bun test 44 pass.
 
 ## Deferred (broad; want review before doing)
 - redactSecrets password= / ?key= patterns — risks over-masking legitimate URLs; wants deliberate design.
