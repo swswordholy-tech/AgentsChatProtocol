@@ -30,6 +30,11 @@ test("redacts an ac_ key and a JWT present together", () => {
   expect(redactSecrets(s)).toBe("ac_***REDACTED*** ***JWT_REDACTED***");
 });
 
+test("masks an ac_ token containing base64url - and _ chars", () => {
+  const tok = "ac_" + "aB3-dE5_fG7hI9jK1lM3"; // 20 chars incl - and _
+  expect(redactSecrets("key " + tok)).toBe("key ac_***REDACTED***");
+});
+
 test("leaves ordinary text (including a bare 'ac_' with too few chars) untouched", () => {
   expect(redactSecrets("hello world, ac_short, no secrets")).toBe(
     "hello world, ac_short, no secrets",

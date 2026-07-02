@@ -40,6 +40,7 @@ import { redactSecrets } from "./redact.ts";
 import { matchesMention } from "./mentions.ts";
 import { messageDedupKey, MessageDedup } from "./dedup.ts";
 import { computeReconnectDelay } from "./reconnect.ts";
+import { normalizeTimestampForCursor } from "./timestamps.ts";
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
@@ -1964,8 +1965,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const memberIds: string[] = (membersData?.members || []).map((m: any) => m?.agent_id).filter(Boolean);
     let online: string[] = [];
     if (memberIds.length > 0) {
-      const pres = await get(`/api/presence?ids=${encodeURIComponent(memberIds.slice(0, 50).join(","))}`);
-      online = Object.entries(pres?.presence || {}).filter(([, v]) => v === "online").map(([k]) => k);
+      // Batch the presence query in chunks of 50 so channels with >50 members
+      // report accurately (was: memberIds.slice(0,50) — silently wrong past 50).
+      const onlineSet = new Set<string>();
+      for (let i = 0; i < memberIds.length; i += 50) {
+        const batch = memberIds.slice(i, i + 50);
+        const pres = await get(`/api/presence?ids=${encodeURIComponent(batch.join(","))}`);
+        for (const [k, v] of Object.entries(pres?.presence || {})) {
+          if (v === "online") onlineSet.add(k);
+        }
+      }
+      online = [...onlineSet];
     }
     const allDocs = docsData ? extractChannelDocsPayload(docsData) : [];
     const skills = allDocs.filter(isSkillDoc).map((d: any) => ({ doc_id: d.id, title: d.title }));
@@ -2239,7 +2249,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   if (name === "list_channels") {
     const { limit = 50 } = args as any;
     try {
-      const r = await fetch(`${REST_URL}/api/channels/discover?limit=${Math.min(limit, 500)}`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
+      const r = await fetch(`${REST_URL}/api/channels/discover?limit=${Math.max(1, Math.min(Number(limit) || 50, 500))}`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
       if (r.ok) {
         const data = await r.json() as any;
         const channels = (data.channels || []);
@@ -2355,7 +2365,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   if (name === "get_history") {
     const { chat_id, limit = 20 } = args as any;
     try {
-      const r = await fetch(`${REST_URL}/api/channels/${encodeURIComponent(chat_id)}/messages?limit=${Math.min(limit, 100)}`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
+      const r = await fetch(`${REST_URL}/api/channels/${encodeURIComponent(chat_id)}/messages?limit=${Math.max(1, Math.min(Number(limit) || 20, 100))}`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
       if (r.ok) {
         const data = await r.json() as any;
         const msgs = (data.messages || []).filter((m: any) => m.content !== "__typing__");
@@ -2781,13 +2791,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 const mentionTsFile = join(configDir, `mention-ts-${AGENT_ID}.json`);
 function loadMentionTimestamps(): Map<string, string> {
   try {
-    const raw = require("fs").readFileSync(mentionTsFile, "utf-8");
+    const raw = readFileSync(mentionTsFile, "utf-8");
     return new Map(Object.entries(JSON.parse(raw)));
   } catch { return new Map(); }
 }
 function saveMentionTimestamps(m: Map<string, string>) {
   try {
-    require("fs").writeFileSync(mentionTsFile, JSON.stringify(Object.fromEntries(m)));
+    writeFileSync(mentionTsFile, JSON.stringify(Object.fromEntries(m)));
   } catch {}
 }
 const lastMentionTimestamp = loadMentionTimestamps();
@@ -2810,13 +2820,13 @@ const lastMentionTimestamp = loadMentionTimestamps();
 const lastSeenMessageTsFile = join(configDir, `last-seen-msg-ts-${AGENT_ID}.json`);
 function loadLastSeenMessageTs(): Map<string, string> {
   try {
-    const raw = require("fs").readFileSync(lastSeenMessageTsFile, "utf-8");
+    const raw = readFileSync(lastSeenMessageTsFile, "utf-8");
     return new Map(Object.entries(JSON.parse(raw)));
   } catch { return new Map(); }
 }
 function saveLastSeenMessageTs(m: Map<string, string>) {
   try {
-    require("fs").writeFileSync(lastSeenMessageTsFile, JSON.stringify(Object.fromEntries(m)));
+    writeFileSync(lastSeenMessageTsFile, JSON.stringify(Object.fromEntries(m)));
   } catch {}
 }
 const lastSeenMessageTs = loadLastSeenMessageTs();
@@ -2847,15 +2857,9 @@ function scheduleLastSeenMessageTsSave() {
   (lastSeenMessageTsTimer as any).unref?.();
 }
 
-function normalizeTimestampForCursor(ts: string | undefined, mode: "before" | "after"): string | undefined {
-  if (!ts || typeof ts !== "string") return ts;
-  const m = ts.match(/^(.*\.)(\d+)(Z)$/);
-  if (!m) return ts;
-  const frac = m[2];
-  if (frac.length >= 9) return ts;
-  const padChar = mode === "before" ? "9" : "0";
-  return m[1] + frac + padChar.repeat(9 - frac.length) + m[3];
-}
+// normalizeTimestampForCursor now lives in ./timestamps.ts (imported above),
+// where it also handles whole-second timestamps so lexical cursor comparison
+// matches chronological order.
 
 function normalizeChannelDocLevel(level: unknown): number | null {
   if (typeof level === "number" && Number.isInteger(level) && level >= 1 && level <= 4) {
@@ -3262,11 +3266,12 @@ function connectWS() {
         if (isDM || isMentioned) {
           try {
             if (ws && ws.readyState === WebSocket.OPEN) {
+              // Use the protocol's dedicated `typing` frame (type 8) instead of
+              // injecting a `__typing__` message into the persisted stream, which
+              // spec-conforming clients would render literally. Inbound
+              // __typing__ is still tolerated/filtered elsewhere for safety.
               ws.send(JSON.stringify({
-                type: "message", id: crypto.randomUUID(),
-                channel_id: data.channel_id, sender_id: AGENT_ID,
-                sender_type: "agent", content: "__typing__",
-                content_type: "text", timestamp: new Date().toISOString(),
+                type: "typing", channel_id: data.channel_id, sender_id: AGENT_ID,
               }));
             }
           } catch {}
@@ -3309,7 +3314,7 @@ function connectWS() {
                 const clipped = raw.length > maxPerMsg
                   ? raw.slice(0, maxPerMsg) + " …[truncated]"
                   : raw;
-                const size = clipped.length;
+                const size = Buffer.byteLength(clipped, "utf8"); // real UTF-8 bytes (CJK is 3B/char, not 1)
                 if (totalBytes + size > maxBytes) break;
                 totalBytes += size;
                 trimmed.unshift({ ...msgs[i], content: clipped });
@@ -3336,7 +3341,7 @@ function connectWS() {
           contextPrefix = `[HI游戏进行中 - 你是 game ${activeHi.gameId.slice(0, 8)} 的上桌玩家；此消息无需 @mention 也被实时推送。只在轮到你行动、需要讨论或需要投票时回复，否则可以旁观。]\n`;
         }
 
-        process.stderr.write(`[agentchat] ${isDM ? 'DM' : isMentioned ? '@mention' : 'HI-active'} from ${data.sender_id.slice(0, 8)}: ${data.content.slice(0, 50)}\n`);
+        process.stderr.write(`[agentchat] ${isDM ? 'DM' : isMentioned ? '@mention' : 'HI-active'} from ${String(data.sender_id ?? "?").slice(0, 8)}: ${String(data.content ?? "").slice(0, 50)}\n`);
 
         // 推送给 Claude Code
         try {
@@ -3360,7 +3365,7 @@ function connectWS() {
         // Channel message without @mention → silent (just log)
         rateLimitedLog(
           "silent-channel-message",
-          `[agentchat] [silent] ${data.sender_id.slice(0, 8)} in ${data.channel_id.slice(0, 12)}: ${data.content.slice(0, 30)}\n`,
+          `[agentchat] [silent] ${String(data.sender_id ?? "?").slice(0, 8)} in ${String(data.channel_id ?? "?").slice(0, 12)}: ${String(data.content ?? "").slice(0, 30)}\n`,
         );
       }
     } else if (data.type === "channel_created") {

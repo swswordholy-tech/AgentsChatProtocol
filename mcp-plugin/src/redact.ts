@@ -11,6 +11,6 @@
  */
 export function redactSecrets(text: string): string {
   return text
-    .replace(/ac_[A-Za-z0-9]{16,}/g, "ac_***REDACTED***")
+    .replace(/ac_[A-Za-z0-9_-]{16,}/g, "ac_***REDACTED***")
     .replace(/eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "***JWT_REDACTED***");
 }

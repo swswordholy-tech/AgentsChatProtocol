@@ -84,6 +84,24 @@ orphan/duplicate connections) + untracked timers + missing planned-reconnect fla
           swallowing non-2xx into a generic error).
       [~] claim_url stderr (167): KEPT by design — it is the sole first-run delivery channel of the
           owner claim URL to the human; masking the key would break the claim flow. Documented, not a leak to fix.
-      [ ] remaining: typing-as-message frame; limit coercion (get_history/list_channels); null-guard
-          inbound content/sender_id slice; byte-vs-char mention budget; channelBrief >50 member truncation;
-          redactSecrets password/?key= patterns; isError:true on tool failures; handler-registry refactor.
+      [x] typing: send the dedicated `typing` frame instead of a `__typing__` message (stops
+          polluting the persisted stream); inbound __typing__ still tolerated/filtered.
+      [x] limit coercion: get_history + list_channels now Math.max(1, Math.min(Number(limit)||d, cap)).
+      [x] null-guard inbound sender_id/content/channel_id in the two stderr log lines (String(x ?? "?")).
+      [x] byte-vs-char mention budget: totalBytes now uses Buffer.byteLength(...,'utf8') (CJK is 3B/char).
+      [x] channelBrief >50 members: presence query now batched in chunks of 50 (was slice(0,50)).
+      [x] normalizeTimestampForCursor → src/timestamps.ts: now also pads whole-second timestamps so the
+          backfill string cursor sorts chronologically ('.' < 'Z' boundary bug); 5 tests.
+      [x] redactSecrets: ac_ pattern widened to [A-Za-z0-9_-] for base64url tokens; +1 test.
+      [x] inline require("fs") ×4 → use the top-level fs import.
+
+## Deferred (structural / broad — NOT surgical "polish"; higher risk, want review)
+- isError:true on tool failures — systemic change across ~70 handlers; needs per-return error/success
+  classification. Big, risky to blanket-apply autonomously.
+- Handler-registry refactor of the ~1400-line CallToolRequestSchema if/elif chain (MEDIUM quality).
+- Shared fetch helper for the ~58 raw fetch() call sites (MEDIUM quality).
+- Blanket runtime arg-validation (zod) for all `args as {...}` casts (partially mitigated by the
+  per-handler guards added in F9-1).
+- tsconfig.json + strict typecheck script — would surface ~79 pre-existing `: any` / TS errors that
+  must be resolved first; out of scope for a polish pass.
+- redactSecrets password= / ?key= patterns — risks over-masking legitimate URLs; wants deliberate design.

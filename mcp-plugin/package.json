@@ -53,6 +53,7 @@
     "src/mentions.ts",
     "src/dedup.ts",
     "src/reconnect.ts",
+    "src/timestamps.ts",
     "README.md"
   ]
 }
