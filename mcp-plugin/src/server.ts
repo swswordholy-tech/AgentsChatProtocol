@@ -499,6 +499,7 @@ const TOOL_GROUPS: ToolGroupMeta[] = [
       "okr_set_links",
       "archive_objective",
       "unarchive_objective",
+      "okr_reparent_objective",
     ],
   },
   {
@@ -1229,6 +1230,18 @@ const ALL_TOOL_DEFS = [
       },
     },
     {
+      name: "okr_reparent_objective",
+      description: "Re-parent one of YOUR objectives under another objective (build the company OKR tree), or detach it to a top-level root with parent_id=null. Owner-only; the server rejects cycles and depth >3. Use this instead of a hand-rolled curl — the plugin handles auth for you.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          objective_id: { type: "string", description: "Your objective's id to move" },
+          parent_id: { type: ["string", "null"], description: "New parent objective id to attach under, or null to detach to a top-level root. Required to be present (pass null explicitly to detach)." },
+        },
+        required: ["objective_id"],
+      },
+    },
+    {
       name: "okr_set_kr_progress",
       description: "Update a KR's current value (progress ping) and optionally risk_level. Allowed for the Objective owner, an admin, or any task assignee whose task contributes_to this KR (self-report path). Unthrottled — progress updates are expected to be frequent during a sprint.",
       inputSchema: {
@@ -1434,6 +1447,32 @@ HANDLERS.set("send_typing", async (args) => {
     }));
   }
   return { content: [{ type: "text", text: "Typing indicator dispatched" }] };
+});
+
+HANDLERS.set("okr_reparent_objective", async (args) => {
+  const { objective_id, parent_id } = (args || {}) as { objective_id?: string; parent_id?: string | null };
+  if (!objective_id) {
+    return { content: [{ type: "text", text: "okr_reparent_objective needs objective_id." }], isError: true };
+  }
+  // parent_id must be PRESENT (a string to attach under, or explicit null to
+  // detach to a root). Absent ≠ null — we don't silently detach on omission.
+  if (!(args && typeof args === "object" && "parent_id" in args)) {
+    return { content: [{ type: "text", text: "okr_reparent_objective needs parent_id (an objective id to attach under, or null to detach to a top-level root)." }], isError: true };
+  }
+  try {
+    const r = await apiFetch(`${REST_URL}/api/okr/objectives/${encodeURIComponent(objective_id)}/parent`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${TOKEN}` },
+      body: JSON.stringify({ parent_id: parent_id ?? null }),
+    });
+    const text = await r.text();
+    if (!r.ok) {
+      return { content: [{ type: "text", text: `okr_reparent_objective failed (${r.status}): ${text.slice(0, 200)}` }], isError: true };
+    }
+    return { content: [{ type: "text", text: `Reparented: ${text}` }] };
+  } catch (e: any) {
+    return { content: [{ type: "text", text: `okr_reparent_objective network error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
+  }
 });
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
