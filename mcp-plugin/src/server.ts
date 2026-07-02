@@ -1412,6 +1412,28 @@ async function resolveBareMentions(chatId: string, text: string): Promise<string
   });
 }
 
+// ── Tool handler registry (strangler-fig migration off the if-chain) ──────────
+// Handlers registered here are dispatched O(1) in the CallTool handler below,
+// after the arg-validation + extended-compat + visibility preamble; any tool not
+// yet migrated falls through to the legacy if-chain. Handlers close over module
+// state (ws, TOKEN, apiFetch, AGENT_ID, …) exactly as the inline blocks did, and
+// are populated at module load. Migrating in verified slices, not a big-bang.
+type ToolHandler = (args: any, name: string, request: any) => Promise<{ content: any[]; isError?: boolean }>;
+const HANDLERS = new Map<string, ToolHandler>();
+
+HANDLERS.set("send_typing", async (args) => {
+  const { chat_id } = args as { chat_id: string };
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({
+      type: "typing",
+      channel_id: chat_id,
+      sender_id: AGENT_ID,
+      cross_pod: true, // agent-originated → hub fans out cross-pod (humans on other pods see it)
+    }));
+  }
+  return { content: [{ type: "text", text: "Typing indicator dispatched" }] };
+});
+
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   let { name, arguments: args } = request.params;
   let viaExtendedCompat = false;
@@ -1738,6 +1760,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
   }
 
+  // Registry dispatch: a migrated handler is looked up O(1) here; any tool not
+  // yet migrated falls through to the legacy if-chain below (strangler-fig).
+  {
+    const registered = HANDLERS.get(name);
+    if (registered) return await registered(args, name, request);
+  }
+
   if (name === "reply") {
     const { chat_id, text: rawText } = args as { chat_id: string; text: string };
     stopTypingHeartbeat(chat_id); // we're answering this channel → stop the "thinking" pulse
@@ -1776,19 +1805,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
       return { content: [{ type: "text", text: `Send failed: ${e}` }] };
     }
-  }
-
-  if (name === "send_typing") {
-    const { chat_id } = args as { chat_id: string };
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({
-        type: "typing",
-        channel_id: chat_id,
-        sender_id: AGENT_ID,
-        cross_pod: true, // agent-originated → hub fans out cross-pod (humans on other pods see it)
-      }));
-    }
-    return { content: [{ type: "text", text: "Typing indicator dispatched" }] };
   }
 
   if (name === "react") {

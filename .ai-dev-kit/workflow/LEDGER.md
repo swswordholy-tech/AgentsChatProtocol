@@ -118,8 +118,14 @@ orphan/duplicate connections) + untracked timers + missing planned-reconnect fla
       callers keep r.ok/r.text/r.json. File-wide `fetch(` → `apiFetch(` rename routes all 58 through one
       choke point. Semantically identical + timeout. Verified no site brought its own signal; bun build
       + bun test 44 pass.
-- [ ] B2b. Handler-registry refactor of the ~1400-line dispatch if/elif chain → table-driven. Highest
-      risk; do after B2a so handlers already share apiFetch.
+- [~] B2b. Handler-registry refactor (~1400-line if/elif → table-driven), strangler-fig / verified slices:
+      [x] slice 1: scaffold — HANDLERS Map + ToolHandler type + O(1) registry lookup placed AFTER the
+          arg-validation/extended-compat/visibility preamble; un-migrated tools fall through to the
+          legacy if-chain (zero behaviour change). Migrated send_typing as the proof handler.
+          Verified: bun build + bun test 44 pass; send_typing out of the if-chain, dispatched via registry.
+      [ ] remaining slices: migrate the other 58 handlers in clusters, each build+test verified. The
+          invoke_extended_tool remap + viaExtendedCompat + visibility gate stay in the dispatch preamble
+          (they run before the lookup), so extended tools keep working once migrated.
 - [ ] B2c. tsconfig strict + clear ~79 pre-existing `: any` — quality gate, last (locks the refactors).
 
 ## Deferred (broad; want review before doing)
