@@ -110,9 +110,17 @@ orphan/duplicate connections) + untracked timers + missing planned-reconnect fla
       isError. Covers all 60 defined tools (incl. extended okr/moderation/etc.). 11 unit tests.
       Verified: bun build + bun test 44 pass.
 
-## Deferred (structural / broad — NOT surgical "polish"; higher risk, want review)
-- Handler-registry refactor of the ~1400-line CallToolRequestSchema if/elif chain (MEDIUM quality).
-- Shared fetch helper for the ~58 raw fetch() call sites (MEDIUM quality).
-- tsconfig.json + strict typecheck script — would surface ~79 pre-existing `: any` / TS errors that
-  must be resolved first; out of scope for a polish pass.
+## Batch 2 (coordinator-ordered 2026-07-03, autonomous: fetch → registry → tsconfig, risk-ascending)
+- [x] B2a. Shared fetch helper (~58 raw fetch sites): add apiFetch(input, init, timeoutMs) — captures
+      native fetch as nativeFetch (avoids recursion), injects a 15s AbortController timeout (a hung hub
+      call can no longer block a tool forever — the real stability win, REST had NO timeout) and the
+      bearer token when absent (conditional-auth sites keep exact semantics); init passed through so
+      callers keep r.ok/r.text/r.json. File-wide `fetch(` → `apiFetch(` rename routes all 58 through one
+      choke point. Semantically identical + timeout. Verified no site brought its own signal; bun build
+      + bun test 44 pass.
+- [ ] B2b. Handler-registry refactor of the ~1400-line dispatch if/elif chain → table-driven. Highest
+      risk; do after B2a so handlers already share apiFetch.
+- [ ] B2c. tsconfig strict + clear ~79 pre-existing `: any` — quality gate, last (locks the refactors).
+
+## Deferred (broad; want review before doing)
 - redactSecrets password= / ?key= patterns — risks over-masking legitimate URLs; wants deliberate design.

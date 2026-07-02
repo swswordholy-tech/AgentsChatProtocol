@@ -167,7 +167,7 @@ if (existsSync(profileFile)) {
   const caps = ["claude-code", "coding", "chat"];
   process.stderr.write(`[agentchat] First run — registering with server...\n`);
   try {
-    const regRes = await fetch(`${REST_URL}/api/account/register`, {
+    const regRes = await apiFetch(`${REST_URL}/api/account/register`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ name: displayName, type: "agent", capabilities: caps, source: "mcp" }),
@@ -201,7 +201,7 @@ if (existsSync(profileFile)) {
 if (profile.token === "dev-token") {
   process.stderr.write(`[agentchat] Migrating dev-token profile — registering with server...\n`);
   try {
-    const regRes = await fetch(`${REST_URL}/api/account/register`, {
+    const regRes = await apiFetch(`${REST_URL}/api/account/register`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ id: profile.agent_id, name: profile.display_name, type: "agent", capabilities: profile.capabilities || [] }),
@@ -214,7 +214,7 @@ if (profile.token === "dev-token") {
       process.stderr.write(`[agentchat] Migrated! New key saved. ID: ${data.id}\n`);
     } else {
       // ID conflict (409) — old UUID taken. Register with auto-generated id instead.
-      const regRes2 = await fetch(`${REST_URL}/api/account/register`, {
+      const regRes2 = await apiFetch(`${REST_URL}/api/account/register`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ name: profile.display_name, type: "agent", capabilities: profile.capabilities || [] }),
@@ -234,6 +234,31 @@ let AGENT_ID = cliArgs.id || process.env.AGENTCHAT_AGENT_ID || profile.agent_id 
 let TOKEN = cliArgs.token || process.env.AGENTCHAT_TOKEN || profile.token || "dev-token";
 let CAPABILITIES: string[] = cliArgs.caps?.split(",") || profile.capabilities || ["claude-code", "coding", "chat"];
 
+// Native fetch, captured before the file-wide call-site rename to apiFetch so the
+// wrapper below can't recurse into itself.
+const nativeFetch = fetch;
+// All AgentsChat REST goes through apiFetch so every call gets, from one place:
+// (1) a timeout — a hung hub call must never block a tool forever; and
+// (2) the bearer token, injected only when absent and TOKEN is set (so the few
+//     conditional-auth sites keep their exact semantics). init is otherwise passed
+//     through untouched, so callers keep using r.ok / r.text() / r.json().
+const REST_TIMEOUT_MS = 15_000;
+async function apiFetch(
+  input: string | URL,
+  init: RequestInit = {},
+  timeoutMs = REST_TIMEOUT_MS,
+): Promise<Response> {
+  const headers: Record<string, string> = { ...(init.headers as Record<string, string> | undefined) };
+  if (TOKEN && !("Authorization" in headers)) headers["Authorization"] = `Bearer ${TOKEN}`;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await nativeFetch(input as any, { ...init, headers, signal: init.signal ?? controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 // Update display name if provided via CLI
 if (cliArgs.name && profile.display_name !== cliArgs.name) {
   profile.display_name = cliArgs.name;
@@ -245,7 +270,7 @@ if (profile.token && profile.token !== "dev-token") {
     // /api/account/:id now requires auth (server tick 88 info-leak
     // fix). Without the Bearer header the welcome/claim banner
     // silently skipped on every MCP startup.
-    const acctRes = await fetch(`${REST_URL}/api/account/${encodeURIComponent(AGENT_ID)}`, {
+    const acctRes = await apiFetch(`${REST_URL}/api/account/${encodeURIComponent(AGENT_ID)}`, {
       headers: { "Authorization": `Bearer ${profile.token}` },
     });
     if (acctRes.ok) {
@@ -1304,7 +1329,7 @@ async function fetchChannelMembers(chatId: string): Promise<{ agent_id: string; 
   const hit = memberCache.get(chatId);
   if (hit && now - hit.at < MEMBER_CACHE_TTL_MS) return hit.members;
   try {
-    const r = await fetch(`${REST_URL}/api/channels/${encodeURIComponent(chatId)}/members`, {
+    const r = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(chatId)}/members`, {
       headers: { "Authorization": `Bearer ${TOKEN}` },
     });
     if (!r.ok) return hit?.members || [];
@@ -1374,7 +1399,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     };
     if (chat_id) {
       try {
-        const r = await fetch(`${REST_URL}/api/channels/${encodeURIComponent(chat_id)}/docs`, {
+        const r = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(chat_id)}/docs`, {
           headers: { "Authorization": `Bearer ${TOKEN}` },
         });
         if (r.ok) out.channel_skills = extractChannelDocsPayload(JSON.parse(await r.text())).filter(isSkillDoc).map(compactSkillDoc);
@@ -1385,7 +1410,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
     // Personal skills (per-owner, follow you across agents). sync_skill(name=…) / load via GET /api/skills/:name.
     try {
-      const pr = await fetch(`${REST_URL}/api/skills`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
+      const pr = await apiFetch(`${REST_URL}/api/skills`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
       if (pr.ok) out.personal_skills = (JSON.parse(await pr.text()).skills) || [];
     } catch { /* best-effort */ }
     return { content: [{ type: "text", text: JSON.stringify(out, null, 2) }] };
@@ -1396,7 +1421,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     // CHANNEL skill: chat_id + doc_id (full frontmatter/metadata handling).
     if (chat_id && doc_id) {
       try {
-        const r = await fetch(`${REST_URL}/api/channels/${encodeURIComponent(chat_id)}/docs/${encodeURIComponent(doc_id)}`, {
+        const r = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(chat_id)}/docs/${encodeURIComponent(doc_id)}`, {
           headers: { "Authorization": `Bearer ${TOKEN}` },
         });
         const text = await r.text();
@@ -1448,7 +1473,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       return { content: [{ type: "text", text: "save_memory needs name (slug) + body (markdown). Optional description (one-line index hook)." }], isError: true };
     }
     try {
-      const r = await fetch(`${REST_URL}/api/memory/${encodeURIComponent(a.name)}`, {
+      const r = await apiFetch(`${REST_URL}/api/memory/${encodeURIComponent(a.name)}`, {
         method: "PUT",
         headers: { "Authorization": `Bearer ${TOKEN}`, "Content-Type": "application/json" },
         body: JSON.stringify({ body_markdown: a.body, description: a.description }),
@@ -1466,7 +1491,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const a = (args || {}) as { name?: string };
     try {
       const path = a.name ? `/api/memory/${encodeURIComponent(a.name)}` : `/api/memory`;
-      const r = await fetch(`${REST_URL}${path}`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
+      const r = await apiFetch(`${REST_URL}${path}`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
       const text = await r.text();
       if (!r.ok) return { content: [{ type: "text", text: `load_memory failed (${r.status}): ${text.slice(0, 240)}` }], isError: true };
       const resp = JSON.parse(text);
@@ -1495,7 +1520,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     if (!a.chat_id) {
       const pslug = String(a.doc_id || a.name).toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^[^a-z0-9]+/, "").replace(/[^a-z0-9]+$/, "").slice(0, 64) || "skill";
       try {
-        const r = await fetch(`${REST_URL}/api/skills/${encodeURIComponent(pslug)}`, {
+        const r = await apiFetch(`${REST_URL}/api/skills/${encodeURIComponent(pslug)}`, {
           method: "PUT",
           headers: { "Authorization": `Bearer ${TOKEN}`, "Content-Type": "application/json" },
           body: JSON.stringify({ body_markdown: md }),
@@ -1516,12 +1541,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       // If-Match: fetch current version (0 = create). The doc store uses
       // optimistic concurrency; "0" creates, current version updates.
       let ifMatch = "0";
-      const cur = await fetch(`${REST_URL}/api/channels/${encodeURIComponent(a.chat_id)}/docs/${encodeURIComponent(docId)}`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
+      const cur = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(a.chat_id)}/docs/${encodeURIComponent(docId)}`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
       if (cur.ok) {
         const curDoc = await cur.json().catch(() => null) as any;
         if (curDoc && curDoc.version != null) ifMatch = String(curDoc.version);
       }
-      const r = await fetch(`${REST_URL}/api/channels/${encodeURIComponent(a.chat_id)}/docs/${encodeURIComponent(docId)}`, {
+      const r = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(a.chat_id)}/docs/${encodeURIComponent(docId)}`, {
         method: "PUT",
         headers: { "Authorization": `Bearer ${TOKEN}`, "Content-Type": "application/json", "If-Match": ifMatch },
         body: JSON.stringify({ kind: "channel_skill", level, title: a.name, body_markdown: md }),
@@ -1548,7 +1573,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const pBase = `${cacheDir}/personal__${safe(a.name)}`;
       const pMd = `${pBase}.md`; const pMeta = `${pBase}.json`;
       try {
-        const listR = await fetch(`${REST_URL}/api/skills`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
+        const listR = await apiFetch(`${REST_URL}/api/skills`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
         if (!listR.ok) return { content: [{ type: "text", text: `sync_skill (personal): list failed (${listR.status})` }], isError: true };
         const meta = (JSON.parse(await listR.text()).skills || []).find((s: any) => s.name === a.name);
         if (!meta) return { content: [{ type: "text", text: `sync_skill: personal skill "${a.name}" not found (save it with save_skill — no chat_id).` }], isError: true };
@@ -1558,7 +1583,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         if (cachedVersion !== null && cachedVersion === currentVersion) {
           return { content: [{ type: "text", text: `up-to-date: personal skill "${a.name}" v${currentVersion} already at ${pMd} — no download. Read that file to run it.` }] };
         }
-        const bodyR = await fetch(`${REST_URL}/api/skills/${encodeURIComponent(a.name)}`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
+        const bodyR = await apiFetch(`${REST_URL}/api/skills/${encodeURIComponent(a.name)}`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
         if (!bodyR.ok) return { content: [{ type: "text", text: `sync_skill (personal): body fetch failed (${bodyR.status})` }], isError: true };
         const doc = JSON.parse(await bodyR.text());
         await Bun.write(pMd, String(doc?.body_markdown ?? ""));
@@ -1578,7 +1603,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     try {
       // 1. Cheap version check: docs-list returns each doc's version WITHOUT the
       // body, so "is my local copy current?" costs one light call.
-      const listR = await fetch(`${REST_URL}/api/channels/${encodeURIComponent(a.chat_id)}/docs`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
+      const listR = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(a.chat_id)}/docs`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
       if (!listR.ok) return { content: [{ type: "text", text: `sync_skill: docs-list failed (${listR.status})` }], isError: true };
       const docs = extractChannelDocsPayload(JSON.parse(await listR.text()));
       const meta = docs.find((d: any) => (d?.id ?? d?.doc_id) === a.doc_id);
@@ -1591,7 +1616,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return { content: [{ type: "text", text: `up-to-date: "${a.doc_id}" v${currentVersion} already at ${mdPath} — no download. Read that file to run it.` }] };
       }
       // 3. Missing/stale → fetch the body (the only expensive call, on the cold path).
-      const docR = await fetch(`${REST_URL}/api/channels/${encodeURIComponent(a.chat_id)}/docs/${encodeURIComponent(a.doc_id)}`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
+      const docR = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(a.chat_id)}/docs/${encodeURIComponent(a.doc_id)}`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
       if (!docR.ok) return { content: [{ type: "text", text: `sync_skill: fetch body failed (${docR.status})` }], isError: true };
       const doc = JSON.parse(await docR.text());
       const body = String(doc?.body_markdown ?? doc?.bodyMarkdown ?? "");
@@ -1681,7 +1706,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const text = redactSecrets(await resolveBareMentions(chat_id, rawText));
     // Use REST API for reliable delivery (WebSocket may be half-open after deploy)
     try {
-      const r = await fetch(`${REST_URL}/api/channels/${encodeURIComponent(chat_id)}/messages`, {
+      const r = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(chat_id)}/messages`, {
         method: "POST",
         headers: { "Content-Type": "application/json", "Authorization": `Bearer ${TOKEN}` },
         body: JSON.stringify({
@@ -1822,7 +1847,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       free_text?: string;
     };
     try {
-      const r = await fetch(`${REST_URL}/api/moderation/report`, {
+      const r = await apiFetch(`${REST_URL}/api/moderation/report`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -1850,7 +1875,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const qs = new URLSearchParams();
     if (agent_id) qs.set("agent_id", agent_id);
     try {
-      const r = await fetch(`${REST_URL}/api/me/moderation_history${qs.toString() ? `?${qs.toString()}` : ""}`, {
+      const r = await apiFetch(`${REST_URL}/api/me/moderation_history${qs.toString() ? `?${qs.toString()}` : ""}`, {
         headers: { "Authorization": `Bearer ${TOKEN}` },
       });
       const text = await r.text();
@@ -1867,7 +1892,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { limit = 20 } = args as { limit?: number };
     const capped = Math.max(1, Math.min(Number(limit) || 20, 100));
     try {
-      const r = await fetch(`${REST_URL}/api/me/reports_submitted?limit=${capped}`, {
+      const r = await apiFetch(`${REST_URL}/api/me/reports_submitted?limit=${capped}`, {
         headers: { "Authorization": `Bearer ${TOKEN}` },
       });
       const text = await r.text();
@@ -1916,7 +1941,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     try {
       const params = new URLSearchParams({ q: query, limit: "20" });
       if (channel_id) params.set("channel_id", channel_id);
-      const r = await fetch(`${REST_URL}/api/search?${params}`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
+      const r = await apiFetch(`${REST_URL}/api/search?${params}`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
       if (!r.ok) {
         return { content: [{ type: "text", text: `Search failed (${r.status})` }], isError: true };
       }
@@ -1970,7 +1995,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   async function channelBrief(chatId: string): Promise<string> {
     const get = async (path: string) => {
       try {
-        const r = await fetch(`${REST_URL}${path}`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
+        const r = await apiFetch(`${REST_URL}${path}`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
         return r.ok ? await r.json() as any : null;
       } catch { return null; }
     };
@@ -2037,7 +2062,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     // Verify by checking membership
     try {
       await new Promise(r => setTimeout(r, 500)); // wait for server to process
-      const r = await fetch(`${REST_URL}/api/channels/${encodeURIComponent(chat_id)}/members`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
+      const r = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(chat_id)}/members`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
       if (r.ok) {
         const data = await r.json() as any;
         const isMember = (data.members || []).some((m: any) => m.agent_id === AGENT_ID);
@@ -2059,7 +2084,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     // fall through to WS leave_channel if REST is unreachable so existing
     // server-side WS handler still fires and updates in-memory state.
     try {
-      const r = await fetch(`${REST_URL}/api/channels/${encodeURIComponent(chat_id)}/leave`, {
+      const r = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(chat_id)}/leave`, {
         method: "POST",
         headers: { "Authorization": `Bearer ${TOKEN}`, "Content-Type": "application/json" },
         body: "{}",
@@ -2103,7 +2128,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   if (name === "hidden_identity_join") {
     const { game_id } = args as any;
     try {
-      const r = await fetch(`${REST_URL}/api/hidden-identity/games/${encodeURIComponent(game_id)}/join`, {
+      const r = await apiFetch(`${REST_URL}/api/hidden-identity/games/${encodeURIComponent(game_id)}/join`, {
         method: "POST",
         headers: { "Authorization": `Bearer ${TOKEN}`, "Content-Type": "application/json" },
         body: "{}",
@@ -2125,7 +2150,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   if (name === "hidden_identity_get_secret") {
     const { game_id } = args as any;
     try {
-      const r = await fetch(`${REST_URL}/api/hidden-identity/games/${encodeURIComponent(game_id)}/secret`, {
+      const r = await apiFetch(`${REST_URL}/api/hidden-identity/games/${encodeURIComponent(game_id)}/secret`, {
         headers: { "Authorization": `Bearer ${TOKEN}` },
       });
       const data = await r.json().catch(() => ({})) as any;
@@ -2166,7 +2191,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     try {
       const body: any = { target_id };
       if (typeof reason === "string" && reason) body.reason = reason;
-      const r = await fetch(`${REST_URL}/api/hidden-identity/games/${encodeURIComponent(game_id)}/vote`, {
+      const r = await apiFetch(`${REST_URL}/api/hidden-identity/games/${encodeURIComponent(game_id)}/vote`, {
         method: "POST",
         headers: { "Authorization": `Bearer ${TOKEN}`, "Content-Type": "application/json" },
         body: JSON.stringify(body),
@@ -2184,7 +2209,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   if (name === "hidden_identity_advance") {
     const { game_id, to } = args as any;
     try {
-      const r = await fetch(`${REST_URL}/api/hidden-identity/games/${encodeURIComponent(game_id)}/advance`, {
+      const r = await apiFetch(`${REST_URL}/api/hidden-identity/games/${encodeURIComponent(game_id)}/advance`, {
         method: "POST",
         headers: { "Authorization": `Bearer ${TOKEN}`, "Content-Type": "application/json" },
         body: JSON.stringify({ to }),
@@ -2203,7 +2228,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   if (name === "hidden_identity_get_state") {
     const { game_id } = args as any;
     try {
-      const r = await fetch(`${REST_URL}/api/hidden-identity/games/${encodeURIComponent(game_id)}`, {
+      const r = await apiFetch(`${REST_URL}/api/hidden-identity/games/${encodeURIComponent(game_id)}`, {
         headers: { "Authorization": `Bearer ${TOKEN}` },
       });
       const data = await r.json().catch(() => ({})) as any;
@@ -2240,7 +2265,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     let healthLine = "REST health: unknown";
     let authLine = "REST auth: unknown";
     try {
-      const r = await fetch(`${REST_URL}/health`);
+      const r = await apiFetch(`${REST_URL}/health`);
       if (r.ok) {
         const h = await r.json() as any;
         const build = h?.build ? ` build=${h.build}` : "";
@@ -2253,7 +2278,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       healthLine = `REST health: error (${String(e?.message || e).slice(0, 80)})`;
     }
     try {
-      const r = await fetch(`${REST_URL}/api/account/${encodeURIComponent(AGENT_ID)}`, {
+      const r = await apiFetch(`${REST_URL}/api/account/${encodeURIComponent(AGENT_ID)}`, {
         headers: TOKEN ? { "Authorization": `Bearer ${TOKEN}` } : {},
       });
       authLine = r.ok ? "REST auth: ok" : `REST auth: failed (${r.status})`;
@@ -2266,7 +2291,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   if (name === "list_channels") {
     const { limit = 50 } = args as any;
     try {
-      const r = await fetch(`${REST_URL}/api/channels/discover?limit=${Math.max(1, Math.min(Number(limit) || 50, 500))}`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
+      const r = await apiFetch(`${REST_URL}/api/channels/discover?limit=${Math.max(1, Math.min(Number(limit) || 50, 500))}`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
       if (r.ok) {
         const data = await r.json() as any;
         const channels = (data.channels || []);
@@ -2296,7 +2321,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       // DMs). DM channel ids are deterministic on iOS but the source of
       // truth for "does this DM exist between us" is server membership,
       // so we list + filter rather than replay the hash.
-      const r = await fetch(`${REST_URL}/api/channels/mine`, {
+      const r = await apiFetch(`${REST_URL}/api/channels/mine`, {
         headers: { "Authorization": `Bearer ${TOKEN}` },
       });
       if (!r.ok) {
@@ -2309,7 +2334,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       for (const ch of channels) {
         if (ch?.type !== "direct") continue;
         try {
-          const mr = await fetch(`${REST_URL}/api/channels/${encodeURIComponent(ch.id)}/members`, {
+          const mr = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(ch.id)}/members`, {
             headers: { "Authorization": `Bearer ${TOKEN}` },
           });
           if (!mr.ok) continue;
@@ -2328,7 +2353,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
   if (name === "list_loops") {
     try {
-      const r = await fetch(`${REST_URL}/api/loops/mine`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
+      const r = await apiFetch(`${REST_URL}/api/loops/mine`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
       if (!r.ok) return { content: [{ type: "text", text: `Failed (${r.status})` }] };
       const data = await r.json() as any;
       const loops = Array.isArray(data?.loops) ? data.loops : [];
@@ -2346,7 +2371,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
   if (name === "my_entitlements") {
     try {
-      const r = await fetch(`${REST_URL}/api/me/entitlements`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
+      const r = await apiFetch(`${REST_URL}/api/me/entitlements`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
       if (!r.ok) return { content: [{ type: "text", text: `Failed (${r.status})` }] };
       const data = await r.json() as any;
       return { content: [{ type: "text", text: JSON.stringify(data) }] };
@@ -2365,7 +2390,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   if (name === "list_members") {
     const { chat_id } = args as any;
     try {
-      const r = await fetch(`${REST_URL}/api/channels/${encodeURIComponent(chat_id)}/members`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
+      const r = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(chat_id)}/members`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
       if (r.ok) {
         const data = await r.json() as any;
         const members = data.members || [];
@@ -2382,7 +2407,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   if (name === "get_history") {
     const { chat_id, limit = 20 } = args as any;
     try {
-      const r = await fetch(`${REST_URL}/api/channels/${encodeURIComponent(chat_id)}/messages?limit=${Math.max(1, Math.min(Number(limit) || 20, 100))}`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
+      const r = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(chat_id)}/messages?limit=${Math.max(1, Math.min(Number(limit) || 20, 100))}`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
       if (r.ok) {
         const data = await r.json() as any;
         const msgs = (data.messages || []).filter((m: any) => m.content !== "__typing__");
@@ -2457,7 +2482,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     if (normalizedLevel !== null) qs.set("level", String(normalizedLevel));
     const url = `${REST_URL}/api/channels/${encodeURIComponent(chat_id)}/docs${qs.toString() ? `?${qs}` : ""}`;
     try {
-      const r = await fetch(url, { headers: { "Authorization": `Bearer ${TOKEN}` } });
+      const r = await apiFetch(url, { headers: { "Authorization": `Bearer ${TOKEN}` } });
       const text = await r.text();
       if (!r.ok) {
         return { content: [{ type: "text", text: `list_channel_docs failed (${r.status}): ${text.slice(0, 200)}` }], isError: true };
@@ -2471,7 +2496,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   if (name === "get_channel_doc") {
     const { chat_id, doc_id } = args as { chat_id: string; doc_id: string };
     try {
-      const r = await fetch(`${REST_URL}/api/channels/${encodeURIComponent(chat_id)}/docs/${encodeURIComponent(doc_id)}`, {
+      const r = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(chat_id)}/docs/${encodeURIComponent(doc_id)}`, {
         headers: { "Authorization": `Bearer ${TOKEN}` },
       });
       const text = await r.text();
@@ -2499,7 +2524,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       return { content: [{ type: "text", text: "upsert_channel_doc failed: level must be 1|2|3|4" }], isError: true };
     }
     try {
-      const r = await fetch(`${REST_URL}/api/channels/${encodeURIComponent(chat_id)}/docs/${encodeURIComponent(doc_id)}`, {
+      const r = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(chat_id)}/docs/${encodeURIComponent(doc_id)}`, {
         method: "PUT",
         headers: {
           "Content-Type": "application/json",
@@ -2521,7 +2546,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   if (name === "list_channel_doc_revisions") {
     const { chat_id, doc_id } = args as { chat_id: string; doc_id: string };
     try {
-      const r = await fetch(`${REST_URL}/api/channels/${encodeURIComponent(chat_id)}/docs/${encodeURIComponent(doc_id)}/revisions`, {
+      const r = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(chat_id)}/docs/${encodeURIComponent(doc_id)}/revisions`, {
         headers: { "Authorization": `Bearer ${TOKEN}` },
       });
       const text = await r.text();
@@ -2548,7 +2573,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     if (task_id) qs.set("task_id", task_id);
     const url = `${REST_URL}/api/okr/objectives${qs.toString() ? "?" + qs.toString() : ""}`;
     try {
-      const r = await fetch(url, { headers: { "Authorization": `Bearer ${TOKEN}` } });
+      const r = await apiFetch(url, { headers: { "Authorization": `Bearer ${TOKEN}` } });
       if (!r.ok) {
         const err = await r.text();
         return { content: [{ type: "text", text: `okr_list failed (${r.status}): ${err.slice(0, 120)}` }], isError: true };
@@ -2570,7 +2595,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     if (due) body.due = due;
     if (discussion_channel_id) body.discussion_channel_id = discussion_channel_id;
     try {
-      const r = await fetch(`${REST_URL}/api/okr/objectives`, {
+      const r = await apiFetch(`${REST_URL}/api/okr/objectives`, {
         method: "POST",
         headers: { "Content-Type": "application/json", "Authorization": `Bearer ${TOKEN}` },
         body: JSON.stringify(body),
@@ -2594,7 +2619,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     if (Array.isArray(depends_on) && depends_on.length > 0) body.depends_on = depends_on;
     if (due) body.due = due;
     try {
-      const r = await fetch(`${REST_URL}/api/okr/objectives/${encodeURIComponent(objective_id)}/tasks`, {
+      const r = await apiFetch(`${REST_URL}/api/okr/objectives/${encodeURIComponent(objective_id)}/tasks`, {
         method: "POST",
         headers: { "Content-Type": "application/json", "Authorization": `Bearer ${TOKEN}` },
         body: JSON.stringify(body),
@@ -2619,7 +2644,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     if (Array.isArray(depends_on)) patch.depends_on = depends_on;
     if (due) patch.due = due;
     try {
-      const r = await fetch(`${REST_URL}/api/okr/tasks/${encodeURIComponent(task_id)}`, {
+      const r = await apiFetch(`${REST_URL}/api/okr/tasks/${encodeURIComponent(task_id)}`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json", "Authorization": `Bearer ${TOKEN}` },
         body: JSON.stringify(patch),
@@ -2638,7 +2663,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { task_id } = args as { task_id: string };
     const path = name === "okr_task_blockers" ? "blockers" : "blocks";
     try {
-      const r = await fetch(`${REST_URL}/api/okr/tasks/${encodeURIComponent(task_id)}/${path}`, {
+      const r = await apiFetch(`${REST_URL}/api/okr/tasks/${encodeURIComponent(task_id)}/${path}`, {
         headers: { "Authorization": `Bearer ${TOKEN}` },
       });
       const text = await r.text();
@@ -2654,7 +2679,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   if (name === "okr_open_thread") {
     const { target_type, target_id } = args as { target_type: string; target_id: string };
     try {
-      const r = await fetch(`${REST_URL}/api/okr/threads`, {
+      const r = await apiFetch(`${REST_URL}/api/okr/threads`, {
         method: "POST",
         headers: { "Content-Type": "application/json", "Authorization": `Bearer ${TOKEN}` },
         body: JSON.stringify({ target_type, target_id }),
@@ -2677,7 +2702,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     if (typeof current === "number") body.current = current;
     if (risk_level) body.risk_level = risk_level;
     try {
-      const r = await fetch(`${REST_URL}/api/okr/objectives/${encodeURIComponent(objective_id)}/krs`, {
+      const r = await apiFetch(`${REST_URL}/api/okr/objectives/${encodeURIComponent(objective_id)}/krs`, {
         method: "POST",
         headers: { "Content-Type": "application/json", "Authorization": `Bearer ${TOKEN}` },
         body: JSON.stringify(body),
@@ -2695,7 +2720,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   if (name === "archive_objective") {
     const { objective_id, completion_summary } = args as { objective_id: string; completion_summary?: string };
     try {
-      const r = await fetch(`${REST_URL}/api/okr/objectives/${encodeURIComponent(objective_id)}/archive`, {
+      const r = await apiFetch(`${REST_URL}/api/okr/objectives/${encodeURIComponent(objective_id)}/archive`, {
         method: "POST",
         headers: { "Content-Type": "application/json", "Authorization": `Bearer ${TOKEN}` },
         body: JSON.stringify(completion_summary !== undefined ? { completion_summary } : {}),
@@ -2713,7 +2738,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   if (name === "unarchive_objective") {
     const { objective_id } = args as { objective_id: string };
     try {
-      const r = await fetch(`${REST_URL}/api/okr/objectives/${encodeURIComponent(objective_id)}/unarchive`, {
+      const r = await apiFetch(`${REST_URL}/api/okr/objectives/${encodeURIComponent(objective_id)}/unarchive`, {
         method: "POST",
         headers: { "Content-Type": "application/json", "Authorization": `Bearer ${TOKEN}` },
       });
@@ -2732,7 +2757,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const body: Record<string, unknown> = { current };
     if (risk_level) body.risk_level = risk_level;
     try {
-      const r = await fetch(`${REST_URL}/api/okr/krs/${encodeURIComponent(kr_id)}/progress`, {
+      const r = await apiFetch(`${REST_URL}/api/okr/krs/${encodeURIComponent(kr_id)}/progress`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json", "Authorization": `Bearer ${TOKEN}` },
         body: JSON.stringify(body),
@@ -2751,7 +2776,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { task_id, text: rawText } = args as { task_id: string; text: string };
     const text = redactSecrets(rawText);
     try {
-      const r = await fetch(`${REST_URL}/api/okr/tasks/${encodeURIComponent(task_id)}/comments`, {
+      const r = await apiFetch(`${REST_URL}/api/okr/tasks/${encodeURIComponent(task_id)}/comments`, {
         method: "POST",
         headers: { "Content-Type": "application/json", "Authorization": `Bearer ${TOKEN}` },
         body: JSON.stringify({ text }),
@@ -2783,7 +2808,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     if (linked_docs !== undefined) body.linked_docs = linked_docs;
     if (linked_channel_docs !== undefined) body.linked_channel_docs = linked_channel_docs;
     try {
-      const r = await fetch(`${REST_URL}/api/okr/links/${encodeURIComponent(target_type)}/${encodeURIComponent(target_id)}`, {
+      const r = await apiFetch(`${REST_URL}/api/okr/links/${encodeURIComponent(target_type)}/${encodeURIComponent(target_id)}`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json", "Authorization": `Bearer ${TOKEN}` },
         body: JSON.stringify(body),
@@ -2977,7 +3002,7 @@ function activateHiddenIdentityGame(gameId: string, channelId?: string) {
 
 async function fetchHiddenIdentityChannelId(gameId: string): Promise<string | undefined> {
   try {
-    const r = await fetch(`${REST_URL}/api/hidden-identity/games/${encodeURIComponent(gameId)}`, {
+    const r = await apiFetch(`${REST_URL}/api/hidden-identity/games/${encodeURIComponent(gameId)}`, {
       headers: { "Authorization": `Bearer ${TOKEN}` },
     });
     if (!r.ok) return undefined;
@@ -3086,7 +3111,7 @@ async function backfillAllChannels(): Promise<void> {
       const after = lastSeenMessageTs.get(channelId);
       const params = after ? `?after=${encodeURIComponent(after)}&limit=50` : `?limit=1`;
       const url = `${REST_URL}/api/channels/${encodeURIComponent(channelId)}/messages${params}`;
-      const res = await fetch(url, {
+      const res = await apiFetch(url, {
         headers: TOKEN ? { "Authorization": `Bearer ${TOKEN}` } : {},
       });
       if (!res.ok) continue;
@@ -3322,7 +3347,7 @@ function connectWS() {
             // membership for private). Without the Bearer header the
             // MCP agent would get 401/403 and answer the @mention
             // without any conversation context.
-            const historyRes = await fetch(historyUrl, {
+            const historyRes = await apiFetch(historyUrl, {
               headers: TOKEN ? { "Authorization": `Bearer ${TOKEN}` } : {},
             });
             if (historyRes.ok) {
