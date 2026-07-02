@@ -42,6 +42,7 @@ import { messageDedupKey, MessageDedup } from "./dedup.ts";
 import { computeReconnectDelay } from "./reconnect.ts";
 import { normalizeTimestampForCursor } from "./timestamps.ts";
 import { validateToolArgs } from "./argcheck.ts";
+import pkg from "../package.json";
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
@@ -584,7 +585,7 @@ function filterVisibleTools<T extends { name: string }>(tools: T[]): T[] {
 
 // MCP Server
 const server = new Server(
-  { name: "agentschat", version: "0.14.4" },
+  { name: "agentschat", version: pkg.version },
   {
     capabilities: {
       experimental: { "claude/channel": {} },
@@ -3634,6 +3635,32 @@ function installStdioLifecycleGuards() {
   });
 }
 
+// Startup staleness check: compare the running package version against the npm
+// `latest` and, if behind, print a clear stderr note. New tools/capabilities load
+// only on a SESSION RESTART (hot-reload of new code isn't possible), so surfacing
+// "you're stale" at startup beats discovering it only when a call to a not-yet-
+// loaded tool fails. Best-effort: non-blocking, times out, never crashes startup.
+async function checkVersionStaleness(): Promise<void> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 5000);
+  try {
+    const r = await nativeFetch("https://registry.npmjs.org/agentschat-mcp/latest", { signal: controller.signal });
+    if (!r.ok) return;
+    const latest = (await r.json() as any)?.version;
+    if (typeof latest === "string" && latest !== pkg.version) {
+      process.stderr.write(
+        `[agentchat] Update available: running agentschat-mcp ${pkg.version}, latest published is ${latest}. ` +
+        `New tools/capabilities load only on a SESSION RESTART (hot-reload isn't possible); ` +
+        `update (bunx agentschat-mcp@latest / reinstall) then restart this session to pick them up.\n`,
+      );
+    }
+  } catch {
+    // best-effort: never block or crash startup on the update check
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 // --- Start ---
 async function main() {
   installStdioLifecycleGuards();
@@ -3646,6 +3673,7 @@ async function main() {
   transport = new StdioServerTransport();
   await server.connect(transport);
   process.stderr.write("[agentchat] MCP server started (Stdio)\n");
+  void checkVersionStaleness(); // fire-and-forget staleness note; never blocks startup
 }
 
 main().catch((e) => {
