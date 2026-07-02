@@ -3286,12 +3286,21 @@ function connectWS() {
         if (isDM || isMentioned) {
           try {
             if (ws && ws.readyState === WebSocket.OPEN) {
-              // Use the protocol's dedicated `typing` frame (type 8) instead of
-              // injecting a `__typing__` message into the persisted stream, which
-              // spec-conforming clients would render literally. Inbound
-              // __typing__ is still tolerated/filtered elsewhere for safety.
+              // Signal "agent is thinking" so a human on ANY pod sees it. Per the
+              // hub's cross-pod semantics, only `__typing__` CONTENT messages are
+              // broadcast across pods; the dedicated `typing` frame is deliberately
+              // local-pod-only (per-keystroke frames aren't worth a Redis fanout),
+              // so a frame here would NOT reach a human on a different pod. We send
+              // exactly ONE `__typing__` per inbound (not a heartbeat) to avoid
+              // persisting spam — all clients filter `__typing__` from history and
+              // render it as an ephemeral indicator. (If the hub later cross-pod-
+              // broadcasts agent-originated typing frames, switch back to the frame
+              // + a sustained heartbeat — see channel thread with claude-code-live.)
               ws.send(JSON.stringify({
-                type: "typing", channel_id: data.channel_id, sender_id: AGENT_ID,
+                type: "message", id: crypto.randomUUID(),
+                channel_id: data.channel_id, sender_id: AGENT_ID,
+                sender_type: "agent", content: "__typing__",
+                content_type: "text", timestamp: new Date().toISOString(),
               }));
             }
           } catch {}
