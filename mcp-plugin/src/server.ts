@@ -298,6 +298,47 @@ try {
 } catch {}
 
 let ws: WebSocket | null = null;
+
+// ── Agent "thinking" typing heartbeat ────────────────────────────────────────
+// While we process an inbound DM/@mention, pulse a cross-pod ephemeral typing
+// frame (~2s) so a human on ANY pod sees the agent think for the whole duration.
+// cross_pod:true → the hub fans out via publishToRemoteInstances; typing frames
+// are never persisted (deliverLocalOnly), so this is zero-write. Rate 2s ≪ the
+// per-agent 30/10s WS inbound cap. Stops when we reply to the channel, at a
+// safety cap, or on shutdown — all timers tracked, so no leak. Survives a brief
+// reconnect (frames no-op while the socket is down, resume on the new socket).
+const TYPING_HEARTBEAT_MS = 2_000;
+const TYPING_HEARTBEAT_MAX_MS = 120_000;
+const typingHeartbeats = new Map<string, { interval: ReturnType<typeof setInterval>; cap: ReturnType<typeof setTimeout> }>();
+function sendTypingFrame(channelId: string) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    try {
+      ws.send(JSON.stringify({ type: "typing", channel_id: channelId, sender_id: AGENT_ID, cross_pod: true }));
+    } catch {}
+  }
+}
+function startTypingHeartbeat(channelId: string) {
+  if (!channelId) return;
+  stopTypingHeartbeat(channelId); // reset if one is already running for this channel
+  sendTypingFrame(channelId); // immediate first pulse
+  const interval = setInterval(() => sendTypingFrame(channelId), TYPING_HEARTBEAT_MS);
+  const cap = setTimeout(() => stopTypingHeartbeat(channelId), TYPING_HEARTBEAT_MAX_MS);
+  typingHeartbeats.set(channelId, { interval, cap });
+}
+function stopTypingHeartbeat(channelId: string) {
+  const h = typingHeartbeats.get(channelId);
+  if (!h) return;
+  clearInterval(h.interval);
+  clearTimeout(h.cap);
+  typingHeartbeats.delete(channelId);
+}
+function stopAllTypingHeartbeats() {
+  for (const h of typingHeartbeats.values()) {
+    clearInterval(h.interval);
+    clearTimeout(h.cap);
+  }
+  typingHeartbeats.clear();
+}
 let sessionId: string | null = null;
 let shuttingDown = false;
 let transport: StdioServerTransport | null = null;
@@ -1699,6 +1740,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
   if (name === "reply") {
     const { chat_id, text: rawText } = args as { chat_id: string; text: string };
+    stopTypingHeartbeat(chat_id); // we're answering this channel → stop the "thinking" pulse
     // Order: resolve bare @<display_name> to paren form FIRST (so the
     // receiving MCP plugin's regex triggers), then redact secrets so
     // an accidental `ac_xxx` in the text gets masked regardless of
@@ -1743,6 +1785,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         type: "typing",
         channel_id: chat_id,
         sender_id: AGENT_ID,
+        cross_pod: true, // agent-originated → hub fans out cross-pod (humans on other pods see it)
       }));
     }
     return { content: [{ type: "text", text: "Typing indicator dispatched" }] };
@@ -3306,30 +3349,12 @@ function connectWS() {
       const activeHi = activeHiddenIdentityForChannel(data.channel_id);
 
       if (isDM || isMentioned || activeHi) {
-        // DM or @mention → respond
-        // 立即发送 typing ACK
-        if (isDM || isMentioned) {
-          try {
-            if (ws && ws.readyState === WebSocket.OPEN) {
-              // Signal "agent is thinking" so a human on ANY pod sees it. Per the
-              // hub's cross-pod semantics, only `__typing__` CONTENT messages are
-              // broadcast across pods; the dedicated `typing` frame is deliberately
-              // local-pod-only (per-keystroke frames aren't worth a Redis fanout),
-              // so a frame here would NOT reach a human on a different pod. We send
-              // exactly ONE `__typing__` per inbound (not a heartbeat) to avoid
-              // persisting spam — all clients filter `__typing__` from history and
-              // render it as an ephemeral indicator. (If the hub later cross-pod-
-              // broadcasts agent-originated typing frames, switch back to the frame
-              // + a sustained heartbeat — see channel thread with claude-code-live.)
-              ws.send(JSON.stringify({
-                type: "message", id: crypto.randomUUID(),
-                channel_id: data.channel_id, sender_id: AGENT_ID,
-                sender_type: "agent", content: "__typing__",
-                content_type: "text", timestamp: new Date().toISOString(),
-              }));
-            }
-          } catch {}
-        }
+        // DM or @mention → respond. Start a cross-pod typing heartbeat so a human
+        // on any pod sees the agent "thinking" for the whole processing duration.
+        // The hub now cross-pod-broadcasts agent typing frames (cross_pod:true)
+        // and never persists them, so this is ephemeral + zero-write. Stops when
+        // we reply to the channel (reply handler), at the 120s cap, or on shutdown.
+        if (isDM || isMentioned) startTypingHeartbeat(data.channel_id);
 
         // For @mention in channels, fetch context since last mention
         let contextPrefix = "";
@@ -3503,6 +3528,7 @@ function shutdownFromStdio(reason: string) {
   safeStderrWrite(`[agentchat] Stdio closed (${reason}), shutting down\n`);
   try { flushLastSeenMessageTs(); } catch {}
   try { heartbeat.stop(); } catch {}
+  try { stopAllTypingHeartbeats(); } catch {}
   if (reconnectTimer) {
     clearTimeout(reconnectTimer);
     reconnectTimer = null;
