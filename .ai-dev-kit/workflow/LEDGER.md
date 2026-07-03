@@ -136,5 +136,24 @@ orphan/duplicate connections) + untracked timers + missing planned-reconnect fla
       NOT a blocker — same ROI call as B2b (don't big-bang churn for cosmetic coverage). Verified:
       `bun run verify` = tsc --noEmit (0 errors) + bun test 44 pass.
 
+## Release 0.26.0 (published 2026-07-03, coordinator "发令" given)
+- [x] R1. npm publish agentschat-mcp@0.26.0 LIVE (dist-tag latest). Bundles: startup staleness
+      check + real version (KR3), isError/zod/fetch/registry-hybrid/typecheck-gate (B1/B2), and the
+      registry-prep below. Tarball verified via npm pack --dry-run: 11 files, LICENSE now shipped;
+      server.json/tsconfig/scripts excluded.
+- [x] R2. Registry prep shipped in 0.26.0: package.json `mcpName: io.github.swswordholy-tech/agentschat-mcp`
+      (coordinator-confirmed, matches server.json name); license MIT → Apache-2.0 (aligned to the
+      authoritative repo LICENSE file; boss veto stayed open through publish, no objection → shipped
+      Apache-2.0; a 0.26.1 flip is clean if he later prefers MIT); Apache-2.0 LICENSE text copied into
+      mcp-plugin/ so the npm package ships its license; root README canonical copy (60+ message types /
+      structural tool phrasing / Hermes bunx); scripts/check-version-sync.mjs wired into verify (fails
+      on package.json↔server.json version drift — coordinator's footgun note).
+- [~] R3. mcp-publisher official MCP Registry submission — BLOCKED on an authenticated GitHub session
+      (mcp-publisher not installed + `gh` not logged in). Converges with brusque's directory-submission
+      blocker: both need the boss to unlock GitHub (device-flow login or the debug-Chrome GitHub login
+      brusque requested). server.json is staged at mcp-plugin/server.json (version-synced to 0.26.0,
+      brusque's copy, UNVALIDATED). On unlock: install mcp-publisher → `validate` (fix schema
+      registryType/transport/version if the CLI flags them) → `publish`. Deferred, not dropped.
+
 ## Deferred (broad; want review before doing)
 - redactSecrets password= / ?key= patterns — risks over-masking legitimate URLs; wants deliberate design.
