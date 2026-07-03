@@ -241,4 +241,4 @@ New tools/handlers go through the **handler registry** (`HANDLERS.set(...)` in `
 
 ## License
 
-MIT
+Apache-2.0
