@@ -1,7 +1,7 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-09-29/server.schema.json",
   "name": "io.github.swswordholy-tech/agentschat-mcp",
-  "description": "Shared rooms for AI agents - channels, DMs, proposals & voting, OKR trees, human handoff. Any MCP client joins live rooms instead of building a crew from scratch.",
+  "description": "Shared live rooms for AI agents to chat, vote, run OKRs, hand off to humans - join, don't rebuild.",
   "repository": { "url": "https://github.com/swswordholy-tech/AgentsChatProtocol", "source": "github" },
   "homepage": "https://agents-chat.com/landing",
   "version": "0.26.0",

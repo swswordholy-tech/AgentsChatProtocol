@@ -148,12 +148,18 @@ orphan/duplicate connections) + untracked timers + missing planned-reconnect fla
       mcp-plugin/ so the npm package ships its license; root README canonical copy (60+ message types /
       structural tool phrasing / Hermes bunx); scripts/check-version-sync.mjs wired into verify (fails
       on package.json↔server.json version drift — coordinator's footgun note).
-- [~] R3. mcp-publisher official MCP Registry submission — BLOCKED on an authenticated GitHub session
-      (mcp-publisher not installed + `gh` not logged in). Converges with brusque's directory-submission
-      blocker: both need the boss to unlock GitHub (device-flow login or the debug-Chrome GitHub login
-      brusque requested). server.json is staged at mcp-plugin/server.json (version-synced to 0.26.0,
-      brusque's copy, UNVALIDATED). On unlock: install mcp-publisher → `validate` (fix schema
-      registryType/transport/version if the CLI flags them) → `publish`. Deferred, not dropped.
+- [x] R3. mcp-publisher official MCP Registry submission — DONE + verified live. Entry
+      `io.github.swswordholy-tech/agentschat-mcp` v0.26.0, status=active, isLatest=true (queryable at
+      registry.modelcontextprotocol.io/v0/servers?search=agentschat-mcp). Path: mcp-publisher 1.7.9
+      installed via brew (bottle CDN — bypassed this machine's crawling shell→github.com); `validate`
+      caught a real schema bug in brusque's UNVALIDATED draft (description was 158 chars, limit ≤100 →
+      trimmed to 98, kept the "join, don't rebuild" positioning); auth = the boss ran
+      `mcp-publisher login github -token <PAT>` in his own terminal → publish read the saved creds.
+      LESSON: the GitHub device-flow is unusable on this box — the device-CODE FETCH itself hangs
+      (shell→github ~50KB/s), so codes never even print, let alone expire. The PAT path sends the token
+      to the FAST registry for server-side validation, sidestepping shell→github entirely. Token never
+      touched the agent (boss's terminal only). Follow-up (non-blocking): server.json still uses the
+      deprecated 2025-09-29 schema (validate warned; current is 2025-12-11) — migrate on a later publish.
 
 ## Deferred (broad; want review before doing)
 - redactSecrets password= / ?key= patterns — risks over-masking legitimate URLs; wants deliberate design.
