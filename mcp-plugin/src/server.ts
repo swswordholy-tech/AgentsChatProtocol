@@ -455,6 +455,7 @@ const CORE_TOOL_NAMES = new Set([
   "reply",
   "whoami",
   "list_channels",
+  "list_my_channels",
   "find_dm",
   "get_history",
   "list_members",
@@ -1026,11 +1027,21 @@ const ALL_TOOL_DEFS = [
     },
     {
       name: "list_channels",
-      description: "List channels you can access. Shows name, member count, and topic.",
+      description: "Browse PUBLIC channels (discovery) — NOT your membership list. Shows name, member count, and topic. For the channels you've actually joined (including DMs), use list_my_channels instead.",
       inputSchema: {
         type: "object" as const,
         properties: {
           limit: { type: "number", description: "Max results (default 50)" },
+        },
+      },
+    },
+    {
+      name: "list_my_channels",
+      description: "List the channels YOU have joined (your actual membership), including DMs — distinct from list_channels, which only browses public channels. Use it to confirm you're a member of a channel before posting, or to see where your messages can go. Shows id, name, type (channel/DM), and member count.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          type: { type: "string", description: "Filter by type: 'all' (default), 'channel', or 'direct' (DMs only)" },
         },
       },
     },
@@ -1480,6 +1491,30 @@ HANDLERS.set("okr_reparent_objective", async (args) => {
     return { content: [{ type: "text", text: `Reparented: ${text}` }] };
   } catch (e: any) {
     return { content: [{ type: "text", text: `okr_reparent_objective network error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
+  }
+});
+
+// list_my_channels — the caller's actual membership (channels + DMs) from
+// /api/channels/mine, distinct from list_channels (public discovery). Registered
+// here per the frozen-registry policy; new tools never join the legacy if-chain.
+HANDLERS.set("list_my_channels", async (args) => {
+  const filter = (((args || {}) as { type?: string }).type || "all").toLowerCase();
+  try {
+    const r = await apiFetch(`${REST_URL}/api/channels/mine`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
+    if (!r.ok) return { content: [{ type: "text", text: `Failed to list your channels (${r.status})` }], isError: true };
+    const data = await r.json() as any;
+    let channels = Array.isArray(data?.channels) ? data.channels : [];
+    if (filter === "channel") channels = channels.filter((c: any) => c?.type !== "direct");
+    else if (filter === "direct") channels = channels.filter((c: any) => c?.type === "direct");
+    if (channels.length === 0) {
+      return { content: [{ type: "text", text: filter === "all" ? "You haven't joined any channels yet." : `No ${filter} channels in your memberships.` }] };
+    }
+    const list = channels.map((ch: any) =>
+      `• [${ch?.type === "direct" ? "DM" : "channel"}] ${ch?.name || ch?.id} (${ch?.id})${ch?.member_count != null ? ` — ${ch.member_count} members` : ""}`
+    ).join("\n");
+    return { content: [{ type: "text", text: `${channels.length} joined:\n${list}` }] };
+  } catch (e: any) {
+    return { content: [{ type: "text", text: `Error listing your channels: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
   }
 });
 
