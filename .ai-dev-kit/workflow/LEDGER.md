@@ -161,7 +161,7 @@ orphan/duplicate connections) + untracked timers + missing planned-reconnect fla
       touched the agent (boss's terminal only). Follow-up (non-blocking): server.json still uses the
       deprecated 2025-09-29 schema (validate warned; current is 2025-12-11) — migrate on a later publish.
 
-## Release 0.27.0 — onboarding funnel batch (npm LIVE 2026-07-05; Registry pending JWT re-auth)
+## Release 0.27.0 — onboarding funnel batch (npm + official Registry LIVE 2026-07-05)
 Motivation: GEO/lead-gen — agents install the plugin but their humans never find the website to
 claim them (agent stuck rate-limited + DM-locked). Coordinator opened the hub gate (unclaimed agents
 can post in PUBLIC channels, 30/hr; message_ack carries claim导流); this batch is the plugin-side half
@@ -187,13 +187,16 @@ hub read path proven clean (Firestore direct query, zero drift), the bug was our
       unclaimed + channel_brief not-a-member paths confirmed rendering correctly.
 - [x] npm publish (coordinator 发令 2026-07-05): agentschat-mcp@0.27.0 LIVE, dist-tags.latest=0.27.0
       verified; tarball 11 files clean (npm pack --dry-run). Irreversible/done.
-- [ ] mcp-publisher registry publish: BLOCKED on 401 "Registry JWT expired" — the PAT-login JWT from the
-      0.26.0 session is short-lived and lapsed. server.json already 0.27.0. Needs boss/coordinator to
-      re-run `mcp-publisher login github -token <PAT>` in their OWN terminal (token red-line; creds persist
-      to a local file this session reads), then retry `mcp-publisher publish` (one command). Registry entry
-      stays active at 0.26.0 meanwhile — non-blocking for users (npm is the install path).
-      LESSON: the Registry JWT expires between releases — every publish after the first needs a fresh login,
-      not just the first-ever one.
+- [x] mcp-publisher registry publish: DONE + verified. io.github.swswordholy-tech/agentschat-mcp
+      version=0.27.0, status=active, isLatest=True, publishedAt 2026-07-05T05:36:00Z (0.26.0 → isLatest
+      false). Unblock: first attempt 401'd (Registry JWT from the 0.26.0 session had expired — JWTs are
+      short-lived); boss then provided his GitHub PAT directly and authorized saving it for self-serve
+      ("下次别再问我了"), overriding the earlier no-token-handling norm for his own credential. PAT stored
+      at ~/.config/agentschat-mcp/gh-pat (0600, outside any git repo, never echoed/committed); publish flow
+      is now `mcp-publisher login github -token "$(cat ~/.config/agentschat-mcp/gh-pat)"` then
+      `mcp-publisher publish` — self-serve, no re-ask.
+      LESSON: the Registry JWT expires between releases — every publish re-logins; the saved PAT makes that
+      a one-liner instead of a human round-trip.
 
 ## Deferred (broad; want review before doing)
 - redactSecrets password= / ?key= patterns — risks over-masking legitimate URLs; wants deliberate design.
