@@ -2421,15 +2421,34 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     } catch (e: any) {
       healthLine = `REST health: error (${String(e?.message || e).slice(0, 80)})`;
     }
+    let claimedLine = "Claimed: unknown";
+    let claimHint = "";
     try {
       const r = await apiFetch(`${REST_URL}/api/account/${encodeURIComponent(AGENT_ID)}`, {
         headers: TOKEN ? { "Authorization": `Bearer ${TOKEN}` } : {},
       });
       authLine = r.ok ? "REST auth: ok" : `REST auth: failed (${r.status})`;
+      if (r.ok) {
+        const acct = (await r.json().catch(() => null)) as any;
+        const claimed = acct?._claimed ?? acct?.claimed ?? (profile as any)?._claimed;
+        if (claimed) {
+          claimedLine = "Claimed: yes";
+        } else {
+          // Onboarding funnel: an unclaimed agent is READ-ONLY (posts 403). Surface
+          // that here so the human running the agent can act, instead of only a
+          // 403 with no hint. Never echo the raw agent key — prefer a server-issued
+          // shareable claim link if present, else point at the web room + first-run URL.
+          claimedLine = "Claimed: NO — READ-ONLY until a human owner claims you (posts return 403 UNCLAIMED_AGENT_READONLY).";
+          const claimUrl = acct?.claim_url || acct?.claimUrl;
+          claimHint = claimUrl
+            ? `  → Share this claim link with your owner: ${claimUrl}`
+            : `  → Your owner claims you at the Web chat link above (the one-time claim link was also printed to this process's stderr at first run).`;
+        }
+      }
     } catch (e: any) {
       authLine = `REST auth: error (${String(e?.message || e).slice(0, 80)})`;
     }
-    return { content: [{ type: "text", text: `Profile: ${profile.display_name || AGENT_ID}\nAgent ID: ${AGENT_ID}\nServer: ${REST_URL}\nWebSocket: ${wsState}${sessionId ? `\nSession: ${sessionId.slice(0, 12)}...` : ""}\n${healthLine}\n${authLine}\nCapabilities: ${CAPABILITIES.join(", ")}\nProfile file: ${profileFile}` }] };
+    return { content: [{ type: "text", text: `Profile: ${profile.display_name || AGENT_ID}\nAgent ID: ${AGENT_ID}\nServer: ${REST_URL}\nWeb chat: ${REST_URL}/chat/${encodeURIComponent(AGENT_ID)}\nWebSocket: ${wsState}${sessionId ? `\nSession: ${sessionId.slice(0, 12)}...` : ""}\n${healthLine}\n${authLine}\n${claimedLine}${claimHint ? `\n${claimHint}` : ""}\nCapabilities: ${CAPABILITIES.join(", ")}\nProfile file: ${profileFile}` }] };
   }
 
   if (name === "list_channels") {
