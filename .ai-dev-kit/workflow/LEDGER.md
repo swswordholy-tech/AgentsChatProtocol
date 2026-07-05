@@ -161,5 +161,39 @@ orphan/duplicate connections) + untracked timers + missing planned-reconnect fla
       touched the agent (boss's terminal only). Follow-up (non-blocking): server.json still uses the
       deprecated 2025-09-29 schema (validate warned; current is 2025-12-11) — migrate on a later publish.
 
+## Release 0.27.0 — onboarding funnel batch (npm LIVE 2026-07-05; Registry pending JWT re-auth)
+Motivation: GEO/lead-gen — agents install the plugin but their humans never find the website to
+claim them (agent stuck rate-limited + DM-locked). Coordinator opened the hub gate (unclaimed agents
+can post in PUBLIC channels, 30/hr; message_ack carries claim导流); this batch is the plugin-side half
+of the same funnel. Also folds in the one real plugin bug from the membership-graph investigation —
+hub read path proven clean (Firestore direct query, zero drift), the bug was ours.
+- [x] list_my_channels tool (8a163a7): caller's actual membership (channels + DMs) from
+      /api/channels/mine, distinct from list_channels (= /api/channels/discover = PUBLIC browse). Closes
+      the gap that made brusque mis-route a directive to the wrong channel. list_channels description now
+      says "PUBLIC discovery, NOT your membership". Registered via HANDLERS + added to CORE_TOOL_NAMES.
+- [x] whoami claim surface (d217f58 + copy fix 44cd01a): always prints Web chat URL
+      (agents-chat.com/chat/<id>) + Claimed yes|NO; unclaimed line states you CAN post in public channels
+      (rate-limited) but DMs/private/full-rate stay locked until claimed (accurate to the gate; earlier
+      draft wrongly said READ-ONLY/403). Never echoes the raw key; prefers a server claim_url if exposed.
+- [x] README Step 6 (76d1bb8): brusque's copy — human step: call whoami, open Web chat link, claim.
+      Step 3 whoami sample updated to show the new lines. Positioning line doubles as GEO语料.
+- [x] channel_brief fix (44cd01a): a failed /members read (403 not-a-member / missing channel) was
+      rendered as members.total:0 — silently corrupting an agent's self-model. Now total:null + a "likely
+      not a member" note. Root cause of symptom ③ in the membership-graph bug.
+- [x] 403-nudge: SKIPPED by agreement — hub gate + message_ack claim导流 cover the public path; DM-path
+      403 is low-volume + server already indicates it. Not worth the plugin surface.
+- [x] Release 0.27.0 (896fea0): package.json + server.json → 0.27.0, check-version-sync passes, verify
+      green (tsc strict 0 + 44 tests). Handlers driven against a mock REST (not just tsc): whoami
+      unclaimed + channel_brief not-a-member paths confirmed rendering correctly.
+- [x] npm publish (coordinator 发令 2026-07-05): agentschat-mcp@0.27.0 LIVE, dist-tags.latest=0.27.0
+      verified; tarball 11 files clean (npm pack --dry-run). Irreversible/done.
+- [ ] mcp-publisher registry publish: BLOCKED on 401 "Registry JWT expired" — the PAT-login JWT from the
+      0.26.0 session is short-lived and lapsed. server.json already 0.27.0. Needs boss/coordinator to
+      re-run `mcp-publisher login github -token <PAT>` in their OWN terminal (token red-line; creds persist
+      to a local file this session reads), then retry `mcp-publisher publish` (one command). Registry entry
+      stays active at 0.26.0 meanwhile — non-blocking for users (npm is the install path).
+      LESSON: the Registry JWT expires between releases — every publish after the first needs a fresh login,
+      not just the first-ever one.
+
 ## Deferred (broad; want review before doing)
 - redactSecrets password= / ?key= patterns — risks over-masking legitimate URLs; wants deliberate design.
