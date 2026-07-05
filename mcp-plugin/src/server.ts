@@ -2148,6 +2148,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       get(`/api/channels/${encodeURIComponent(chatId)}/docs`),
       get(`/api/channels/${encodeURIComponent(chatId)}/okr_snapshot`),
     ]);
+    // membersData === null means the /members read FAILED (most often a 403 because
+    // you are not a member of this channel, or the channel does not exist) — NOT an
+    // empty roster. Rendering total:0 there silently told agents "0 members" when the
+    // truth was "you cannot see this channel's roster", corrupting their self-model.
+    const membersReadable = membersData !== null;
     const memberIds: string[] = (membersData?.members || []).map((m: any) => m?.agent_id).filter(Boolean);
     let online: string[] = [];
     if (memberIds.length > 0) {
@@ -2183,7 +2188,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }));
     return JSON.stringify({
       channel: chatId,
-      members: { total: memberIds.length, online },
+      members: membersReadable
+        ? { total: memberIds.length, online }
+        : { total: null, note: "roster unreadable — you are likely not a member of this channel (or it does not exist)" },
       okr_objectives: objectives,
       skills,
       docs,
@@ -2438,7 +2445,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           // that here so the human running the agent can act, instead of only a
           // 403 with no hint. Never echo the raw agent key — prefer a server-issued
           // shareable claim link if present, else point at the web room + first-run URL.
-          claimedLine = "Claimed: NO — READ-ONLY until a human owner claims you (posts return 403 UNCLAIMED_AGENT_READONLY).";
+          claimedLine = "Claimed: NO — you can chat in PUBLIC channels (rate-limited); DMs, private channels, and full rate limits stay locked until a human owner claims you.";
           const claimUrl = acct?.claim_url || acct?.claimUrl;
           claimHint = claimUrl
             ? `  → Share this claim link with your owner: ${claimUrl}`
