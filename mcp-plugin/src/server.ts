@@ -441,7 +441,8 @@ type ToolGroupName =
   | "moderation"
   | "notifications"
   | "forward_search"
-  | "channel_docs";
+  | "channel_docs"
+  | "media";
 
 type ToolGroupMeta = {
   name: ToolGroupName;
@@ -560,6 +561,13 @@ const TOOL_GROUPS: ToolGroupMeta[] = [
       "list_channel_doc_revisions",
     ],
   },
+  {
+    name: "media",
+    summary: "Send images and voice/audio clips into channels (upload a local file or attach an already-hosted url).",
+    tags: ["chat", "media"],
+    estimated_tokens: 700,
+    tools: ["send_image", "send_voice"],
+  },
 ];
 
 const TOOL_NAME_TO_GROUP = new Map<string, ToolGroupName>();
@@ -615,6 +623,38 @@ const ALL_TOOL_DEFS = [
           text: { type: "string", description: "The reply text" },
         },
         required: ["chat_id", "text"],
+      },
+    },
+    {
+      name: "send_image",
+      description: "Send an image into a channel. Give a local file `path` (the plugin uploads it for you — agents can't build multipart bodies) OR an already-hosted `url` (an /api/file/uploads/* proxy path). `caption` becomes the message text. Pass `width`/`height` (px) when known so the receiver's list doesn't reflow while the image loads.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          chat_id: { type: "string", description: "Channel id to post into" },
+          path: { type: "string", description: "Local image file to upload (jpeg/png/gif/webp/heic/heif/avif; ≤10MB, 50MB for VIP). Provide this OR url." },
+          url: { type: "string", description: "Already-uploaded proxy url (/api/file/uploads/<name>). Provide this OR path." },
+          caption: { type: "string", description: "Optional text shown alongside the image" },
+          width: { type: "number", description: "Image width in px (optional; prevents receiver list reflow)" },
+          height: { type: "number", description: "Image height in px (optional)" },
+        },
+        required: ["chat_id"],
+      },
+    },
+    {
+      name: "send_voice",
+      description: "Send a voice/audio clip into a channel. Give a local file `path` (the plugin uploads it) OR an already-hosted `url`. Optional `duration_ms`, `transcript`, and `caption`. (The text-to-speech `{text, voice}` form arrives with T4.)",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          chat_id: { type: "string", description: "Channel id to post into" },
+          path: { type: "string", description: "Local audio file to upload (m4a/mp3/aac/wav/webm/ogg; ≤10MB, 50MB for VIP). Provide this OR url." },
+          url: { type: "string", description: "Already-uploaded proxy url (/api/file/uploads/<name>). Provide this OR path." },
+          caption: { type: "string", description: "Optional text shown alongside the clip" },
+          duration_ms: { type: "number", description: "Clip length in milliseconds (optional)" },
+          transcript: { type: "string", description: "Optional transcript of the clip" },
+        },
+        required: ["chat_id"],
       },
     },
     {
@@ -1517,6 +1557,84 @@ HANDLERS.set("list_my_channels", async (args) => {
     return { content: [{ type: "text", text: `Error listing your channels: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
   }
 });
+
+// ── media (T6, obj_mr9hu1v4) — send_image / send_voice ───────────────────────
+// Agents can't build multipart bodies, so these take a local file `path` and do
+// the /api/upload multipart here (MCP-server side), or accept an already-hosted
+// proxy `url`. The message is posted with an orthogonal attachments[] entry per
+// the T1 wire contract; the server's sanitizeAttachments normalizes the url to a
+// relative /api/file/uploads/* path and drops anything off-whitelist/off-host.
+const MEDIA_MIME_BY_EXT: Record<string, string> = {
+  jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png", gif: "image/gif",
+  webp: "image/webp", heic: "image/heic", heif: "image/heif", avif: "image/avif",
+  m4a: "audio/mp4", mp4: "audio/mp4", aac: "audio/aac", mp3: "audio/mpeg",
+  wav: "audio/wav", weba: "audio/webm", webm: "audio/webm", ogg: "audio/ogg", oga: "audio/ogg",
+};
+function mimeFromPath(p: string): string {
+  const ext = p.split(".").pop()?.toLowerCase() ?? "";
+  return MEDIA_MIME_BY_EXT[ext] ?? "application/octet-stream";
+}
+// Upload a local file via multipart POST /api/upload → { url, mime, size }.
+async function uploadLocalFile(path: string): Promise<{ url: string; mime: string; size: number }> {
+  const f = Bun.file(path);
+  if (!(await f.exists())) throw new Error(`file not found: ${path}`);
+  const mime = f.type && f.type !== "application/octet-stream" ? f.type : mimeFromPath(path);
+  const bytes = await f.arrayBuffer();
+  const name = path.split("/").pop() || "upload";
+  const form = new FormData();
+  form.append("file", new Blob([bytes], { type: mime }), name);
+  // No Content-Type header → fetch derives the multipart boundary itself.
+  const r = await apiFetch(`${REST_URL}/api/upload`, { method: "POST", headers: { "Authorization": `Bearer ${TOKEN}` }, body: form });
+  const text = await r.text();
+  if (!r.ok) throw new Error(`upload failed (${r.status}): ${text.slice(0, 160)}`);
+  let data: any;
+  try { data = JSON.parse(text); } catch { throw new Error(`upload returned non-JSON: ${text.slice(0, 120)}`); }
+  if (!data?.url) throw new Error(`upload response missing url: ${text.slice(0, 120)}`);
+  return { url: data.url as string, mime: (data.type as string) || mime, size: (data.size as number) ?? bytes.byteLength };
+}
+// Post a message carrying exactly one media attachment (image|audio).
+async function sendMediaMessage(kind: "image" | "audio", args: any): Promise<{ content: any[]; isError?: boolean }> {
+  const { chat_id, path, url, caption } = (args || {}) as { chat_id?: string; path?: string; url?: string; caption?: string };
+  if (!chat_id) return { content: [{ type: "text", text: "Error: chat_id required" }], isError: true };
+  if (!path && !url) return { content: [{ type: "text", text: "Error: provide either 'path' (local file to upload) or 'url' (already-hosted /api/file/uploads/*)" }], isError: true };
+  if (path && url) return { content: [{ type: "text", text: "Error: provide only one of 'path' or 'url', not both" }], isError: true };
+  try {
+    let finalUrl = url as string;
+    let mime: string | undefined;
+    let size: number | undefined;
+    if (path) {
+      const up = await uploadLocalFile(path);
+      finalUrl = up.url; mime = up.mime; size = up.size;
+    } else {
+      mime = mimeFromPath(finalUrl);
+    }
+    const attachment: Record<string, any> = { type: kind, url: finalUrl };
+    if (mime && mime !== "application/octet-stream") attachment.mime = mime;
+    if (size != null) attachment.size = size;
+    if (kind === "image") {
+      if (typeof args.width === "number") attachment.width = args.width;
+      if (typeof args.height === "number") attachment.height = args.height;
+    } else {
+      if (typeof args.duration_ms === "number") attachment.duration_ms = args.duration_ms;
+      if (typeof args.transcript === "string" && args.transcript) attachment.transcript = args.transcript;
+    }
+    const content = caption ? redactSecrets(await resolveBareMentions(chat_id, caption)) : "";
+    const r = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(chat_id)}/messages`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${TOKEN}` },
+      body: JSON.stringify({ sender_id: AGENT_ID, content, sender_type: "agent", content_type: "text", attachments: [attachment] }),
+    });
+    if (!r.ok) {
+      const t = await r.text();
+      return { content: [{ type: "text", text: `Failed to send ${kind} (${r.status}): ${t.slice(0, 160)}` }], isError: true };
+    }
+    return { content: [{ type: "text", text: `Sent ${kind} to channel ${chat_id.slice(0, 8)}${path ? ` (uploaded ${finalUrl.split("/").pop()})` : ""}` }] };
+  } catch (e: any) {
+    return { content: [{ type: "text", text: `Error sending ${kind}: ${String(e?.message || e).slice(0, 160)}` }], isError: true };
+  }
+}
+HANDLERS.set("send_image", (args) => sendMediaMessage("image", args));
+HANDLERS.set("send_voice", (args) => sendMediaMessage("audio", args));
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   let { name, arguments: args } = request.params;
