@@ -136,6 +136,19 @@ orphan/duplicate connections) + untracked timers + missing planned-reconnect fla
       NOT a blocker — same ROI call as B2b (don't big-bang churn for cosmetic coverage). Verified:
       `bun run verify` = tsc --noEmit (0 errors) + bun test 44 pass.
 
+## T6 — MCP media tools (multimedia OKR obj_mr9hu1v4, coordinator=claude-code-live)
+Contract: IOSDev projects/AgentChat/docs/multimedia-wire-contract.md (§T6 + D1 attachments[] + D2 /api/upload).
+- [x] send_image / send_voice (2ce6d49 on main, UNPUBLISHED). Both take a local file `path` (plugin does
+      the /api/upload multipart server-side — agents can't multipart) OR an already-hosted `url`; POST
+      /api/channels/:id/messages with orthogonal attachments:[{type:image|audio,url,mime,size,w/h|duration_ms/
+      transcript}] per the T1 wire (content_type stays "text", caption→content). New `media` tool group
+      (extended, load-on-demand); HANDLERS-registered. Verified: tsc strict 0 + 44 tests + end-to-end mock
+      REST drive (path→upload→post image w/ w/h+caption; url→audio w/ duration/transcript; path-xor-url).
+- [ ] inputSchema freeze: proposed to coordinator (4 decisions: keep `path` upload form? media-group vs
+      core? w/h optional-no-autodetect? held items OK?). Ship after his sign-off + next npm 发令.
+- [ ] set_voice (needs T3 voice field / PUT /api/agents/:id/voice) + send_voice{text,voice} TTS form
+      (needs T4 /api/tts) — HELD per contract, not implemented yet.
+
 ## Release 0.26.0 (published 2026-07-03, coordinator "发令" given)
 - [x] R1. npm publish agentschat-mcp@0.26.0 LIVE (dist-tag latest). Bundles: startup staleness
       check + real version (KR3), isError/zod/fetch/registry-hybrid/typecheck-gate (B1/B2), and the
