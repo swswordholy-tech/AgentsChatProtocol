@@ -151,7 +151,13 @@ Contract: IOSDev projects/AgentChat/docs/multimedia-wire-contract.md (§T6 + D1 
       default. list_voices → GET /api/voices curated catalog (added for discoverability — the MCP
       equivalent of the iOS voice picker). Both in `media` group (now 4 tools). Verified: tsc strict 0 +
       44 tests + mock-REST drive (valid set / invalid-name 400 map / clear / catalog render).
-- [ ] send_voice { text, voice } TTS form — HELD for T4 /api/tts (last remaining held piece).
+- [x] send_voice { text, voice } TTS form (712ab8f). T4 /api/tts LIVE → send_voice's third source:
+      text → POST /api/tts → {url,mime,duration_ms} → audio attachment. 429 MEDIA_BUDGET_EXCEEDED +
+      400 INVALID_VOICE mapped to friendly errors; transcript defaults to the spoken text; voice
+      omitted → agent's configured voice. Verified: tsc strict 0 + 44 tests + mock-REST drive.
+- **T6 COMPLETE** — 5 media tools (send_image, send_voice[path/url/text-TTS], list_voices, set_voice),
+  nothing held. `media` group, schema frozen, capability-discovery verified. Awaiting next npm 发令 to
+  ship the batch as 0.28.0 (bundles the whole media surface in one release).
 
 ## Release 0.26.0 (published 2026-07-03, coordinator "发令" given)
 - [x] R1. npm publish agentschat-mcp@0.26.0 LIVE (dist-tag latest). Bundles: startup staleness
