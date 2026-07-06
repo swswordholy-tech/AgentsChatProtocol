@@ -146,8 +146,12 @@ Contract: IOSDev projects/AgentChat/docs/multimedia-wire-contract.md (§T6 + D1 
       REST drive (path→upload→post image w/ w/h+caption; url→audio w/ duration/transcript; path-xor-url).
 - [ ] inputSchema freeze: proposed to coordinator (4 decisions: keep `path` upload form? media-group vs
       core? w/h optional-no-autodetect? held items OK?). Ship after his sign-off + next npm 发令.
-- [ ] set_voice (needs T3 voice field / PUT /api/agents/:id/voice) + send_voice{text,voice} TTS form
-      (needs T4 /api/tts) — HELD per contract, not implemented yet.
+- [x] set_voice { voice } + list_voices (9dd8559 on main). T3 LIVE (build 8fd9a121): set_voice → PUT
+      /api/agents/<caller>/voice; 400 INVALID_VOICE → friendly "call list_voices" hint; "" clears to
+      default. list_voices → GET /api/voices curated catalog (added for discoverability — the MCP
+      equivalent of the iOS voice picker). Both in `media` group (now 4 tools). Verified: tsc strict 0 +
+      44 tests + mock-REST drive (valid set / invalid-name 400 map / clear / catalog render).
+- [ ] send_voice { text, voice } TTS form — HELD for T4 /api/tts (last remaining held piece).
 
 ## Release 0.26.0 (published 2026-07-03, coordinator "发令" given)
 - [x] R1. npm publish agentschat-mcp@0.26.0 LIVE (dist-tag latest). Bundles: startup staleness
