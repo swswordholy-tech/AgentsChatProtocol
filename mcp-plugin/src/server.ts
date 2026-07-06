@@ -643,16 +643,18 @@ const ALL_TOOL_DEFS = [
     },
     {
       name: "send_voice",
-      description: "Send a voice/audio clip into a channel. Give a local file `path` (the plugin uploads it) OR an already-hosted `url`. Optional `duration_ms`, `transcript`, and `caption`. (The text-to-speech `{text, voice}` form arrives with T4.)",
+      description: "Send a voice/audio clip into a channel. Provide exactly one of: a local file `path` (the plugin uploads it), an already-hosted `url`, or `text` to speak (the server runs text-to-speech and sends the resulting audio — this is the natural way for an agent to \"talk\"; optional `voice` overrides your configured voice). Optional `caption`, `duration_ms`, `transcript`.",
       inputSchema: {
         type: "object" as const,
         properties: {
           chat_id: { type: "string", description: "Channel id to post into" },
-          path: { type: "string", description: "Local audio file to upload (m4a/mp3/aac/wav/webm/ogg; ≤10MB, 50MB for VIP). Provide this OR url." },
-          url: { type: "string", description: "Already-uploaded proxy url (/api/file/uploads/<name>). Provide this OR path." },
+          path: { type: "string", description: "Local audio file to upload (m4a/mp3/aac/wav/webm/ogg; ≤10MB, 50MB for VIP). One of path/url/text." },
+          url: { type: "string", description: "Already-uploaded proxy url (/api/file/uploads/<name>). One of path/url/text." },
+          text: { type: "string", description: "Text to synthesize into speech (server TTS) and send as audio. One of path/url/text." },
+          voice: { type: "string", description: "Optional voice name (from list_voices) for the `text` form; defaults to your configured voice" },
           caption: { type: "string", description: "Optional text shown alongside the clip" },
-          duration_ms: { type: "number", description: "Clip length in milliseconds (optional)" },
-          transcript: { type: "string", description: "Optional transcript of the clip" },
+          duration_ms: { type: "number", description: "Clip length in milliseconds (optional; auto-filled for the text form)" },
+          transcript: { type: "string", description: "Optional transcript of the clip (auto-set to the spoken text for the text form)" },
         },
         required: ["chat_id"],
       },
@@ -1617,16 +1619,41 @@ async function uploadLocalFile(path: string): Promise<{ url: string; mime: strin
 async function sendMediaMessage(kind: "image" | "audio", args: any): Promise<{ content: any[]; isError?: boolean }> {
   const { chat_id, path, url, caption } = (args || {}) as { chat_id?: string; path?: string; url?: string; caption?: string };
   if (!chat_id) return { content: [{ type: "text", text: "Error: chat_id required" }], isError: true };
-  if (!path && !url) return { content: [{ type: "text", text: "Error: provide either 'path' (local file to upload) or 'url' (already-hosted /api/file/uploads/*)" }], isError: true };
-  if (path && url) return { content: [{ type: "text", text: "Error: provide only one of 'path' or 'url', not both" }], isError: true };
+  // `text` (speak-via-TTS) is an audio-only third source, alongside path/url.
+  const text = kind === "audio" && typeof args?.text === "string" && args.text.length > 0 ? (args.text as string) : undefined;
+  const sources = [path ? "path" : null, url ? "url" : null, text ? "text" : null].filter(Boolean) as string[];
+  if (sources.length === 0) {
+    const opts = kind === "audio" ? "'path' (local file), 'url' (already-hosted), or 'text' (speak via TTS)" : "'path' (local file to upload) or 'url' (already-hosted /api/file/uploads/*)";
+    return { content: [{ type: "text", text: `Error: provide ${opts}` }], isError: true };
+  }
+  if (sources.length > 1) return { content: [{ type: "text", text: `Error: provide only one of ${sources.join(", ")}, not multiple` }], isError: true };
   try {
-    let finalUrl = url as string;
+    let finalUrl: string;
     let mime: string | undefined;
     let size: number | undefined;
-    if (path) {
+    let ttsDuration: number | undefined;
+    if (text) {
+      const voice = typeof args.voice === "string" && args.voice ? args.voice : undefined;
+      const r = await apiFetch(`${REST_URL}/api/tts`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${TOKEN}` },
+        body: JSON.stringify({ text, ...(voice ? { voice } : {}) }),
+      });
+      const t = await r.text();
+      if (r.status === 429 && /MEDIA_BUDGET_EXCEEDED/i.test(t)) return { content: [{ type: "text", text: "Voice budget exhausted for today (MEDIA_BUDGET_EXCEEDED) — try again tomorrow, or send a recorded clip via path/url." }], isError: true };
+      if (r.status === 400 && /INVALID_VOICE/i.test(t)) return { content: [{ type: "text", text: "Invalid voice for TTS. Call list_voices for valid names, or omit `voice` to use your configured one." }], isError: true };
+      if (!r.ok) return { content: [{ type: "text", text: `TTS failed (${r.status}): ${t.slice(0, 140)}` }], isError: true };
+      let d: any;
+      try { d = JSON.parse(t); } catch { return { content: [{ type: "text", text: `TTS returned non-JSON: ${t.slice(0, 120)}` }], isError: true }; }
+      if (!d?.url) return { content: [{ type: "text", text: `TTS response missing url: ${t.slice(0, 120)}` }], isError: true };
+      finalUrl = d.url as string;
+      mime = (d.mime as string) || "audio/mpeg";
+      ttsDuration = typeof d.duration_ms === "number" ? d.duration_ms : undefined;
+    } else if (path) {
       const up = await uploadLocalFile(path);
       finalUrl = up.url; mime = up.mime; size = up.size;
     } else {
+      finalUrl = url as string;
       mime = mimeFromPath(finalUrl);
     }
     const attachment: Record<string, any> = { type: kind, url: finalUrl };
@@ -1636,8 +1663,10 @@ async function sendMediaMessage(kind: "image" | "audio", args: any): Promise<{ c
       if (typeof args.width === "number") attachment.width = args.width;
       if (typeof args.height === "number") attachment.height = args.height;
     } else {
-      if (typeof args.duration_ms === "number") attachment.duration_ms = args.duration_ms;
+      const dur = typeof args.duration_ms === "number" ? args.duration_ms : ttsDuration;
+      if (dur != null) attachment.duration_ms = dur;
       if (typeof args.transcript === "string" && args.transcript) attachment.transcript = args.transcript;
+      else if (text) attachment.transcript = text; // the spoken text is its own transcript
     }
     const content = caption ? redactSecrets(await resolveBareMentions(chat_id, caption)) : "";
     const r = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(chat_id)}/messages`, {
@@ -1649,7 +1678,7 @@ async function sendMediaMessage(kind: "image" | "audio", args: any): Promise<{ c
       const t = await r.text();
       return { content: [{ type: "text", text: `Failed to send ${kind} (${r.status}): ${t.slice(0, 160)}` }], isError: true };
     }
-    return { content: [{ type: "text", text: `Sent ${kind} to channel ${chat_id.slice(0, 8)}${path ? ` (uploaded ${finalUrl.split("/").pop()})` : ""}` }] };
+    return { content: [{ type: "text", text: `Sent ${kind} to channel ${chat_id.slice(0, 8)}${text ? " (spoken via TTS)" : path ? ` (uploaded ${finalUrl.split("/").pop()})` : ""}` }] };
   } catch (e: any) {
     return { content: [{ type: "text", text: `Error sending ${kind}: ${String(e?.message || e).slice(0, 160)}` }], isError: true };
   }
