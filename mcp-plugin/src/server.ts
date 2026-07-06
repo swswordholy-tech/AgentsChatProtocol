@@ -566,7 +566,7 @@ const TOOL_GROUPS: ToolGroupMeta[] = [
     summary: "Send images and voice/audio clips into channels (upload a local file or attach an already-hosted url).",
     tags: ["chat", "media"],
     estimated_tokens: 700,
-    tools: ["send_image", "send_voice"],
+    tools: ["send_image", "send_voice", "set_voice", "list_voices"],
   },
 ];
 
@@ -655,6 +655,27 @@ const ALL_TOOL_DEFS = [
           transcript: { type: "string", description: "Optional transcript of the clip" },
         },
         required: ["chat_id"],
+      },
+    },
+    {
+      name: "list_voices",
+      description: "List the text-to-speech voices (Google Neural2/Wavenet, multilingual) you can assign to yourself with set_voice. Optionally filter by language code.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          language: { type: "string", description: "Optional BCP-47 language filter, e.g. 'cmn-CN' or 'en-US'" },
+        },
+      },
+    },
+    {
+      name: "set_voice",
+      description: "Set your own agent's text-to-speech voice (used when the server synthesizes your messages as audio). `voice` must be a name from list_voices (e.g. en-US-Neural2-F, cmn-CN-Wavenet-A); pass an empty string to clear it back to the default.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          voice: { type: "string", description: "Voice name from list_voices, or \"\" to clear back to default" },
+        },
+        required: ["voice"],
       },
     },
     {
@@ -1635,6 +1656,55 @@ async function sendMediaMessage(kind: "image" | "audio", args: any): Promise<{ c
 }
 HANDLERS.set("send_image", (args) => sendMediaMessage("image", args));
 HANDLERS.set("send_voice", (args) => sendMediaMessage("audio", args));
+
+// list_voices — the server's curated TTS voice catalog (GET /api/voices), so an
+// agent can discover valid names before set_voice. Companion to set_voice; without
+// it the voice field is un-discoverable.
+HANDLERS.set("list_voices", async (args) => {
+  const { language } = (args || {}) as { language?: string };
+  try {
+    const q = language ? `?language=${encodeURIComponent(language)}` : "";
+    const r = await apiFetch(`${REST_URL}/api/voices${q}`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
+    if (!r.ok) return { content: [{ type: "text", text: `Failed to list voices (${r.status})` }], isError: true };
+    const data = (await r.json()) as any;
+    const voices = Array.isArray(data) ? data : (data?.voices || []);
+    if (!voices.length) return { content: [{ type: "text", text: language ? `No voices for language ${language}.` : "No voices available." }] };
+    const def = data && !Array.isArray(data) && data.default ? ` (default: ${data.default})` : "";
+    const list = voices.map((v: any) => {
+      const name = typeof v === "string" ? v : v?.name;
+      const langs = v?.language_codes ? (Array.isArray(v.language_codes) ? v.language_codes : [v.language_codes]).join(",") : "";
+      const gender = v?.ssml_gender ? ` ${v.ssml_gender}` : "";
+      return `• ${name}${langs ? ` [${langs}]` : ""}${gender}`;
+    }).join("\n");
+    return { content: [{ type: "text", text: `${voices.length} voices${def}:\n${list}\n\nAssign one with set_voice({ voice: "<name>" }).` }] };
+  } catch (e: any) {
+    return { content: [{ type: "text", text: `Error listing voices: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
+  }
+});
+
+// set_voice — writes the caller agent's own voice field. Voice must be a name from
+// list_voices; the server 400s INVALID_VOICE on a bad name (guards against storing a
+// name that only blows up later at TTS time). "" / null clears back to default.
+HANDLERS.set("set_voice", async (args) => {
+  const hasVoice = args && typeof args === "object" && "voice" in args;
+  if (!hasVoice) return { content: [{ type: "text", text: "Error: voice required (a name from list_voices; pass \"\" to clear back to default)" }], isError: true };
+  const voice = (args as { voice?: string | null }).voice ?? "";
+  try {
+    const r = await apiFetch(`${REST_URL}/api/agents/${encodeURIComponent(AGENT_ID)}/voice`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${TOKEN}` },
+      body: JSON.stringify({ voice }),
+    });
+    const text = await r.text();
+    if (r.status === 400 && /INVALID_VOICE/i.test(text)) {
+      return { content: [{ type: "text", text: `Invalid voice name "${voice}". Call list_voices to see valid names.` }], isError: true };
+    }
+    if (!r.ok) return { content: [{ type: "text", text: `Failed to set voice (${r.status}): ${text.slice(0, 140)}` }], isError: true };
+    return { content: [{ type: "text", text: voice ? `Voice set to ${voice}.` : "Voice cleared (back to default)." }] };
+  } catch (e: any) {
+    return { content: [{ type: "text", text: `Error setting voice: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
+  }
+});
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   let { name, arguments: args } = request.params;
