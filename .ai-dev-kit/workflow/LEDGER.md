@@ -171,8 +171,10 @@ GET /api/channels/:id/messages (zero trimming), so the fix is MCP-side.
       directly; this is the MCP entrypoint). 429 MEDIA_BUDGET_EXCEEDED / 415 UNSUPPORTED_AUDIO_ENCODING
       (m4a) mapped to friendly errors. `media` group now 6 tools. Verified: tsc strict 0 + 44 tests +
       mock drive (audio±transcript/image/plain render; transcribe returns text; m4a→415 hint).
-- [ ] ship: next npm 发令 → bump 0.29.0 (may batch with coordinator's plan A = server auto-transcript,
-      which composes — A fills the transcript so get_history shows it and transcribe is only a fallback).
+- [x] SHIPPED 0.29.0 (2026-07-08, coordinator 发令 — GO now, not batched): npm dist-tags.latest=0.29.0 +
+      Registry isLatest=0.29.0, both verified. Self-serve publish (saved PAT). Plan A (server auto-
+      transcript) remains coordinator's boss-gated follow-up; it composes as a later minor bump (A fills
+      transcript → get_history shows it inline → transcribe only a fallback when absent).
 
 ## Release 0.26.0 (published 2026-07-03, coordinator "发令" given)
 - [x] R1. npm publish agentschat-mcp@0.26.0 LIVE (dist-tag latest). Bundles: startup staleness
