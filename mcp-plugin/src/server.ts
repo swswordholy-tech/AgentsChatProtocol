@@ -566,7 +566,7 @@ const TOOL_GROUPS: ToolGroupMeta[] = [
     summary: "Send images and voice/audio clips into channels (upload a local file or attach an already-hosted url).",
     tags: ["chat", "media"],
     estimated_tokens: 700,
-    tools: ["send_image", "send_voice", "set_voice", "list_voices"],
+    tools: ["send_image", "send_voice", "set_voice", "list_voices", "transcribe"],
   },
 ];
 
@@ -678,6 +678,17 @@ const ALL_TOOL_DEFS = [
           voice: { type: "string", description: "Voice name from list_voices, or \"\" to clear back to default" },
         },
         required: ["voice"],
+      },
+    },
+    {
+      name: "transcribe",
+      description: "Transcribe a voice/audio attachment to text via the server's speech-to-text, so you can \"hear\" a voice message. Pass the audio `url` from get_history (an /api/file/uploads/* proxy path). Returns the spoken text. (If get_history already shows a transcript for that clip, just read it — no need to call this.)",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          url: { type: "string", description: "Audio attachment url from get_history (/api/file/uploads/<name>)" },
+        },
+        required: ["url"],
       },
     },
     {
@@ -1732,6 +1743,33 @@ HANDLERS.set("set_voice", async (args) => {
     return { content: [{ type: "text", text: voice ? `Voice set to ${voice}.` : "Voice cleared (back to default)." }] };
   } catch (e: any) {
     return { content: [{ type: "text", text: `Error setting voice: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
+  }
+});
+
+// transcribe — POST /api/stt {audio_url} so an agent can "hear" a voice attachment
+// (the LLM can't consume audio; STT turns it into readable text). Closes the
+// "voice is perceivable to humans but not to agents" gap (plan B). Server already
+// returns attachment URLs in get_history; this is the transcribe entrypoint.
+HANDLERS.set("transcribe", async (args) => {
+  const { url } = (args || {}) as { url?: string };
+  if (!url) return { content: [{ type: "text", text: "Error: url required (an audio attachment url from get_history)" }], isError: true };
+  try {
+    const r = await apiFetch(`${REST_URL}/api/stt`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${TOKEN}` },
+      body: JSON.stringify({ audio_url: url }),
+    });
+    const t = await r.text();
+    if (r.status === 429 && /MEDIA_BUDGET_EXCEEDED/i.test(t)) return { content: [{ type: "text", text: "Voice budget exhausted for today (MEDIA_BUDGET_EXCEEDED) — try again tomorrow." }], isError: true };
+    if (r.status === 415 && /UNSUPPORTED_AUDIO_ENCODING/i.test(t)) return { content: [{ type: "text", text: "That audio format can't be transcribed (m4a/AAC aren't supported by the STT engine; wav/mp3/ogg/opus/webm are)." }], isError: true };
+    if (!r.ok) return { content: [{ type: "text", text: `Transcription failed (${r.status}): ${t.slice(0, 140)}` }], isError: true };
+    let d: any;
+    try { d = JSON.parse(t); } catch { return { content: [{ type: "text", text: `STT returned non-JSON: ${t.slice(0, 120)}` }], isError: true }; }
+    const transcript = d?.transcript;
+    if (!transcript) return { content: [{ type: "text", text: "No speech detected in that audio." }] };
+    return { content: [{ type: "text", text: `Transcript${d?.language ? ` (${d.language})` : ""}: ${transcript}` }] };
+  } catch (e: any) {
+    return { content: [{ type: "text", text: `Error transcribing: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
   }
 });
 
@@ -2801,7 +2839,27 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         if (msgs.length === 0) return { content: [{ type: "text", text: "No messages in this channel." }] };
         const list = msgs.map((m: any) => {
           const time = m.timestamp ? new Date(m.timestamp).toLocaleString() : "?";
-          return `[${time}] ${m.sender_id?.slice(0, 12)}: ${m.content?.slice(0, 200)}`;
+          let line = `[${time}] ${m.sender_id?.slice(0, 12)}: ${m.content?.slice(0, 200) ?? ""}`;
+          // Surface media attachments so an agent can perceive voice/image messages,
+          // not just their text caption. Audio: show any server transcript inline
+          // (agent reads it directly); otherwise point at transcribe(url).
+          const atts = Array.isArray(m.attachments) ? m.attachments : [];
+          for (const a of atts) {
+            if (!a?.url) continue;
+            if (a.type === "audio") {
+              const dur = typeof a.duration_ms === "number" ? ` ${(a.duration_ms / 1000).toFixed(1)}s` : "";
+              line += `\n    🔊 audio${dur}: ${a.url}`;
+              line += a.transcript
+                ? `\n       transcript: "${String(a.transcript).slice(0, 400)}"`
+                : `\n       (no transcript — call transcribe(url) to read what was said)`;
+            } else if (a.type === "image") {
+              const dim = a.width && a.height ? ` ${a.width}×${a.height}` : "";
+              line += `\n    🖼 image${dim}: ${a.url}`;
+            } else {
+              line += `\n    📎 ${a.type || "file"}: ${a.url}`;
+            }
+          }
+          return line;
         }).join("\n");
         return { content: [{ type: "text", text: `${msgs.length} messages:\n${list}` }] };
       }
