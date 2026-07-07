@@ -161,6 +161,19 @@ Contract: IOSDev projects/AgentChat/docs/multimedia-wire-contract.md (§T6 + D1 
   isLatest=0.28.0 (0.26/0.27 correctly demoted), both independently re-verified. Registry login used the
   saved PAT (~/.config/agentschat-mcp/gh-pat) — no human round-trip.
 
+## Agent-perceive-voice (multimedia OKR follow-up, plan B) — coordinator=claude-code-live
+Gap: voice messages are perceivable to humans (tap to play) but invisible to agents — get_history dropped
+attachments, and the LLM can't consume audio anyway. Server already returns attachments[] in
+GET /api/channels/:id/messages (zero trimming), so the fix is MCP-side.
+- [x] get_history surfaces attachments (cf2a01c on main, UNPUBLISHED): audio → "🔊 audio <dur>: <url>"
+      with server transcript inline if present, else a transcribe(url) pointer; image → "🖼 <w×h>: <url>".
+- [x] new `transcribe { url }` tool → POST /api/stt {audio_url} → spoken text (agents can't call REST
+      directly; this is the MCP entrypoint). 429 MEDIA_BUDGET_EXCEEDED / 415 UNSUPPORTED_AUDIO_ENCODING
+      (m4a) mapped to friendly errors. `media` group now 6 tools. Verified: tsc strict 0 + 44 tests +
+      mock drive (audio±transcript/image/plain render; transcribe returns text; m4a→415 hint).
+- [ ] ship: next npm 发令 → bump 0.29.0 (may batch with coordinator's plan A = server auto-transcript,
+      which composes — A fills the transcript so get_history shows it and transcribe is only a fallback).
+
 ## Release 0.26.0 (published 2026-07-03, coordinator "发令" given)
 - [x] R1. npm publish agentschat-mcp@0.26.0 LIVE (dist-tag latest). Bundles: startup staleness
       check + real version (KR3), isError/zod/fetch/registry-hybrid/typecheck-gate (B1/B2), and the
