@@ -281,5 +281,30 @@ web-UI step, not a file field).
       0.29.0 — packaging only: human `npx agentschat-mcp` + any npm-path introspector (PulseMCP etc.) now
       install + introspect under plain Node, not just Bun.
 
+## Docs follow-up — READMEs still denied Node support (brusque caught it, 2026-07-09)
+0.29.1 removed the Bun-only barrier but both READMEs still told visitors it existed. `mcp-plugin/README.md`
+is the tarball README = what **npmjs.com renders**; root `README.md` = what **Glama's Overview renders**.
+The two highest-traffic install surfaces were advertising a barrier we'd just torn down (conversion tax).
+- [x] mcp-plugin/README.md: blockquote "Requires the Bun runtime … launch with bunx, not npx/Node" →
+      "Runs on Node ≥ 22 or Bun ≥ 1.0", npx/bunx documented as equivalent; Install + Options lines lead with
+      `npx -y agentschat-mcp` (bunx kept as the equivalent Bun-user alternative).
+- [x] root README.md: Ecosystem Setup column, Hermes `mcp_servers` row (dropped "requires Bun"), Quick Start
+      → `npx -y agentschat-mcp`.
+- [x] package.json `engines` += `"node": ">=22"` so directories ingesting npm metadata read the real floor
+      instead of "bun only". Commit 2debba3.
+- [x] CORRECTED brusque's proposed copy: he suggested **Node ≥ 18**; the real floor is **Node ≥ 22**.
+      Node's global `WebSocket` only became default-on in **v22.0.0** (added v21.0.0/v20.10.0 behind
+      `--experimental-websocket`) — per Node docs. Proven under real node@18 (homebrew): server starts,
+      `initialize` + `tools/list` return 24 tools (so introspection passes on ANY Node — that's why the
+      npx smoke looked clean), but stderr = `WebSocket constructor failed: ReferenceError: WebSocket is not
+      defined, retrying in 5s` → live @mention/DM push never connects. Shipping "Node 18" would have been a
+      silent-failure recommendation. Split the claim: introspection floor 18, functional floor 22.
+- [x] Verified against the PUBLISHED artifact: `npm i agentschat-mcp@0.29.1` in a temp dir, **zero Bun on
+      PATH** → npm bin (symlink → src/cli.mjs) runs under Node 24 → initialize (agentschat v0.29.1) +
+      24 tools + WebSocket connects. verify green (44 tests).
+- [ ] npm republish 0.29.2 (docs + engines only, zero behavior change) — **publish-gated**, needs boss 发令.
+      npm's README/engines only refresh on republish, so npmjs.com keeps showing the stale "requires Bun"
+      text until then. Root README (→ Glama Overview) is already fixed on main and needs no publish.
+
 ## Deferred (broad; want review before doing)
 - redactSecrets password= / ?key= patterns — risks over-masking legitimate URLs; wants deliberate design.
