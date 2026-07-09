@@ -55,7 +55,7 @@ import { join, dirname } from "path";
 // "the key is never world-readable, even mid-write" property is directly testable.
 import { safeWriteProfile } from "./profile-store.ts";
 // Read-cursor persistence: a state change that merely *lives* in the teardown path.
-import { flushCursor, persistCursor } from "./read-cursor.ts";
+import { flushCursor, loadCursor, persistCursor } from "./read-cursor.ts";
 import { randomUUID } from "crypto";
 
 function parseArgs() {
@@ -3363,15 +3363,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 // Persisted to disk so reconnect/restart doesn't lose state
 const mentionTsFile = join(configDir, `mention-ts-${AGENT_ID}.json`);
 function loadMentionTimestamps(): Map<string, string> {
-  try {
-    const raw = readFileSync(mentionTsFile, "utf-8");
-    return new Map(Object.entries(JSON.parse(raw)));
-  } catch { return new Map(); }
+  return loadCursor(mentionTsFile, safeStderrWrite);
 }
+// Re-attempted on the next mention, but a persistent failure (perms, full disk) would
+// retry just as silently forever — and the state is gone on restart. So it reports.
 function saveMentionTimestamps(m: Map<string, string>) {
-  try {
-    writeFileSync(mentionTsFile, JSON.stringify(Object.fromEntries(m)));
-  } catch {}
+  persistCursor(mentionTsFile, m, safeStderrWrite);
 }
 const lastMentionTimestamp = loadMentionTimestamps();
 
@@ -3392,10 +3389,7 @@ const lastMentionTimestamp = loadMentionTimestamps();
 // connect or reconnect; if we missed anything, we find it.
 const lastSeenMessageTsFile = join(configDir, `last-seen-msg-ts-${AGENT_ID}.json`);
 function loadLastSeenMessageTs(): Map<string, string> {
-  try {
-    const raw = readFileSync(lastSeenMessageTsFile, "utf-8");
-    return new Map(Object.entries(JSON.parse(raw)));
-  } catch { return new Map(); }
+  return loadCursor(lastSeenMessageTsFile, safeStderrWrite);
 }
 const lastSeenMessageTs = loadLastSeenMessageTs();
 const cursorFlushIntervalMs = Math.max(

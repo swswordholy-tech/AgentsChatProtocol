@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { flushCursor, persistCursor } from "../src/read-cursor.ts";
-import { mkdtempSync, rmSync, readFileSync } from "node:fs";
+import { flushCursor, loadCursor, persistCursor } from "../src/read-cursor.ts";
+import { mkdtempSync, rmSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -42,6 +42,37 @@ describe("flushCursor clears dirty only after the write lands", () => {
     let attempts = 0;
     expect(flushCursor({ dirty: false }, () => { attempts++; return true; })).toBe(false);
     expect(attempts).toBe(0);
+  });
+});
+
+describe("loadCursor distinguishes 'never existed' from 'we just lost it'", () => {
+  /**
+   * This runs ONCE at startup — there is no second attempt that could notice the failure.
+   * A corrupt/unreadable file silently reset remembered state on the old implementation.
+   */
+  test("a corrupt file reports the reset instead of pretending it was empty", () => {
+    const file = join(dir, "c.json");
+    writeFileSync(file, "{ this is not json");
+    const warnings: string[] = [];
+
+    expect(loadCursor(file, (m) => warnings.push(m)).size).toBe(0);
+    expect(warnings.join("")).toMatch(/could not read/); // old: silent
+    expect(warnings.join("")).toContain(file);
+  });
+
+  test("control: a missing file is the normal first run and stays quiet", () => {
+    // Without this, the assertion above could pass on a warn that always fires.
+    const warnings: string[] = [];
+    expect(loadCursor(join(dir, "absent.json"), (m) => warnings.push(m)).size).toBe(0);
+    expect(warnings).toEqual([]);
+  });
+
+  test("control: a valid file round-trips quietly", () => {
+    const file = join(dir, "c.json");
+    writeFileSync(file, JSON.stringify({ chan: "ts" }));
+    const warnings: string[] = [];
+    expect(loadCursor(file, (m) => warnings.push(m))).toEqual(new Map([["chan", "ts"]]));
+    expect(warnings).toEqual([]);
   });
 });
 

@@ -252,7 +252,7 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema
 } from "@modelcontextprotocol/sdk/types.js";
-import { readFileSync, existsSync as existsSync2, writeFileSync as writeFileSync3, mkdirSync, readdirSync } from "fs";
+import { readFileSync as readFileSync2, existsSync as existsSync2, writeFileSync as writeFileSync3, mkdirSync, readdirSync } from "fs";
 import { join, dirname } from "path";
 
 // src/profile-store.ts
@@ -288,7 +288,18 @@ function safeWriteProfile(path, data, warn = defaultWarn) {
 }
 
 // src/read-cursor.ts
-import { writeFileSync as writeFileSync2 } from "fs";
+import { readFileSync, writeFileSync as writeFileSync2 } from "fs";
+function loadCursor(file, warn) {
+  try {
+    return new Map(Object.entries(JSON.parse(readFileSync(file, "utf-8"))));
+  } catch (e) {
+    if (e?.code !== "ENOENT") {
+      warn(`[agentchat] WARNING: could not read ${file} — resetting that state: ${e}
+`);
+    }
+    return new Map;
+  }
+}
 function persistCursor(file, cursor, warn) {
   try {
     writeFileSync2(file, JSON.stringify(Object.fromEntries(cursor)));
@@ -521,7 +532,7 @@ var identity = decideIdentity({
   fallbackName: `Claude-${randomUUID().slice(0, 6)}`
 });
 if (identity.mode === "profile") {
-  profile = JSON.parse(readFileSync(profileFile, "utf-8"));
+  profile = JSON.parse(readFileSync2(profileFile, "utf-8"));
   process.stderr.write(`[agentchat] Profile loaded: ${profileFile}
 `);
 } else if (identity.mode === "env-creds") {
@@ -1884,7 +1895,7 @@ async function uploadLocalFile(path) {
   if (!existsSync2(path))
     throw new Error(`file not found: ${path}`);
   const mime = mimeFromPath(path);
-  const buf = readFileSync(path);
+  const buf = readFileSync2(path);
   const name = path.split("/").pop() || "upload";
   const form = new FormData;
   form.append("file", new Blob([new Uint8Array(buf)], { type: mime }), name);
@@ -2289,7 +2300,7 @@ ${a.body || ""}`;
           const currentVersion = Number(meta.version ?? 0);
           let cachedVersion = null;
           try {
-            cachedVersion = Number(JSON.parse(readFileSync(pMeta, "utf8")).version);
+            cachedVersion = Number(JSON.parse(readFileSync2(pMeta, "utf8")).version);
           } catch {}
           if (cachedVersion !== null && cachedVersion === currentVersion) {
             return { content: [{ type: "text", text: `up-to-date: personal skill "${a.name}" v${currentVersion} already at ${pMd} \u2014 no download. Read that file to run it.` }] };
@@ -2323,7 +2334,7 @@ ${a.body || ""}`;
         const currentVersion = Number(meta.version ?? 0);
         let cachedVersion = null;
         try {
-          cachedVersion = Number(JSON.parse(readFileSync(metaPath, "utf8")).version);
+          cachedVersion = Number(JSON.parse(readFileSync2(metaPath, "utf8")).version);
         } catch {}
         if (cachedVersion !== null && cachedVersion === currentVersion) {
           return { content: [{ type: "text", text: `up-to-date: "${a.doc_id}" v${currentVersion} already at ${mdPath} \u2014 no download. Read that file to run it.` }] };
@@ -3178,7 +3189,7 @@ ${list}` }] };
       if (!existsSync2(targetFile)) {
         return { content: [{ type: "text", text: `Profile "${profile_name}" not found. Available: ${available.join(", ")}` }], isError: true };
       }
-      const newProfile = JSON.parse(readFileSync(targetFile, "utf-8"));
+      const newProfile = JSON.parse(readFileSync2(targetFile, "utf-8"));
       heartbeat.stop();
       if (backfillTimer) {
         clearTimeout(backfillTimer);
@@ -3556,27 +3567,15 @@ ${list}` }] };
 });
 var mentionTsFile = join(configDir, `mention-ts-${AGENT_ID}.json`);
 function loadMentionTimestamps() {
-  try {
-    const raw = readFileSync(mentionTsFile, "utf-8");
-    return new Map(Object.entries(JSON.parse(raw)));
-  } catch {
-    return new Map;
-  }
+  return loadCursor(mentionTsFile, safeStderrWrite);
 }
 function saveMentionTimestamps(m) {
-  try {
-    writeFileSync3(mentionTsFile, JSON.stringify(Object.fromEntries(m)));
-  } catch {}
+  persistCursor(mentionTsFile, m, safeStderrWrite);
 }
 var lastMentionTimestamp = loadMentionTimestamps();
 var lastSeenMessageTsFile = join(configDir, `last-seen-msg-ts-${AGENT_ID}.json`);
 function loadLastSeenMessageTs() {
-  try {
-    const raw = readFileSync(lastSeenMessageTsFile, "utf-8");
-    return new Map(Object.entries(JSON.parse(raw)));
-  } catch {
-    return new Map;
-  }
+  return loadCursor(lastSeenMessageTsFile, safeStderrWrite);
 }
 var lastSeenMessageTs = loadLastSeenMessageTs();
 var cursorFlushIntervalMs = Math.max(500, Number(process.env.AGENTSCHAT_MCP_CURSOR_FLUSH_MS || 5000));

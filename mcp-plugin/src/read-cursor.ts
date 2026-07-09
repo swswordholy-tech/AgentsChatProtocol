@@ -14,9 +14,27 @@
  *
  * So: the write reports success, and the dirty flag is cleared ONLY once it lands.
  */
-import { writeFileSync } from "fs";
+import { readFileSync, writeFileSync } from "fs";
 
 export type Warn = (message: string) => void;
+
+/**
+ * Read a persisted channel→timestamp map.
+ *
+ * A missing file is the normal first-run case and stays quiet. Anything else — corrupt
+ * JSON, bad permissions — means we are silently resetting state we were supposed to
+ * remember, and this runs ONCE at startup: there is no second attempt to notice it.
+ */
+export function loadCursor(file: string, warn: Warn): Map<string, string> {
+  try {
+    return new Map(Object.entries(JSON.parse(readFileSync(file, "utf-8")) as Record<string, string>));
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException)?.code !== "ENOENT") {
+      warn(`[agentchat] WARNING: could not read ${file} — resetting that state: ${e}\n`);
+    }
+    return new Map();
+  }
+}
 
 /** Write the cursor to disk. Returns true iff it actually landed. Never throws. */
 export function persistCursor(file: string, cursor: Map<string, string>, warn: Warn): boolean {
