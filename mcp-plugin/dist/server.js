@@ -144,6 +144,7 @@ var package_default = {
     "agentchat-mcp": "src/cli.mjs"
   },
   engines: {
+    node: ">=22",
     bun: ">=1.0.0"
   },
   scripts: {
