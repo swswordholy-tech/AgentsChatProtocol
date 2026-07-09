@@ -14,7 +14,7 @@
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { spawn } from "node:child_process";
-import { mkdtempSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { mkdtempSync, existsSync, mkdirSync, writeFileSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -90,6 +90,12 @@ function drive(args: string[], home: string, frames: any[], waitMs = 3000) {
 
 const freshHome = (tag: string) => mkdtempSync(join(tmpdir(), `acid-${tag}-`));
 
+/** Everything the run persisted under a config dir ([] if the dir was never created). */
+const written = (home: string, dir: string) => {
+  const p = join(home, dir);
+  return existsSync(p) ? readdirSync(p).sort() : [];
+};
+
 describe("identity policy, end-to-end against a mock hub", () => {
   test("bare start registers NOTHING and still answers tools/list", async () => {
     calls = [];
@@ -97,7 +103,11 @@ describe("identity policy, end-to-end against a mock hub", () => {
     const { res, err } = await drive([], home, [INIT, INITED, LIST]);
 
     expect(registerCalls()).toBe(0);
-    expect(existsSync(join(home, ".agentschat", "profile.json"))).toBe(false);
+    // "Writes nothing" is a NEW guarantee, not prior behavior: on 0.29.1 a bare-ish run
+    // still persisted a dev-token profile (the register-failure fallback). Pin it hard —
+    // nothing may land in EITHER config dir, incl. the legacy one nameToPath falls back to.
+    expect(written(home, ".agentschat")).toEqual([]);
+    expect(written(home, ".agentchat")).toEqual([]);
     expect(err).toMatch(/Refusing to auto-register/);
     // Introspection contract (Glama builds and runs this with zero config) must survive.
     expect(res.get(1)?.result).toBeTruthy();
@@ -113,6 +123,9 @@ describe("identity policy, end-to-end against a mock hub", () => {
     expect(registerCalls()).toBe(1);
     expect(err).toMatch(/Registered!/);
     expect(existsSync(join(home, ".agentschat", "Foo.json"))).toBe(true);
+    // Control group for the `written(...) === []` assertions above: prove the helper
+    // actually observes a persisted profile, so those empty expectations aren't vacuous.
+    expect(written(home, ".agentschat")).toEqual(["Foo.json"]);
   }, 15_000);
 
   test("dev-token profile on the shared default path is NOT re-registered", async () => {
@@ -129,13 +142,16 @@ describe("identity policy, end-to-end against a mock hub", () => {
     expect(err).toMatch(/refusing to auto-register/i);
   }, 15_000);
 
-  test("declared-but-missing profile exits non-zero without registering", async () => {
+  test("declared-but-missing profile exits non-zero without registering or writing", async () => {
     calls = [];
-    const { err, code } = await drive(["--profile", "nope"], freshHome("missing"), [INIT], 2500);
+    const home = freshHome("missing");
+    const { err, code } = await drive(["--profile", "nope"], home, [INIT], 2500);
 
     expect(registerCalls()).toBe(0);
     expect(code).toBe(1);
     expect(err).toMatch(/nope/);
+    expect(written(home, ".agentschat")).toEqual([]);
+    expect(written(home, ".agentchat")).toEqual([]);
   }, 15_000);
 
   test("whoami's `Profile file:` follows switch_profile", async () => {
