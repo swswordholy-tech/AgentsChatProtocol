@@ -306,5 +306,62 @@ The two highest-traffic install surfaces were advertising a barrier we'd just to
       npm's README/engines only refresh on republish, so npmjs.com keeps showing the stale "requires Bun"
       text until then. Root README (→ Glama Overview) is already fixed on main and needs no publish.
 
+## Identity safety root-fix — task_mre09xq1_z5xzpd1g (commit 8fe958f, 2026-07-10)
+cc-live/mellow traced a misattributed comment to plugin identity handling and filed 3 defects. Fixing them
+surfaced a 4th, larger one that had been hiding the first.
+- [x] **D1 auto-register fired implicitly.** `resolveProfilePath()` falls back to the SHARED
+      `~/.agentschat/profile.json`; a missing file meant `POST /api/account/register`. Now requires explicit
+      opt-in (`--name`, or new `--register`). Nothing declared → **ANONYMOUS**: no register, no profile
+      written, hub not dialed, but stdio still answers initialize/tools/list. Declared-but-missing → hard
+      error exit 1. `--token`/`AGENTCHAT_TOKEN` → authenticate, never register (previously registered anyway).
+      Policy extracted to pure `src/identity.ts`.
+- [x] **D2 second trigger** (`profile.token === "dev-token"` → re-register) behind the same gate: refused on
+      the bare default path, still heals a declared identity.
+- [x] **D3 `whoami` `Profile file:` stale** — `profileFile` was `const`; `switch_profile` moved AGENT_ID but
+      not it. Now mutable + tracked; anonymous/token-only report `(none …)`.
+- [x] **D4 (NEW, mine) registration had been silently DEAD since `a953486`** ("route all REST through
+      apiFetch", B2a). That refactor left the register call sites ABOVE apiFetch's `const` deps. apiFetch is
+      hoisted, but `timeoutMs = REST_TIMEOUT_MS` and the `TOKEN` read evaluate at CALL time → **TDZ
+      ReferenceError** every time, reported by the surrounding catch as "Server unreachable" (the dev-token
+      migration's catch is empty → failed with no output at all). Fixed by declaring AGENT_ID/TOKEN/
+      CAPABILITIES (initialized) and defining nativeFetch/REST_TIMEOUT_MS/apiFetch above the identity block.
+      Gate + this fix MUST ship together: TDZ-fix alone re-arms the footgun; gate alone leaves onboarding dead.
+- [x] Verified end-to-end vs a **local mock hub** (never prod), counting real HTTP calls: bare = 0 register +
+      24 tools + no profile written; `--name` = exactly 1 register + persisted; dev-token on default = 0;
+      declared-but-missing = exit 1 + 0 register; `switch_profile(beta)` → whoami `Profile file:` → beta.json.
+      Register count 0→1 purely from the hoist, with network proven reachable by a control probe. Landed as
+      `tests/identity.integration.test.ts` (no unit test can catch a swallowed TDZ). verify green: 66 tests.
+- [x] **Deliberate deviation from acceptance #1** ("bare → 报错退出"): exiting at startup would re-break Glama
+      introspection (task_mrd68sll), which runs us with zero config and needs initialize/tools/list. The
+      security intent (never implicitly POST register; never write the shared profile) is fully met by
+      anonymous mode and asserted by call-counting. Exit is reserved for declared-but-missing, which
+      introspection never hits.
+
+### Corrections to the channel audit (evidence, not inference)
+- **No anonymous account was ever minted.** cc-live's "whoever's MCP respawns first triggers it" cannot
+  happen: registration is TDZ-dead on every released version. That is also why `~/.agentschat/profile.json`
+  never appeared, and why a throwaway `--name NpxProof` smoke test got `dev-token` + a *locally* generated
+  uuid instead of a real key.
+- **The bare default path is not empty on this box.** `nameToPath` falls back to the legacy dir, and
+  `~/.agentchat/profile.json` EXISTS (2026-04-08). So the missing-file branch never runs here at all. That
+  file uses an older schema (`id`/`name`/`key`) which the plugin does not read (`agent_id`/`token`), so its
+  live `ac_` key for `tweed-reactive-lidar` ("Gemini CLI") is **not** adopted — resolved TOKEN falls to
+  `dev-token`. Simulated with a fake key against the mock hub: 0 register calls, identity not adopted.
+
+### 🔴 Live user-facing consequence — needs a publish
+`0.26.0 … 0.29.1` all ship the TDZ. The documented Quick Start `npx agentschat-mcp --name "My-Agent"`
+**never registers**: the user silently gets an unauthenticated `dev-token` profile and an agent that can
+never connect. Confirmed by inspecting the *published* 0.29.1 tarball (register call at char 7362, its
+dependency at 11203). We are actively driving npx installs at this funnel.
+- [ ] Publish **0.30.0** (gate + revived registration + whoami fix; also carries the pending docs/engines
+      fix) — **publish-gated**, needs boss 发令. Root fix is on main; npm still serves the broken build.
+
+### 🔑 Credentials finding (boss's domain — reported, not touched)
+13 profile files under `~/.agentschat` + `~/.agentchat` hold a live `ac_` key; **7 are `0644`**
+(world/group-readable), incl. `claude-code-live`, `mellow-blessed-obsidian`, `tweed-reactive-lidar`, and the
+legacy default `profile.json`. The plugin's `safeWriteProfile` writes `0600`, so these predate it or came
+from other clients. Fix: `chmod 600 ~/.agentschat/*.json ~/.agentchat/*.json`. Adds to the 3 credential items
+already escalated.
+
 ## Deferred (broad; want review before doing)
 - redactSecrets password= / ?key= patterns — risks over-masking legitimate URLs; wants deliberate design.
