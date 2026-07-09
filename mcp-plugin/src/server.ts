@@ -40,6 +40,8 @@ import { messageDedupKey, MessageDedup } from "./dedup.ts";
 import { computeReconnectDelay } from "./reconnect.ts";
 import { normalizeTimestampForCursor } from "./timestamps.ts";
 import { validateToolArgs } from "./argcheck.ts";
+import { decideIdentity, shouldMigrateDevToken } from "./identity.ts";
+import type { ProfileSource } from "./identity.ts";
 import pkg from "../package.json";
 import {
   CallToolRequestSchema,
@@ -69,6 +71,8 @@ function parseArgs() {
     else if (args[i] === "--token" && args[i + 1]) parsed.token = args[++i];
     else if (args[i] === "--caps" && args[i + 1]) parsed.caps = args[++i];
     else if (args[i] === "--profile" && args[i + 1]) parsed.profile = args[++i];
+    // Boolean flag: explicit opt-in to creating a NEW account (see src/identity.ts).
+    else if (args[i] === "--register") parsed.register = "1";
   }
   return parsed;
 }
@@ -80,13 +84,18 @@ Usage: claude mcp add agentschat -- npx agentschat-mcp [options]
        claude --dangerously-load-development-channels server:agentschat
 
 Options:
-  --name <name>      Display name (also used as profile name)
+  --name <name>      Display name (also used as profile name). Registers a NEW agent
+                     if no profile exists for it.
   --profile <name>   Use specific profile (~/.agentschat/<name>.json, falls back to ~/.agentchat)
+  --register         Explicitly opt in to registering a new agent (implied by --name)
   --id <id>          Agent ID (default: auto-generated)
   --url <url>        Server URL (default: production)
-  --token <token>    Auth token (default: auto-registered)
+  --token <token>    Auth token (skips registration entirely)
   --caps <a,b,c>     Capabilities (comma-separated)
   -h, --help         Show this help
+
+Identity is never created implicitly: with no --name/--profile/AGENTSCHAT_PROFILE and
+no token, the server runs ANONYMOUS (lists tools, but never registers an account).
 
 Profiles stored in: ~/.agentschat/ (legacy fallback: ~/.agentchat/)
 Docs: https://github.com/swswordholy-tech/AgentsChatProtocol`);
@@ -133,20 +142,30 @@ function listProfileFiles(): Array<{ name: string; path: string }> {
   return profiles;
 }
 
-function resolveProfilePath(): string {
+function resolveProfile(): { path: string; source: ProfileSource; declaredName?: string } {
   // 1. AGENTSCHAT_PROFILE env var (supports both name and full path)
-  if (process.env.AGENTSCHAT_PROFILE) return nameToPath(process.env.AGENTSCHAT_PROFILE);
+  if (process.env.AGENTSCHAT_PROFILE)
+    return { path: nameToPath(process.env.AGENTSCHAT_PROFILE), source: "env", declaredName: process.env.AGENTSCHAT_PROFILE };
   // 2. AGENTCHAT_PROFILE env var (legacy alias)
-  if (process.env.AGENTCHAT_PROFILE) return nameToPath(process.env.AGENTCHAT_PROFILE);
+  if (process.env.AGENTCHAT_PROFILE)
+    return { path: nameToPath(process.env.AGENTCHAT_PROFILE), source: "legacy-env", declaredName: process.env.AGENTCHAT_PROFILE };
   // 3. --profile <name>
-  if (cliArgs.profile) return nameToPath(cliArgs.profile);
+  if (cliArgs.profile) return { path: nameToPath(cliArgs.profile), source: "flag-profile", declaredName: cliArgs.profile };
   // 4. --name <name>
-  if (cliArgs.name) return nameToPath(cliArgs.name);
-  // 5. default
-  return nameToPath("profile");
+  if (cliArgs.name) return { path: nameToPath(cliArgs.name), source: "flag-name", declaredName: cliArgs.name };
+  // 5. default — nothing was declared. NOT a licence to invent an identity.
+  return { path: nameToPath("profile"), source: "default" };
 }
 
-const profileFile = resolveProfilePath();
+const { path: profileFile, source: profileSource, declaredName } = resolveProfile();
+/**
+ * The profile file currently in effect. Mutable because `switch_profile` swaps
+ * identity at runtime — `whoami` must report the live one, not the boot-time one.
+ * null = no profile is backing this session (anonymous, or token-only).
+ */
+let activeProfileFile: string | null = profileFile;
+/** No identity at all: serve tools/list, register nothing, connect nothing. */
+let anonymousMode = false;
 let profile: any = {};
 
 const DEFAULT_SERVER = "https://agents-chat.com";
@@ -157,14 +176,82 @@ const WS_URL = process.env.AGENTCHAT_URL || (() => {
 })();
 const REST_URL = serverUrl;
 
-if (existsSync(profileFile)) {
+// Identity, declared (not just hoisted) BEFORE anything can call apiFetch. These are
+// filled in from `profile` once the identity block below has run. Registration runs
+// before that and must not read them through the temporal dead zone — see below.
+let AGENT_ID = "";
+let TOKEN = "";
+let CAPABILITIES: string[] = [];
+
+// Native fetch, captured before the file-wide call-site rename to apiFetch so the
+// wrapper below can't recurse into itself.
+const nativeFetch = fetch;
+// All AgentsChat REST goes through apiFetch so every call gets, from one place:
+// (1) a timeout — a hung hub call must never block a tool forever; and
+// (2) the bearer token, injected only when absent and TOKEN is set (so the few
+//     conditional-auth sites keep their exact semantics). init is otherwise passed
+//     through untouched, so callers keep using r.ok / r.text() / r.json().
+//
+// This must be defined ABOVE the registration block. apiFetch is a hoisted function,
+// but its `timeoutMs = REST_TIMEOUT_MS` default and its `TOKEN` read are evaluated at
+// CALL time: when the bare-fetch→apiFetch refactor moved these call sites above the
+// const declarations, every /api/account/register call threw a TDZ ReferenceError that
+// the surrounding `catch` reported as "Server unreachable" — silently disabling
+// registration (and its dev-token migration twin, whose catch is empty). Registration
+// happens before TOKEN is assigned, so TOKEN is "" there and no Authorization header is
+// sent — exactly what the register endpoint expects.
+const REST_TIMEOUT_MS = 15_000;
+async function apiFetch(
+  input: string | URL,
+  init: RequestInit = {},
+  timeoutMs = REST_TIMEOUT_MS,
+): Promise<Response> {
+  const headers: Record<string, string> = { ...(init.headers as Record<string, string> | undefined) };
+  if (TOKEN && !("Authorization" in headers)) headers["Authorization"] = `Bearer ${TOKEN}`;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await nativeFetch(input as any, { ...init, headers, signal: init.signal ?? controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+const hasToken = !!(cliArgs.token || process.env.AGENTCHAT_TOKEN);
+const identity = decideIdentity({
+  profileExists: existsSync(profileFile),
+  source: profileSource,
+  profileFile,
+  cliName: cliArgs.name,
+  declaredName,
+  registerFlag: !!cliArgs.register,
+  hasToken,
+  fallbackName: `Claude-${randomUUID().slice(0, 6)}`,
+});
+
+if (identity.mode === "profile") {
   profile = JSON.parse(readFileSync(profileFile, "utf-8"));
   process.stderr.write(`[agentchat] Profile loaded: ${profileFile}\n`);
+} else if (identity.mode === "env-creds") {
+  // Token handed to us directly — authenticate with it, register nothing, write nothing.
+  activeProfileFile = null;
+  process.stderr.write(`[agentchat] Using credentials from environment — not registering.\n`);
+} else if (identity.mode === "error") {
+  // A declared identity with no profile behind it. Inventing one is what corrupted
+  // attribution before, so fail loudly instead. Introspection never lands here.
+  process.stderr.write(`[agentchat] ERROR: ${identity.message}\n`);
+  process.exit(1);
+} else if (identity.mode === "anonymous") {
+  // Nothing declared. Stay alive so stdio introspection (initialize/tools/list) works,
+  // but create no account and persist no credentials.
+  anonymousMode = true;
+  activeProfileFile = null;
+  process.stderr.write(`[agentchat] ${identity.reason}\n`);
 } else {
-  // First run: auto-register with server to get a real agent key
-  const displayName = cliArgs.name || `Claude-${randomUUID().slice(0, 6)}`;
+  // Explicit opt-in: register a real account and persist it.
+  const displayName = identity.displayName;
   const caps = ["claude-code", "coding", "chat"];
-  process.stderr.write(`[agentchat] First run — registering with server...\n`);
+  process.stderr.write(`[agentchat] Registering "${displayName}" with server...\n`);
   try {
     const regRes = await apiFetch(`${REST_URL}/api/account/register`, {
       method: "POST",
@@ -196,8 +283,15 @@ if (existsSync(profileFile)) {
   process.stderr.write(`[agentchat] Profile saved: ${profileFile}\n`);
 }
 
-// Migrate old profiles with dev-token: auto-register to get real key
-if (profile.token === "dev-token") {
+// Second auto-register trigger: a loaded profile still carrying the `dev-token`
+// placeholder. Healing it is intended for a declared identity, but on the bare
+// shared default path it mints an anonymous account just like the first trigger.
+if (profile.token === "dev-token" && !shouldMigrateDevToken({ source: profileSource, hasToken, registerFlag: !!cliArgs.register })) {
+  process.stderr.write(
+    `[agentchat] Profile at ${profileFile} carries a dev-token but no identity was declared — ` +
+      `refusing to auto-register. Pass --name <name> or --register to create a real agent.\n`,
+  );
+} else if (profile.token === "dev-token") {
   process.stderr.write(`[agentchat] Migrating dev-token profile — registering with server...\n`);
   try {
     const regRes = await apiFetch(`${REST_URL}/api/account/register`, {
@@ -229,34 +323,10 @@ if (profile.token === "dev-token") {
   } catch {}
 }
 
-let AGENT_ID = cliArgs.id || process.env.AGENTCHAT_AGENT_ID || profile.agent_id || randomUUID();
-let TOKEN = cliArgs.token || process.env.AGENTCHAT_TOKEN || profile.token || "dev-token";
-let CAPABILITIES: string[] = cliArgs.caps?.split(",") || profile.capabilities || ["claude-code", "coding", "chat"];
-
-// Native fetch, captured before the file-wide call-site rename to apiFetch so the
-// wrapper below can't recurse into itself.
-const nativeFetch = fetch;
-// All AgentsChat REST goes through apiFetch so every call gets, from one place:
-// (1) a timeout — a hung hub call must never block a tool forever; and
-// (2) the bearer token, injected only when absent and TOKEN is set (so the few
-//     conditional-auth sites keep their exact semantics). init is otherwise passed
-//     through untouched, so callers keep using r.ok / r.text() / r.json().
-const REST_TIMEOUT_MS = 15_000;
-async function apiFetch(
-  input: string | URL,
-  init: RequestInit = {},
-  timeoutMs = REST_TIMEOUT_MS,
-): Promise<Response> {
-  const headers: Record<string, string> = { ...(init.headers as Record<string, string> | undefined) };
-  if (TOKEN && !("Authorization" in headers)) headers["Authorization"] = `Bearer ${TOKEN}`;
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    return await nativeFetch(input as any, { ...init, headers, signal: init.signal ?? controller.signal });
-  } finally {
-    clearTimeout(timer);
-  }
-}
+// Now that the identity block has settled `profile`, bind the runtime identity.
+AGENT_ID = cliArgs.id || process.env.AGENTCHAT_AGENT_ID || profile.agent_id || randomUUID();
+TOKEN = cliArgs.token || process.env.AGENTCHAT_TOKEN || profile.token || "dev-token";
+CAPABILITIES = cliArgs.caps?.split(",") || profile.capabilities || ["claude-code", "coding", "chat"];
 
 // Update display name if provided via CLI
 if (cliArgs.name && profile.display_name !== cliArgs.name) {
@@ -2714,7 +2784,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     } catch (e: any) {
       authLine = `REST auth: error (${String(e?.message || e).slice(0, 80)})`;
     }
-    return { content: [{ type: "text", text: `Profile: ${profile.display_name || AGENT_ID}\nAgent ID: ${AGENT_ID}\nServer: ${REST_URL}\nWeb chat: ${REST_URL}/chat/${encodeURIComponent(AGENT_ID)}\nWebSocket: ${wsState}${sessionId ? `\nSession: ${sessionId.slice(0, 12)}...` : ""}\n${healthLine}\n${authLine}\n${claimedLine}${claimHint ? `\n${claimHint}` : ""}\nCapabilities: ${CAPABILITIES.join(", ")}\nProfile file: ${profileFile}` }] };
+    return { content: [{ type: "text", text: `Profile: ${profile.display_name || AGENT_ID}\nAgent ID: ${AGENT_ID}\nServer: ${REST_URL}\nWeb chat: ${REST_URL}/chat/${encodeURIComponent(AGENT_ID)}\nWebSocket: ${wsState}${sessionId ? `\nSession: ${sessionId.slice(0, 12)}...` : ""}\n${healthLine}\n${authLine}\n${claimedLine}${claimHint ? `\n${claimHint}` : ""}\nCapabilities: ${CAPABILITIES.join(", ")}\nProfile file: ${activeProfileFile ?? (anonymousMode ? "(none — anonymous, no profile written)" : "(none — credentials from environment)")}` }] };
   }
 
   if (name === "list_channels") {
@@ -2907,11 +2977,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
     sessionId = null;
 
-    // Update identity
+    // Update identity. activeProfileFile must move too — whoami reports it, and a
+    // stale value there makes the identity probe lie about which profile is live.
     AGENT_ID = newProfile.agent_id;
     TOKEN = newProfile.token || "dev-token";
     CAPABILITIES = newProfile.capabilities || ["claude-code", "coding", "chat"];
     profile = newProfile;
+    activeProfileFile = targetFile;
+    anonymousMode = false;
 
     // Restart heartbeat and connect with new identity
     wsReconnectAttempt = 0;
@@ -4004,7 +4077,13 @@ async function checkVersionStaleness(): Promise<void> {
 // --- Start ---
 async function main() {
   installStdioLifecycleGuards();
-  connectWS();
+  // Anonymous = no credentials to present. Connecting would just fail auth in a
+  // reconnect loop; stdio (initialize/tools/list) is served either way.
+  if (anonymousMode) {
+    process.stderr.write(`[agentchat] Anonymous — not connecting to the hub.\n`);
+  } else {
+    connectWS();
+  }
 
   // Stdio is the only supported transport. The --port HTTP SSE path was
   // removed in v0.6.7 — OpenClaw users should install the native channel

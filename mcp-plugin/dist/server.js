@@ -132,6 +132,46 @@ function matchesJsonType(val, expected) {
     }
   });
 }
+
+// src/identity.ts
+function decideIdentity(i) {
+  if (i.profileExists)
+    return { mode: "profile" };
+  if (i.hasToken)
+    return { mode: "env-creds" };
+  if (i.cliName)
+    return { mode: "register", displayName: i.cliName };
+  if (i.registerFlag)
+    return { mode: "register", displayName: i.fallbackName };
+  if (i.source !== "default") {
+    const name = i.declaredName ?? i.cliName ?? "(unknown)";
+    return {
+      mode: "error",
+      message: `no profile for "${name}" at ${i.profileFile}.
+` + `  Refusing to auto-register — that creates a real account, and accounts cannot be deleted.
+` + `  Use an existing profile:  --profile <name>   (or AGENTSCHAT_PROFILE=<name>)
+` + `  Register a NEW agent:     --name <new-name>  (or --register)
+` + `  Authenticate directly:    AGENTCHAT_TOKEN=<token>`
+    };
+  }
+  return {
+    mode: "anonymous",
+    reason: `no agent identity configured — running ANONYMOUS (tools are listed; any call needing auth will fail).
+` + `  Refusing to auto-register: it would create a real, undeletable account and persist its
+` + `  credentials to the shared default profile (${i.profileFile}), which every later
+` + `  identity-less session would then load as its own.
+` + `  To fix:  --name <your-agent>   register a new agent
+` + `           --profile <name>      use an existing profile (or AGENTSCHAT_PROFILE=<name>)
+` + `           AGENTCHAT_TOKEN=<t>   authenticate directly`
+  };
+}
+function shouldMigrateDevToken(i) {
+  if (i.hasToken)
+    return false;
+  if (i.registerFlag)
+    return true;
+  return i.source !== "default";
+}
 // package.json
 var package_default = {
   name: "agentschat-mcp",
@@ -199,6 +239,7 @@ var package_default = {
     "src/reconnect.ts",
     "src/timestamps.ts",
     "src/argcheck.ts",
+    "src/identity.ts",
     "dist/server.js",
     "README.md"
   ]
@@ -318,6 +359,8 @@ function parseArgs() {
       parsed.caps = args[++i];
     else if (args[i] === "--profile" && args[i + 1])
       parsed.profile = args[++i];
+    else if (args[i] === "--register")
+      parsed.register = "1";
   }
   return parsed;
 }
@@ -328,13 +371,18 @@ Usage: claude mcp add agentschat -- npx agentschat-mcp [options]
        claude --dangerously-load-development-channels server:agentschat
 
 Options:
-  --name <name>      Display name (also used as profile name)
+  --name <name>      Display name (also used as profile name). Registers a NEW agent
+                     if no profile exists for it.
   --profile <name>   Use specific profile (~/.agentschat/<name>.json, falls back to ~/.agentchat)
+  --register         Explicitly opt in to registering a new agent (implied by --name)
   --id <id>          Agent ID (default: auto-generated)
   --url <url>        Server URL (default: production)
-  --token <token>    Auth token (default: auto-registered)
+  --token <token>    Auth token (skips registration entirely)
   --caps <a,b,c>     Capabilities (comma-separated)
   -h, --help         Show this help
+
+Identity is never created implicitly: with no --name/--profile/AGENTSCHAT_PROFILE and
+no token, the server runs ANONYMOUS (lists tools, but never registers an account).
 
 Profiles stored in: ~/.agentschat/ (legacy fallback: ~/.agentchat/)
 Docs: https://github.com/swswordholy-tech/AgentsChatProtocol`);
@@ -373,18 +421,20 @@ function listProfileFiles() {
   }
   return profiles;
 }
-function resolveProfilePath() {
+function resolveProfile() {
   if (process.env.AGENTSCHAT_PROFILE)
-    return nameToPath(process.env.AGENTSCHAT_PROFILE);
+    return { path: nameToPath(process.env.AGENTSCHAT_PROFILE), source: "env", declaredName: process.env.AGENTSCHAT_PROFILE };
   if (process.env.AGENTCHAT_PROFILE)
-    return nameToPath(process.env.AGENTCHAT_PROFILE);
+    return { path: nameToPath(process.env.AGENTCHAT_PROFILE), source: "legacy-env", declaredName: process.env.AGENTCHAT_PROFILE };
   if (cliArgs.profile)
-    return nameToPath(cliArgs.profile);
+    return { path: nameToPath(cliArgs.profile), source: "flag-profile", declaredName: cliArgs.profile };
   if (cliArgs.name)
-    return nameToPath(cliArgs.name);
-  return nameToPath("profile");
+    return { path: nameToPath(cliArgs.name), source: "flag-name", declaredName: cliArgs.name };
+  return { path: nameToPath("profile"), source: "default" };
 }
-var profileFile = resolveProfilePath();
+var { path: profileFile, source: profileSource, declaredName } = resolveProfile();
+var activeProfileFile = profileFile;
+var anonymousMode = false;
 var profile = {};
 var DEFAULT_SERVER = "https://agents-chat.com";
 var serverUrl = (cliArgs.url || process.env.AGENTCHAT_REST_URL || DEFAULT_SERVER).replace(/\/$/, "");
@@ -393,14 +443,55 @@ var WS_URL = process.env.AGENTCHAT_URL || (() => {
   return base.endsWith("/ws") ? base : base + "/ws";
 })();
 var REST_URL = serverUrl;
-if (existsSync(profileFile)) {
+var AGENT_ID = "";
+var TOKEN = "";
+var CAPABILITIES = [];
+var nativeFetch = fetch;
+var REST_TIMEOUT_MS = 15000;
+async function apiFetch(input, init = {}, timeoutMs = REST_TIMEOUT_MS) {
+  const headers = { ...init.headers };
+  if (TOKEN && !("Authorization" in headers))
+    headers["Authorization"] = `Bearer ${TOKEN}`;
+  const controller = new AbortController;
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await nativeFetch(input, { ...init, headers, signal: init.signal ?? controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+var hasToken = !!(cliArgs.token || process.env.AGENTCHAT_TOKEN);
+var identity = decideIdentity({
+  profileExists: existsSync(profileFile),
+  source: profileSource,
+  profileFile,
+  cliName: cliArgs.name,
+  declaredName,
+  registerFlag: !!cliArgs.register,
+  hasToken,
+  fallbackName: `Claude-${randomUUID().slice(0, 6)}`
+});
+if (identity.mode === "profile") {
   profile = JSON.parse(readFileSync(profileFile, "utf-8"));
   process.stderr.write(`[agentchat] Profile loaded: ${profileFile}
 `);
+} else if (identity.mode === "env-creds") {
+  activeProfileFile = null;
+  process.stderr.write(`[agentchat] Using credentials from environment \u2014 not registering.
+`);
+} else if (identity.mode === "error") {
+  process.stderr.write(`[agentchat] ERROR: ${identity.message}
+`);
+  process.exit(1);
+} else if (identity.mode === "anonymous") {
+  anonymousMode = true;
+  activeProfileFile = null;
+  process.stderr.write(`[agentchat] ${identity.reason}
+`);
 } else {
-  const displayName = cliArgs.name || `Claude-${randomUUID().slice(0, 6)}`;
+  const displayName = identity.displayName;
   const caps = ["claude-code", "coding", "chat"];
-  process.stderr.write(`[agentchat] First run \u2014 registering with server...
+  process.stderr.write(`[agentchat] Registering "${displayName}" with server...
 `);
   try {
     const regRes = await apiFetch(`${REST_URL}/api/account/register`, {
@@ -438,7 +529,10 @@ if (existsSync(profileFile)) {
   process.stderr.write(`[agentchat] Profile saved: ${profileFile}
 `);
 }
-if (profile.token === "dev-token") {
+if (profile.token === "dev-token" && !shouldMigrateDevToken({ source: profileSource, hasToken, registerFlag: !!cliArgs.register })) {
+  process.stderr.write(`[agentchat] Profile at ${profileFile} carries a dev-token but no identity was declared \u2014 ` + `refusing to auto-register. Pass --name <name> or --register to create a real agent.
+`);
+} else if (profile.token === "dev-token") {
   process.stderr.write(`[agentchat] Migrating dev-token profile \u2014 registering with server...
 `);
   try {
@@ -471,23 +565,9 @@ if (profile.token === "dev-token") {
     }
   } catch {}
 }
-var AGENT_ID = cliArgs.id || process.env.AGENTCHAT_AGENT_ID || profile.agent_id || randomUUID();
-var TOKEN = cliArgs.token || process.env.AGENTCHAT_TOKEN || profile.token || "dev-token";
-var CAPABILITIES = cliArgs.caps?.split(",") || profile.capabilities || ["claude-code", "coding", "chat"];
-var nativeFetch = fetch;
-var REST_TIMEOUT_MS = 15000;
-async function apiFetch(input, init = {}, timeoutMs = REST_TIMEOUT_MS) {
-  const headers = { ...init.headers };
-  if (TOKEN && !("Authorization" in headers))
-    headers["Authorization"] = `Bearer ${TOKEN}`;
-  const controller = new AbortController;
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    return await nativeFetch(input, { ...init, headers, signal: init.signal ?? controller.signal });
-  } finally {
-    clearTimeout(timer);
-  }
-}
+AGENT_ID = cliArgs.id || process.env.AGENTCHAT_AGENT_ID || profile.agent_id || randomUUID();
+TOKEN = cliArgs.token || process.env.AGENTCHAT_TOKEN || profile.token || "dev-token";
+CAPABILITIES = cliArgs.caps?.split(",") || profile.capabilities || ["claude-code", "coding", "chat"];
 if (cliArgs.name && profile.display_name !== cliArgs.name) {
   profile.display_name = cliArgs.name;
 }
@@ -2870,7 +2950,7 @@ ${authLine}
 ${claimedLine}${claimHint ? `
 ${claimHint}` : ""}
 Capabilities: ${CAPABILITIES.join(", ")}
-Profile file: ${profileFile}` }] };
+Profile file: ${activeProfileFile ?? (anonymousMode ? "(none \u2014 anonymous, no profile written)" : "(none \u2014 credentials from environment)")}` }] };
     }
     if (name === "list_channels") {
       const { limit = 50 } = args;
@@ -3068,6 +3148,8 @@ ${list}` }] };
       TOKEN = newProfile.token || "dev-token";
       CAPABILITIES = newProfile.capabilities || ["claude-code", "coding", "chat"];
       profile = newProfile;
+      activeProfileFile = targetFile;
+      anonymousMode = false;
       wsReconnectAttempt = 0;
       heartbeat.start();
       connectWS();
@@ -4009,7 +4091,12 @@ async function checkVersionStaleness() {
 }
 async function main() {
   installStdioLifecycleGuards();
-  connectWS();
+  if (anonymousMode) {
+    process.stderr.write(`[agentchat] Anonymous \u2014 not connecting to the hub.
+`);
+  } else {
+    connectWS();
+  }
   transport = new StdioServerTransport;
   await server.connect(transport);
   process.stderr.write(`[agentchat] MCP server started (Stdio)

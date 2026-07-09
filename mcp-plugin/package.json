@@ -64,6 +64,7 @@
     "src/reconnect.ts",
     "src/timestamps.ts",
     "src/argcheck.ts",
+    "src/identity.ts",
     "dist/server.js",
     "README.md"
   ]
