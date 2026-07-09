@@ -272,9 +272,14 @@ web-UI step, not a file field).
       via src/cli.mjs, drove MCP `initialize` + `tools/list` over stdio → initialize ok (agentschat v0.29.0),
       24 tools listed. Same driver under Bun (raw .ts path) = identical 24 tools → zero regression on the
       primary path. verify green (build + version-sync + tsc strict 0 + 44 tests).
-- [ ] npm publish (0.29.1, packaging-only) — DEFERRED, publish-gated. Repo commit alone covers Glama's
-      from-repo build + unlocks the claim path; the versioned publish additionally makes `npm install`/`npx
-      agentschat-mcp` work under Node for humans + any npm-path introspector. Ready on coordinator/boss 发令.
+- [x] Release 0.29.1 (packaging-only, npm + official Registry LIVE 2026-07-09, boss 发令 relayed by
+      brusque; npm creds on-box = agentchat_2026). Bump 0.29.0→0.29.1 (package.json + server.json ×2),
+      committed bundle rebuilt at 0.29.1 (71c0f3b), verify green. `npm publish` → agentschat-mcp@0.29.1,
+      dist-tags.latest=0.29.1, tarball 13 files (cli.mjs + dist/server.js present). Registry: re-login with
+      saved PAT (JWT expires between releases) → `mcp-publisher publish` → 0.29.1 isLatest=True verified via
+      registry API (0.26/0.27/0.28/0.29.0 all demoted to isLatest=False). No runtime behavior change vs
+      0.29.0 — packaging only: human `npx agentschat-mcp` + any npm-path introspector (PulseMCP etc.) now
+      install + introspect under plain Node, not just Bun.
 
 ## Deferred (broad; want review before doing)
 - redactSecrets password= / ?key= patterns — risks over-masking legitimate URLs; wants deliberate design.
