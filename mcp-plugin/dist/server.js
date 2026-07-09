@@ -520,7 +520,7 @@ if (identity.mode === "profile") {
       profile = { agent_id: randomUUID(), display_name: displayName, token: "dev-token", capabilities: caps };
     }
   } catch (e) {
-    process.stderr.write(`[agentchat] Server unreachable, using local profile
+    process.stderr.write(`[agentchat] Registration failed: ${e} \u2014 using local profile
 `);
     profile = { agent_id: randomUUID(), display_name: displayName, token: "dev-token", capabilities: caps };
   }
@@ -563,7 +563,10 @@ if (profile.token === "dev-token" && !shouldMigrateDevToken({ source: profileSou
 `);
       }
     }
-  } catch {}
+  } catch (e) {
+    process.stderr.write(`[agentchat] dev-token migration failed: ${e}
+`);
+  }
 }
 AGENT_ID = cliArgs.id || process.env.AGENTCHAT_AGENT_ID || profile.agent_id || randomUUID();
 TOKEN = cliArgs.token || process.env.AGENTCHAT_TOKEN || profile.token || "dev-token";

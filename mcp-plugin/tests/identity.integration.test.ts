@@ -126,6 +126,23 @@ describe("identity policy, end-to-end against a mock hub", () => {
     // Control group for the `written(...) === []` assertions above: prove the helper
     // actually observes a persisted profile, so those empty expectations aren't vacuous.
     expect(written(home, ".agentschat")).toEqual(["Foo.json"]);
+    // Control for the failure-path test below: on success we must NOT print that line.
+    expect(err).not.toMatch(/Registration failed/);
+  }, 15_000);
+
+  test("a failed registration prints the real cause, not a fabricated one", async () => {
+    calls = [];
+    // Point at a dead port (last --url wins in parseArgs) so the fetch genuinely throws.
+    const home = freshHome("regfail");
+    const { err } = await drive(["--name", "Foo", "--url", "http://127.0.0.1:1"], home, [INIT, INITED, LIST]);
+
+    expect(registerCalls()).toBe(0); // never reached the hub
+    // The cause must be surfaced. The old code reported every failure — including a TDZ
+    // ReferenceError — as "Server unreachable", a fluent lie pointing at the network.
+    expect(err).toMatch(/Registration failed: .+/);
+    expect(err).not.toMatch(/Server unreachable/);
+    // ...and the server still comes up, so this stays a degradation, not a crash.
+    expect(err).toMatch(/MCP server started/);
   }, 15_000);
 
   test("dev-token profile on the shared default path is NOT re-registered", async () => {

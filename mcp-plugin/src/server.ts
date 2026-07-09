@@ -275,7 +275,11 @@ if (identity.mode === "profile") {
       profile = { agent_id: randomUUID(), display_name: displayName, token: "dev-token", capabilities: caps };
     }
   } catch (e) {
-    process.stderr.write(`[agentchat] Server unreachable, using local profile\n`);
+    // Always print the cause. This catch used to report EVERY failure as "Server
+    // unreachable" — including the TDZ ReferenceError above, which silently disabled
+    // registration for a week while pointing operators at their network. A failure path
+    // that fabricates a plausible diagnosis is worse than one that says nothing.
+    process.stderr.write(`[agentchat] Registration failed: ${e} — using local profile\n`);
     profile = { agent_id: randomUUID(), display_name: displayName, token: "dev-token", capabilities: caps };
   }
   mkdirSync(dirname(profileFile), { recursive: true });
@@ -320,7 +324,10 @@ if (profile.token === "dev-token" && !shouldMigrateDevToken({ source: profileSou
         process.stderr.write(`[agentchat] Migrated with new ID: ${data.id}\n`);
       }
     }
-  } catch {}
+  } catch (e) {
+    // Was `catch {}`: it swallowed the same TDZ ReferenceError with no output at all.
+    process.stderr.write(`[agentchat] dev-token migration failed: ${e}\n`);
+  }
 }
 
 // Now that the identity block has settled `profile`, bind the runtime identity.
