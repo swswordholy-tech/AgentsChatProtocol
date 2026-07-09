@@ -241,6 +241,7 @@ var package_default = {
     "src/argcheck.ts",
     "src/identity.ts",
     "src/profile-store.ts",
+    "src/read-cursor.ts",
     "dist/server.js",
     "README.md"
   ]
@@ -251,7 +252,7 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema
 } from "@modelcontextprotocol/sdk/types.js";
-import { readFileSync, existsSync as existsSync2, writeFileSync as writeFileSync2, mkdirSync, readdirSync } from "fs";
+import { readFileSync, existsSync as existsSync2, writeFileSync as writeFileSync3, mkdirSync, readdirSync } from "fs";
 import { join, dirname } from "path";
 
 // src/profile-store.ts
@@ -284,6 +285,27 @@ function safeWriteProfile(path, data, warn = defaultWarn) {
     warn(`[agentchat] WARNING: could not verify permissions of ${path}: ${e}
 `);
   }
+}
+
+// src/read-cursor.ts
+import { writeFileSync as writeFileSync2 } from "fs";
+function persistCursor(file, cursor, warn) {
+  try {
+    writeFileSync2(file, JSON.stringify(Object.fromEntries(cursor)));
+    return true;
+  } catch (e) {
+    warn(`[agentchat] WARNING: failed to persist read cursor to ${file}: ${e}
+`);
+    return false;
+  }
+}
+function flushCursor(state, persist) {
+  if (!state.dirty)
+    return false;
+  const ok = persist();
+  if (ok)
+    state.dirty = false;
+  return ok;
 }
 
 // src/server.ts
@@ -2277,8 +2299,8 @@ ${a.body || ""}`;
             return { content: [{ type: "text", text: `sync_skill (personal): body fetch failed (${bodyR.status})` }], isError: true };
           const doc = JSON.parse(await bodyR.text());
           mkdirSync(dirname(pMd), { recursive: true });
-          writeFileSync2(pMd, String(doc?.body_markdown ?? ""));
-          writeFileSync2(pMeta, JSON.stringify({ version: currentVersion, name: a.name, syncedAt: new Date().toISOString() }));
+          writeFileSync3(pMd, String(doc?.body_markdown ?? ""));
+          writeFileSync3(pMeta, JSON.stringify({ version: currentVersion, name: a.name, syncedAt: new Date().toISOString() }));
           return { content: [{ type: "text", text: `synced personal skill "${a.name}" v${currentVersion} \u2192 ${pMd} (was ${cachedVersion === null ? "missing" : `stale v${cachedVersion}`}). Read that file to run it.` }] };
         } catch (e) {
           return { content: [{ type: "text", text: `sync_skill (personal) error: ${String(e?.message || e).slice(0, 140)}` }], isError: true };
@@ -2312,8 +2334,8 @@ ${a.body || ""}`;
         const doc = JSON.parse(await docR.text());
         const body = String(doc?.body_markdown ?? doc?.bodyMarkdown ?? "");
         mkdirSync(dirname(mdPath), { recursive: true });
-        writeFileSync2(mdPath, body);
-        writeFileSync2(metaPath, JSON.stringify({ version: currentVersion, title: doc?.title, doc_id: a.doc_id, chat_id: a.chat_id, syncedAt: new Date().toISOString() }));
+        writeFileSync3(mdPath, body);
+        writeFileSync3(metaPath, JSON.stringify({ version: currentVersion, title: doc?.title, doc_id: a.doc_id, chat_id: a.chat_id, syncedAt: new Date().toISOString() }));
         const was = cachedVersion === null ? "missing" : `stale v${cachedVersion}`;
         return { content: [{ type: "text", text: `synced "${doc?.title || a.doc_id}" v${currentVersion} \u2192 ${mdPath} (was ${was}). Read that file to run it in your runtime.` }] };
       } catch (e) {
@@ -3543,7 +3565,7 @@ function loadMentionTimestamps() {
 }
 function saveMentionTimestamps(m) {
   try {
-    writeFileSync2(mentionTsFile, JSON.stringify(Object.fromEntries(m)));
+    writeFileSync3(mentionTsFile, JSON.stringify(Object.fromEntries(m)));
   } catch {}
 }
 var lastMentionTimestamp = loadMentionTimestamps();
@@ -3556,27 +3578,21 @@ function loadLastSeenMessageTs() {
     return new Map;
   }
 }
-function saveLastSeenMessageTs(m) {
-  try {
-    writeFileSync2(lastSeenMessageTsFile, JSON.stringify(Object.fromEntries(m)));
-  } catch {}
-}
 var lastSeenMessageTs = loadLastSeenMessageTs();
 var cursorFlushIntervalMs = Math.max(500, Number(process.env.AGENTSCHAT_MCP_CURSOR_FLUSH_MS || 5000));
-var lastSeenMessageTsDirty = false;
+var cursorState = { dirty: false };
 var lastSeenMessageTsTimer = null;
 function flushLastSeenMessageTs() {
-  if (!lastSeenMessageTsDirty)
+  if (!cursorState.dirty)
     return;
-  lastSeenMessageTsDirty = false;
   if (lastSeenMessageTsTimer) {
     clearTimeout(lastSeenMessageTsTimer);
     lastSeenMessageTsTimer = null;
   }
-  saveLastSeenMessageTs(lastSeenMessageTs);
+  flushCursor(cursorState, () => persistCursor(lastSeenMessageTsFile, lastSeenMessageTs, safeStderrWrite));
 }
 function scheduleLastSeenMessageTsSave() {
-  lastSeenMessageTsDirty = true;
+  cursorState.dirty = true;
   if (lastSeenMessageTsTimer)
     return;
   lastSeenMessageTsTimer = setTimeout(() => {
@@ -4056,7 +4072,10 @@ function shutdownFromStdio(reason) {
 `);
   try {
     flushLastSeenMessageTs();
-  } catch {}
+  } catch (e) {
+    safeStderrWrite(`[agentchat] WARNING: read-cursor flush failed on shutdown: ${e}
+`);
+  }
   try {
     heartbeat.stop();
   } catch {}
@@ -4100,7 +4119,10 @@ function installStdioLifecycleGuards() {
   process.on("beforeExit", () => {
     try {
       flushLastSeenMessageTs();
-    } catch {}
+    } catch (e) {
+      safeStderrWrite(`[agentchat] WARNING: read-cursor fallback flush failed: ${e}
+`);
+    }
   });
 }
 async function checkVersionStaleness() {

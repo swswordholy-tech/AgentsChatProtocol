@@ -54,6 +54,8 @@ import { join, dirname } from "path";
 // Atomic + 0600-by-construction profile writer. Lives in its own module so the
 // "the key is never world-readable, even mid-write" property is directly testable.
 import { safeWriteProfile } from "./profile-store.ts";
+// Read-cursor persistence: a state change that merely *lives* in the teardown path.
+import { flushCursor, persistCursor } from "./read-cursor.ts";
 import { randomUUID } from "crypto";
 
 function parseArgs() {
@@ -3395,31 +3397,27 @@ function loadLastSeenMessageTs(): Map<string, string> {
     return new Map(Object.entries(JSON.parse(raw)));
   } catch { return new Map(); }
 }
-function saveLastSeenMessageTs(m: Map<string, string>) {
-  try {
-    writeFileSync(lastSeenMessageTsFile, JSON.stringify(Object.fromEntries(m)));
-  } catch {}
-}
 const lastSeenMessageTs = loadLastSeenMessageTs();
 const cursorFlushIntervalMs = Math.max(
   500,
   Number(process.env.AGENTSCHAT_MCP_CURSOR_FLUSH_MS || 5000),
 );
-let lastSeenMessageTsDirty = false;
+/** Dirty flag lives in an object so flushCursor can clear it only on a landed write. */
+const cursorState = { dirty: false };
 let lastSeenMessageTsTimer: ReturnType<typeof setTimeout> | null = null;
 
 function flushLastSeenMessageTs() {
-  if (!lastSeenMessageTsDirty) return;
-  lastSeenMessageTsDirty = false;
+  if (!cursorState.dirty) return;
   if (lastSeenMessageTsTimer) {
     clearTimeout(lastSeenMessageTsTimer);
     lastSeenMessageTsTimer = null;
   }
-  saveLastSeenMessageTs(lastSeenMessageTs);
+  // Stays dirty if the write fails, so the shutdown fallback flush actually retries.
+  flushCursor(cursorState, () => persistCursor(lastSeenMessageTsFile, lastSeenMessageTs, safeStderrWrite));
 }
 
 function scheduleLastSeenMessageTsSave() {
-  lastSeenMessageTsDirty = true;
+  cursorState.dirty = true;
   if (lastSeenMessageTsTimer) return;
   lastSeenMessageTsTimer = setTimeout(() => {
     lastSeenMessageTsTimer = null;
@@ -4009,7 +4007,8 @@ function shutdownFromStdio(reason: string) {
   if (shuttingDown) return;
   shuttingDown = true;
   safeStderrWrite(`[agentchat] Stdio closed (${reason}), shutting down\n`);
-  try { flushLastSeenMessageTs(); } catch {}
+  // Persisting the read cursor is a state change, not teardown: report, never swallow.
+  try { flushLastSeenMessageTs(); } catch (e) { safeStderrWrite(`[agentchat] WARNING: read-cursor flush failed on shutdown: ${e}\n`); }
   try { heartbeat.stop(); } catch {}
   try { stopAllTypingHeartbeats(); } catch {}
   if (reconnectTimer) {
@@ -4046,7 +4045,7 @@ function installStdioLifecycleGuards() {
   process.stderr.on("error", handleOutputError);
   process.on("SIGPIPE", () => shutdownFromStdio("SIGPIPE"));
   process.on("beforeExit", () => {
-    try { flushLastSeenMessageTs(); } catch {}
+    try { flushLastSeenMessageTs(); } catch (e) { safeStderrWrite(`[agentchat] WARNING: read-cursor fallback flush failed: ${e}\n`); }
   });
 }
 
