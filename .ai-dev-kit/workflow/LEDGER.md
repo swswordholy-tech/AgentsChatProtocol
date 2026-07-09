@@ -356,6 +356,34 @@ dependency at 11203). We are actively driving npx installs at this funnel.
 - [ ] Publish **0.30.0** (gate + revived registration + whoami fix; also carries the pending docs/engines
       fix) — **publish-gated**, needs boss 发令. Root fix is on main; npm still serves the broken build.
 
+### Follow-on hardening (all found by applying one rule, all with tests that fail on the old code)
+The rule this round produced: **a `catch` may swallow only if something will redo the wrapped call
+after it fails.** Not "is it in teardown" — teardown is a location, not a semantic.
+- [x] `e9df653` — the registration catches fabricated a diagnosis. Every failure, including the TDZ
+      `ReferenceError`, was printed as `"Server unreachable"`; the migration's `catch {}` said nothing at
+      all. Both now print `e`. Control flow unchanged; only the diagnosis becomes true.
+- [x] `7626ef9` — profile key is now `0600` **by construction**. `writeFileSync`'s `mode` is ignored for an
+      existing file and `renameSync` preserves the source's mode, so a stale `.tmp` from a crash carried
+      `0644` through; `chmodSync` was the sole repair AND its failure was swallowed. Worse: `0600` only
+      became true *after* the chmod, so dying between rename and chmod left a live key world-readable.
+      Now: unlink the stale tmp (mode applies at creation), report a chmod failure, verify the final mode.
+      Extracted to `src/profile-store.ts` — the mid-write property is only observable if you can call it.
+- [x] `8dbd3a5` — read cursor. `flushLastSeenMessageTs` cleared `dirty` BEFORE a write whose error was
+      swallowed one frame lower (inside `saveLastSeenMessageTs`), so one failure discarded the cursor and
+      disabled its own retry (the shutdown fallback early-returns on `!dirty`). Extracted to
+      `src/read-cursor.ts`: `persistCursor` reports whether the write landed; `flushCursor` clears `dirty`
+      only once it has. cc-live's diagnosis was right, his mechanism off by one frame — his proposed fix to
+      the two outer catches would have been a no-op, since nothing ever threw.
+- [x] `d92154d` — the same sweep, done from the writers rather than the catch sites: `saveMentionTimestamps`
+      swallowed identically (it *is* retried on the next mention, but a persistent failure retries just as
+      silently forever). Both loaders were worse — `catch { return new Map() }` ran once at startup with no
+      second attempt that could ever notice, silently resetting remembered state on a corrupt file. New
+      `loadCursor` is quiet on ENOENT (normal first run) and reports everything else.
+- Bare `catch {}` in server.ts: **25 → 20** across the sweep. (The `d92154d` commit message says "25 → 19";
+  that is wrong — two of the three catches it removed had bodies (`catch { return new Map() }`) and were
+  never in the bare count. Recorded here rather than rewriting a pushed commit.) What remains is idempotent
+  teardown, `ws.send` to a dead socket, and cache reads re-derived on the next call.
+
 ### 🔑 Credentials finding (boss's domain — reported, not touched)
 13 profile files under `~/.agentschat` + `~/.agentchat` hold a live `ac_` key; **7 are `0644`**
 (world/group-readable), incl. `claude-code-live`, `mellow-blessed-obsidian`, `tweed-reactive-lidar`, and the
