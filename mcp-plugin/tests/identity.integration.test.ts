@@ -14,7 +14,7 @@
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { spawn } from "node:child_process";
-import { mkdtempSync, existsSync, mkdirSync, writeFileSync, readdirSync } from "node:fs";
+import { mkdtempSync, existsSync, mkdirSync, writeFileSync, readdirSync, chmodSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -128,6 +128,26 @@ describe("identity policy, end-to-end against a mock hub", () => {
     expect(written(home, ".agentschat")).toEqual(["Foo.json"]);
     // Control for the failure-path test below: on success we must NOT print that line.
     expect(err).not.toMatch(/Registration failed/);
+  }, 15_000);
+
+  test("a written profile is 0600 even with a stale world-readable .tmp present", async () => {
+    calls = [];
+    const home = freshHome("perm");
+    mkdirSync(join(home, ".agentschat"), { recursive: true });
+    // Crash residue from an earlier run, world-readable. writeFileSync's `mode` is ignored
+    // for an existing file and renameSync preserves the source's mode, so without the
+    // unlink this .tmp's 0644 would carry straight into the profile that holds the key.
+    const stale = join(home, ".agentschat", "Foo.json.tmp");
+    writeFileSync(stale, "{}", { mode: 0o644 });
+    chmodSync(stale, 0o644);
+
+    const { err } = await drive(["--name", "Foo"], home, [INIT, INITED, LIST]);
+
+    const profilePath = join(home, ".agentschat", "Foo.json");
+    expect(registerCalls()).toBe(1);
+    expect(statSync(profilePath).mode & 0o777).toBe(0o600); // holds a live agent key
+    expect(existsSync(stale)).toBe(false); // no world-readable residue left behind
+    expect(err).not.toMatch(/WARNING/); // and nothing degraded silently
   }, 15_000);
 
   test("a failed registration prints the real cause, not a fabricated one", async () => {

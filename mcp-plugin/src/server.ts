@@ -49,16 +49,11 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 
 // --- Config: CLI args > env vars > profile file > defaults ---
-import { readFileSync, existsSync, writeFileSync, mkdirSync, renameSync, chmodSync, readdirSync } from "fs";
+import { readFileSync, existsSync, writeFileSync, mkdirSync, readdirSync } from "fs";
 import { join, dirname } from "path";
-
-/** Atomic write: write to .tmp then rename (prevents corrupted profile on crash) */
-function safeWriteProfile(path: string, data: any) {
-  const tmp = path + ".tmp";
-  writeFileSync(tmp, JSON.stringify(data, null, 2), { mode: 0o600 });
-  renameSync(tmp, path);
-  try { chmodSync(path, 0o600); } catch {}
-}
+// Atomic + 0600-by-construction profile writer. Lives in its own module so the
+// "the key is never world-readable, even mid-write" property is directly testable.
+import { safeWriteProfile } from "./profile-store.ts";
 import { randomUUID } from "crypto";
 
 function parseArgs() {

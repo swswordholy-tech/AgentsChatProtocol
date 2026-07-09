@@ -240,6 +240,7 @@ var package_default = {
     "src/timestamps.ts",
     "src/argcheck.ts",
     "src/identity.ts",
+    "src/profile-store.ts",
     "dist/server.js",
     "README.md"
   ]
@@ -250,8 +251,42 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema
 } from "@modelcontextprotocol/sdk/types.js";
-import { readFileSync, existsSync, writeFileSync, mkdirSync, renameSync, chmodSync, readdirSync } from "fs";
+import { readFileSync, existsSync as existsSync2, writeFileSync as writeFileSync2, mkdirSync, readdirSync } from "fs";
 import { join, dirname } from "path";
+
+// src/profile-store.ts
+import { existsSync, writeFileSync, renameSync, chmodSync, unlinkSync, statSync } from "fs";
+var defaultWarn = (m) => process.stderr.write(m);
+function safeWriteProfile(path, data, warn = defaultWarn) {
+  const tmp = path + ".tmp";
+  try {
+    if (existsSync(tmp))
+      unlinkSync(tmp);
+  } catch (e) {
+    warn(`[agentchat] WARNING: stale ${tmp} could not be removed: ${e}
+`);
+  }
+  writeFileSync(tmp, JSON.stringify(data, null, 2), { mode: 384 });
+  renameSync(tmp, path);
+  try {
+    chmodSync(path, 384);
+  } catch (e) {
+    warn(`[agentchat] WARNING: could not chmod ${path} to 0600: ${e}
+`);
+  }
+  try {
+    const mode = statSync(path).mode & 511;
+    if (mode !== 384) {
+      warn(`[agentchat] WARNING: ${path} is mode ${mode.toString(8)}, expected 600 — it holds your agent key. Fix: chmod 600 ${path}
+`);
+    }
+  } catch (e) {
+    warn(`[agentchat] WARNING: could not verify permissions of ${path}: ${e}
+`);
+  }
+}
+
+// src/server.ts
 import { randomUUID } from "crypto";
 
 // src/heartbeat.ts
@@ -335,14 +370,6 @@ if (process.env.AGENTCHAT_NO_PROXY === "1") {
   delete process.env.http_proxy;
   delete process.env.https_proxy;
 }
-function safeWriteProfile(path, data) {
-  const tmp = path + ".tmp";
-  writeFileSync(tmp, JSON.stringify(data, null, 2), { mode: 384 });
-  renameSync(tmp, path);
-  try {
-    chmodSync(path, 384);
-  } catch {}
-}
 function parseArgs() {
   const args = process.argv.slice(2);
   const parsed = {};
@@ -401,7 +428,7 @@ function profileNameToPaths(name) {
 }
 function nameToPath(name) {
   const candidates = profileNameToPaths(name);
-  return candidates.find((path) => existsSync(path)) || candidates[0];
+  return candidates.find((path) => existsSync2(path)) || candidates[0];
 }
 function listProfileFiles() {
   const seen = new Set;
@@ -462,7 +489,7 @@ async function apiFetch(input, init = {}, timeoutMs = REST_TIMEOUT_MS) {
 }
 var hasToken = !!(cliArgs.token || process.env.AGENTCHAT_TOKEN);
 var identity = decideIdentity({
-  profileExists: existsSync(profileFile),
+  profileExists: existsSync2(profileFile),
   source: profileSource,
   profileFile,
   cliName: cliArgs.name,
@@ -1832,7 +1859,7 @@ function mimeFromPath(p) {
   return MEDIA_MIME_BY_EXT[ext] ?? "application/octet-stream";
 }
 async function uploadLocalFile(path) {
-  if (!existsSync(path))
+  if (!existsSync2(path))
     throw new Error(`file not found: ${path}`);
   const mime = mimeFromPath(path);
   const buf = readFileSync(path);
@@ -2250,8 +2277,8 @@ ${a.body || ""}`;
             return { content: [{ type: "text", text: `sync_skill (personal): body fetch failed (${bodyR.status})` }], isError: true };
           const doc = JSON.parse(await bodyR.text());
           mkdirSync(dirname(pMd), { recursive: true });
-          writeFileSync(pMd, String(doc?.body_markdown ?? ""));
-          writeFileSync(pMeta, JSON.stringify({ version: currentVersion, name: a.name, syncedAt: new Date().toISOString() }));
+          writeFileSync2(pMd, String(doc?.body_markdown ?? ""));
+          writeFileSync2(pMeta, JSON.stringify({ version: currentVersion, name: a.name, syncedAt: new Date().toISOString() }));
           return { content: [{ type: "text", text: `synced personal skill "${a.name}" v${currentVersion} \u2192 ${pMd} (was ${cachedVersion === null ? "missing" : `stale v${cachedVersion}`}). Read that file to run it.` }] };
         } catch (e) {
           return { content: [{ type: "text", text: `sync_skill (personal) error: ${String(e?.message || e).slice(0, 140)}` }], isError: true };
@@ -2285,8 +2312,8 @@ ${a.body || ""}`;
         const doc = JSON.parse(await docR.text());
         const body = String(doc?.body_markdown ?? doc?.bodyMarkdown ?? "");
         mkdirSync(dirname(mdPath), { recursive: true });
-        writeFileSync(mdPath, body);
-        writeFileSync(metaPath, JSON.stringify({ version: currentVersion, title: doc?.title, doc_id: a.doc_id, chat_id: a.chat_id, syncedAt: new Date().toISOString() }));
+        writeFileSync2(mdPath, body);
+        writeFileSync2(metaPath, JSON.stringify({ version: currentVersion, title: doc?.title, doc_id: a.doc_id, chat_id: a.chat_id, syncedAt: new Date().toISOString() }));
         const was = cachedVersion === null ? "missing" : `stale v${cachedVersion}`;
         return { content: [{ type: "text", text: `synced "${doc?.title || a.doc_id}" v${currentVersion} \u2192 ${mdPath} (was ${was}). Read that file to run it in your runtime.` }] };
       } catch (e) {
@@ -3126,7 +3153,7 @@ Available profiles:
 ${list}` }] };
       }
       const targetFile = nameToPath(profile_name);
-      if (!existsSync(targetFile)) {
+      if (!existsSync2(targetFile)) {
         return { content: [{ type: "text", text: `Profile "${profile_name}" not found. Available: ${available.join(", ")}` }], isError: true };
       }
       const newProfile = JSON.parse(readFileSync(targetFile, "utf-8"));
@@ -3516,7 +3543,7 @@ function loadMentionTimestamps() {
 }
 function saveMentionTimestamps(m) {
   try {
-    writeFileSync(mentionTsFile, JSON.stringify(Object.fromEntries(m)));
+    writeFileSync2(mentionTsFile, JSON.stringify(Object.fromEntries(m)));
   } catch {}
 }
 var lastMentionTimestamp = loadMentionTimestamps();
@@ -3531,7 +3558,7 @@ function loadLastSeenMessageTs() {
 }
 function saveLastSeenMessageTs(m) {
   try {
-    writeFileSync(lastSeenMessageTsFile, JSON.stringify(Object.fromEntries(m)));
+    writeFileSync2(lastSeenMessageTsFile, JSON.stringify(Object.fromEntries(m)));
   } catch {}
 }
 var lastSeenMessageTs = loadLastSeenMessageTs();
