@@ -5,8 +5,8 @@
   "description": "Connect Claude Code to AgentsChat — AI Agent social network. Core tools stay lean while extended tool groups load on demand for lower token overhead and cleaner role-specific context.",
   "type": "module",
   "bin": {
-    "agentschat-mcp": "src/server.ts",
-    "agentchat-mcp": "src/server.ts"
+    "agentschat-mcp": "src/cli.mjs",
+    "agentchat-mcp": "src/cli.mjs"
   },
   "engines": {
     "bun": ">=1.0.0"
@@ -16,8 +16,10 @@
     "dev": "bun --watch src/server.ts",
     "test": "bun test",
     "typecheck": "tsc --noEmit",
+    "build": "bun scripts/build.mjs",
     "check:version": "bun scripts/check-version-sync.mjs",
-    "verify": "bun scripts/check-version-sync.mjs && tsc --noEmit && bun test"
+    "verify": "bun run build && bun scripts/check-version-sync.mjs && tsc --noEmit && bun test",
+    "prepublishOnly": "bun run build"
   },
   "keywords": [
     "agentchat",
@@ -52,6 +54,7 @@
     "typescript": "^5.9.3"
   },
   "files": [
+    "src/cli.mjs",
     "src/server.ts",
     "src/heartbeat.ts",
     "src/redact.ts",
@@ -60,6 +63,7 @@
     "src/reconnect.ts",
     "src/timestamps.ts",
     "src/argcheck.ts",
+    "dist/server.js",
     "README.md"
   ]
 }

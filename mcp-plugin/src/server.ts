@@ -4,16 +4,14 @@
  * 像 weixin 插件一样：WebSocket 消息 → MCP channel notification → Claude Code 对话
  */
 
-// Runtime guard: this plugin ships its TypeScript entrypoint directly and
-// relies on Bun's global WebSocket, so it must run under Bun (launch via
-// `bunx agentschat-mcp`, not npx/node). Fail fast with a clear message rather
-// than a cryptic parse/"WebSocket is not defined" error downstream.
-if (typeof (globalThis as any).Bun === "undefined") {
-  process.stderr.write(
-    "[agentchat] agentschat-mcp requires the Bun runtime. Install Bun (https://bun.sh) and launch with `bunx agentschat-mcp` (not npx/node).\n",
-  );
-  process.exit(1);
-}
+// Runtime: Bun is the primary/first-class runtime (`bunx agentschat-mcp` runs
+// this .ts source directly, no build step). It ALSO runs on plain Node via the
+// prebuilt bundle in dist/ (see src/cli.mjs launcher) so directory/registry
+// tooling that introspects over stdio with Node/npx (e.g. Glama) can install
+// and list tools. All Bun-specific I/O was replaced with node:fs; the WebSocket
+// connect is wrapped in try/catch, so a missing global WebSocket (older Node)
+// degrades to a reconnect log rather than crashing stdio/tools-list. Node 22+
+// (global WebSocket/fetch/FormData) gets full functionality.
 
 // ── Proxy bypass ──────────────────────────────────────────────────
 // MCP subprocess inherits the parent's HTTP_PROXY/HTTPS_PROXY which
@@ -1610,13 +1608,14 @@ function mimeFromPath(p: string): string {
 }
 // Upload a local file via multipart POST /api/upload → { url, mime, size }.
 async function uploadLocalFile(path: string): Promise<{ url: string; mime: string; size: number }> {
-  const f = Bun.file(path);
-  if (!(await f.exists())) throw new Error(`file not found: ${path}`);
-  const mime = f.type && f.type !== "application/octet-stream" ? f.type : mimeFromPath(path);
-  const bytes = await f.arrayBuffer();
+  // node:fs (not Bun.file) so this runs on plain Node too — Bun supports node:fs
+  // identically, and the Node path is what registry introspection (Glama) uses.
+  if (!existsSync(path)) throw new Error(`file not found: ${path}`);
+  const mime = mimeFromPath(path);
+  const buf = readFileSync(path);
   const name = path.split("/").pop() || "upload";
   const form = new FormData();
-  form.append("file", new Blob([bytes], { type: mime }), name);
+  form.append("file", new Blob([new Uint8Array(buf)], { type: mime }), name);
   // No Content-Type header → fetch derives the multipart boundary itself.
   const r = await apiFetch(`${REST_URL}/api/upload`, { method: "POST", headers: { "Authorization": `Bearer ${TOKEN}` }, body: form });
   const text = await r.text();
@@ -1624,7 +1623,7 @@ async function uploadLocalFile(path: string): Promise<{ url: string; mime: strin
   let data: any;
   try { data = JSON.parse(text); } catch { throw new Error(`upload returned non-JSON: ${text.slice(0, 120)}`); }
   if (!data?.url) throw new Error(`upload response missing url: ${text.slice(0, 120)}`);
-  return { url: data.url as string, mime: (data.type as string) || mime, size: (data.size as number) ?? bytes.byteLength };
+  return { url: data.url as string, mime: (data.type as string) || mime, size: (data.size as number) ?? buf.byteLength };
 }
 // Post a message carrying exactly one media attachment (image|audio).
 async function sendMediaMessage(kind: "image" | "audio", args: any): Promise<{ content: any[]; isError?: boolean }> {
@@ -1981,15 +1980,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         if (!meta) return { content: [{ type: "text", text: `sync_skill: personal skill "${a.name}" not found (save it with save_skill — no chat_id).` }], isError: true };
         const currentVersion = Number(meta.version ?? 0);
         let cachedVersion: number | null = null;
-        try { cachedVersion = Number(JSON.parse(await Bun.file(pMeta).text()).version); } catch {}
+        try { cachedVersion = Number(JSON.parse(readFileSync(pMeta, "utf8")).version); } catch {}
         if (cachedVersion !== null && cachedVersion === currentVersion) {
           return { content: [{ type: "text", text: `up-to-date: personal skill "${a.name}" v${currentVersion} already at ${pMd} — no download. Read that file to run it.` }] };
         }
         const bodyR = await apiFetch(`${REST_URL}/api/skills/${encodeURIComponent(a.name)}`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
         if (!bodyR.ok) return { content: [{ type: "text", text: `sync_skill (personal): body fetch failed (${bodyR.status})` }], isError: true };
         const doc = JSON.parse(await bodyR.text());
-        await Bun.write(pMd, String(doc?.body_markdown ?? ""));
-        await Bun.write(pMeta, JSON.stringify({ version: currentVersion, name: a.name, syncedAt: new Date().toISOString() }));
+        // node:fs (not Bun.write) — runs on plain Node too. Bun.write auto-creates
+        // parent dirs; writeFileSync does not, so mkdir the cache dir first.
+        mkdirSync(dirname(pMd), { recursive: true });
+        writeFileSync(pMd, String(doc?.body_markdown ?? ""));
+        writeFileSync(pMeta, JSON.stringify({ version: currentVersion, name: a.name, syncedAt: new Date().toISOString() }));
         return { content: [{ type: "text", text: `synced personal skill "${a.name}" v${currentVersion} → ${pMd} (was ${cachedVersion === null ? "missing" : `stale v${cachedVersion}`}). Read that file to run it.` }] };
       } catch (e: any) {
         return { content: [{ type: "text", text: `sync_skill (personal) error: ${String(e?.message || e).slice(0, 140)}` }], isError: true };
@@ -2013,7 +2015,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const currentVersion = Number(meta.version ?? 0);
       // 2. Local cache check — skip the body fetch if we already have this version.
       let cachedVersion: number | null = null;
-      try { cachedVersion = Number(JSON.parse(await Bun.file(metaPath).text()).version); } catch {}
+      try { cachedVersion = Number(JSON.parse(readFileSync(metaPath, "utf8")).version); } catch {}
       if (cachedVersion !== null && cachedVersion === currentVersion) {
         return { content: [{ type: "text", text: `up-to-date: "${a.doc_id}" v${currentVersion} already at ${mdPath} — no download. Read that file to run it.` }] };
       }
@@ -2022,9 +2024,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (!docR.ok) return { content: [{ type: "text", text: `sync_skill: fetch body failed (${docR.status})` }], isError: true };
       const doc = JSON.parse(await docR.text());
       const body = String(doc?.body_markdown ?? doc?.bodyMarkdown ?? "");
-      // 4. Write the local mirror + version sidecar.
-      await Bun.write(mdPath, body);
-      await Bun.write(metaPath, JSON.stringify({ version: currentVersion, title: doc?.title, doc_id: a.doc_id, chat_id: a.chat_id, syncedAt: new Date().toISOString() }));
+      // 4. Write the local mirror + version sidecar (node:fs, not Bun.write, for
+      // Node compat; mkdir the cache dir first since writeFileSync won't auto-create).
+      mkdirSync(dirname(mdPath), { recursive: true });
+      writeFileSync(mdPath, body);
+      writeFileSync(metaPath, JSON.stringify({ version: currentVersion, title: doc?.title, doc_id: a.doc_id, chat_id: a.chat_id, syncedAt: new Date().toISOString() }));
       const was = cachedVersion === null ? "missing" : `stale v${cachedVersion}`;
       return { content: [{ type: "text", text: `synced "${doc?.title || a.doc_id}" v${currentVersion} → ${mdPath} (was ${was}). Read that file to run it in your runtime.` }] };
     } catch (e: any) {

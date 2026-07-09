@@ -238,5 +238,43 @@ hub read path proven clean (Firestore direct query, zero drift), the bug was our
       LESSON: the Registry JWT expires between releases — every publish re-logins; the saved PAT makes that
       a one-liner instead of a human round-trip.
 
+## Node/npx-compat entry for Glama introspection (task_mrd68sll, GEO obj_mr4ipcw7 / KR2 — low-pri)
+Motivation: brusque + coordinator diagnosed Glama's "This server cannot be installed" + Quality **B
+("not tested")** — root cause was **Bun-only, not docs**. Confirmed exactly: server.ts had a hard guard
+`if (typeof Bun === "undefined") process.exit(1)`, and the bin pointed at bare `.ts` with a `bun` shebang.
+Glama builds an (AI-inferred) Dockerfile and runs it under **Node** to introspect over stdio — the guard
+hard-exited → build "failed" → withheld from search + capped at B. Fix = a real Node/`npx` entry so
+introspection installs + lists tools. Confirmed authoritative via Glama methodology (Dockerfile build +
+`tools/list` introspection) + schema (glama.json only carries `maintainers`; Docker config is a post-claim
+web-UI step, not a file field).
+- [x] Node-compat source (server.ts): removed the Bun-required exit guard; replaced the only 7 Bun-API
+      sites (`Bun.file`/`Bun.write` in uploadLocalFile + sync_skill cache) with `node:fs` (already imported;
+      byte-identical on Bun) + explicit `mkdirSync` since writeFileSync doesn't auto-create parents like
+      Bun.write did. WebSocket connect was already try/caught → a missing global WebSocket (old Node)
+      degrades to a reconnect log, never crashes stdio/tools-list. No other Bun API in shipped src.
+- [x] Universal launcher `src/cli.mjs` (new bin): `bunx` runs it under Bun → imports the raw `.ts` source
+      (no build step, full fidelity — unchanged for the primary Claude-Code audience); `npx`/Node honors the
+      node shebang → imports the prebuilt bundle. CLI args inherited, so --name/--profile unchanged.
+- [x] Prebuilt Node bundle `dist/server.js` (committed): `bun build --target node` (scripts/build.mjs)
+      bundles source + 8 local modules into one Node-ESM file (@modelcontextprotocol/sdk stays external,
+      JSON version import inlined) + normalizes the copied `bun` shebang to `node`. Committed (root
+      .gitignore ignores dist/ → scoped `mcp-plugin/.gitignore` un-ignores just this file) so a clean repo
+      checkout is Node-runnable — Glama's Node sandbox has no Bun to build one, and `prepare`/`prepack`
+      can't shell `bun` there. `verify` now runs `bun run build` first so the committed bundle never drifts;
+      `prepublishOnly` rebuilds it into the tarball too.
+- [x] package.json: bin → src/cli.mjs (both aliases); files += src/cli.mjs, dist/server.js; scripts +=
+      build/prepublishOnly; verify = build → version-sync → tsc → test. `npm pack --dry-run` = 13 files,
+      launcher + bundle present.
+- [x] `glama.json` (repo root): `maintainers:["swswordholy-tech"]` — lets the repo owner CLAIM the Glama
+      listing (populates the empty Maintainers field) and unlocks the web-UI "configure Docker image" path
+      as a definitive fallback (point Glama at the working Bun Dockerfile) if auto-build still underperforms.
+- [x] VERIFIED end-to-end = exactly Glama's flow: spawned the server **under Node v24.7 (Bun NOT used)**
+      via src/cli.mjs, drove MCP `initialize` + `tools/list` over stdio → initialize ok (agentschat v0.29.0),
+      24 tools listed. Same driver under Bun (raw .ts path) = identical 24 tools → zero regression on the
+      primary path. verify green (build + version-sync + tsc strict 0 + 44 tests).
+- [ ] npm publish (0.29.1, packaging-only) — DEFERRED, publish-gated. Repo commit alone covers Glama's
+      from-repo build + unlocks the claim path; the versioned publish additionally makes `npm install`/`npx
+      agentschat-mcp` work under Node for humans + any npm-path introspector. Ready on coordinator/boss 发令.
+
 ## Deferred (broad; want review before doing)
 - redactSecrets password= / ?key= patterns — risks over-masking legitimate URLs; wants deliberate design.
