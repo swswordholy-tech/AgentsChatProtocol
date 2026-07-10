@@ -302,9 +302,49 @@ The two highest-traffic install surfaces were advertising a barrier we'd just to
 - [x] Verified against the PUBLISHED artifact: `npm i agentschat-mcp@0.29.1` in a temp dir, **zero Bun on
       PATH** → npm bin (symlink → src/cli.mjs) runs under Node 24 → initialize (agentschat v0.29.1) +
       24 tools + WebSocket connects. verify green (44 tests).
-- [ ] npm republish 0.29.2 (docs + engines only, zero behavior change) — **publish-gated**, needs boss 发令.
-      npm's README/engines only refresh on republish, so npmjs.com keeps showing the stale "requires Bun"
-      text until then. Root README (→ Glama Overview) is already fixed on main and needs no publish.
+- [x] ~~npm republish 0.29.2~~ — **subsumed by 0.30.0** (2026-07-10, boss 发令 → brusque published).
+      npmjs.com now renders "Runs on Node ≥ 22 or Bun ≥ 1.0" + `npx -y agentschat-mcp`; `engines` =
+      `{node: ">=22", bun: ">=1.0.0"}`. Verified by diffing the two *registry* tarballs, not by grep:
+      the pattern `requires the bun` never matched either version because the source reads
+      `Requires the [Bun](https://bun.sh) runtime` — the markdown link bracket swallowed it, so both
+      READMEs reported 0 hits and the "fixed" claim would have been vacuous. The control caught it.
+
+## Release 0.30.0 — registration works again (2026-07-10, boss 发令, published by brusque)
+npm `latest` = 0.30.0 (shasum 57b1cde…, 16 files, engines.node >=22). Ships 8fe958f/a1d6175/e9df653/
+7626ef9/8dbd3a5/d92154d/2debba3. Release commit 59ded95, verify green (82 tests, tsc strict 0).
+
+**Why it mattered**: `0.26.0..0.29.1` never registered. A hoist put the register call sites above
+apiFetch's `const` deps → TDZ ReferenceError → the surrounding catch printed "Server unreachable".
+Every reader of the documented Quick Start got a `dev-token` profile and an agent that can never connect,
+while being pointed at their own firewall. We were driving npx installs at it.
+
+**Verified against the PUBLISHED tarballs, never against main, never against prod** (a stray register
+mints a real account and accounts cannot be deleted). Mock hub on 127.0.0.1 counting real HTTP calls:
+
+| | run | register | profile | note |
+|---|---|---|---|---|
+| A | npm **0.29.1** `--name` | **0** | `token=dev-token` | stderr "Server unreachable" — hub was up, got 0 requests |
+| B | HEAD `--name` | **1** | `token=ac_…` | the 0→1 is purely the hoist |
+| C | HEAD bare | 0 | none written | 24 tools still listed (Glama introspection intact) |
+| D | HEAD declared+missing | 0 | — | exit 1, refuses to invent an identity |
+| E | npm **0.30.0** `--name` | **1** | `token=ac_…` | the fix reaches a real user |
+| F | npm **0.30.0** bare | 0 | none written | 24 tools; gate survived the release |
+
+Two controls, because a 0 from "never sent" and a 0 from "could not send" are the same byte:
+the hub records a hand-rolled POST (200) before each run, and a node probe under A's exact env
+(proxies unset, same HOME) reaches the hub. Without them A's "Server unreachable" reads as an honest
+network failure — which is the lie that hid this bug for a week.
+
+Three false zeros hit *while verifying this release*, all shape-identical to the right answer:
+(1) first run of A returned 0 registers because the un-installed tarball died at `import` — fixed by
+proving boot with 24 tools before trusting any count; (2) `mcp-publisher publish` "exit=0" was `tail`'s
+exit code, the real one is 1; (3) the README grep above. **A control is a branch, not a sentence.**
+
+- [ ] **Official MCP Registry still isLatest=0.29.1** — `mcp-publisher publish` → 401, Registry JWT in
+      `~/.config/mcp-publisher/token.json` expired. Refresh needs `mcp-publisher login github`
+      (interactive auth = boss-gated; `--token` would put the secret in argv, world-readable via `ps`).
+      Not user-facing: downstream directories ingest this feed for metadata but resolve installs through
+      npm `latest`, which is fixed. See `IOSDev/issues/mcp-registry-jwt-expired-0.30.0.md`.
 
 ## Identity safety root-fix — task_mre09xq1_z5xzpd1g (commit 8fe958f, 2026-07-10)
 cc-live/mellow traced a misattributed comment to plugin identity handling and filed 3 defects. Fixing them
