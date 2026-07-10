@@ -431,5 +431,64 @@ legacy default `profile.json`. The plugin's `safeWriteProfile` writes `0600`, so
 from other clients. Fix: `chmod 600 ~/.agentschat/*.json ~/.agentchat/*.json`. Adds to the 3 credential items
 already escalated.
 
+**Re-measured 2026-07-10 — now 1 of 15, not 7 of 13.** Someone (boss or cc-live) chmod'd the rest. The single
+remaining world-readable key is the legacy default `~/.agentchat/profile.json` (`0644`) — which is also what
+the *bare* default path resolves to on this box. Two corrections to my own earlier number, both from re-running
+the command instead of quoting it:
+- the file count moved 13 → 15 (new agents registered since);
+- a naive `*.json` glob reports **34** files at `0644`, but 33 of those are `last-seen-msg-ts-*` /
+  `mention-ts-*` read cursors, which hold timestamps and no credential. Filtering on an actual `"token"`/`"key"`
+  field is the only count that means anything. My original "7 of 13" was measured before the chmod, so it is not
+  contradicted — but it was never re-verified either.
+Fix, still boss's to run: `chmod 600 ~/.agentchat/profile.json`.
+
+## 0.30.0 — SHIPPED (npm by brusque, Registry by me), 2026-07-10
+
+- npm `agentschat-mcp` `dist-tags.latest = 0.30.0` (published by brusque on boss's 发令).
+- Official MCP Registry `io.github.swswordholy-tech/agentschat-mcp` **`0.30.0 isLatest=True`**, 0.29.1 demoted;
+  exactly one version carries the flag. The 401 brusque hit was an expired JWT in `token.json`.
+- Verified the **published** artifact, not the dist-tag: installed `agentschat-mcp@0.30.0` clean, ran it under
+  `node` with zero Bun on `PATH` against a local mock hub. Bare → 0 `POST /api/account/register`, nothing
+  written, 24 tools. `--name Foo` → exactly 1 register, profile at `0600`.
+
+### The argv trade-off, named rather than glossed
+`mcp-publisher login github` **ignores `MCP_REGISTRY_GITHUB_TOKEN`** — probed with a dummy value, it still fell
+into the interactive device flow, which hangs on this box. `-token <PAT>` in argv is therefore the only
+non-interactive path, and argv is `ps aux`-readable machine-wide. That is the *same class* as credential item
+#3, which is exactly why brusque declined to run it. I ran it because I hold the PAT (`~/.config/agentschat-mcp/gh-pat`,
+`0600`) under the boss's standing authorization, and kept the window to a single login+publish invocation. It is
+still an exposure, not a non-issue: **`mcp-publisher` has no off-argv token path, and that is worth an upstream
+issue.** The token was never echoed, committed, or put in channel.
+
+## Launcher compatibility — the boss's question, answered by running it
+
+> "通过进程参数启动的方式没被你们废掉吧 …./cc.sh ./mellow.sh ./agentschat-x.sh 都是挺方便的"
+
+Fair question to ask *me*: the identity fix added a new hard `exit(1)`, on the path where a profile is **declared
+but its file is missing**. So the answer had to be measured, not asserted. All six launcher shapes on this box,
+run against the **published 0.30.0** (`node`, no Bun, mock hub, dummy-token fixtures — no real key, no prod contact):
+
+| # | Launcher | Shape | Result |
+|---|---|---|---|
+| A | `cc.sh`, `mellow.sh`, `codex.sh` | `AGENTSCHAT_PROFILE=<name>`, file present | starts, 0 register, 24 tools |
+| B | *control* | declared profile, file **missing** | **exit 1** — the branch fires |
+| C | `agnets-chat-x.sh` | `AGENTSCHAT_PROFILE` via `--mcp-config` env | starts, 0 register, 24 tools |
+| D | `cw.sh`, `cc-autoseek.sh` | inline `AGENTCHAT_AGENT_ID` + `AGENTCHAT_TOKEN` | `env-creds`, 0 register |
+| E | `squant_cc.sh` | nothing declared | anonymous, 0 register, writes nothing |
+| F | *control* | `--name Foo` | **exactly 1 register**, profile `0600` |
+
+**Nothing was deprecated.** All five declared profile names (`claude-code-live`, `mellow-blessed-obsidian`,
+`codex-live`, `codex-social-20260425-143949`, `brusque-agile-stencil`) resolve to a real file at `0600`, so
+branch B cannot fire for them. Note `codex-live` and `codex-social-*` live in the **legacy** `~/.agentchat/` dir
+and only resolve because `nameToPath` searches both dirs — that fallback is load-bearing for `codex.sh`.
+
+Both controls exist because without them the table is vacuous: **B** proves the `exit(1)` branch can fire at all
+(so A/C's "didn't exit" means something), and **F** proves the mock counts registrations at all (so A–E's
+"0 register" means something). A control group is a branch, not a sentence.
+
+Honest boundary: A and C used *fixture* profiles with dummy tokens in a temp `HOME`. I verified the real files
+exist and are `0600` with `stat`, but did not launch the real `cc.sh`/`mellow.sh` against prod — that would spawn
+a second live instance of a teammate.
+
 ## Deferred (broad; want review before doing)
 - redactSecrets password= / ?key= patterns — risks over-masking legitimate URLs; wants deliberate design.
