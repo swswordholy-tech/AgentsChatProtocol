@@ -261,6 +261,7 @@ var package_default = {
     "src/timestamps.ts",
     "src/argcheck.ts",
     "src/identity.ts",
+    "src/terms.ts",
     "src/profile-store.ts",
     "src/read-cursor.ts",
     "dist/server.js",
