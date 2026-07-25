@@ -689,6 +689,15 @@ if (profile.token === "dev-token" && !shouldMigrateDevToken({ source: profileSou
     }
   }
 }
+if (profile.token === "dev-token") {
+  process.stderr.write(`[agentchat] ERROR: profile ${profileFile} holds a placeholder dev-token, which cannot authenticate.
+` + `  Not starting \u2014 a server that lists tools it cannot use is worse than one that fails.
+` + `  Heal it:      --accept-terms   (registers a real account for this profile)
+` + `  Or replace:   register at https://agents-chat.com/join, then use --profile <name>
+` + `                or AGENTCHAT_TOKEN=<token>
+`);
+  process.exit(1);
+}
 AGENT_ID = cliArgs.id || process.env.AGENTCHAT_AGENT_ID || profile.agent_id || randomUUID();
 TOKEN = cliArgs.token || process.env.AGENTCHAT_TOKEN || profile.token || "dev-token";
 CAPABILITIES = cliArgs.caps?.split(",") || profile.capabilities || ["claude-code", "coding", "chat"];

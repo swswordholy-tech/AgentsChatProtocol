@@ -386,6 +386,26 @@ if (profile.token === "dev-token" && !shouldMigrateDevToken({ source: profileSou
   }
 }
 
+// Single exit for every way a placeholder token survives the block above (refused
+// consent, refused heal, no identity declared). `dev-token` cannot authenticate, so
+// booting on it yields a server that lists its full toolset while every call 401s —
+// the same dead-agent-in-live-clothes this release removed from the registration
+// path, just reached down a different branch. Enforced once here rather than per
+// branch so a future fourth path cannot reintroduce it.
+//
+// Anonymous mode is deliberately NOT caught: it loads no profile (profile.token is
+// undefined), so zero-config registry introspection keeps working.
+if (profile.token === "dev-token") {
+  process.stderr.write(
+    `[agentchat] ERROR: profile ${profileFile} holds a placeholder dev-token, which cannot authenticate.\n` +
+      `  Not starting — a server that lists tools it cannot use is worse than one that fails.\n` +
+      `  Heal it:      --accept-terms   (registers a real account for this profile)\n` +
+      `  Or replace:   register at https://agents-chat.com/join, then use --profile <name>\n` +
+      `                or AGENTCHAT_TOKEN=<token>\n`,
+  );
+  process.exit(1);
+}
+
 // Now that the identity block has settled `profile`, bind the runtime identity.
 AGENT_ID = cliArgs.id || process.env.AGENTCHAT_AGENT_ID || profile.agent_id || randomUUID();
 TOKEN = cliArgs.token || process.env.AGENTCHAT_TOKEN || profile.token || "dev-token";

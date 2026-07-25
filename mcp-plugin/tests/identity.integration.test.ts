@@ -234,10 +234,51 @@ describe("identity policy, end-to-end against a mock hub", () => {
       join(home, ".agentschat", "profile.json"),
       JSON.stringify({ agent_id: "local", display_name: "Ghost", token: "dev-token", capabilities: [] }),
     );
-    const { err } = await drive([], home, [INIT, INITED, LIST]);
+    const { err, code } = await drive([], home, [INIT, INITED, LIST], 2500);
 
     expect(registerCalls()).toBe(0);
     expect(err).toMatch(/refusing to auto-register/i);
+    // A dev-token cannot authenticate — every call 401s. Booting anyway is the same
+    // "dead agent wearing a live one's clothes" this release exists to kill; it was
+    // simply reached down a different branch than the failed-registration one.
+    expect(code).toBe(1);
+    expect(err).not.toMatch(/MCP server started/);
+  }, 15_000);
+
+  test("dev-token profile + refused terms: does not boot a dead agent", async () => {
+    // Reported by review against 7a0b2a6: the NEW-registration path exited 1, but the
+    // legacy dev-token heal path printed an equally good message and then started the
+    // server anyway (exit 0, full tool list). Same harm, second failure policy — and
+    // these are exactly the users the shipped 0.30.0 created.
+    calls = [];
+    const home = freshHome("devtokterms");
+    mkdirSync(join(home, ".agentschat"), { recursive: true });
+    writeFileSync(
+      join(home, ".agentschat", "victim.json"),
+      JSON.stringify({ agent_id: "local", display_name: "Victim", token: "dev-token", capabilities: [] }),
+    );
+    const { err, code } = await drive(["--profile", "victim"], home, [INIT, INITED, LIST], 2500);
+
+    expect(registerCalls()).toBe(0); // no consent → no account
+    expect(code).toBe(1);
+    expect(err).not.toMatch(/MCP server started/);
+    expect(err).toContain("https://agents-chat.com/terms"); // still tells them how to fix it
+  }, 15_000);
+
+  test("a real key still boots normally (control for the dev-token guard)", async () => {
+    // Without this, the two assertions above would also pass if the guard were too
+    // broad and refused to start for ANY profile.
+    calls = [];
+    const home = freshHome("realkey");
+    mkdirSync(join(home, ".agentschat"), { recursive: true });
+    writeFileSync(
+      join(home, ".agentschat", "real.json"),
+      JSON.stringify({ agent_id: "real-id", display_name: "Real", token: "ac_realish_key", capabilities: ["chat"] }),
+    );
+    const { err, res } = await drive(["--profile", "real"], home, [INIT, INITED, LIST]);
+
+    expect(err).toMatch(/MCP server started/);
+    expect(res.get(2)?.result?.tools?.length ?? 0).toBeGreaterThan(0);
   }, 15_000);
 
   test("declared-but-missing profile exits non-zero without registering or writing", async () => {
