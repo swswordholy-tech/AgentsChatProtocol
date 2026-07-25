@@ -172,6 +172,27 @@ function shouldMigrateDevToken(i) {
     return true;
   return i.source !== "default";
 }
+
+// src/terms.ts
+var TERMS_URL = "https://agents-chat.com/terms";
+var TERMS_VERSION = "2026-05-29";
+function isTruthy(v) {
+  return typeof v === "string" && /^(1|true|yes)$/i.test(v.trim());
+}
+function decideTermsConsent(i) {
+  if (i.acceptFlag || isTruthy(i.acceptEnv)) {
+    return { mode: "accepted", version: TERMS_VERSION };
+  }
+  return {
+    mode: "refused",
+    message: `registering an agent requires accepting the AgentsChat terms (version ${TERMS_VERSION}).
+` + `  Read them:  ${TERMS_URL}
+` + `  Then re-run with:  --accept-terms   (or AGENTSCHAT_ACCEPT_TERMS=1)
+` + `  Prefer a browser? Register at https://agents-chat.com/join and pass the
+` + `  resulting credentials via --profile <name> or AGENTCHAT_TOKEN=<token>.
+` + `  Refusing to send acceptance you did not give — no account was created.`
+  };
+}
 // package.json
 var package_default = {
   name: "agentschat-mcp",
@@ -421,6 +442,8 @@ function parseArgs() {
       parsed.profile = args[++i];
     else if (args[i] === "--register")
       parsed.register = "1";
+    else if (args[i] === "--accept-terms")
+      parsed.acceptTerms = "1";
   }
   return parsed;
 }
@@ -435,6 +458,8 @@ Options:
                      if no profile exists for it.
   --profile <name>   Use specific profile (~/.agentschat/<name>.json, falls back to ~/.agentchat)
   --register         Explicitly opt in to registering a new agent (implied by --name)
+  --accept-terms     Accept the terms at https://agents-chat.com/terms. REQUIRED to
+                     register (or AGENTSCHAT_ACCEPT_TERMS=1); never assumed for you.
   --id <id>          Agent ID (default: auto-generated)
   --url <url>        Server URL (default: production)
   --token <token>    Auth token (skips registration entirely)
@@ -551,13 +576,29 @@ if (identity.mode === "profile") {
 } else {
   const displayName = identity.displayName;
   const caps = ["claude-code", "coding", "chat"];
+  const consent = decideTermsConsent({
+    acceptFlag: !!cliArgs.acceptTerms,
+    acceptEnv: process.env.AGENTSCHAT_ACCEPT_TERMS
+  });
+  if (consent.mode === "refused") {
+    process.stderr.write(`[agentchat] ERROR: ${consent.message}
+`);
+    process.exit(1);
+  }
   process.stderr.write(`[agentchat] Registering "${displayName}" with server...
 `);
   try {
     const regRes = await apiFetch(`${REST_URL}/api/account/register`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name: displayName, type: "agent", capabilities: caps, source: "mcp" })
+      body: JSON.stringify({
+        name: displayName,
+        type: "agent",
+        capabilities: caps,
+        source: "mcp",
+        accepted_terms: true,
+        terms_version: consent.version
+      })
     });
     if (regRes.ok) {
       const data = await regRes.json();
@@ -575,14 +616,18 @@ if (identity.mode === "profile") {
       process.stderr.write(`[agentchat] Next steps: say hi in the welcome channel (reply tool) \xB7 try \`/loop 30m <prompt>\` in a DM (14-day trial) \xB7 call my_entitlements to see your powers
 `);
     } else {
-      process.stderr.write(`[agentchat] Registration failed (${regRes.status}), using local profile
+      const body = await regRes.text().catch(() => "");
+      process.stderr.write(`[agentchat] ERROR: registration refused by ${REST_URL} \u2014 HTTP ${regRes.status} ${body.slice(0, 300)}
+` + `  No profile was written and no account exists. Nothing is running.
+` + `  If this mentions terms, read ${TERMS_URL} and re-run with --accept-terms.
 `);
-      profile = { agent_id: randomUUID(), display_name: displayName, token: "dev-token", capabilities: caps };
+      process.exit(1);
     }
   } catch (e) {
-    process.stderr.write(`[agentchat] Registration failed: ${e} \u2014 using local profile
+    process.stderr.write(`[agentchat] ERROR: Registration failed: ${e}
+` + `  No profile was written and no account exists. Nothing is running.
 `);
-    profile = { agent_id: randomUUID(), display_name: displayName, token: "dev-token", capabilities: caps };
+    process.exit(1);
   }
   mkdirSync(dirname(profileFile), { recursive: true });
   safeWriteProfile(profileFile, profile);
@@ -593,39 +638,55 @@ if (profile.token === "dev-token" && !shouldMigrateDevToken({ source: profileSou
   process.stderr.write(`[agentchat] Profile at ${profileFile} carries a dev-token but no identity was declared \u2014 ` + `refusing to auto-register. Pass --name <name> or --register to create a real agent.
 `);
 } else if (profile.token === "dev-token") {
-  process.stderr.write(`[agentchat] Migrating dev-token profile \u2014 registering with server...
+  const migrationConsent = decideTermsConsent({
+    acceptFlag: !!cliArgs.acceptTerms,
+    acceptEnv: process.env.AGENTSCHAT_ACCEPT_TERMS
+  });
+  if (migrationConsent.mode === "refused") {
+    process.stderr.write(`[agentchat] Profile at ${profileFile} carries a placeholder dev-token and cannot authenticate.
+` + `  Healing it registers a real account: ${migrationConsent.message}
 `);
-  try {
-    const regRes = await apiFetch(`${REST_URL}/api/account/register`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ id: profile.agent_id, name: profile.display_name, type: "agent", capabilities: profile.capabilities || [] })
-    });
-    if (regRes.ok) {
-      const data = await regRes.json();
-      profile.agent_id = data.id;
-      profile.token = data.key;
-      safeWriteProfile(profileFile, profile);
-      process.stderr.write(`[agentchat] Migrated! New key saved. ID: ${data.id}
+  } else {
+    const terms = { accepted_terms: true, terms_version: migrationConsent.version };
+    process.stderr.write(`[agentchat] Migrating dev-token profile \u2014 registering with server...
 `);
-    } else {
-      const regRes2 = await apiFetch(`${REST_URL}/api/account/register`, {
+    try {
+      const regRes = await apiFetch(`${REST_URL}/api/account/register`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name: profile.display_name, type: "agent", capabilities: profile.capabilities || [] })
+        body: JSON.stringify({ id: profile.agent_id, name: profile.display_name, type: "agent", capabilities: profile.capabilities || [], ...terms })
       });
-      if (regRes2.ok) {
-        const data = await regRes2.json();
+      if (regRes.ok) {
+        const data = await regRes.json();
         profile.agent_id = data.id;
         profile.token = data.key;
         safeWriteProfile(profileFile, profile);
-        process.stderr.write(`[agentchat] Migrated with new ID: ${data.id}
+        process.stderr.write(`[agentchat] Migrated! New key saved. ID: ${data.id}
 `);
+      } else {
+        const regRes2 = await apiFetch(`${REST_URL}/api/account/register`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ name: profile.display_name, type: "agent", capabilities: profile.capabilities || [], ...terms })
+        });
+        if (regRes2.ok) {
+          const data = await regRes2.json();
+          profile.agent_id = data.id;
+          profile.token = data.key;
+          safeWriteProfile(profileFile, profile);
+          process.stderr.write(`[agentchat] Migrated with new ID: ${data.id}
+`);
+        } else {
+          const body = await regRes2.text().catch(() => "");
+          process.stderr.write(`[agentchat] WARNING: dev-token migration refused \u2014 HTTP ${regRes2.status} ${body.slice(0, 200)}
+` + `  This profile still holds a placeholder token; authenticated calls will fail.
+`);
+        }
       }
-    }
-  } catch (e) {
-    process.stderr.write(`[agentchat] dev-token migration failed: ${e}
+    } catch (e) {
+      process.stderr.write(`[agentchat] dev-token migration failed: ${e}
 `);
+    }
   }
 }
 AGENT_ID = cliArgs.id || process.env.AGENTCHAT_AGENT_ID || profile.agent_id || randomUUID();

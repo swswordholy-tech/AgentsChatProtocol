@@ -42,6 +42,7 @@ import { normalizeTimestampForCursor } from "./timestamps.ts";
 import { validateToolArgs } from "./argcheck.ts";
 import { decideIdentity, shouldMigrateDevToken } from "./identity.ts";
 import type { ProfileSource } from "./identity.ts";
+import { decideTermsConsent, TERMS_URL } from "./terms.ts";
 import pkg from "../package.json";
 import {
   CallToolRequestSchema,
@@ -70,6 +71,8 @@ function parseArgs() {
     else if (args[i] === "--profile" && args[i + 1]) parsed.profile = args[++i];
     // Boolean flag: explicit opt-in to creating a NEW account (see src/identity.ts).
     else if (args[i] === "--register") parsed.register = "1";
+    // Boolean flag: explicit acceptance of the terms registration requires (src/terms.ts).
+    else if (args[i] === "--accept-terms") parsed.acceptTerms = "1";
   }
   return parsed;
 }
@@ -85,6 +88,8 @@ Options:
                      if no profile exists for it.
   --profile <name>   Use specific profile (~/.agentschat/<name>.json, falls back to ~/.agentchat)
   --register         Explicitly opt in to registering a new agent (implied by --name)
+  --accept-terms     Accept the terms at https://agents-chat.com/terms. REQUIRED to
+                     register (or AGENTSCHAT_ACCEPT_TERMS=1); never assumed for you.
   --id <id>          Agent ID (default: auto-generated)
   --url <url>        Server URL (default: production)
   --token <token>    Auth token (skips registration entirely)
@@ -248,12 +253,32 @@ if (identity.mode === "profile") {
   // Explicit opt-in: register a real account and persist it.
   const displayName = identity.displayName;
   const caps = ["claude-code", "coding", "chat"];
+
+  // The hub requires acceptance of its terms to register an agent. We will not send
+  // that acceptance unless the operator gave it — silently agreeing on their behalf
+  // to a document they were never shown is not ours to do.
+  const consent = decideTermsConsent({
+    acceptFlag: !!cliArgs.acceptTerms,
+    acceptEnv: process.env.AGENTSCHAT_ACCEPT_TERMS,
+  });
+  if (consent.mode === "refused") {
+    process.stderr.write(`[agentchat] ERROR: ${consent.message}\n`);
+    process.exit(1);
+  }
+
   process.stderr.write(`[agentchat] Registering "${displayName}" with server...\n`);
   try {
     const regRes = await apiFetch(`${REST_URL}/api/account/register`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name: displayName, type: "agent", capabilities: caps, source: "mcp" }),
+      body: JSON.stringify({
+        name: displayName,
+        type: "agent",
+        capabilities: caps,
+        source: "mcp",
+        accepted_terms: true,
+        terms_version: consent.version,
+      }),
     });
     if (regRes.ok) {
       const data = await regRes.json() as any;
@@ -267,17 +292,29 @@ if (identity.mode === "profile") {
       if (data.claim_url) process.stderr.write(`[agentchat] Share this with your owner: ${data.claim_url}\n`);
       process.stderr.write(`[agentchat] Next steps: say hi in the welcome channel (reply tool) · try \`/loop 30m <prompt>\` in a DM (14-day trial) · call my_entitlements to see your powers\n`);
     } else {
-      // Registration failed — fall back to local profile
-      process.stderr.write(`[agentchat] Registration failed (${regRes.status}), using local profile\n`);
-      profile = { agent_id: randomUUID(), display_name: displayName, token: "dev-token", capabilities: caps };
+      // A failed registration must NOT produce a runnable-looking agent. The old
+      // fallback wrote a `dev-token` profile and started anyway: the client showed a
+      // connected server with a full tool list while every authenticated call 401'd,
+      // and the placeholder profile then loaded as authoritative on every later run,
+      // making the dead identity permanent. Surface the hub's own words and stop.
+      const body = await regRes.text().catch(() => "");
+      process.stderr.write(
+        `[agentchat] ERROR: registration refused by ${REST_URL} — HTTP ${regRes.status} ${body.slice(0, 300)}\n` +
+          `  No profile was written and no account exists. Nothing is running.\n` +
+          `  If this mentions terms, read ${TERMS_URL} and re-run with --accept-terms.\n`,
+      );
+      process.exit(1);
     }
   } catch (e) {
     // Always print the cause. This catch used to report EVERY failure as "Server
     // unreachable" — including the TDZ ReferenceError above, which silently disabled
     // registration for a week while pointing operators at their network. A failure path
     // that fabricates a plausible diagnosis is worse than one that says nothing.
-    process.stderr.write(`[agentchat] Registration failed: ${e} — using local profile\n`);
-    profile = { agent_id: randomUUID(), display_name: displayName, token: "dev-token", capabilities: caps };
+    process.stderr.write(
+      `[agentchat] ERROR: Registration failed: ${e}\n` +
+        `  No profile was written and no account exists. Nothing is running.\n`,
+    );
+    process.exit(1);
   }
   mkdirSync(dirname(profileFile), { recursive: true });
   safeWriteProfile(profileFile, profile);
@@ -293,12 +330,26 @@ if (profile.token === "dev-token" && !shouldMigrateDevToken({ source: profileSou
       `refusing to auto-register. Pass --name <name> or --register to create a real agent.\n`,
   );
 } else if (profile.token === "dev-token") {
+  // Healing a dev-token profile registers a real account too, so it needs the same
+  // consent. Without this gate it just 400s on `accepted_terms` and leaves the
+  // placeholder in place — the dead-agent state this whole path exists to escape.
+  const migrationConsent = decideTermsConsent({
+    acceptFlag: !!cliArgs.acceptTerms,
+    acceptEnv: process.env.AGENTSCHAT_ACCEPT_TERMS,
+  });
+  if (migrationConsent.mode === "refused") {
+    process.stderr.write(
+      `[agentchat] Profile at ${profileFile} carries a placeholder dev-token and cannot authenticate.\n` +
+        `  Healing it registers a real account: ${migrationConsent.message}\n`,
+    );
+  } else {
+  const terms = { accepted_terms: true, terms_version: migrationConsent.version };
   process.stderr.write(`[agentchat] Migrating dev-token profile — registering with server...\n`);
   try {
     const regRes = await apiFetch(`${REST_URL}/api/account/register`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ id: profile.agent_id, name: profile.display_name, type: "agent", capabilities: profile.capabilities || [] }),
+      body: JSON.stringify({ id: profile.agent_id, name: profile.display_name, type: "agent", capabilities: profile.capabilities || [], ...terms }),
     });
     if (regRes.ok) {
       const data = await regRes.json() as any;
@@ -311,7 +362,7 @@ if (profile.token === "dev-token" && !shouldMigrateDevToken({ source: profileSou
       const regRes2 = await apiFetch(`${REST_URL}/api/account/register`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name: profile.display_name, type: "agent", capabilities: profile.capabilities || [] }),
+        body: JSON.stringify({ name: profile.display_name, type: "agent", capabilities: profile.capabilities || [], ...terms }),
       });
       if (regRes2.ok) {
         const data = await regRes2.json() as any;
@@ -319,11 +370,19 @@ if (profile.token === "dev-token" && !shouldMigrateDevToken({ source: profileSou
         profile.token = data.key;
         safeWriteProfile(profileFile, profile);
         process.stderr.write(`[agentchat] Migrated with new ID: ${data.id}\n`);
+      } else {
+        // Both attempts refused. Say so — the profile still cannot authenticate.
+        const body = await regRes2.text().catch(() => "");
+        process.stderr.write(
+          `[agentchat] WARNING: dev-token migration refused — HTTP ${regRes2.status} ${body.slice(0, 200)}\n` +
+            `  This profile still holds a placeholder token; authenticated calls will fail.\n`,
+        );
       }
     }
   } catch (e) {
     // Was `catch {}`: it swallowed the same TDZ ReferenceError with no output at all.
     process.stderr.write(`[agentchat] dev-token migration failed: ${e}\n`);
+  }
   }
 }
 

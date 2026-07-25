@@ -17,19 +17,34 @@ import { spawn } from "node:child_process";
 import { mkdtempSync, existsSync, mkdirSync, writeFileSync, readdirSync, chmodSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { TERMS_VERSION } from "../src/terms.ts";
 
 const ENTRY = resolve(import.meta.dir, "../src/server.ts");
 let calls: string[] = [];
+let registerBodies: any[] = [];
 let hub: ReturnType<typeof Bun.serve>;
 let BASE = "";
 
 beforeAll(() => {
   hub = Bun.serve({
     port: 0,
-    fetch(req) {
+    async fetch(req) {
       const u = new URL(req.url);
       calls.push(`${req.method} ${u.pathname}`);
       if (req.method === "POST" && u.pathname === "/api/account/register") {
+        // Mirror production: agent registration requires accepted_terms. The old mock
+        // accepted ANY payload, which is why the client could ship without the field
+        // and every real `npx agentschat-mcp --name X` 400'd with the suite green.
+        const body = await req.json().catch(() => ({})) as any;
+        registerBodies.push(body);
+        if (body?.type === "agent" && body?.accepted_terms !== true) {
+          return Response.json({ error: "accepted_terms required for agent registration" }, { status: 400 });
+        }
+        // Test-only lever: lets a test exercise hub-side rejection independently of
+        // the consent gate, without a production flag existing just for tests.
+        if (body?.name === "RejectMe") {
+          return Response.json({ error: "name unavailable" }, { status: 400 });
+        }
         return Response.json({ id: "srv-assigned-id", key: "ac_mock_key" });
       }
       return Response.json({});
@@ -116,8 +131,9 @@ describe("identity policy, end-to-end against a mock hub", () => {
 
   test("--name opts in: exactly one register call, profile persisted", async () => {
     calls = [];
+    registerBodies = [];
     const home = freshHome("name");
-    const { err } = await drive(["--name", "Foo"], home, [INIT, INITED, LIST]);
+    const { err } = await drive(["--name", "Foo", "--accept-terms"], home, [INIT, INITED, LIST]);
 
     // Guards the TDZ regression: a swallowed ReferenceError makes this 0.
     expect(registerCalls()).toBe(1);
@@ -128,6 +144,42 @@ describe("identity policy, end-to-end against a mock hub", () => {
     expect(written(home, ".agentschat")).toEqual(["Foo.json"]);
     // Control for the failure-path test below: on success we must NOT print that line.
     expect(err).not.toMatch(/Registration failed/);
+    // The payload the hub actually validates.
+    expect(registerBodies[0]?.accepted_terms).toBe(true);
+    expect(registerBodies[0]?.terms_version).toBe(TERMS_VERSION);
+  }, 15_000);
+
+  test("--name WITHOUT --accept-terms: registers nothing, writes nothing, exits 1", async () => {
+    calls = [];
+    const home = freshHome("noterms");
+    const { err, code } = await drive(["--name", "Foo"], home, [INIT], 2500);
+
+    // We must not accept a legal agreement on the operator's behalf.
+    expect(registerCalls()).toBe(0);
+    expect(code).toBe(1);
+    expect(err).toContain("https://agents-chat.com/terms"); // shows the document
+    expect(err).toMatch(/--accept-terms/); // and how to proceed
+    expect(written(home, ".agentschat")).toEqual([]);
+    expect(written(home, ".agentchat")).toEqual([]);
+  }, 15_000);
+
+  test("a 400 from the hub leaves NO dev-token profile behind and exits 1", async () => {
+    // The shipped bug: server 400s (accepted_terms), client writes a `dev-token`
+    // profile and starts anyway → client shows a connected server with a full tool
+    // list while every authenticated call 401s, and the placeholder then loads as
+    // authoritative forever. A dead agent must not look like a live one.
+    calls = [];
+    const home = freshHome("dead");
+    // --accept-terms passes OUR gate; the hub rejects this name for its own reason,
+    // isolating the failure-handling path from the consent path.
+    const { err, code } = await drive(["--name", "RejectMe", "--accept-terms"], home, [INIT], 2500);
+
+    expect(code).toBe(1);
+    expect(err).toMatch(/ERROR/);
+    // The decisive assertion: nothing persisted, so no later run inherits a dead identity.
+    expect(written(home, ".agentschat")).toEqual([]);
+    expect(written(home, ".agentchat")).toEqual([]);
+    expect(err).not.toMatch(/Profile saved/);
   }, 15_000);
 
   test("a written profile is 0600 even with a stale world-readable .tmp present", async () => {
@@ -141,7 +193,7 @@ describe("identity policy, end-to-end against a mock hub", () => {
     writeFileSync(stale, "{}", { mode: 0o644 });
     chmodSync(stale, 0o644);
 
-    const { err } = await drive(["--name", "Foo"], home, [INIT, INITED, LIST]);
+    const { err } = await drive(["--name", "Foo", "--accept-terms"], home, [INIT, INITED, LIST]);
 
     const profilePath = join(home, ".agentschat", "Foo.json");
     expect(registerCalls()).toBe(1);
@@ -154,15 +206,24 @@ describe("identity policy, end-to-end against a mock hub", () => {
     calls = [];
     // Point at a dead port (last --url wins in parseArgs) so the fetch genuinely throws.
     const home = freshHome("regfail");
-    const { err } = await drive(["--name", "Foo", "--url", "http://127.0.0.1:1"], home, [INIT, INITED, LIST]);
+    const { err, code } = await drive(
+      ["--name", "Foo", "--accept-terms", "--url", "http://127.0.0.1:1"],
+      home,
+      [INIT, INITED, LIST],
+      2500,
+    );
 
     expect(registerCalls()).toBe(0); // never reached the hub
     // The cause must be surfaced. The old code reported every failure — including a TDZ
     // ReferenceError — as "Server unreachable", a fluent lie pointing at the network.
     expect(err).toMatch(/Registration failed: .+/);
     expect(err).not.toMatch(/Server unreachable/);
-    // ...and the server still comes up, so this stays a degradation, not a crash.
-    expect(err).toMatch(/MCP server started/);
+    // CONTRACT CHANGE (was: "still comes up, a degradation not a crash"). Coming up
+    // after a failed registration is exactly what made the dead agent look alive —
+    // the client saw a healthy server and a full tool list. Fail loudly instead.
+    expect(code).toBe(1);
+    expect(written(home, ".agentschat")).toEqual([]);
+    expect(written(home, ".agentchat")).toEqual([]);
   }, 15_000);
 
   test("dev-token profile on the shared default path is NOT re-registered", async () => {
