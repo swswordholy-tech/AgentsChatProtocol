@@ -55,7 +55,10 @@ describe("decideIdentity — declared-but-missing is a hard error, not an invent
       const d = decideIdentity({ ...base, source, declaredName: "mellow-blessed-obsidian" });
       expect(d.mode).toBe("error");
       expect(d.mode === "error" && d.message).toContain("mellow-blessed-obsidian");
-      expect(d.mode === "error" && d.message).toContain("accounts cannot be deleted");
+      // Was pinned to "accounts cannot be deleted" — verified false against production
+      // 2026-07-26 (DELETE /api/account/<id> with the agent's own key → 200, then auth
+      // 401). The refusal is still right; its reason had to become a true one.
+      expect(d.mode === "error" && d.message).toContain("Refusing to auto-register");
     });
   }
 

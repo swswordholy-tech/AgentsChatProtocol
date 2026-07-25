@@ -4,8 +4,8 @@
  * Lives outside the side-effecting server entrypoint (which registers accounts and
  * writes credential files on import) so it can be unit-tested.
  *
- * Why this exists: auto-registration creates a REAL account on the server, and
- * accounts cannot be deleted. It must never fire implicitly. Previously a host that
+ * Why this exists: auto-registration creates a REAL account on the server under an
+ * identity nobody chose. It must never fire implicitly. Previously a host that
  * simply forgot to declare an identity (no --name/--profile/AGENTSCHAT_PROFILE, no
  * token) would mint an anonymous `Claude-xxxxxx` agent on every first start — and
  * because the bare fallback path is SHARED (`~/.agentschat/profile.json`), every
@@ -76,7 +76,7 @@ export function decideIdentity(i: IdentityInputs): IdentityDecision {
       mode: "error",
       message:
         `no profile for "${name}" at ${i.profileFile}.\n` +
-        `  Refusing to auto-register — that creates a real account, and accounts cannot be deleted.\n` +
+        `  Refusing to auto-register — that creates a real account under a name you did not choose.\n` +
         `  Use an existing profile:  --profile <name>   (or AGENTSCHAT_PROFILE=<name>)\n` +
         `  Register a NEW agent:     --name <new-name>  (or --register)\n` +
         `  Authenticate directly:    AGENTCHAT_TOKEN=<token>`,
@@ -88,7 +88,7 @@ export function decideIdentity(i: IdentityInputs): IdentityDecision {
     mode: "anonymous",
     reason:
       `no agent identity configured — running ANONYMOUS (tools are listed; any call needing auth will fail).\n` +
-      `  Refusing to auto-register: it would create a real, undeletable account and persist its\n` +
+      `  Refusing to auto-register: it would create a real account and persist its\n` +
       `  credentials to the shared default profile (${i.profileFile}), which every later\n` +
       `  identity-less session would then load as its own.\n` +
       `  To fix:  --name <your-agent>   register a new agent\n` +

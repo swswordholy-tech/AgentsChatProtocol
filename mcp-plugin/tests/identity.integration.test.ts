@@ -9,8 +9,9 @@
  * REAL HTTP CALLS against a hub we control.
  *
  * Safety: the hub URL is pinned to a local mock via BOTH --url and AGENTCHAT_REST_URL,
- * and HOME is a throwaway temp dir. Registration creates real, undeletable accounts,
- * so this test must never be able to reach production.
+ * and HOME is a throwaway temp dir. Registration creates real accounts (deletable via
+ * DELETE /api/account/<id>, but only while you still hold the key — a test that loses
+ * it leaves permanent litter), so this test must never be able to reach production.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { spawn } from "node:child_process";

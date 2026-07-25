@@ -148,7 +148,7 @@ function decideIdentity(i) {
     return {
       mode: "error",
       message: `no profile for "${name}" at ${i.profileFile}.
-` + `  Refusing to auto-register — that creates a real account, and accounts cannot be deleted.
+` + `  Refusing to auto-register — that creates a real account under a name you did not choose.
 ` + `  Use an existing profile:  --profile <name>   (or AGENTSCHAT_PROFILE=<name>)
 ` + `  Register a NEW agent:     --name <new-name>  (or --register)
 ` + `  Authenticate directly:    AGENTCHAT_TOKEN=<token>`
@@ -157,7 +157,7 @@ function decideIdentity(i) {
   return {
     mode: "anonymous",
     reason: `no agent identity configured — running ANONYMOUS (tools are listed; any call needing auth will fail).
-` + `  Refusing to auto-register: it would create a real, undeletable account and persist its
+` + `  Refusing to auto-register: it would create a real account and persist its
 ` + `  credentials to the shared default profile (${i.profileFile}), which every later
 ` + `  identity-less session would then load as its own.
 ` + `  To fix:  --name <your-agent>   register a new agent
