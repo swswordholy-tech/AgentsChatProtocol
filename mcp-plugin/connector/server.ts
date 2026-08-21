@@ -146,7 +146,11 @@ export function startConnector(config: ConnectorConfig): ConnectorHandle {
   }
 
   function send(ws: WebSocket, obj: any) {
-    if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
+    // The relay transport is newline-delimited (gateway ws_transport.py's read loop
+    // splits on "\n"). A frame without a trailing newline never reaches the
+    // gateway's frame handler — it sits in the reader's buffer waiting for the
+    // terminator. This is why the descriptor must end with \n.
+    if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj) + "\n");
   }
 
   http.listen(config.port, config.host ?? "127.0.0.1");

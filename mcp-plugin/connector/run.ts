@@ -74,26 +74,32 @@ broadcast = (msg) => connector.injectAgentsChatMessage(msg);
 log(`listening on ${HOST}:${connector.port} (contract v1, gateway id "${GATEWAY_ID}")`);
 
 // ── agentschat WebSocket: receive messages, push to connected gateways ──
+//
+// Uses the `ws` npm package, NOT Bun's global WebSocket: on some networks the global
+// client hangs forever in CONNECTING (readyState 0, no error) while Python's
+// `websockets` and `ws` both connect cleanly. Verified 2026-08-21 — the global client
+// never opened against wss://agents-chat.com/ws, `ws` did.
 
-let ws: WebSocket | null = null;
+import WS from "ws";
+
+let ws: WS | null = null;
 let reconnectDelay = 1000;
 
 function sendAgentsChatFrame(frame: any) {
-  if (ws && ws.readyState === ws.OPEN) {
+  if (ws && ws.readyState === WS.OPEN) {
     try { ws.send(JSON.stringify(frame)); } catch {}
   }
 }
 
-async function connectAgentsChat() {
-  const WebSocketImpl = (globalThis as any).WebSocket;
-  ws = new WebSocketImpl(WS_URL);
-  ws.onopen = () => {
+function connectAgentsChat() {
+  ws = new WS(WS_URL);
+  ws.on("open", () => {
     reconnectDelay = 1000;
     sendAgentsChatFrame({ type: "auth", agent_id: AGENT_ID, token: TOKEN, capabilities: ["chat"] });
-  };
-  ws.onmessage = (ev: any) => {
+  });
+  ws.on("message", (raw: any) => {
     let data: any;
-    try { data = JSON.parse(String(ev.data)); } catch { return; }
+    try { data = JSON.parse(String(raw)); } catch { return; }
     if (data.type === "auth_ok") {
       log(`connected to agentschat as ${AGENT_ID}`);
       return;
@@ -101,14 +107,16 @@ async function connectAgentsChat() {
     if (data.type === "message" && data.sender_id !== AGENT_ID) {
       broadcast?.(data);
     }
-  };
-  ws.onclose = () => {
-    if (process.exitCode !== undefined && (process as any).__shutdown) return;
+  });
+  ws.on("close", () => {
+    if ((process as any).__shutdown) return;
     log(`agentschat WS closed; reconnecting in ${reconnectDelay}ms`);
     setTimeout(connectAgentsChat, reconnectDelay);
     reconnectDelay = Math.min(reconnectDelay * 2, 30000);
-  };
-  ws.onerror = () => {};
+  });
+  ws.on("error", (e: any) => {
+    log(`agentschat WS error: ${e?.message ?? e}`);
+  });
 }
 
 connectAgentsChat();
