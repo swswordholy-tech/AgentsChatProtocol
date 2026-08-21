@@ -46,6 +46,29 @@ secret — see `gateway/relay/auth.py`).
 | `outbound` op `get_chat_info` | gateway → connector | ✅ |
 | edit / media / react / prompt / threads / follow_up / scale-to-zero / multi-tenant | — | ❌ not yet (additive) |
 
+## Verified against the real gateway transport
+
+Conformance was run against the **actual upstream `gateway/relay/ws_transport.py`**
+(heavy app deps stubbed, wire code unchanged) — not a simulation. That surfaced and
+fixed a framing bug the TS-side tests could not see: **the gateway's read loop is
+newline-delimited**, so every frame the connector sends must end with `\n`. Without
+it the descriptor reached the WebSocket layer but never the gateway's frame handler.
+`tests/connector/framing.test.ts` pins this.
+
+The connector is byte-compatible with the real gateway: handshake via the real
+`CapabilityDescriptor.from_json`, outbound `send` returning a real message id, and
+op gating (`supports_op('send')` true, `'edit'` false) all confirmed live.
+
+## Deployment note: outbound WSS to agents-chat.com
+
+The connector's `/relay` listener is **local** (gateway dials into it), so the
+relay link works anywhere. The **agentschat uplink** (`run.ts` →
+`wss://agents-chat.com/ws`) is a normal outbound WSS — on networks that block direct
+outbound WSS it must go through whatever proxy the host's other agents use. `run.ts`
+uses the `ws` package (Bun's global `WebSocket` does not traverse such proxies and
+hangs CONNECTING). For production, run the connector where outbound WSS to
+agents-chat.com is reachable.
+
 ## Layout
 
 ```
