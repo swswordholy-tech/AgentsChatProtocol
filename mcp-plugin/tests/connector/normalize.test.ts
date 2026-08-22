@@ -8,7 +8,14 @@
  * guild/scope concept, so `scope_id` stays undefined and `chat_type` is `dm`/`group`.
  */
 import { describe, expect, test } from "bun:test";
-import { toWireEvent } from "../../connector/normalize.ts";
+import { toWireEvent, type WireEvent } from "../../connector/normalize.ts";
+
+/** toWireEvent returns WireEvent | null; these tests assert the non-null cases. */
+function must(msg: Parameters<typeof toWireEvent>[0]): WireEvent {
+  const e = toWireEvent(msg, "agentschat");
+  if (!e) throw new Error("expected a wire event, got null");
+  return e;
+}
 
 const base = {
   id: "msg-1",
@@ -21,44 +28,44 @@ const base = {
 
 describe("toWireEvent — source discriminators", () => {
   test("platform matches the descriptor's platform", () => {
-    const e = toWireEvent(base, "agentschat");
+    const e = must(base);
     expect(e.source.platform).toBe("agentschat");
   });
 
   test("a group channel maps to chat_type group", () => {
-    const e = toWireEvent(base, "agentschat");
+    const e = must(base);
     expect(e.source.chat_id).toBe("welcome");
     expect(e.source.chat_type).toBe("group");
   });
 
   test("a dm- prefixed channel maps to chat_type dm", () => {
-    const e = toWireEvent({ ...base, channel_id: "dm-abc123" }, "agentschat");
+    const e = must({ ...base, channel_id: "dm-abc123" });
     expect(e.source.chat_type).toBe("dm");
     expect(e.source.chat_id).toBe("dm-abc123");
   });
 
   test("carries the authentic author identity", () => {
-    const e = toWireEvent(base, "agentschat");
+    const e = must(base);
     expect(e.source.user_id).toBe("human-1");
     expect(e.source.user_name).toBe("Alice");
   });
 
   test("no scope/guild concept — scope_id is absent, not a wrong value", () => {
-    const e = toWireEvent(base, "agentschat");
+    const e = must(base);
     expect(e.source.scope_id).toBeUndefined();
   });
 });
 
 describe("toWireEvent — content + identity of the message itself", () => {
   test("text comes from content, message_id from id", () => {
-    const e = toWireEvent(base, "agentschat");
+    const e = must(base);
     expect(e.text).toBe("hello bot");
     expect(e.message_id).toBe("msg-1");
     expect(e.message_type).toBe("text");
   });
 
   test("a reply carries reply_to_message_id", () => {
-    const e = toWireEvent({ ...base, reply_to: "msg-0" }, "agentschat");
+    const e = must({ ...base, reply_to: "msg-0" });
     expect(e.reply_to_message_id).toBe("msg-0");
   });
 

@@ -244,10 +244,12 @@ var package_default = {
   },
   homepage: "https://agents-chat.com/landing",
   dependencies: {
-    "@modelcontextprotocol/sdk": "^1.29.0"
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    ws: "^8.21.3"
   },
   devDependencies: {
     "@types/bun": "latest",
+    "@types/ws": "^8.18.1",
     typescript: "^5.9.3"
   },
   files: [
@@ -264,7 +266,14 @@ var package_default = {
     "src/terms.ts",
     "src/profile-store.ts",
     "src/read-cursor.ts",
+    "connector/auth.ts",
+    "connector/descriptor.ts",
+    "connector/normalize.ts",
+    "connector/server.ts",
+    "connector/run.ts",
+    "connector/README.md",
     "dist/server.js",
+    "dist/connector.js",
     "README.md"
   ]
 };
