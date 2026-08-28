@@ -68,3 +68,43 @@ describe("grokBearerFromGatewayConfig — read the token from a local gateway.js
     expect(grokBearerFromGatewayConfig({})).toBeNull();
   });
 });
+
+import { resolveGrokAgentId } from "../src/wake.ts";
+
+describe("resolveGrokAgentId — 1:1 binding, explicit env wins", () => {
+  test("explicit AGENTCHAT_GROK_AGENT_ID wins over listAgents", async () => {
+    const id = await resolveGrokAgentId({
+      explicitId: "uuid-explicit",
+      agentschatName: "Grok",
+      listAgents: async () => [{ id: "uuid-other", name: "Grok" }],
+    });
+    expect(id).toBe("uuid-explicit");
+  });
+
+  test("no explicit id → listAgents name match (fallback)", async () => {
+    const id = await resolveGrokAgentId({
+      explicitId: "",
+      agentschatName: "Grok",
+      listAgents: async () => [{ id: "uuid-matched", name: "Grok" }],
+    });
+    expect(id).toBe("uuid-matched");
+  });
+
+  test("no match anywhere → null (fail closed, no wake)", async () => {
+    const id = await resolveGrokAgentId({
+      explicitId: "",
+      agentschatName: "Grok",
+      listAgents: async () => [{ id: "uuid-x", name: "SomeoneElse" }],
+    });
+    expect(id).toBeNull();
+  });
+
+  test("listAgents throwing does not crash — falls to null", async () => {
+    const id = await resolveGrokAgentId({
+      explicitId: "",
+      agentschatName: "Grok",
+      listAgents: async () => { throw new Error("gateway down"); },
+    });
+    expect(id).toBeNull();
+  });
+});

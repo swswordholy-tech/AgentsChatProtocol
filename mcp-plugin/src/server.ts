@@ -43,7 +43,7 @@ import { validateToolArgs } from "./argcheck.ts";
 import { decideIdentity, shouldMigrateDevToken } from "./identity.ts";
 import type { ProfileSource } from "./identity.ts";
 import { decideTermsConsent, TERMS_URL } from "./terms.ts";
-import { fireWake, fireGrokWake } from "./wake.ts";
+import { fireWake, fireGrokWake, resolveGrokAgentId, grokBearerFromGatewayConfig, grokPortFromGatewayConfig } from "./wake.ts";
 import pkg from "../package.json";
 import {
   CallToolRequestSchema,
@@ -4003,10 +4003,39 @@ function connectWS() {
         // loopback /api/sendPrompt with its own Bearer (read from gateway.json) and
         // a {agentId, prompt} body — a different transport, same trigger.
         if (process.env.AGENTCHAT_WAKE_MODE === "grok") {
-          void fireGrokWake(data, {
-            gatewayConfigPath: process.env.AGENTCHAT_GROK_GATEWAY || `${process.env.HOME}/.grok/gateway.json`,
-            agentId: process.env.AGENTCHAT_GROK_AGENT_ID || "",
-          });
+          // 1:1 mapping: this plugin instance (one AgentsChat agent) wakes ONE Grok
+          // agent. Explicit AGENTCHAT_GROK_AGENT_ID wins; else resolve by matching
+          // the AgentsChat display name against the gateway's listAgents (warns);
+          // else fail closed (no wake). The gateway token/port come from gateway.json.
+          void (async () => {
+            try {
+              const { readFileSync } = await import("node:fs");
+              const gwPath = process.env.AGENTCHAT_GROK_GATEWAY || `${process.env.HOME}/.grok/gateway.json`;
+              let agentId = process.env.AGENTCHAT_GROK_AGENT_ID || "";
+              if (!agentId) {
+                agentId = (await resolveGrokAgentId({
+                  explicitId: "",
+                  agentschatName: profile.display_name || AGENT_ID,
+                  listAgents: async () => {
+                    const gwcfg = JSON.parse(readFileSync(gwPath, "utf8"));
+                    const token = grokBearerFromGatewayConfig(gwcfg);
+                    const port = grokPortFromGatewayConfig(gwcfg);
+                    const res = await fetch(`http://127.0.0.1:${port}/api/listAgents`, {
+                      headers: token ? { Authorization: `Bearer ${token}` } : {},
+                    });
+                    if (!res.ok) throw new Error(`listAgents HTTP ${res.status}`);
+                    const d = (await res.json()) as any;
+                    return Array.isArray(d) ? d : d?.agents ?? [];
+                  },
+                })) ?? "";
+              }
+              if (agentId) {
+                void fireGrokWake(data, { gatewayConfigPath: gwPath, agentId });
+              }
+            } catch (e) {
+              process.stderr.write(`[agentchat] grok wake resolve failed: ${e}\n`);
+            }
+          })();
         } else {
           void fireWake(data, {
             url: process.env.AGENTCHAT_WAKE_URL,

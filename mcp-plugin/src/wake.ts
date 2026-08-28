@@ -203,11 +203,47 @@ export function grokPortFromGatewayConfig(cfg: any, fallback = 1340): number {
 export interface GrokWakeConfig {
   /** Path to the Grok gateway.json (read at send time). */
   gatewayConfigPath: string;
-  /** The gateway agent uuid to address. Falls back to reading listAgents is out of scope; required. */
+  /**
+   * The gateway agent uuid to address. One plugin instance fronts ONE AgentsChat
+   * agent, which binds to ONE Grok agent (1:1) — set this explicitly. If empty,
+   * the caller may fall back to resolving by name via listAgents (see
+   * resolveGrokAgentId); an unresolved id means no wake is sent.
+   */
   agentId: string;
   timeoutMs?: number;
   fetchImpl?: typeof fetch;
   logger?: (msg: string) => void;
+}
+
+/**
+ * Resolve which Grok agent to wake. Preference order (per the 1:1 design):
+ *   1. the explicit agentId (operator-bound, unambiguous) — wins if set;
+ *   2. name match against the gateway's listAgents (convenience fallback, warns —
+ *      names on the two sides are not guaranteed to agree);
+ *   3. null — fail closed (no wake), with a stderr note on how to bind.
+ */
+export async function resolveGrokAgentId(opts: {
+  explicitId?: string;
+  agentschatName?: string;
+  listAgents?: () => Promise<Array<{ id?: string; name?: string }>>;
+  logger?: (msg: string) => void;
+}): Promise<string | null> {
+  const log = opts.logger ?? (() => {});
+  if (opts.explicitId && opts.explicitId.trim()) return opts.explicitId.trim();
+  if (opts.listAgents && opts.agentschatName) {
+    try {
+      const agents = await opts.listAgents();
+      const hit = agents.find((a) => a.name && a.name === opts.agentschatName);
+      if (hit?.id) {
+        log(`[agentchat] grok wake: no AGENTCHAT_GROK_AGENT_ID; matched "${opts.agentschatName}" → ${hit.id} via listAgents (set the env to bind explicitly)`);
+        return hit.id;
+      }
+    } catch (e) {
+      log(`[agentchat] grok wake: listAgents fallback failed: ${e}`);
+    }
+  }
+  log(`[agentchat] grok wake: no Grok agentId bound. Set AGENTCHAT_GROK_AGENT_ID=<gateway agent uuid> (1:1 mapping).`);
+  return null;
 }
 
 /**

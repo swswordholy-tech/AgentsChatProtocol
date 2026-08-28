@@ -276,6 +276,25 @@ function grokPortFromGatewayConfig(cfg, fallback = 1340) {
   const p = cfg?.port;
   return typeof p === "number" && p > 0 ? p : fallback;
 }
+async function resolveGrokAgentId(opts) {
+  const log = opts.logger ?? (() => {});
+  if (opts.explicitId && opts.explicitId.trim())
+    return opts.explicitId.trim();
+  if (opts.listAgents && opts.agentschatName) {
+    try {
+      const agents = await opts.listAgents();
+      const hit = agents.find((a) => a.name && a.name === opts.agentschatName);
+      if (hit?.id) {
+        log(`[agentchat] grok wake: no AGENTCHAT_GROK_AGENT_ID; matched "${opts.agentschatName}" → ${hit.id} via listAgents (set the env to bind explicitly)`);
+        return hit.id;
+      }
+    } catch (e) {
+      log(`[agentchat] grok wake: listAgents fallback failed: ${e}`);
+    }
+  }
+  log(`[agentchat] grok wake: no Grok agentId bound. Set AGENTCHAT_GROK_AGENT_ID=<gateway agent uuid> (1:1 mapping).`);
+  return null;
+}
 async function fireGrokWake(msg, cfg) {
   const log = cfg.logger ?? (() => {});
   if (!cfg.agentId) {
@@ -4195,10 +4214,37 @@ ${context}
 `);
         }
         if (process.env.AGENTCHAT_WAKE_MODE === "grok") {
-          fireGrokWake(data, {
-            gatewayConfigPath: process.env.AGENTCHAT_GROK_GATEWAY || `${process.env.HOME}/.grok/gateway.json`,
-            agentId: process.env.AGENTCHAT_GROK_AGENT_ID || ""
-          });
+          (async () => {
+            try {
+              const { readFileSync: readFileSync3 } = await import("fs");
+              const gwPath = process.env.AGENTCHAT_GROK_GATEWAY || `${process.env.HOME}/.grok/gateway.json`;
+              let agentId = process.env.AGENTCHAT_GROK_AGENT_ID || "";
+              if (!agentId) {
+                agentId = await resolveGrokAgentId({
+                  explicitId: "",
+                  agentschatName: profile.display_name || AGENT_ID,
+                  listAgents: async () => {
+                    const gwcfg = JSON.parse(readFileSync3(gwPath, "utf8"));
+                    const token = grokBearerFromGatewayConfig(gwcfg);
+                    const port = grokPortFromGatewayConfig(gwcfg);
+                    const res = await fetch(`http://127.0.0.1:${port}/api/listAgents`, {
+                      headers: token ? { Authorization: `Bearer ${token}` } : {}
+                    });
+                    if (!res.ok)
+                      throw new Error(`listAgents HTTP ${res.status}`);
+                    const d = await res.json();
+                    return Array.isArray(d) ? d : d?.agents ?? [];
+                  }
+                }) ?? "";
+              }
+              if (agentId) {
+                fireGrokWake(data, { gatewayConfigPath: gwPath, agentId });
+              }
+            } catch (e) {
+              process.stderr.write(`[agentchat] grok wake resolve failed: ${e}
+`);
+            }
+          })();
         } else {
           fireWake(data, {
             url: process.env.AGENTCHAT_WAKE_URL,
@@ -4357,7 +4403,7 @@ async function checkVersionStaleness() {
       return;
     const latest = (await r.json())?.version;
     if (typeof latest === "string" && latest !== package_default.version) {
-      process.stderr.write(`[agentchat] Update available: running agentschat-mcp ${package_default.version}, latest published is ${latest}. ` + `New tools/capabilities load only on a SESSION RESTART (hot-reload isn't possible); ` + `update (bunx agentschat-mcp@latest / reinstall) then restart this session to pick them up.
+      process.stderr.write(`[agentchat] Update available: running agentschat-mcp ${package_default.version}, latest published is ${latest}. New tools/capabilities load only on a SESSION RESTART (hot-reload isn't possible); update (bunx agentschat-mcp@latest / reinstall) then restart this session to pick them up.
 `);
     }
   } catch {} finally {
