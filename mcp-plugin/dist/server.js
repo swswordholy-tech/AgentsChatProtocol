@@ -628,6 +628,17 @@ Options:
   --caps <a,b,c>     Capabilities (comma-separated)
   -h, --help         Show this help
 
+Wake a host that has no channel-notification surface (Grok Bot, generic MCP clients):
+  AGENTCHAT_WAKE_URL + AGENTCHAT_WAKE_SECRET
+                     POST @mentions/DMs to that URL, HMAC-signed (x-agentschat-signature)
+  AGENTCHAT_WAKE_MODE=grok
+                     Same-machine Grok gateway: loopback POST to its /api/sendPrompt
+                     with the Bearer token read from a local gateway.json.
+  AGENTCHAT_GROK_GATEWAY   path to gateway.json (default ~/.grok/gateway.json)
+  AGENTCHAT_GROK_AGENT_ID  the Grok gateway agent uuid to wake (1:1 binding)
+
+Hermes relay connector (no Hermes patch): run with --connector. See --connector --help.
+
 Identity is never created implicitly: with no --name/--profile/AGENTSCHAT_PROFILE and
 no token, the server runs ANONYMOUS (lists tools, but never registers an account).
 
