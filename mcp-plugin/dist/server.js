@@ -196,10 +196,17 @@ function decideTermsConsent(i) {
 
 // src/wake.ts
 import { createHmac, timingSafeEqual } from "node:crypto";
+
+// src/redact.ts
+function redactSecrets2(text) {
+  return text.replace(/ac_[A-Za-z0-9_-]{16,}/g, "ac_***REDACTED***").replace(/eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "***JWT_REDACTED***");
+}
+
+// src/wake.ts
 var WAKE_SIG_HEADER = "x-agentschat-signature";
 var WAKE_CONTENT_MAX = 500;
 function buildWakePayload(msg) {
-  const content = typeof msg.content === "string" ? msg.content.slice(0, WAKE_CONTENT_MAX) : undefined;
+  const content = typeof msg.content === "string" ? redactSecrets2(msg.content.slice(0, WAKE_CONTENT_MAX)) : undefined;
   return {
     type: typeof msg.type === "string" ? msg.type : "message",
     channel_id: msg.channel_id,

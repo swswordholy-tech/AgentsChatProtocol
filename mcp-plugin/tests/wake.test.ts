@@ -60,6 +60,17 @@ describe("buildWakePayload — what the receiver needs, nothing more", () => {
     expect(p.type).toBe("message");
     expect(p.channel_id).toBeUndefined();
   });
+
+  test("a credential pasted INTO the message body is redacted, not relayed", () => {
+    // Same rule as every other outbound path (reply/edit/caption/status all call
+    // redactSecrets): if someone pastes an ac_ key or JWT into a message, the wake
+    // body must not carry it to the receiver.
+    const p = buildWakePayload({ ...MSG, content: "key: ac_abcdefghijklmnopqrstuvwxyz and jwt eyJabcdefghijklmnopqrstuv.abc.def" });
+    expect(p.content).toContain("ac_***REDACTED***");
+    expect(p.content).toContain("***JWT_REDACTED***");
+    expect(p.content).not.toContain("ac_abcdefghij");
+    expect(p.content).not.toContain("eyJabcdefghij");
+  });
 });
 
 describe("signWakeBody / verifyWakeSignature — HMAC over the raw body", () => {

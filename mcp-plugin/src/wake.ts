@@ -23,6 +23,7 @@
  * timeout, then drop with a stderr note.
  */
 import { createHmac, timingSafeEqual } from "node:crypto";
+import { redactSecrets } from "./redact.ts";
 
 /** Signature header the receiver reads to verify a wake POST. */
 export const WAKE_SIG_HEADER = "x-agentschat-signature";
@@ -59,7 +60,11 @@ export interface WakePayload {
  * skip a history fetch. Credential-shaped fields are never carried across.
  */
 export function buildWakePayload(msg: WakeMessage): WakePayload {
-  const content = typeof msg.content === "string" ? msg.content.slice(0, WAKE_CONTENT_MAX) : undefined;
+  // The content excerpt crosses the wire to the wake receiver, so it goes through
+  // the same redactSecrets every other outbound content path uses (reply/edit/
+  // caption/status) — a message with an ac_ key or JWT pasted into it must not leak
+  // it into the wake body either.
+  const content = typeof msg.content === "string" ? redactSecrets(msg.content.slice(0, WAKE_CONTENT_MAX)) : undefined;
   return {
     type: typeof msg.type === "string" ? msg.type : "message",
     channel_id: msg.channel_id,
