@@ -193,11 +193,63 @@ function decideTermsConsent(i) {
 ` + `  Refusing to send acceptance you did not give — no account was created.`
   };
 }
+
+// src/wake.ts
+import { createHmac, timingSafeEqual } from "node:crypto";
+var WAKE_SIG_HEADER = "x-agentschat-signature";
+var WAKE_CONTENT_MAX = 500;
+function buildWakePayload(msg) {
+  const content = typeof msg.content === "string" ? msg.content.slice(0, WAKE_CONTENT_MAX) : undefined;
+  return {
+    type: typeof msg.type === "string" ? msg.type : "message",
+    channel_id: msg.channel_id,
+    message_id: msg.id,
+    sender_id: msg.sender_id,
+    content,
+    mentioned_ids: Array.isArray(msg.mentioned_ids) ? msg.mentioned_ids.filter((x) => typeof x === "string") : undefined,
+    timestamp: typeof msg.timestamp === "string" ? msg.timestamp : undefined
+  };
+}
+function signWakeBody(body, secret) {
+  return createHmac("sha256", secret).update(body, "utf8").digest("hex");
+}
+async function fireWake(msg, cfg) {
+  const log = cfg.logger ?? (() => {});
+  const url = (cfg.url ?? "").trim();
+  if (!url)
+    return;
+  const payload = buildWakePayload(msg);
+  const body = JSON.stringify(payload);
+  const headers = { "Content-Type": "application/json" };
+  if (cfg.secret)
+    headers[WAKE_SIG_HEADER] = signWakeBody(body, cfg.secret);
+  const doPost = async () => {
+    const f = cfg.fetchImpl ?? fetch;
+    const ctrl = new AbortController;
+    const t = setTimeout(() => ctrl.abort(), cfg.timeoutMs ?? 5000);
+    try {
+      const res = await f(url, { method: "POST", headers, body, signal: ctrl.signal });
+      if (!res.ok)
+        log(`[agentchat] wake POST ${url} → HTTP ${res.status}`);
+    } finally {
+      clearTimeout(t);
+    }
+  };
+  try {
+    await doPost();
+  } catch (e) {
+    try {
+      await doPost();
+    } catch (e2) {
+      log(`[agentchat] wake POST ${url} failed: ${e2}`);
+    }
+  }
+}
 // package.json
 var package_default = {
   name: "agentschat-mcp",
   mcpName: "io.github.swswordholy-tech/agentschat-mcp",
-  version: "0.31.0",
+  version: "0.32.0",
   description: "Connect Claude Code to AgentsChat — AI Agent social network. Core tools stay lean while extended tool groups load on demand for lower token overhead and cleaner role-specific context.",
   type: "module",
   bin: {
@@ -264,6 +316,7 @@ var package_default = {
     "src/argcheck.ts",
     "src/identity.ts",
     "src/terms.ts",
+    "src/wake.ts",
     "src/profile-store.ts",
     "src/read-cursor.ts",
     "connector/auth.ts",
@@ -4061,6 +4114,10 @@ ${context}
           process.stderr.write(`[agentchat] Notification FAILED: ${notifErr}
 `);
         }
+        fireWake(data, {
+          url: process.env.AGENTCHAT_WAKE_URL,
+          secret: process.env.AGENTCHAT_WAKE_SECRET
+        });
         if (activeHi)
           clearFinishedHiddenIdentityGamesFromMessage(data);
       } else {

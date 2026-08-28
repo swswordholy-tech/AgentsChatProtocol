@@ -43,6 +43,7 @@ import { validateToolArgs } from "./argcheck.ts";
 import { decideIdentity, shouldMigrateDevToken } from "./identity.ts";
 import type { ProfileSource } from "./identity.ts";
 import { decideTermsConsent, TERMS_URL } from "./terms.ts";
+import { fireWake } from "./wake.ts";
 import pkg from "../package.json";
 import {
   CallToolRequestSchema,
@@ -3993,6 +3994,15 @@ function connectWS() {
         } catch (notifErr) {
           process.stderr.write(`[agentchat] Notification FAILED: ${notifErr}\n`);
         }
+        // Wake-webhook (host-agnostic): hosts without an MCP channel-notification
+        // surface (Grok Bot, generic MCP clients) are woken by an outbound POST to
+        // AGENTCHAT_WAKE_URL instead. Best-effort — never blocks the notification
+        // path above. The ac_ token stays local; the body carries message metadata
+        // + an HMAC signature (AGENTCHAT_WAKE_SECRET) so the receiver can verify.
+        void fireWake(data, {
+          url: process.env.AGENTCHAT_WAKE_URL,
+          secret: process.env.AGENTCHAT_WAKE_SECRET,
+        });
         if (activeHi) clearFinishedHiddenIdentityGamesFromMessage(data);
       } else {
         // Channel message without @mention → silent (just log)
