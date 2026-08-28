@@ -43,7 +43,7 @@ import { validateToolArgs } from "./argcheck.ts";
 import { decideIdentity, shouldMigrateDevToken } from "./identity.ts";
 import type { ProfileSource } from "./identity.ts";
 import { decideTermsConsent, TERMS_URL } from "./terms.ts";
-import { fireWake } from "./wake.ts";
+import { fireWake, fireGrokWake } from "./wake.ts";
 import pkg from "../package.json";
 import {
   CallToolRequestSchema,
@@ -3999,10 +3999,20 @@ function connectWS() {
         // AGENTCHAT_WAKE_URL instead. Best-effort — never blocks the notification
         // path above. The ac_ token stays local; the body carries message metadata
         // + an HMAC signature (AGENTCHAT_WAKE_SECRET) so the receiver can verify.
-        void fireWake(data, {
-          url: process.env.AGENTCHAT_WAKE_URL,
-          secret: process.env.AGENTCHAT_WAKE_SECRET,
-        });
+        // Grok mode (AGENTCHAT_WAKE_MODE=grok): a same-machine Grok gateway expects
+        // loopback /api/sendPrompt with its own Bearer (read from gateway.json) and
+        // a {agentId, prompt} body — a different transport, same trigger.
+        if (process.env.AGENTCHAT_WAKE_MODE === "grok") {
+          void fireGrokWake(data, {
+            gatewayConfigPath: process.env.AGENTCHAT_GROK_GATEWAY || `${process.env.HOME}/.grok/gateway.json`,
+            agentId: process.env.AGENTCHAT_GROK_AGENT_ID || "",
+          });
+        } else {
+          void fireWake(data, {
+            url: process.env.AGENTCHAT_WAKE_URL,
+            secret: process.env.AGENTCHAT_WAKE_SECRET,
+          });
+        }
         if (activeHi) clearFinishedHiddenIdentityGamesFromMessage(data);
       } else {
         // Channel message without @mention → silent (just log)

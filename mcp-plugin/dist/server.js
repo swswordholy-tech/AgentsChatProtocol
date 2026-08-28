@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 // @bun
+import { createRequire } from "node:module";
+var __require = /* @__PURE__ */ createRequire(import.meta.url);
 
 // src/server.ts
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -249,6 +251,77 @@ async function fireWake(msg, cfg) {
       await doPost();
     } catch (e2) {
       log(`[agentchat] wake POST ${url} failed: ${e2}`);
+    }
+  }
+}
+function buildGrokPrompt(msg, agentId) {
+  const content = typeof msg.content === "string" ? redactSecrets2(msg.content.slice(0, WAKE_CONTENT_MAX)) : "";
+  const channel = msg.channel_id ?? "?";
+  const sender = msg.sender_id ?? "someone";
+  const isDm = channel.startsWith("dm-");
+  const where = isDm ? "私聊 (DM)" : `频道 ${channel}`;
+  const prompt = `[AgentsChat] ${sender} 在${where}提到了你` + (content ? `："${content}"` : "。") + (msg.message_id ? ` (channel_id=${channel}, message_id=${msg.message_id}——用 get_history 拉上下文、reply 回复)` : "");
+  return { agentId, prompt };
+}
+function grokBearerFromGatewayConfig(cfg) {
+  if (!cfg || typeof cfg !== "object")
+    return null;
+  if (typeof cfg.token === "string" && cfg.token)
+    return cfg.token;
+  if (cfg.auth && typeof cfg.auth.bearer === "string" && cfg.auth.bearer)
+    return cfg.auth.bearer;
+  return null;
+}
+function grokPortFromGatewayConfig(cfg, fallback = 1340) {
+  const p = cfg?.port;
+  return typeof p === "number" && p > 0 ? p : fallback;
+}
+async function fireGrokWake(msg, cfg) {
+  const log = cfg.logger ?? (() => {});
+  if (!cfg.agentId) {
+    log(`[agentchat] grok wake: no agentId configured, skipping`);
+    return;
+  }
+  let gwcfg;
+  try {
+    const { readFileSync } = await import("node:fs");
+    gwcfg = JSON.parse(readFileSync(cfg.gatewayConfigPath, "utf8"));
+  } catch (e) {
+    log(`[agentchat] grok wake: cannot read ${cfg.gatewayConfigPath}: ${e}`);
+    return;
+  }
+  const token = grokBearerFromGatewayConfig(gwcfg);
+  if (!token) {
+    log(`[agentchat] grok wake: no bearer token in ${cfg.gatewayConfigPath}`);
+    return;
+  }
+  const port = grokPortFromGatewayConfig(gwcfg);
+  const url = `http://127.0.0.1:${port}/api/sendPrompt`;
+  const body = JSON.stringify(buildGrokPrompt(msg, cfg.agentId));
+  const doPost = async () => {
+    const f = cfg.fetchImpl ?? fetch;
+    const ctrl = new AbortController;
+    const t = setTimeout(() => ctrl.abort(), cfg.timeoutMs ?? 5000);
+    try {
+      const res = await f(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+        body,
+        signal: ctrl.signal
+      });
+      if (!res.ok)
+        log(`[agentchat] grok wake POST ${url} → HTTP ${res.status}`);
+    } finally {
+      clearTimeout(t);
+    }
+  };
+  try {
+    await doPost();
+  } catch (e) {
+    try {
+      await doPost();
+    } catch (e2) {
+      log(`[agentchat] grok wake POST ${url} failed: ${e2}`);
     }
   }
 }
@@ -4121,10 +4194,17 @@ ${context}
           process.stderr.write(`[agentchat] Notification FAILED: ${notifErr}
 `);
         }
-        fireWake(data, {
-          url: process.env.AGENTCHAT_WAKE_URL,
-          secret: process.env.AGENTCHAT_WAKE_SECRET
-        });
+        if (process.env.AGENTCHAT_WAKE_MODE === "grok") {
+          fireGrokWake(data, {
+            gatewayConfigPath: process.env.AGENTCHAT_GROK_GATEWAY || `${process.env.HOME}/.grok/gateway.json`,
+            agentId: process.env.AGENTCHAT_GROK_AGENT_ID || ""
+          });
+        } else {
+          fireWake(data, {
+            url: process.env.AGENTCHAT_WAKE_URL,
+            secret: process.env.AGENTCHAT_WAKE_SECRET
+          });
+        }
         if (activeHi)
           clearFinishedHiddenIdentityGamesFromMessage(data);
       } else {

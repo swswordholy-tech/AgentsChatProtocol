@@ -148,3 +148,119 @@ export async function fireWake(msg: WakeMessage, cfg: WakeConfig): Promise<void>
     }
   }
 }
+
+// ── Grok mode (A1): loopback /api/sendPrompt to a same-machine Grok gateway ──
+//
+// A Grok gateway is NOT a generic wake receiver: it expects
+//   POST http://127.0.0.1:<port>/api/sendPrompt
+//   Authorization: Bearer <gateway token>          (from the local gateway.json)
+//   {"agentId": "<gw agent uuid>", "prompt": "..."}
+// Different auth (Bearer, not the wake HMAC header) and a different body shape, so
+// this is a separate path — reusing the trigger (WS @/DM) but not the transport.
+
+export interface GrokPrompt {
+  agentId: string;
+  prompt: string;
+}
+
+/**
+ * Build the sendPrompt body. The prompt is a human-readable wake: which channel,
+ * who spoke, and the (redacted) content excerpt, so the Grok agent can act without
+ * an immediate history fetch. Credential-shaped fields are never carried.
+ */
+export function buildGrokPrompt(msg: WakeMessage, agentId: string): GrokPrompt {
+  const content = typeof msg.content === "string" ? redactSecrets(msg.content.slice(0, WAKE_CONTENT_MAX)) : "";
+  const channel = msg.channel_id ?? "?";
+  const sender = msg.sender_id ?? "someone";
+  const isDm = channel.startsWith("dm-");
+  const where = isDm ? "私聊 (DM)" : `频道 ${channel}`;
+  const prompt =
+    `[AgentsChat] ${sender} 在${where}提到了你` +
+    (content ? `："${content}"` : "。") +
+    (msg.message_id ? ` (channel_id=${channel}, message_id=${msg.message_id}——用 get_history 拉上下文、reply 回复)` : "");
+  return { agentId, prompt };
+}
+
+/**
+ * Extract the gateway Bearer token from a parsed gateway.json. Tries the common
+ * shapes (`token`, `auth.bearer`); returns null when absent — fail closed, never
+ * guess. The token is read from the local file at send time so host restarts that
+ * rotate it are picked up automatically, and it never touches argv/env/channel.
+ */
+export function grokBearerFromGatewayConfig(cfg: any): string | null {
+  if (!cfg || typeof cfg !== "object") return null;
+  if (typeof cfg.token === "string" && cfg.token) return cfg.token;
+  if (cfg.auth && typeof cfg.auth.bearer === "string" && cfg.auth.bearer) return cfg.auth.bearer;
+  return null;
+}
+
+/** Extract the gateway port (for the loopback URL) from a parsed gateway.json. */
+export function grokPortFromGatewayConfig(cfg: any, fallback = 1340): number {
+  const p = cfg?.port;
+  return typeof p === "number" && p > 0 ? p : fallback;
+}
+
+export interface GrokWakeConfig {
+  /** Path to the Grok gateway.json (read at send time). */
+  gatewayConfigPath: string;
+  /** The gateway agent uuid to address. Falls back to reading listAgents is out of scope; required. */
+  agentId: string;
+  timeoutMs?: number;
+  fetchImpl?: typeof fetch;
+  logger?: (msg: string) => void;
+}
+
+/**
+ * Fire a Grok wake: read the gateway token from gateway.json, POST the sendPrompt
+ * body to the loopback gateway. Best-effort, never throws into the message path.
+ */
+export async function fireGrokWake(msg: WakeMessage, cfg: GrokWakeConfig): Promise<void> {
+  const log = cfg.logger ?? (() => {});
+  if (!cfg.agentId) {
+    log(`[agentchat] grok wake: no agentId configured, skipping`);
+    return;
+  }
+  let gwcfg: any;
+  try {
+    const { readFileSync } = await import("node:fs");
+    gwcfg = JSON.parse(readFileSync(cfg.gatewayConfigPath, "utf8"));
+  } catch (e) {
+    log(`[agentchat] grok wake: cannot read ${cfg.gatewayConfigPath}: ${e}`);
+    return;
+  }
+  const token = grokBearerFromGatewayConfig(gwcfg);
+  if (!token) {
+    log(`[agentchat] grok wake: no bearer token in ${cfg.gatewayConfigPath}`);
+    return;
+  }
+  const port = grokPortFromGatewayConfig(gwcfg);
+  const url = `http://127.0.0.1:${port}/api/sendPrompt`;
+  const body = JSON.stringify(buildGrokPrompt(msg, cfg.agentId));
+
+  const doPost = async (): Promise<void> => {
+    const f = cfg.fetchImpl ?? fetch;
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), cfg.timeoutMs ?? 5000);
+    try {
+      const res = await f(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+        body,
+        signal: ctrl.signal,
+      });
+      if (!res.ok) log(`[agentchat] grok wake POST ${url} → HTTP ${res.status}`);
+    } finally {
+      clearTimeout(t);
+    }
+  };
+
+  try {
+    await doPost();
+  } catch (e) {
+    try {
+      await doPost();
+    } catch (e2) {
+      log(`[agentchat] grok wake POST ${url} failed: ${e2}`);
+    }
+  }
+}
