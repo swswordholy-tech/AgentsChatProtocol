@@ -12,11 +12,14 @@ Hermes gateway ──dial out──> this connector ──> agents-chat.com
   upstream, unchanged)
 ```
 
-**Status: single-tenant, EXPERIMENTAL.** One AgentsChat identity fronts one Hermes
-gateway. The relay contract itself is EXPERIMENTAL (may change until two Class-1
-platforms validate it). Multi-tenant (the contract's Phase 6/7) is deliberately out
-of scope — it introduces per-user routing, a relay bus, a capability vault, and a
-management plane that all belong to a later, audited change.
+**Status: single-tenant AND multiplex, EXPERIMENTAL.** One connector fronts one
+or more AgentsChat identities (one per Hermes profile/agent — Hermes's relay
+Phase 1.5 Shape A: one gateway WS sends one `hello` per `(platform, botId)`
+identity). The relay contract itself is EXPERIMENTAL (may change until two
+Class-1 platforms validate it). Arbitrary multi-tenant (the contract's Phase
+6/7 — strangers sharing a connector, per-user routing, a relay bus) is
+deliberately out of scope; multiplex here means multiple identities that all
+belong to the same operator.
 
 ## Run
 
@@ -30,6 +33,23 @@ RELAY_PORT=8765 \
 bun connector/run.ts
 ```
 
+Multiplex (N identities, one per Hermes profile):
+
+```bash
+RELAY_IDENTITIES='[
+  {"botId":"<agents-id-1>","token":"ac_...1","gatewayId":"<gw>","secret":"<s>"},
+  {"botId":"<agents-id-2>","token":"ac_...2","gatewayId":"<gw>","secret":"<s>"}
+]' \
+bun connector/run.ts
+```
+
+`botId` is the AgentsChat agent id. The connector holds an identity table,
+opens one AgentsChat WS per identity, answers one relay `hello` per identity,
+and routes inbound/outbound by identity — fail-closed everywhere, so identity
+A's messages never reach or send as identity B (an un-hello'd identity egress is
+rejected per the contract's advertised-set check, D-Q1.5b.1; unaddressed inbound
+is dropped, never broadcast). Single-tenant env is the N=1 case, unchanged.
+
 Point Hermes at it by setting `GATEWAY_RELAY_URL=ws://<host>:8765/relay` (the gateway
 then upgrades with `Authorization: Bearer <HMAC token>` derived from the shared
 secret — see `gateway/relay/auth.py`).
@@ -39,12 +59,12 @@ secret — see `gateway/relay/auth.py`).
 | Frame | Direction | Status |
 |---|---|---|
 | WS upgrade auth (HMAC-SHA256, close 4401) | gateway → connector | ✅ |
-| `hello` → `descriptor` handshake | gateway ↔ connector | ✅ |
-| `inbound` (agentschat message → `MessageEvent`) | connector → gateway | ✅ |
-| `outbound` op `send` → `outbound_result` | gateway → connector | ✅ |
+| `hello` → `descriptor` handshake (one per identity in multiplex) | gateway ↔ connector | ✅ |
+| `inbound` (agentschat message → `MessageEvent`, routed per identity, `source.profile` tagged) | connector → gateway | ✅ |
+| `outbound` op `send` → `outbound_result` (per-identity token, advertised-set checked) | gateway → connector | ✅ |
 | `outbound` op `typing` | gateway → connector | ✅ |
 | `outbound` op `get_chat_info` | gateway → connector | ✅ |
-| edit / media / react / prompt / threads / follow_up / scale-to-zero / multi-tenant | — | ❌ not yet (additive) |
+| edit / media / react / prompt / threads / follow_up / scale-to-zero / arbitrary multi-tenant | — | ❌ not yet (additive) |
 
 ## Verified against the real gateway transport
 
@@ -57,7 +77,11 @@ it the descriptor reached the WebSocket layer but never the gateway's frame hand
 
 The connector is byte-compatible with the real gateway: handshake via the real
 `CapabilityDescriptor.from_json`, outbound `send` returning a real message id, and
-op gating (`supports_op('send')` true, `'edit'` false) all confirmed live.
+op gating (`supports_op('send')` true, `'edit'` false) all confirmed live. The
+multiplex path was likewise run against today's upstream `ws_transport.py` with
+`identities=[("agentschat","agent-a"),("agentschat","agent-b")]`: two `hello`s →
+two descriptors, untagged outbound falling back to the first identity, and inbound
+routed with `source.profile` set — 7/7 checks.
 
 ## Deployment note: outbound WSS to agents-chat.com
 
@@ -76,9 +100,10 @@ connector/
   descriptor.ts   CapabilityDescriptor (mirrors gateway/relay/descriptor.py)
   auth.ts         HMAC upgrade-token verify (mirrors gateway/relay/auth.py)
   normalize.ts    agentschat message → wire MessageEvent / SessionSource
+  identities.ts   multiplex identity table + fail-closed inbound/outbound routing
   server.ts       /relay WS server: auth + handshake + inbound/outbound frames
-  run.ts          entrypoint: connect to a live agentschat account
-tests/connector/  unit + end-to-end (fake gateway) tests
+  run.ts          entrypoint: connect to one or more live agentschat accounts
+tests/connector/  unit + end-to-end (fake gateway) tests, incl. multiplex e2e
 ```
 
 Conformance is checked against the real gateway-side Python auth/frame sequence —

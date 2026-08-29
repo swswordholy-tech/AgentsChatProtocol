@@ -25,15 +25,21 @@ const connectorMode = args.includes("--connector");
 if ((args.includes("--help") || args.includes("-h")) && connectorMode) {
   console.log(`agentschat-mcp --connector — run the AgentsChat ↔ Hermes relay connector
 
-Starts a WebSocket service that a Hermes gateway dials into (relay contract,
-single-tenant). No Hermes patch needed — Hermes uses its built-in generic
-RelayAdapter and just needs GATEWAY_RELAY_URL pointed at this service.
+Starts a WebSocket service that a Hermes gateway dials into (relay contract).
+No Hermes patch needed — Hermes uses its built-in generic RelayAdapter and just
+needs GATEWAY_RELAY_URL pointed at this service.
 
-Required env:
+Required env (single identity):
   AGENTCHAT_AGENT_ID    your AgentsChat agent id
   AGENTCHAT_TOKEN       your AgentsChat agent key (ac_...)
   RELAY_GATEWAY_ID      the gateway id Hermes will use in its upgrade token
   RELAY_GATEWAY_SECRET  the shared secret that token is HMAC'd with
+
+Multiplex (N identities, one per Hermes profile — replaces the four vars above):
+  RELAY_IDENTITIES      JSON array: [{"botId":"<agents-id>","token":"ac_...",
+                        "gatewayId":"...","secret":"..."}, ...]
+                        One AgentsChat connection per identity; identity A's
+                        traffic never crosses to identity B.
 
 Optional env:
   RELAY_PORT            listen port (default 8765)

@@ -1,4 +1,7 @@
 #!/usr/bin/env node
+// connector/run.ts
+import WS from "ws";
+
 // connector/server.ts
 import { createServer } from "node:http";
 import { WebSocketServer, WebSocket } from "ws";
@@ -101,14 +104,58 @@ function toWireEvent(msg, platform = "agentschat") {
   };
 }
 
+// connector/identities.ts
+class IdentityTable {
+  byBot = new Map;
+  constructor(identities) {
+    for (const id of identities) {
+      if (this.byBot.has(id.botId)) {
+        throw new Error(`duplicate identity botId "${id.botId}" — ambiguous routing`);
+      }
+      this.byBot.set(id.botId, id);
+    }
+  }
+  forBot(botId) {
+    return this.byBot.get(botId) ?? null;
+  }
+  isSingle() {
+    return this.byBot.size === 1;
+  }
+  get size() {
+    return this.byBot.size;
+  }
+  all() {
+    return [...this.byBot.values()];
+  }
+}
+function routeInbound(table, ctx) {
+  if (ctx.channel_id?.startsWith("dm-")) {
+    return ctx.dmOwnerBotId ? table.forBot(ctx.dmOwnerBotId) : null;
+  }
+  const mentioned = Array.isArray(ctx.mentioned_ids) ? ctx.mentioned_ids : [];
+  for (const mid of mentioned) {
+    const id = table.forBot(mid);
+    if (id)
+      return id;
+  }
+  return null;
+}
+
 // connector/server.ts
 function startConnector(config) {
   const log = config.logger ?? (() => {});
   const descriptor = buildDescriptor(config.descriptor);
+  const single = !config.identities || config.identities.length === 0;
+  const table = new IdentityTable(single ? [{ botId: "default", agentId: "default", token: "", gatewayId: "", secret: "" }] : config.identities);
+  const hooks = single ? {
+    sendMessage: (_b, chatId, content, replyTo) => config.agentschat.sendMessage(chatId, content, replyTo),
+    getChatInfo: (_b, chatId) => config.agentschat.getChatInfo(chatId),
+    sendTyping: (_b, chatId) => config.agentschat.sendTyping?.(chatId) ?? Promise.resolve()
+  } : config.agentschat;
   const sockets = new Set;
   const http = createServer((_req, res) => {
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ ok: true, service: "agentschat-connector", contract_version: 1 }));
+    res.end(JSON.stringify({ ok: true, service: "agentschat-connector", contract_version: 1, identities: table.size }));
   });
   const wss = new WebSocketServer({ noServer: true });
   http.on("upgrade", (req, socket, head) => {
@@ -134,52 +181,75 @@ function startConnector(config) {
     });
   });
   function onConnection(ws, gatewayId) {
-    sockets.add(ws);
+    const conn = { ws, gatewayId, fronted: new Set };
+    sockets.add(conn);
     log(`[connector] gateway connected: ${gatewayId} (${sockets.size} total)`);
     ws.on("message", async (data) => {
-      let frame;
-      try {
-        frame = JSON.parse(data.toString());
-      } catch {
-        return;
+      const text = data.toString();
+      for (const line of text.split(`
+`)) {
+        if (!line.trim())
+          continue;
+        let frame;
+        try {
+          frame = JSON.parse(line);
+        } catch {
+          continue;
+        }
+        await handleFrame(conn, frame).catch((e) => log(`[connector] frame error: ${e}`));
       }
-      await handleFrame(ws, frame).catch((e) => log(`[connector] frame error: ${e}`));
     });
     ws.on("close", () => {
-      sockets.delete(ws);
+      sockets.delete(conn);
       log(`[connector] gateway disconnected: ${gatewayId} (${sockets.size} left)`);
     });
-    ws.on("error", () => sockets.delete(ws));
+    ws.on("error", () => sockets.delete(conn));
   }
-  async function handleFrame(ws, frame) {
+  async function handleFrame(conn, frame) {
     const t = frame?.type;
     if (t === "hello") {
-      send(ws, { type: "descriptor", descriptor });
+      const botId = String(frame.botId ?? "");
+      const identity = single ? table.all()[0] : botId ? table.forBot(botId) : null;
+      if (!identity) {
+        send(conn.ws, { type: "error", error: `unknown identity botId: ${botId || "(none)"}` });
+        return;
+      }
+      conn.fronted.add(identity.botId);
+      send(conn.ws, { type: "descriptor", descriptor: { ...descriptor, platform: "agentschat" } });
       return;
     }
     if (t === "outbound") {
-      const result = await handleOutbound(frame.action ?? {});
-      send(ws, { type: "outbound_result", requestId: frame.requestId, result });
+      const result = await handleOutbound(conn, frame);
+      send(conn.ws, { type: "outbound_result", requestId: frame.requestId, result });
       return;
     }
   }
-  async function handleOutbound(action) {
+  async function handleOutbound(conn, frame) {
+    const action = frame?.action ?? {};
     const op = action?.op;
     const chatId = action?.chat_id ?? "";
+    const firstFronted = [...conn.fronted][0];
+    const requested = typeof frame?.botId === "string" && frame.botId ? frame.botId : firstFronted ?? null;
+    const identity = single ? table.all()[0] : requested && conn.fronted.has(requested) ? table.forBot(requested) : null;
+    if (!identity) {
+      log(`[connector] outbound failed: no fronted identity for botId=${requested ?? "?"}`);
+      return { success: false, error: `no fronted identity for outbound (botId=${requested ?? "?"})` };
+    }
     switch (op) {
       case "send": {
-        const r = await config.agentschat.sendMessage(chatId, action.content ?? "", action.reply_to);
+        const r = await hooks.sendMessage(identity.botId, chatId, action.content ?? "", action.reply_to);
         return { success: true, message_id: r?.id };
       }
       case "typing": {
-        await config.agentschat.sendTyping?.(chatId);
+        await hooks.sendTyping?.(identity.botId, chatId);
         return { success: true };
       }
       case "get_chat_info": {
-        const info = await config.agentschat.getChatInfo(chatId);
+        const info = await hooks.getChatInfo(identity.botId, chatId);
         return info ?? {};
       }
       default:
+        log(`[connector] outbound failed: unsupported op ${String(op)}`);
         return { success: false, error: `unsupported op: ${String(op)}` };
     }
   }
@@ -194,20 +264,33 @@ function startConnector(config) {
   return {
     port,
     stop() {
-      for (const ws of sockets) {
+      for (const c of sockets) {
         try {
-          ws.close(1001, "connector shutdown");
+          c.ws.close(1001, "connector shutdown");
         } catch {}
       }
       wss.close();
       http.close();
     },
     injectAgentsChatMessage(msg) {
-      const event = toWireEvent(msg, descriptor.platform);
+      const bySocket = msg.__botId ? table.forBot(String(msg.__botId)) : null;
+      const target = bySocket ?? routeInbound(table, {
+        channel_id: msg.channel_id,
+        mentioned_ids: msg.mentioned_ids,
+        dmOwnerBotId: msg.dm_owner
+      }) ?? (table.isSingle() ? table.all()[0] : null);
+      if (!target) {
+        log(`[connector] inbound unaddressed (channel=${msg.channel_id ?? "?"} mentions=${JSON.stringify(msg.mentioned_ids ?? [])}) — dropped`);
+        return;
+      }
+      const event = toWireEvent(msg, "agentschat");
       if (!event)
         return;
-      for (const ws of sockets)
-        send(ws, { type: "inbound", event });
+      event.source.profile = target.botId;
+      for (const conn of sockets) {
+        if (conn.fronted.has(target.botId))
+          send(conn.ws, { type: "inbound", event });
+      }
     },
     connections() {
       return sockets.size;
@@ -227,7 +310,6 @@ function peekPayload(token) {
 }
 
 // connector/run.ts
-import WS from "ws";
 var log = (m) => process.stderr.write(`[agentschat-connector] ${m}
 `);
 function need(name) {
@@ -238,62 +320,61 @@ function need(name) {
   }
   return v;
 }
-var AGENT_ID = need("AGENTCHAT_AGENT_ID");
-var TOKEN = need("AGENTCHAT_TOKEN");
-var GATEWAY_ID = need("RELAY_GATEWAY_ID");
-var GATEWAY_SECRET = need("RELAY_GATEWAY_SECRET");
 var API = (process.env.AGENTCHAT_API_URL || "https://agents-chat.com").replace(/\/$/, "");
 var WS_URL = process.env.AGENTCHAT_WS_URL || API.replace(/^http/, "ws") + "/ws";
 var PORT = Number(process.env.RELAY_PORT || 8765);
 var HOST = process.env.RELAY_HOST || "127.0.0.1";
-var broadcast = null;
-var connector = startConnector({
-  port: PORT,
-  host: HOST,
-  secrets: { [GATEWAY_ID]: [GATEWAY_SECRET] },
-  agentschat: {
-    async sendMessage(chatId, content, replyTo) {
-      const res = await fetch(`${API}/api/channels/${encodeURIComponent(chatId)}/messages`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${TOKEN}` },
-        body: JSON.stringify({ sender_id: AGENT_ID, content_type: "text", content, ...replyTo ? { parent_id: replyTo } : {} })
-      });
-      if (!res.ok)
-        throw new Error(`agentschat send failed: ${res.status}`);
-      const data = await res.json();
-      return { id: data?.id };
-    },
-    async getChatInfo(chatId) {
-      const res = await fetch(`${API}/api/channels/${encodeURIComponent(chatId)}`, {
-        headers: { Authorization: `Bearer ${TOKEN}` }
-      });
-      if (!res.ok)
-        return { name: chatId, type: chatId.startsWith("dm-") ? "dm" : "group" };
-      const data = await res.json();
-      return { name: data?.name ?? chatId, type: chatId.startsWith("dm-") ? "dm" : "group" };
-    },
-    async sendTyping(chatId) {
-      sendAgentsChatFrame({ type: "typing", channel_id: chatId, sender_id: AGENT_ID });
-    }
-  },
-  logger: log
-});
-broadcast = (msg) => connector.injectAgentsChatMessage(msg);
-log(`listening on ${HOST}:${connector.port} (contract v1, gateway id "${GATEWAY_ID}")`);
-var ws = null;
-var reconnectDelay = 1000;
-function sendAgentsChatFrame(frame) {
-  if (ws && ws.readyState === WS.OPEN) {
+function resolveIdentities() {
+  const raw = (process.env.RELAY_IDENTITIES || "").trim();
+  if (raw) {
+    let parsed;
     try {
-      ws.send(JSON.stringify(frame));
-    } catch {}
+      parsed = JSON.parse(raw);
+    } catch (e) {
+      log(`ERROR: RELAY_IDENTITIES is not valid JSON: ${e}`);
+      process.exit(1);
+    }
+    if (!Array.isArray(parsed) || parsed.length === 0) {
+      log(`ERROR: RELAY_IDENTITIES must be a non-empty JSON array`);
+      process.exit(1);
+    }
+    for (const it of parsed) {
+      if (!it?.botId || !it?.token || !it?.gatewayId || !it?.secret) {
+        log(`ERROR: each RELAY_IDENTITIES entry needs botId, token, gatewayId, secret — got: ${JSON.stringify(it).slice(0, 80)}`);
+        process.exit(1);
+      }
+    }
+    return parsed.map((it) => ({
+      botId: String(it.botId),
+      agentId: String(it.agentId ?? it.botId),
+      token: String(it.token),
+      gatewayId: String(it.gatewayId),
+      secret: String(it.secret)
+    }));
   }
+  const agentId = need("AGENTCHAT_AGENT_ID");
+  const token = need("AGENTCHAT_TOKEN");
+  const gatewayId = need("RELAY_GATEWAY_ID");
+  const secret = need("RELAY_GATEWAY_SECRET");
+  return [{ botId: agentId, agentId, token, gatewayId, secret }];
 }
-function connectAgentsChat() {
-  ws = new WS(WS_URL);
+var identities = resolveIdentities();
+var single = identities.length === 1;
+var secrets = {};
+for (const id of identities) {
+  (secrets[id.gatewayId] ??= []).push(id.secret);
+}
+var broadcast = null;
+var socketsByBot = new Map;
+var backoffByBot = new Map;
+function connectIdentity(id) {
+  const ws = new WS(WS_URL);
+  socketsByBot.set(id.botId, ws);
   ws.on("open", () => {
-    reconnectDelay = 1000;
-    sendAgentsChatFrame({ type: "auth", agent_id: AGENT_ID, token: TOKEN, capabilities: ["chat"] });
+    backoffByBot.set(id.botId, 1000);
+    try {
+      ws.send(JSON.stringify({ type: "auth", agent_id: id.agentId, token: id.token, capabilities: ["chat"] }));
+    } catch {}
   });
   ws.on("message", (raw) => {
     let data;
@@ -303,31 +384,75 @@ function connectAgentsChat() {
       return;
     }
     if (data.type === "auth_ok") {
-      log(`connected to agentschat as ${AGENT_ID}`);
+      log(`connected to agentschat as ${id.agentId}`);
       return;
     }
-    if (data.type === "message" && data.sender_id !== AGENT_ID) {
-      broadcast?.(data);
+    if (data.type === "message" && data.sender_id !== id.agentId) {
+      broadcast?.({ ...data, __botId: id.botId });
     }
   });
   ws.on("close", () => {
     if (process.__shutdown)
       return;
-    log(`agentschat WS closed; reconnecting in ${reconnectDelay}ms`);
-    setTimeout(connectAgentsChat, reconnectDelay);
-    reconnectDelay = Math.min(reconnectDelay * 2, 30000);
+    const delay = backoffByBot.get(id.botId) ?? 1000;
+    log(`agentschat WS closed for ${id.botId}; reconnecting in ${delay}ms`);
+    setTimeout(() => connectIdentity(id), delay);
+    backoffByBot.set(id.botId, Math.min(delay * 2, 30000));
   });
-  ws.on("error", (e) => {
-    log(`agentschat WS error: ${e?.message ?? e}`);
-  });
+  ws.on("error", (e) => log(`agentschat WS error (${id.botId}): ${e?.message ?? e}`));
 }
-connectAgentsChat();
+var connector = startConnector({
+  port: PORT,
+  host: HOST,
+  secrets,
+  identities: single ? undefined : identities,
+  agentschat: {
+    async sendMessage(botId, chatId, content, replyTo) {
+      const id = identities.find((i) => i.botId === botId) ?? identities[0];
+      const res = await fetch(`${API}/api/channels/${encodeURIComponent(chatId)}/messages`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${id.token}` },
+        body: JSON.stringify({ sender_id: id.agentId, content_type: "text", content, ...replyTo ? { parent_id: replyTo } : {} })
+      });
+      if (!res.ok)
+        throw new Error(`agentschat send failed: ${res.status}`);
+      const data = await res.json();
+      return { id: data?.id };
+    },
+    async getChatInfo(botId, chatId) {
+      const id = identities.find((i) => i.botId === botId) ?? identities[0];
+      const res = await fetch(`${API}/api/channels/${encodeURIComponent(chatId)}`, {
+        headers: { Authorization: `Bearer ${id.token}` }
+      });
+      if (!res.ok)
+        return { name: chatId, type: chatId.startsWith("dm-") ? "dm" : "group" };
+      const data = await res.json();
+      return { name: data?.name ?? chatId, type: chatId.startsWith("dm-") ? "dm" : "group" };
+    },
+    async sendTyping(botId, chatId) {
+      const id = identities.find((i) => i.botId === botId) ?? identities[0];
+      const ws = socketsByBot.get(id.botId);
+      if (ws && ws.readyState === WS.OPEN) {
+        try {
+          ws.send(JSON.stringify({ type: "typing", channel_id: chatId, sender_id: id.agentId }));
+        } catch {}
+      }
+    }
+  },
+  logger: log
+});
+broadcast = (msg) => connector.injectAgentsChatMessage(msg);
+log(`listening on ${HOST}:${connector.port} (contract v1, ${identities.length} identit${identities.length === 1 ? "y" : "ies"})`);
+for (const id of identities)
+  connectIdentity(id);
 for (const sig of ["SIGINT", "SIGTERM"]) {
   process.on(sig, () => {
     process.__shutdown = true;
-    try {
-      ws?.close();
-    } catch {}
+    for (const ws of socketsByBot.values()) {
+      try {
+        ws.close();
+      } catch {}
+    }
     connector.stop();
     process.exit(0);
   });

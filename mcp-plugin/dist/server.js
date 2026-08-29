@@ -421,6 +421,7 @@ var package_default = {
     "connector/auth.ts",
     "connector/descriptor.ts",
     "connector/normalize.ts",
+    "connector/identities.ts",
     "connector/server.ts",
     "connector/run.ts",
     "connector/README.md",
