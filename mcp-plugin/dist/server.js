@@ -276,6 +276,19 @@ function grokPortFromGatewayConfig(cfg, fallback = 1340) {
   const p = cfg?.port;
   return typeof p === "number" && p > 0 ? p : fallback;
 }
+var GROK_GATEWAY_PATH_CANDIDATES = [
+  `${process.env.HOME}/.grok/gateway.json`,
+  "/home/box/sand-data/gateway.json"
+];
+function resolveGrokGatewayPath(explicit, exists) {
+  if (explicit && explicit.trim())
+    return explicit;
+  for (const candidate of GROK_GATEWAY_PATH_CANDIDATES) {
+    if (exists(candidate))
+      return candidate;
+  }
+  return GROK_GATEWAY_PATH_CANDIDATES[0];
+}
 async function resolveGrokAgentId(opts) {
   const log = opts.logger ?? (() => {});
   if (opts.explicitId && opts.explicitId.trim())
@@ -348,7 +361,7 @@ async function fireGrokWake(msg, cfg) {
 var package_default = {
   name: "agentschat-mcp",
   mcpName: "io.github.swswordholy-tech/agentschat-mcp",
-  version: "0.32.0",
+  version: "0.32.1",
   description: "Connect Claude Code to AgentsChat — AI Agent social network. Core tools stay lean while extended tool groups load on demand for lower token overhead and cleaner role-specific context.",
   type: "module",
   bin: {
@@ -635,7 +648,8 @@ Wake a host that has no channel-notification surface (Grok Bot, generic MCP clie
   AGENTCHAT_WAKE_MODE=grok
                      Same-machine Grok gateway: loopback POST to its /api/sendPrompt
                      with the Bearer token read from a local gateway.json.
-  AGENTCHAT_GROK_GATEWAY   path to gateway.json (default ~/.grok/gateway.json)
+  AGENTCHAT_GROK_GATEWAY   path to gateway.json (default: first existing of
+                           ~/.grok/gateway.json, /home/box/sand-data/gateway.json)
   AGENTCHAT_GROK_AGENT_ID  the Grok gateway agent uuid to wake (1:1 binding)
 
 Hermes relay connector (no Hermes patch): run with --connector. See --connector --help.
@@ -4228,8 +4242,8 @@ ${context}
         if (process.env.AGENTCHAT_WAKE_MODE === "grok") {
           (async () => {
             try {
-              const { readFileSync: readFileSync3 } = await import("fs");
-              const gwPath = process.env.AGENTCHAT_GROK_GATEWAY || `${process.env.HOME}/.grok/gateway.json`;
+              const { readFileSync: readFileSync3, existsSync: existsSync3 } = await import("fs");
+              const gwPath = resolveGrokGatewayPath(process.env.AGENTCHAT_GROK_GATEWAY, existsSync3);
               let agentId = process.env.AGENTCHAT_GROK_AGENT_ID || "";
               if (!agentId) {
                 agentId = await resolveGrokAgentId({

@@ -43,7 +43,7 @@ import { validateToolArgs } from "./argcheck.ts";
 import { decideIdentity, shouldMigrateDevToken } from "./identity.ts";
 import type { ProfileSource } from "./identity.ts";
 import { decideTermsConsent, TERMS_URL } from "./terms.ts";
-import { fireWake, fireGrokWake, resolveGrokAgentId, grokBearerFromGatewayConfig, grokPortFromGatewayConfig } from "./wake.ts";
+import { fireWake, fireGrokWake, resolveGrokAgentId, resolveGrokGatewayPath, grokBearerFromGatewayConfig, grokPortFromGatewayConfig } from "./wake.ts";
 import pkg from "../package.json";
 import {
   CallToolRequestSchema,
@@ -103,7 +103,8 @@ Wake a host that has no channel-notification surface (Grok Bot, generic MCP clie
   AGENTCHAT_WAKE_MODE=grok
                      Same-machine Grok gateway: loopback POST to its /api/sendPrompt
                      with the Bearer token read from a local gateway.json.
-  AGENTCHAT_GROK_GATEWAY   path to gateway.json (default ~/.grok/gateway.json)
+  AGENTCHAT_GROK_GATEWAY   path to gateway.json (default: first existing of
+                           ~/.grok/gateway.json, /home/box/sand-data/gateway.json)
   AGENTCHAT_GROK_AGENT_ID  the Grok gateway agent uuid to wake (1:1 binding)
 
 Hermes relay connector (no Hermes patch): run with --connector. See --connector --help.
@@ -4020,8 +4021,10 @@ function connectWS() {
           // else fail closed (no wake). The gateway token/port come from gateway.json.
           void (async () => {
             try {
-              const { readFileSync } = await import("node:fs");
-              const gwPath = process.env.AGENTCHAT_GROK_GATEWAY || `${process.env.HOME}/.grok/gateway.json`;
+              const { readFileSync, existsSync } = await import("node:fs");
+              // env override wins; else first existing candidate (~/.grok default,
+              // production GrokBot /home/box/sand-data) — never guess a path blindly.
+              const gwPath = resolveGrokGatewayPath(process.env.AGENTCHAT_GROK_GATEWAY, existsSync);
               let agentId = process.env.AGENTCHAT_GROK_AGENT_ID || "";
               if (!agentId) {
                 agentId = (await resolveGrokAgentId({

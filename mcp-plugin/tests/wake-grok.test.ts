@@ -69,6 +69,38 @@ describe("grokBearerFromGatewayConfig — read the token from a local gateway.js
   });
 });
 
+import { resolveGrokGatewayPath, GROK_GATEWAY_PATH_CANDIDATES } from "../src/wake.ts";
+
+describe("resolveGrokGatewayPath — production GrokBot hosts keep gateway.json elsewhere", () => {
+  const HOME_DEFAULT = `${process.env.HOME}/.grok/gateway.json`;
+  const SANDBOX = "/home/box/sand-data/gateway.json";
+
+  test("explicit env path always wins, even when nothing exists there", () => {
+    const p = resolveGrokGatewayPath("/custom/gw.json", () => false);
+    expect(p).toBe("/custom/gw.json");
+  });
+
+  test("falls back to the production sandbox path when ~/.grok does not exist", () => {
+    // The live GrokBot box: no ~/.grok/gateway.json, config at /home/box/sand-data.
+    const p = resolveGrokGatewayPath(undefined, (path) => path === SANDBOX);
+    expect(p).toBe(SANDBOX);
+  });
+
+  test("prefers ~/.grok when both exist (classic default unchanged)", () => {
+    const p = resolveGrokGatewayPath(undefined, () => true);
+    expect(p).toBe(HOME_DEFAULT);
+  });
+
+  test("when nothing exists, returns the classic default so the error names a sane path (fail closed)", () => {
+    const p = resolveGrokGatewayPath(undefined, () => false);
+    expect(p).toBe(HOME_DEFAULT);
+  });
+
+  test("the candidate list covers the production GrokBot path", () => {
+    expect(GROK_GATEWAY_PATH_CANDIDATES).toContain(SANDBOX);
+  });
+});
+
 import { resolveGrokAgentId } from "../src/wake.ts";
 
 describe("resolveGrokAgentId — 1:1 binding, explicit env wins", () => {

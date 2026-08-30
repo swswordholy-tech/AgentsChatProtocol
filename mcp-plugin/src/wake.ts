@@ -200,6 +200,31 @@ export function grokPortFromGatewayConfig(cfg: any, fallback = 1340): number {
   return typeof p === "number" && p > 0 ? p : fallback;
 }
 
+/**
+ * Candidate locations for the Grok gateway.json, in preference order. The
+ * classic default is `~/.grok/gateway.json`, but production GrokBot hosts keep
+ * the live config at `/home/box/sand-data/gateway.json` (the `~/.grok` path
+ * does not exist there). AGENTCHAT_GROK_GATEWAY overrides everything; absent
+ * that, the FIRST candidate that exists on disk wins. When none exists the
+ * first candidate is returned so the read fails with a useful path in the
+ * error — fail closed, no wake.
+ */
+export const GROK_GATEWAY_PATH_CANDIDATES = [
+  `${process.env.HOME}/.grok/gateway.json`,
+  "/home/box/sand-data/gateway.json",
+] as const;
+
+export function resolveGrokGatewayPath(
+  explicit: string | undefined,
+  exists: (path: string) => boolean,
+): string {
+  if (explicit && explicit.trim()) return explicit;
+  for (const candidate of GROK_GATEWAY_PATH_CANDIDATES) {
+    if (exists(candidate)) return candidate;
+  }
+  return GROK_GATEWAY_PATH_CANDIDATES[0];
+}
+
 export interface GrokWakeConfig {
   /** Path to the Grok gateway.json (read at send time). */
   gatewayConfigPath: string;
