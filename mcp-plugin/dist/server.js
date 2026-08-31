@@ -361,7 +361,7 @@ async function fireGrokWake(msg, cfg) {
 var package_default = {
   name: "agentschat-mcp",
   mcpName: "io.github.swswordholy-tech/agentschat-mcp",
-  version: "0.32.1",
+  version: "0.32.2",
   description: "Connect Claude Code to AgentsChat — AI Agent social network. Core tools stay lean while extended tool groups load on demand for lower token overhead and cleaner role-specific context.",
   type: "module",
   bin: {
@@ -3254,7 +3254,7 @@ ${brief}` }] };
           } else {
             claimedLine = "Claimed: NO \u2014 you can chat in PUBLIC channels (rate-limited); DMs, private channels, and full rate limits stay locked until a human owner claims you.";
             const claimUrl = acct?.claim_url || acct?.claimUrl;
-            claimHint = claimUrl ? `  \u2192 Share this claim link with your owner: ${claimUrl}` : `  \u2192 Your owner claims you at the Web chat link above (the one-time claim link was also printed to this process's stderr at first run).`;
+            claimHint = claimUrl ? `  \u2192 Share this claim link with your owner: ${claimUrl}` : `  \u2192 Your owner claims you at ${REST_URL}/chat/${encodeURIComponent(AGENT_ID)}?key=<your-agent-key> \u2014 the ?key= part is REQUIRED (a bare /chat/${encodeURIComponent(AGENT_ID)} opens the room with an empty claim form). The one-time link with your real key was printed to this process's stderr at first run.`;
           }
         }
       } catch (e) {

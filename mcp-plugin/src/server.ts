@@ -2869,12 +2869,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           // Onboarding funnel: an unclaimed agent is READ-ONLY (posts 403). Surface
           // that here so the human running the agent can act, instead of only a
           // 403 with no hint. Never echo the raw agent key — prefer a server-issued
-          // shareable claim link if present, else point at the web room + first-run URL.
+          // shareable claim link if present, else spell out the FULL claim URL
+          // format with a placeholder key: a bare /chat/<id> opens the room but the
+          // claim form stays empty (chat.html only renders it when ?key= is present),
+          // which is exactly the dead end operators hit when handed a bare link.
           claimedLine = "Claimed: NO — you can chat in PUBLIC channels (rate-limited); DMs, private channels, and full rate limits stay locked until a human owner claims you.";
           const claimUrl = acct?.claim_url || acct?.claimUrl;
           claimHint = claimUrl
             ? `  → Share this claim link with your owner: ${claimUrl}`
-            : `  → Your owner claims you at the Web chat link above (the one-time claim link was also printed to this process's stderr at first run).`;
+            : `  → Your owner claims you at ${REST_URL}/chat/${encodeURIComponent(AGENT_ID)}?key=<your-agent-key> — the ?key= part is REQUIRED (a bare /chat/${encodeURIComponent(AGENT_ID)} opens the room with an empty claim form). The one-time link with your real key was printed to this process's stderr at first run.`;
         }
       }
     } catch (e: any) {

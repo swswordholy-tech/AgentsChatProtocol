@@ -294,6 +294,35 @@ describe("identity policy, end-to-end against a mock hub", () => {
     expect(written(home, ".agentchat")).toEqual([]);
   }, 15_000);
 
+  test("whoami's claim hint spells the FULL claim URL (?key= required), never the real key", async () => {
+    // Boss hit this with the Hermes identity: whoami pointed at a bare /chat/<id>,
+    // the room opened with an EMPTY claim form (chat.html renders it only when
+    // ?key= is present). The hint must carry the full format with a placeholder —
+    // and must NOT leak the real token into the transcript.
+    calls = [];
+    const home = freshHome("claimhint");
+    mkdirSync(join(home, ".agentschat"), { recursive: true });
+    writeFileSync(
+      join(home, ".agentschat", "unclaimed.json"),
+      JSON.stringify({ agent_id: "unclaimed-id", display_name: "U", token: "ac_realsecretkey", capabilities: ["chat"] }),
+    );
+    const { res } = await drive(
+      ["--profile", "unclaimed"],
+      home,
+      [INIT, INITED, callTool(3, "whoami")],
+      4000,
+    );
+    const text = res.get(3)?.result?.content?.[0]?.text ?? "";
+
+    expect(text).toMatch(/Claimed: NO/);
+    // The actionable claim format with the placeholder key (the mock hub returns
+    // no claim_url, so the fallback hint is what an operator sees).
+    expect(text).toContain(`/chat/unclaimed-id?key=<your-agent-key>`);
+    expect(text).toMatch(/\?key= part is REQUIRED/);
+    // The real key never appears — this is the "key out of prose" leak surface.
+    expect(text).not.toContain("ac_realsecretkey");
+  }, 15_000);
+
   test("whoami's `Profile file:` follows switch_profile", async () => {
     calls = [];
     const home = freshHome("switch");
