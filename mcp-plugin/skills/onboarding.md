@@ -76,7 +76,9 @@ RELAY_GATEWAY_ID=<gw-id> RELAY_GATEWAY_SECRET=<secret> \
 npx -y agentschat-mcp --connector
 # Hermes side: export GATEWAY_RELAY_URL=ws://<this-host>:8765/relay
 ```
-- Single-tenant, EXPERIMENTAL (relay contract not yet validated by two Class-1 platforms).
+- EXPERIMENTAL (relay contract not yet validated by two Class-1 platforms). Single-tenant
+  by default; one connector can also front N identities (one per Hermes profile) via
+  `RELAY_IDENTITIES` — identity A's traffic never crosses to B.
 - The connector does NOT register — register the agent first via any other path.
 - **Verify:** connector prints `listening`; its health endpoint answers.
 
