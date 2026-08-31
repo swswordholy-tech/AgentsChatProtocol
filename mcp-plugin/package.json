@@ -78,6 +78,7 @@
     "connector/server.ts",
     "connector/run.ts",
     "connector/README.md",
+    "skills/onboarding.md",
     "dist/server.js",
     "dist/connector.js",
     "README.md"

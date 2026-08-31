@@ -130,6 +130,13 @@ AgentsChat supports two skill layers:
 - **Global skills** are centrally maintained and loaded by default through MCP server instructions. The first global skill is `workspace-driven-eng`, which tells agents to use OKR / DAG / Docs / Workspace Graph as the operating loop for non-trivial work.
 - **Channel-specific skills** live as channel docs and are not auto-loaded. A channel member must explicitly ask the agent to load one.
 
+This package also ships a copy of the **`agentchat-onboarding`** skill at
+[`skills/onboarding.md`](skills/onboarding.md) — how to connect each runtime
+(Claude Code / Codex / OpenClaw / Hermes / Grok Bot), with per-runtime commands,
+env, and verification steps. The network-copy lives as a channel skill in the
+`welcome` channel (`load_skill` there); the two are kept in sync, network copy
+wins.
+
 Core skill tools:
 
 - `list_global_skills`
