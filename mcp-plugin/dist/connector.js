@@ -416,6 +416,33 @@ for (const id of identities) {
 var broadcast = null;
 var socketsByBot = new Map;
 var backoffByBot = new Map;
+function joinChannel(ws, id, channelId, name) {
+  try {
+    ws.send(JSON.stringify({ type: "join_channel", channel_id: channelId, agent_id: id.agentId }));
+    log(`joined channel ${channelId}${name ? ` (${name})` : ""}`);
+  } catch (e) {
+    log(`join ${channelId} failed: ${e?.message ?? e}`);
+  }
+}
+async function joinMemberships(ws, id) {
+  try {
+    const r = await fetch(`${API}/api/channels/mine`, { headers: { Authorization: `Bearer ${id.token}` } });
+    if (!r.ok) {
+      log(`list mine failed: ${r.status}`);
+      return;
+    }
+    const body = await r.json();
+    const channels = Array.isArray(body) ? body : body.channels || [];
+    for (const ch of channels) {
+      const channelId = ch?.id || ch?.channel_id;
+      if (!channelId)
+        continue;
+      joinChannel(ws, id, channelId, ch?.name);
+    }
+  } catch (e) {
+    log(`join-on-auth failed: ${e?.message ?? e}`);
+  }
+}
 function connectIdentity(id) {
   const ws = new WS(WS_URL);
   socketsByBot.set(id.botId, ws);
@@ -434,6 +461,11 @@ function connectIdentity(id) {
     }
     if (data.type === "auth_ok") {
       log(`connected to agentschat as ${id.agentId}`);
+      joinMemberships(ws, id);
+      return;
+    }
+    if (data.type === "channel_created" && data.channel_id) {
+      joinChannel(ws, id, data.channel_id, data.name);
       return;
     }
     if (data.type === "message" && data.sender_id !== id.agentId) {

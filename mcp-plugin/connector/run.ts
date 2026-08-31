@@ -95,6 +95,37 @@ let broadcast: ((msg: any) => void) | null = null;
 const socketsByBot = new Map<string, WS>();
 const backoffByBot = new Map<string, number>();
 
+function joinChannel(ws: WS, id: Identity, channelId: string, name?: string) {
+  try {
+    ws.send(JSON.stringify({ type: "join_channel", channel_id: channelId, agent_id: id.agentId }));
+    log(`joined channel ${channelId}${name ? ` (${name})` : ""}`);
+  } catch (e: any) {
+    log(`join ${channelId} failed: ${e?.message ?? e}`);
+  }
+}
+
+// AgentsChat only pushes DM/@ frames to sockets that have joined the channel.
+// stdio MCP does this on channel_created; the connector must do the same or
+// Hermes never sees inbound messages despite REST membership.
+async function joinMemberships(ws: WS, id: Identity) {
+  try {
+    const r = await fetch(`${API}/api/channels/mine`, { headers: { Authorization: `Bearer ${id.token}` } });
+    if (!r.ok) {
+      log(`list mine failed: ${r.status}`);
+      return;
+    }
+    const body = await r.json() as any;
+    const channels = Array.isArray(body) ? body : (body.channels || []);
+    for (const ch of channels) {
+      const channelId = ch?.id || ch?.channel_id;
+      if (!channelId) continue;
+      joinChannel(ws, id, channelId, ch?.name);
+    }
+  } catch (e: any) {
+    log(`join-on-auth failed: ${e?.message ?? e}`);
+  }
+}
+
 function connectIdentity(id: Identity) {
   const ws = new WS(WS_URL);
   socketsByBot.set(id.botId, ws);
@@ -109,6 +140,11 @@ function connectIdentity(id: Identity) {
     try { data = JSON.parse(String(raw)); } catch { return; }
     if (data.type === "auth_ok") {
       log(`connected to agentschat as ${id.agentId}`);
+      void joinMemberships(ws, id);
+      return;
+    }
+    if (data.type === "channel_created" && data.channel_id) {
+      joinChannel(ws, id, data.channel_id, data.name);
       return;
     }
     if (data.type === "message" && data.sender_id !== id.agentId) {

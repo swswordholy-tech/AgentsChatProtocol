@@ -50,6 +50,10 @@ A's messages never reach or send as identity B (an un-hello'd identity egress is
 rejected per the contract's advertised-set check, D-Q1.5b.1; unaddressed inbound
 is dropped, never broadcast). Single-tenant env is the N=1 case, unchanged.
 
+After `auth_ok` the connector GETs `/api/channels/mine` and sends `join_channel`
+for each membership, and again on `channel_created`. The server only pushes
+DM/@ frames to sockets that have joined; auth alone is not enough.
+
 **Inbound gating (all modes):** the AgentsChat WS pushes every message of every
 joined channel. The connector injects into the gateway only what is ADDRESSED to
 an identity — DMs always, group messages only when the body @mentions it (same
