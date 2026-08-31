@@ -158,6 +158,14 @@ function routeInbound(table, ctx) {
   }
   return null;
 }
+function hermesSourceProfile(id, frontedCount) {
+  const named = typeof id.profile === "string" ? id.profile.trim() : "";
+  if (named)
+    return named;
+  if (frontedCount > 1)
+    return id.botId;
+  return;
+}
 
 // connector/server.ts
 function startConnector(config) {
@@ -308,10 +316,9 @@ function startConnector(config) {
         log(`[connector] inbound unaddressed (channel=${msg.channel_id ?? "?"} mentions=${JSON.stringify(msg.mentioned_ids ?? [])}) — dropped`);
         return;
       }
-      const event = toWireEvent(msg, "agentschat");
-      if (!event)
+      const baseEvent = toWireEvent(msg, "agentschat");
+      if (!baseEvent)
         return;
-      event.source.profile = target.botId;
       if (!isDm) {
         const key = `${target.botId}:${msg.channel_id}`;
         const since = lastAddressed.get(key);
@@ -319,7 +326,7 @@ function startConnector(config) {
           try {
             const ctx = await hooks.getChannelContext(target.botId, msg.channel_id, since, msg.id);
             if (ctx && ctx.length) {
-              event.context = ctx.slice(-10).map((c) => ({
+              baseEvent.context = ctx.slice(-10).map((c) => ({
                 text: String(c?.text ?? "").slice(0, 500),
                 source: { user_name: c?.user_name, user_id: c?.user_id }
               }));
@@ -332,8 +339,13 @@ function startConnector(config) {
           lastAddressed.set(key, msg.timestamp);
       }
       for (const conn of sockets) {
-        if (conn.fronted.has(target.botId))
-          send(conn.ws, { type: "inbound", event });
+        if (!conn.fronted.has(target.botId))
+          continue;
+        const event = { ...baseEvent, source: { ...baseEvent.source } };
+        const profile = hermesSourceProfile(target, conn.fronted.size);
+        if (profile)
+          event.source.profile = profile;
+        send(conn.ws, { type: "inbound", event });
       }
     },
     connections() {
@@ -398,7 +410,8 @@ function resolveIdentities() {
       agentId: String(it.agentId ?? it.botId),
       token: String(it.token),
       gatewayId: String(it.gatewayId),
-      secret: String(it.secret)
+      secret: String(it.secret),
+      ...it.profile ? { profile: String(it.profile) } : {}
     }));
   }
   const agentId = need("AGENTCHAT_AGENT_ID");

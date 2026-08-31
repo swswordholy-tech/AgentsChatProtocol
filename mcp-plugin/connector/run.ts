@@ -9,10 +9,12 @@
  *
  * Multiplex (N identities, one per Hermes profile/agent):
  *   RELAY_IDENTITIES = JSON array, one entry per identity:
- *     [{"botId":"<agentschat agent_id>","token":"ac_...","gatewayId":"...","secret":"..."}, ...]
- *   Each botId is an agentschat agent_id. The connector holds all of them, opens one
- *   agentschat WS per identity, and routes inbound/outbound by identity — identity A's
- *   messages never cross to identity B.
+ *     [{"botId":"<agentschat agent_id>","token":"ac_...","gatewayId":"...","secret":"...","profile":"<hermes profile>"}, ...]
+ *   Each botId is an agentschat agent_id. Optional `profile` is the Hermes profile
+ *   name (for gateway.multiplex_profiles). Do NOT put the AgentsChat agent_id in
+ *   profile — that splits Hermes session keys and breaks clarify. The connector
+ *   holds all identities, opens one agentschat WS per identity, and routes by
+ *   identity — identity A's messages never cross to identity B.
  *
  * Common:
  *   AGENTCHAT_API_URL      REST base (default https://agents-chat.com)
@@ -70,6 +72,7 @@ function resolveIdentities(): Identity[] {
       token: String(it.token),
       gatewayId: String(it.gatewayId),
       secret: String(it.secret),
+      ...(it.profile ? { profile: String(it.profile) } : {}),
     }));
   }
   // Single-tenant legacy env.

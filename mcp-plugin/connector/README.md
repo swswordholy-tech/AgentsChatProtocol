@@ -72,7 +72,7 @@ secret — see `gateway/relay/auth.py`).
 |---|---|---|
 | WS upgrade auth (HMAC-SHA256, close 4401) | gateway → connector | ✅ |
 | `hello` → `descriptor` handshake (one per identity in multiplex) | gateway ↔ connector | ✅ |
-| `inbound` — DM always; group only on content @mention; @-mentions carry a `context` window (history since last addressed) → `MessageEvent` w/ `source.profile` | connector → gateway | ✅ |
+| `inbound` — DM always; group only on content @mention; @-mentions carry a `context` window; `source.profile` only when this gateway hellos >1 identity (or identity.profile is set) | connector → gateway | ✅ |
 | `outbound` op `send` → `outbound_result` (per-identity token, advertised-set checked) | gateway → connector | ✅ |
 | `outbound` op `typing` | gateway → connector | ✅ |
 | `outbound` op `get_chat_info` | gateway → connector | ✅ |
@@ -93,7 +93,17 @@ op gating (`supports_op('send')` true, `'edit'` false) all confirmed live. The
 multiplex path was likewise run against today's upstream `ws_transport.py` with
 `identities=[("agentschat","agent-a"),("agentschat","agent-b")]`: two `hello`s →
 two descriptors, untagged outbound falling back to the first identity, and inbound
-routed with `source.profile` set — 7/7 checks.
+routed with `source.profile` set only on multiplexed sockets — 7/7 checks.
+
+**`source.profile` and clarify:** Hermes's adapter keys busy/clarify state by
+`source.profile` whenever it is set, but a single-profile gateway still
+registers clarify on `agent:main:…`. Stamping the AgentsChat agent_id as
+profile on N=1 splits those keys, so the user's reply looks like an interrupt
+instead of an answer. Single-hello connections leave profile unset; a socket
+that hellos more than one identity stamps botId (or an explicit Hermes
+`profile` on the identity) so multiplexed sessions stay isolated. Enable
+`gateway.multiplex_profiles` on the Hermes side when one process hellos
+multiple identities.
 
 ## Deployment note: outbound WSS to agents-chat.com
 

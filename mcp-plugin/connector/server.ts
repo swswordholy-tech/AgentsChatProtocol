@@ -27,7 +27,7 @@ import { WebSocketServer, WebSocket } from "ws";
 import { verifyUpgradeToken, CLOSE_UNAUTHORIZED } from "./auth.ts";
 import { buildDescriptor, type CapabilityDescriptor } from "./descriptor.ts";
 import { toWireEvent, type AgentsChatMessage } from "./normalize.ts";
-import { IdentityTable, routeInbound, type Identity } from "./identities.ts";
+import { IdentityTable, routeInbound, hermesSourceProfile, type Identity } from "./identities.ts";
 
 /** What the connector needs from agentschat to fulfil outbound ops, per identity. */
 export interface AgentsChatHooks {
@@ -288,10 +288,8 @@ export function startConnector(config: ConnectorConfig): ConnectorHandle {
         log(`[connector] inbound unaddressed (channel=${(msg as any).channel_id ?? "?"} mentions=${JSON.stringify((msg as any).mentioned_ids ?? [])}) — dropped`);
         return;
       }
-      const event = toWireEvent(msg, "agentschat");
-      if (!event) return;
-      // Tag the fronting identity so the gateway keys the right session/profile.
-      (event.source as any).profile = target.botId;
+      const baseEvent = toWireEvent(msg, "agentschat");
+      if (!baseEvent) return;
       if (!isDm) {
         // Attach "what happened since you were last addressed" so the agent gets
         // the conversation BETWEEN its @-mentions without being injected into
@@ -304,7 +302,7 @@ export function startConnector(config: ConnectorConfig): ConnectorHandle {
           try {
             const ctx = await hooks.getChannelContext(target.botId, msg.channel_id!, since, msg.id);
             if (ctx && ctx.length) {
-              event.context = ctx.slice(-10).map((c) => ({
+              baseEvent.context = ctx.slice(-10).map((c) => ({
                 text: String(c?.text ?? "").slice(0, 500),
                 source: { user_name: c?.user_name, user_id: c?.user_id },
               }));
@@ -316,7 +314,13 @@ export function startConnector(config: ConnectorConfig): ConnectorHandle {
         if (msg.timestamp) lastAddressed.set(key, msg.timestamp);
       }
       for (const conn of sockets) {
-        if (conn.fronted.has(target.botId)) send(conn.ws, { type: "inbound", event });
+        if (!conn.fronted.has(target.botId)) continue;
+        // Per-connection clone: a single-hello gateway must NOT inherit a
+        // profile stamp meant for a multiplexed sibling socket.
+        const event = { ...baseEvent, source: { ...baseEvent.source } };
+        const profile = hermesSourceProfile(target, conn.fronted.size);
+        if (profile) (event.source as any).profile = profile;
+        send(conn.ws, { type: "inbound", event });
       }
     },
     connections() {

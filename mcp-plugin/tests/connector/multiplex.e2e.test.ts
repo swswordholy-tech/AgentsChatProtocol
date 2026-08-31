@@ -172,6 +172,27 @@ describe("multiplex inbound — a message reaches only the addressed identity's 
     } as any);
     const f = await p;
     expect(f.type).toBe("inbound");
+    // One hello on this socket: do NOT stamp AgentsChat agent_id as Hermes
+    // profile (that splits agent:main vs agent:<id> and breaks clarify).
+    expect(f.event.source.profile).toBeUndefined();
+    ws.close();
+  });
+
+  test("two hellos on one socket stamp source.profile so multiplexed sessions isolate", async () => {
+    const ws = await dial();
+    const h1 = nextFrame(ws);
+    ws.send(JSON.stringify({ type: "hello", platform: "agentschat", botId: "agent-a" }) + "\n");
+    await h1;
+    const h2 = nextFrame(ws);
+    ws.send(JSON.stringify({ type: "hello", platform: "agentschat", botId: "agent-b" }) + "\n");
+    await h2;
+    const p = nextFrame(ws);
+    server.injectAgentsChatMessage({
+      id: "m2b", channel_id: "dm-human-1-agent-b", sender_id: "human-1", sender_name: "H",
+      content: "hi b multiplex", __botId: "agent-b",
+    } as any);
+    const f = await p;
+    expect(f.type).toBe("inbound");
     expect(f.event.source.profile).toBe("agent-b");
     ws.close();
   });

@@ -10,7 +10,7 @@
  * agentschat agent_id. A single-identity deployment is the N=1 case of the same table.
  */
 import { describe, expect, test } from "bun:test";
-import { IdentityTable, routeInbound, resolveOutbound } from "../../connector/identities.ts";
+import { IdentityTable, routeInbound, resolveOutbound, hermesSourceProfile } from "../../connector/identities.ts";
 
 const IDENTITIES = [
   { botId: "agent-a", agentId: "agent-a", token: "ac_aaa", gatewayId: "gw-1", secret: "s1" },
@@ -107,5 +107,22 @@ describe("resolveOutbound — a send uses the SENDING identity's credentials", (
     const cred = resolveOutbound(t, "agent-b");
     expect(cred?.token).toBe("ac_bbb");
     expect(cred?.token).not.toBe("ac_aaa");
+  });
+});
+
+describe("hermesSourceProfile — do not stamp AgentsChat agent_id on single-hello", () => {
+  const a = IDENTITIES[0];
+
+  test("single-hello (typical one Hermes, one identity) leaves profile unset", () => {
+    expect(hermesSourceProfile(a, 1)).toBeUndefined();
+  });
+
+  test("a multiplexed connection (frontedCount>1) stamps botId so sessions stay isolated", () => {
+    expect(hermesSourceProfile(a, 2)).toBe("agent-a");
+  });
+
+  test("an explicit Hermes profile name wins over botId", () => {
+    expect(hermesSourceProfile({ ...a, profile: "coder" }, 1)).toBe("coder");
+    expect(hermesSourceProfile({ ...a, profile: "coder" }, 2)).toBe("coder");
   });
 });

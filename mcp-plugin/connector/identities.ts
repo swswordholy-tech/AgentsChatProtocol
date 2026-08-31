@@ -27,6 +27,12 @@ export interface Identity {
   gatewayId: string;
   /** The per-gateway secret for that gateway's upgrade token. */
   secret: string;
+  /**
+   * Optional Hermes profile name. When set, inbound `source.profile` uses this
+   * so a multiplexed gateway (`gateway.multiplex_profiles`) keys the right
+   * session. This is a Hermes profile, NOT the AgentsChat agent_id.
+   */
+  profile?: string;
 }
 
 export class IdentityTable {
@@ -113,4 +119,27 @@ export function routeInbound(table: IdentityTable, ctx: InboundContext): Identit
  */
 export function resolveOutbound(table: IdentityTable, botId: string): Identity | null {
   return table.forBot(botId);
+}
+
+/**
+ * Hermes session namespace to stamp on inbound `source.profile`.
+ *
+ * Hermes's relay adapter keys `_active_sessions` by `source.profile` whenever
+ * it is set, while the runner only uses that namespace when
+ * `multiplex_profiles` is on. Stamping the AgentsChat agent_id on a
+ * single-hello connection (one Hermes, one identity) splits clarify pending
+ * (`agent:main:…`) from intercept (`agent:<agent_id>:…`), so the user's
+ * answer is treated as an interrupt instead of resolving the prompt.
+ *
+ * Rules:
+ *   - explicit `identity.profile` (Hermes profile name) always wins
+ *   - a gateway connection that hellos MORE THAN ONE identity is multiplexing:
+ *     stamp botId so those sessions stay isolated
+ *   - otherwise leave profile unset so keys stay `agent:main` and clarify matches
+ */
+export function hermesSourceProfile(id: Identity, frontedCount: number): string | undefined {
+  const named = typeof id.profile === "string" ? id.profile.trim() : "";
+  if (named) return named;
+  if (frontedCount > 1) return id.botId;
+  return undefined;
 }

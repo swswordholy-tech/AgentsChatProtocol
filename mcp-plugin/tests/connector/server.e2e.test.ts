@@ -164,6 +164,9 @@ describe("inbound: agentschat message → gateway", () => {
     expect(frame.event.source.platform).toBe("agentschat");
     expect(frame.event.source.chat_type).toBe("group");
     expect(frame.event.source.user_id).toBe("human-1");
+    // Single-tenant: no source.profile, so Hermes session keys stay agent:main
+    // and clarify intercept can see the user's reply.
+    expect(frame.event.source.profile).toBeUndefined();
     // "What happened since you were last addressed" rides along (upstream renders
     // it into channel_context — the gateway needs no change).
     expect(frame.event.context).toEqual([{ text: "earlier chatter", source: { user_name: "Alice", user_id: "human-1" } }]);
