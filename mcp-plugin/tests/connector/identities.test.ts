@@ -67,6 +67,27 @@ describe("routeInbound — a message reaches ONLY the identity it's addressed to
     expect(forA?.botId).toBe("agent-a");
     expect(forA?.botId).not.toBe("agent-b");
   });
+
+  test("content-based mention routes when no mentioned_ids annotation exists (the real WS shape)", () => {
+    // The agentschat WS pushes joined-channel messages WITHOUT mentioned_ids —
+    // the mention must be parsed from the body, like the MCP path's isMentioned gate.
+    const forB = routeInbound(t, { channel_id: "welcome", content: "@agent-b 看下这个" });
+    expect(forB?.botId).toBe("agent-b");
+  });
+
+  test("display-name mention form `@Name(<id>)` also routes", () => {
+    const forA = routeInbound(t, { channel_id: "welcome", content: "@Forge(agent-a) ping" });
+    expect(forA?.botId).toBe("agent-a");
+  });
+
+  test("group chatter mentioning NO fronted identity routes to no one (token-waste fix)", () => {
+    expect(routeInbound(t, { channel_id: "welcome", content: "随便聊聊" })).toBeNull();
+    expect(routeInbound(t, { channel_id: "welcome", content: "@someone-else 你好" })).toBeNull();
+  });
+
+  test("an incidental `(<id>)` substring is NOT a mention (the msg:fc8b9b1a regression)", () => {
+    expect(routeInbound(t, { channel_id: "welcome", content: "User joined: forge (agent-a)" })).toBeNull();
+  });
 });
 
 describe("resolveOutbound — a send uses the SENDING identity's credentials", () => {

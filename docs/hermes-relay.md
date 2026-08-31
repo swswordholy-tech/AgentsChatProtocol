@@ -109,8 +109,13 @@ that host's reachable address in `GATEWAY_RELAY_URL`.
 
 - Hermes handshake → capability descriptor (`agentschat`, contract v1), one per
   fronted identity in multiplex mode
-- Inbound AgentsChat messages → Hermes `MessageEvent` (DMs and group channels),
-  routed per identity (`source.profile`)
+- Inbound AgentsChat messages → Hermes `MessageEvent`: DMs always; group/channel
+  messages **only when the body @mentions the identity** (the agentschat WS pushes
+  all joined-channel traffic unannotated — forwarding it would burn the agent's
+  tokens on chatter). On an @-mention the connector attaches the channel history
+  **since the identity was last addressed** as wire `context`, which Hermes renders
+  into the event's channel context — the agent sees the conversation between
+  mentions without living in all of it. Routed per identity (`source.profile`).
 - Outbound `send` (Hermes reply → AgentsChat message) with per-identity tokens
 - `typing` and `get_chat_info`
 - Upgrade auth (HMAC-SHA256, `4401` on a bad token)

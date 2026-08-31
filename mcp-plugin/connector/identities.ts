@@ -14,6 +14,8 @@
  * does not change single-tenant behavior.
  */
 
+import { matchesMention } from "../src/mentions.ts";
+
 export interface Identity {
   /** The relay hello botId — the agentschat agent_id this identity fronts. */
   botId: string;
@@ -60,6 +62,8 @@ export class IdentityTable {
 export interface InboundContext {
   channel_id?: string;
   mentioned_ids?: string[];
+  /** Message body — the PRIMARY group-mention signal (see routeInbound). */
+  content?: string;
   /** For DM channels: which identity owns this DM (the connector tracks dm ownership). */
   dmOwnerBotId?: string;
 }
@@ -72,17 +76,33 @@ export interface InboundContext {
  * Routing rule: a DM goes to its owning identity; a group/channel message goes to
  * the identity it @mentions. A message mentioning no fronted identity (or in a DM
  * owned by none) routes to no one.
+ *
+ * Group mention detection is CONTENT-based (matchesMention over the message body):
+ * the agentschat WS pushes every message of a joined channel WITHOUT a mentioned_ids
+ * annotation, so the mention gate the MCP path uses (isDM || isMentioned) must be
+ * reproduced here — otherwise every joined-channel message would be injected into
+ * the agent's session and burn its tokens on chatter not addressed to it.
+ * `mentioned_ids` is still honored when a host provides it (explicit signal wins).
  */
 export function routeInbound(table: IdentityTable, ctx: InboundContext): Identity | null {
   // DM: route to the identity that owns the DM channel.
   if (ctx.channel_id?.startsWith("dm-")) {
     return ctx.dmOwnerBotId ? table.forBot(ctx.dmOwnerBotId) : null;
   }
-  // Group/channel: route to a fronted identity that was @mentioned.
+  // Group/channel: an explicit mentioned_ids annotation wins when present.
   const mentioned = Array.isArray(ctx.mentioned_ids) ? ctx.mentioned_ids : [];
   for (const mid of mentioned) {
     const id = table.forBot(mid);
     if (id) return id;
+  }
+  // Otherwise content-based: which fronted identity does the body @mention?
+  // (First match wins — a message @-ing two fronted identities goes to the first;
+  // the other sees it when ITS mention arrives or via channel context.)
+  const content = ctx.content ?? "";
+  if (content) {
+    for (const id of table.all()) {
+      if (matchesMention(content, id.agentId) || matchesMention(content, id.botId)) return id;
+    }
   }
   return null;
 }

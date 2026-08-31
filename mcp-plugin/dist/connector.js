@@ -104,6 +104,17 @@ function toWireEvent(msg, platform = "agentschat") {
   };
 }
 
+// src/mentions.ts
+function matchesMention(content, agentId) {
+  if (!content || !agentId)
+    return false;
+  if (content.includes(`@${agentId}`))
+    return true;
+  const idEsc = agentId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const displayMentionRe = new RegExp(`@[^(\\n]+\\(${idEsc}\\)`);
+  return displayMentionRe.test(content);
+}
+
 // connector/identities.ts
 class IdentityTable {
   byBot = new Map;
@@ -138,6 +149,13 @@ function routeInbound(table, ctx) {
     if (id)
       return id;
   }
+  const content = ctx.content ?? "";
+  if (content) {
+    for (const id of table.all()) {
+      if (matchesMention(content, id.agentId) || matchesMention(content, id.botId))
+        return id;
+    }
+  }
   return null;
 }
 
@@ -145,14 +163,17 @@ function routeInbound(table, ctx) {
 function startConnector(config) {
   const log = config.logger ?? (() => {});
   const descriptor = buildDescriptor(config.descriptor);
-  const single = !config.identities || config.identities.length === 0;
-  const table = new IdentityTable(single ? [{ botId: "default", agentId: "default", token: "", gatewayId: "", secret: "" }] : config.identities);
-  const hooks = single ? {
+  const legacy = !config.identities || config.identities.length === 0;
+  const table = new IdentityTable(legacy ? [{ botId: "default", agentId: "default", token: "", gatewayId: "", secret: "" }] : config.identities);
+  const single = table.isSingle();
+  const hooks = legacy ? {
     sendMessage: (_b, chatId, content, replyTo) => config.agentschat.sendMessage(chatId, content, replyTo),
     getChatInfo: (_b, chatId) => config.agentschat.getChatInfo(chatId),
-    sendTyping: (_b, chatId) => config.agentschat.sendTyping?.(chatId) ?? Promise.resolve()
+    sendTyping: (_b, chatId) => config.agentschat.sendTyping?.(chatId) ?? Promise.resolve(),
+    getChannelContext: (_b, chatId, sinceTs, excludeId) => config.agentschat.getChannelContext?.(chatId, sinceTs, excludeId) ?? Promise.resolve(null)
   } : config.agentschat;
   const sockets = new Set;
+  const lastAddressed = new Map;
   const http = createServer((_req, res) => {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ ok: true, service: "agentschat-connector", contract_version: 1, identities: table.size }));
@@ -272,13 +293,17 @@ function startConnector(config) {
       wss.close();
       http.close();
     },
-    injectAgentsChatMessage(msg) {
+    async injectAgentsChatMessage(msg) {
+      const isDm = typeof msg.channel_id === "string" && msg.channel_id.startsWith("dm-");
       const bySocket = msg.__botId ? table.forBot(String(msg.__botId)) : null;
-      const target = bySocket ?? routeInbound(table, {
+      const target = isDm ? bySocket ?? routeInbound(table, {
+        channel_id: msg.channel_id,
+        dmOwnerBotId: msg.dm_owner
+      }) ?? (table.isSingle() ? table.all()[0] : null) : routeInbound(table, {
         channel_id: msg.channel_id,
         mentioned_ids: msg.mentioned_ids,
-        dmOwnerBotId: msg.dm_owner
-      }) ?? (table.isSingle() ? table.all()[0] : null);
+        content: msg.content
+      });
       if (!target) {
         log(`[connector] inbound unaddressed (channel=${msg.channel_id ?? "?"} mentions=${JSON.stringify(msg.mentioned_ids ?? [])}) — dropped`);
         return;
@@ -287,6 +312,25 @@ function startConnector(config) {
       if (!event)
         return;
       event.source.profile = target.botId;
+      if (!isDm) {
+        const key = `${target.botId}:${msg.channel_id}`;
+        const since = lastAddressed.get(key);
+        if (hooks.getChannelContext) {
+          try {
+            const ctx = await hooks.getChannelContext(target.botId, msg.channel_id, since, msg.id);
+            if (ctx && ctx.length) {
+              event.context = ctx.slice(-10).map((c) => ({
+                text: String(c?.text ?? "").slice(0, 500),
+                source: { user_name: c?.user_name, user_id: c?.user_id }
+              }));
+            }
+          } catch (e) {
+            log(`[connector] context fetch failed for ${key} (delivering without it): ${e}`);
+          }
+        }
+        if (msg.timestamp)
+          lastAddressed.set(key, msg.timestamp);
+      }
       for (const conn of sockets) {
         if (conn.fronted.has(target.botId))
           send(conn.ws, { type: "inbound", event });
@@ -307,6 +351,11 @@ function peekPayload(token) {
   } catch {
     return null;
   }
+}
+
+// src/redact.ts
+function redactSecrets(text) {
+  return text.replace(/ac_[A-Za-z0-9_-]{16,}/g, "ac_***REDACTED***").replace(/eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "***JWT_REDACTED***");
 }
 
 // connector/run.ts
@@ -405,7 +454,7 @@ var connector = startConnector({
   port: PORT,
   host: HOST,
   secrets,
-  identities: single ? undefined : identities,
+  identities,
   agentschat: {
     async sendMessage(botId, chatId, content, replyTo) {
       const id = identities.find((i) => i.botId === botId) ?? identities[0];
@@ -437,6 +486,24 @@ var connector = startConnector({
           ws.send(JSON.stringify({ type: "typing", channel_id: chatId, sender_id: id.agentId }));
         } catch {}
       }
+    },
+    async getChannelContext(botId, chatId, sinceTs, excludeId) {
+      const id = identities.find((i) => i.botId === botId) ?? identities[0];
+      const res = await fetch(`${API}/api/channels/${encodeURIComponent(chatId)}/messages?limit=50`, {
+        headers: { Authorization: `Bearer ${id.token}` }
+      });
+      if (!res.ok)
+        return null;
+      const msgs = ((await res.json())?.messages ?? []).filter((m) => m?.content && m.content !== "__typing__" && m?.id !== excludeId).sort((a, b) => String(a.timestamp ?? "").localeCompare(String(b.timestamp ?? "")));
+      const windowed = sinceTs ? msgs.filter((m) => String(m.timestamp ?? "") > sinceTs) : msgs;
+      const tail = windowed.slice(-10);
+      if (!tail.length)
+        return null;
+      return tail.map((m) => ({
+        text: redactSecrets(String(m.content)).slice(0, 500),
+        user_name: m.sender_name ?? m.sender_id,
+        user_id: m.sender_id
+      }));
     }
   },
   logger: log

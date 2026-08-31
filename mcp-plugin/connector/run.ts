@@ -24,6 +24,7 @@
 import WS from "ws";
 import { startConnector } from "./server.ts";
 import type { Identity } from "./identities.ts";
+import { redactSecrets } from "../src/redact.ts";
 
 const log = (m: string) => process.stderr.write(`[agentschat-connector] ${m}\n`);
 
@@ -130,7 +131,9 @@ const connector = startConnector({
   port: PORT,
   host: HOST,
   secrets,
-  identities: single ? undefined : identities, // single-tenant → derived default identity
+  // Always pass the real identity table (even N=1) so botId = the real agentschat
+  // agent_id and content-based @mention routing works in single-tenant too.
+  identities,
   agentschat: {
     async sendMessage(botId, chatId, content, replyTo) {
       const id = identities.find((i) => i.botId === botId) ?? identities[0];
@@ -158,6 +161,28 @@ const connector = startConnector({
       if (ws && ws.readyState === WS.OPEN) {
         try { ws.send(JSON.stringify({ type: "typing", channel_id: chatId, sender_id: id.agentId })); } catch {}
       }
+    },
+    // The "since you were last @'d" window: recent channel history after sinceTs,
+    // oldest→newest, trigger message excluded, secrets redacted (a group channel is
+    // untrusted content — never forward a leaked key downstream). Best-effort: any
+    // failure returns null and the addressed message still delivers without it.
+    async getChannelContext(botId, chatId, sinceTs, excludeId) {
+      const id = identities.find((i) => i.botId === botId) ?? identities[0];
+      const res = await fetch(`${API}/api/channels/${encodeURIComponent(chatId)}/messages?limit=50`, {
+        headers: { Authorization: `Bearer ${id.token}` },
+      });
+      if (!res.ok) return null;
+      const msgs = (((await res.json()) as any)?.messages ?? [])
+        .filter((m: any) => m?.content && m.content !== "__typing__" && m?.id !== excludeId)
+        .sort((a: any, b: any) => String(a.timestamp ?? "").localeCompare(String(b.timestamp ?? "")));
+      const windowed = sinceTs ? msgs.filter((m: any) => String(m.timestamp ?? "") > sinceTs) : msgs;
+      const tail = windowed.slice(-10);
+      if (!tail.length) return null;
+      return tail.map((m: any) => ({
+        text: redactSecrets(String(m.content)).slice(0, 500),
+        user_name: m.sender_name ?? m.sender_id,
+        user_id: m.sender_id,
+      }));
     },
   },
   logger: log,

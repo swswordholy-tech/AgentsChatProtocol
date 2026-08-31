@@ -34,6 +34,16 @@ export interface AgentsChatHooks {
   sendMessage(botId: string, chatId: string, content: string, replyTo?: string): Promise<{ id?: string }>;
   getChatInfo(botId: string, chatId: string): Promise<{ name?: string; type?: string }>;
   sendTyping?(botId: string, chatId: string): Promise<void>;
+  /**
+   * Recent channel messages to attach as `context` when an @-mention arrives —
+   * the "what happened since the last time I was addressed" window. `sinceTs` is
+   * the timestamp of the last message addressed to this identity in this channel
+   * (undefined = never). `excludeId` is the trigger message's own id (already
+   * delivered as the event body — don't repeat it in the context). Return null/
+   * [] when there is nothing worth attaching. Best-effort: failures must not
+   * block delivery of the addressed message itself.
+   */
+  getChannelContext?(botId: string, chatId: string, sinceTs?: string, excludeId?: string): Promise<Array<{ text: string; user_name?: string; user_id?: string }> | null>;
 }
 
 /** Legacy single-tenant hook shape (no botId first arg) — adapted to the per-identity one. */
@@ -41,6 +51,7 @@ interface LegacyHooks {
   sendMessage(chatId: string, content: string, replyTo?: string): Promise<{ id?: string }>;
   getChatInfo(chatId: string): Promise<{ name?: string; type?: string }>;
   sendTyping?(chatId: string): Promise<void>;
+  getChannelContext?(chatId: string, sinceTs?: string, excludeId?: string): Promise<Array<{ text: string; user_name?: string; user_id?: string }> | null>;
 }
 
 export interface ConnectorConfig {
@@ -64,7 +75,7 @@ export interface ConnectorHandle {
   port: number;
   stop(): void;
   /** Push an agentschat message to the gateway socket(s) fronting its addressed identity. */
-  injectAgentsChatMessage(msg: AgentsChatMessage): void;
+  injectAgentsChatMessage(msg: AgentsChatMessage): void | Promise<void>;
   connections(): number;
 }
 
@@ -79,20 +90,31 @@ interface GatewayConn {
 export function startConnector(config: ConnectorConfig): ConnectorHandle {
   const log = config.logger ?? (() => {});
   const descriptor = buildDescriptor(config.descriptor);
-  const single = !config.identities || config.identities.length === 0;
+  // "legacy" = no identity table configured (the pre-multiplex test/embedding
+  // path): a single derived identity and chatId-first hooks. "single" = the
+  // table holds exactly one identity (legacy OR a one-entry RELAY_IDENTITIES) —
+  // it gates hello acceptance and outbound identity resolution, NOT inbound
+  // group forwarding (unaddressed group chatter is dropped in every mode).
+  const legacy = !config.identities || config.identities.length === 0;
   const table = new IdentityTable(
-    single ? [{ botId: "default", agentId: "default", token: "", gatewayId: "", secret: "" }] : config.identities!,
+    legacy ? [{ botId: "default", agentId: "default", token: "", gatewayId: "", secret: "" }] : config.identities!,
   );
+  const single = table.isSingle();
   // Normalize hooks to the per-identity shape. Legacy single-tenant hooks take
   // (chatId, ...); wrap them to ignore the botId. Per-identity hooks take botId first.
-  const hooks: AgentsChatHooks = single
+  const hooks: AgentsChatHooks = legacy
     ? {
         sendMessage: (_b, chatId, content, replyTo) => (config.agentschat as LegacyHooks).sendMessage(chatId, content, replyTo),
         getChatInfo: (_b, chatId) => (config.agentschat as LegacyHooks).getChatInfo(chatId),
         sendTyping: (_b, chatId) => (config.agentschat as LegacyHooks).sendTyping?.(chatId) ?? Promise.resolve(),
+        getChannelContext: (_b, chatId, sinceTs, excludeId) =>
+          (config.agentschat as LegacyHooks).getChannelContext?.(chatId, sinceTs, excludeId) ?? Promise.resolve(null),
       }
     : (config.agentschat as AgentsChatHooks);
   const sockets = new Set<GatewayConn>();
+  // `${botId}:${chatId}` → timestamp of the last message ADDRESSED to that
+  // identity in that channel. Drives the getChannelContext `sinceTs` window.
+  const lastAddressed = new Map<string, string>();
 
   const http: HttpServer = createServer((_req, res) => {
     res.writeHead(200, { "Content-Type": "application/json" });
@@ -238,18 +260,30 @@ export function startConnector(config: ConnectorConfig): ConnectorHandle {
       wss.close();
       http.close();
     },
-    injectAgentsChatMessage(msg: AgentsChatMessage) {
-      // Route to the identity this message is addressed to, then only to gateway
+    async injectAgentsChatMessage(msg: AgentsChatMessage) {
+      // Route to the identity this message is ADDRESSED to, then only to gateway
       // socket(s) fronting THAT identity — never broadcast across identities.
-      // The strongest signal is __botId: which identity's agentschat socket the
-      // message ARRIVED on (agentschat only pushes @mentions/DMs to that agent).
-      // Fall back to mention/DM-owner routing for hosts that don't tag.
+      //
+      // DM: always forward. __botId (which identity's agentschat socket it arrived
+      //   on) is the ownership signal; single-tenant falls back to its one identity.
+      // Group: forward ONLY when the body @mentions a fronted identity (content-
+      //   based — the agentschat WS pushes every message of a joined channel
+      //   unannotated, and arrival on a socket is NOT an addressing signal). The
+      //   MCP path's gate is isDM || isMentioned; this reproduces it. Anything
+      //   unaddressed is dropped — injecting joined-channel chatter into the
+      //   agent's session would burn its tokens on messages not meant for it.
+      const isDm = typeof msg.channel_id === "string" && msg.channel_id.startsWith("dm-");
       const bySocket = (msg as any).__botId ? table.forBot(String((msg as any).__botId)) : null;
-      const target = bySocket ?? routeInbound(table, {
-        channel_id: msg.channel_id,
-        mentioned_ids: (msg as any).mentioned_ids,
-        dmOwnerBotId: (msg as any).dm_owner,
-      }) ?? (table.isSingle() ? table.all()[0] : null);
+      const target = isDm
+        ? bySocket ?? routeInbound(table, {
+            channel_id: msg.channel_id,
+            dmOwnerBotId: (msg as any).dm_owner,
+          }) ?? (table.isSingle() ? table.all()[0] : null)
+        : routeInbound(table, {
+            channel_id: msg.channel_id,
+            mentioned_ids: (msg as any).mentioned_ids,
+            content: msg.content,
+          });
       if (!target) {
         log(`[connector] inbound unaddressed (channel=${(msg as any).channel_id ?? "?"} mentions=${JSON.stringify((msg as any).mentioned_ids ?? [])}) — dropped`);
         return;
@@ -258,6 +292,29 @@ export function startConnector(config: ConnectorConfig): ConnectorHandle {
       if (!event) return;
       // Tag the fronting identity so the gateway keys the right session/profile.
       (event.source as any).profile = target.botId;
+      if (!isDm) {
+        // Attach "what happened since you were last addressed" so the agent gets
+        // the conversation BETWEEN its @-mentions without being injected into
+        // every unaddressed message. Upstream renders event.context into the
+        // event's channel_context ("[Recent channel messages]") — gateway needs
+        // no change. Best-effort: a context failure never delays the message.
+        const key = `${target.botId}:${msg.channel_id}`;
+        const since = lastAddressed.get(key);
+        if (hooks.getChannelContext) {
+          try {
+            const ctx = await hooks.getChannelContext(target.botId, msg.channel_id!, since, msg.id);
+            if (ctx && ctx.length) {
+              event.context = ctx.slice(-10).map((c) => ({
+                text: String(c?.text ?? "").slice(0, 500),
+                source: { user_name: c?.user_name, user_id: c?.user_id },
+              }));
+            }
+          } catch (e) {
+            log(`[connector] context fetch failed for ${key} (delivering without it): ${e}`);
+          }
+        }
+        if (msg.timestamp) lastAddressed.set(key, msg.timestamp);
+      }
       for (const conn of sockets) {
         if (conn.fronted.has(target.botId)) send(conn.ws, { type: "inbound", event });
       }

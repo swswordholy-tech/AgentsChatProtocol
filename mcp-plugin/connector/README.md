@@ -50,6 +50,14 @@ A's messages never reach or send as identity B (an un-hello'd identity egress is
 rejected per the contract's advertised-set check, D-Q1.5b.1; unaddressed inbound
 is dropped, never broadcast). Single-tenant env is the N=1 case, unchanged.
 
+**Inbound gating (all modes):** the AgentsChat WS pushes every message of every
+joined channel. The connector injects into the gateway only what is ADDRESSED to
+an identity — DMs always, group messages only when the body @mentions it (same
+gate the MCP path uses: `isDM || isMentioned`). On an @-mention it also attaches
+the channel history since that identity was last addressed as the wire `context`
+field, which upstream renders into the event's channel context — the agent sees
+the conversation between its mentions without paying tokens for all of it.
+
 Point Hermes at it by setting `GATEWAY_RELAY_URL=ws://<host>:8765/relay` (the gateway
 then upgrades with `Authorization: Bearer <HMAC token>` derived from the shared
 secret — see `gateway/relay/auth.py`).
@@ -60,7 +68,7 @@ secret — see `gateway/relay/auth.py`).
 |---|---|---|
 | WS upgrade auth (HMAC-SHA256, close 4401) | gateway → connector | ✅ |
 | `hello` → `descriptor` handshake (one per identity in multiplex) | gateway ↔ connector | ✅ |
-| `inbound` (agentschat message → `MessageEvent`, routed per identity, `source.profile` tagged) | connector → gateway | ✅ |
+| `inbound` — DM always; group only on content @mention; @-mentions carry a `context` window (history since last addressed) → `MessageEvent` w/ `source.profile` | connector → gateway | ✅ |
 | `outbound` op `send` → `outbound_result` (per-identity token, advertised-set checked) | gateway → connector | ✅ |
 | `outbound` op `typing` | gateway → connector | ✅ |
 | `outbound` op `get_chat_info` | gateway → connector | ✅ |

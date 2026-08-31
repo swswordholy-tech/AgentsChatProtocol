@@ -33,6 +33,13 @@ export interface WireEvent {
   message_type: string;
   message_id?: string;
   reply_to_message_id?: string;
+  /**
+   * Surrounding channel context (the "since you were last addressed" window the
+   * connector attaches on @-mentions). Upstream `_render_relay_context` renders
+   * it into the event's channel_context: oldest→newest `{text, source:{user_name
+   * |user_id}}` items. Absent on DMs and when there's nothing worth attaching.
+   */
+  context?: Array<{ text: string; source?: { user_name?: string; user_id?: string } }>;
   source: {
     platform: string;
     chat_id: string;
