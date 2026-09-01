@@ -175,6 +175,51 @@ function shouldMigrateDevToken(i) {
   return i.source !== "default";
 }
 
+// src/grok-bind.ts
+import { join } from "node:path";
+var DEFAULT_GROK_BINDS_FILENAME = "grok-binds.json";
+function parseGrokBinds(raw) {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw))
+    return {};
+  const out = {};
+  for (const [k, v] of Object.entries(raw)) {
+    if (typeof v !== "string")
+      continue;
+    const name = v.trim();
+    if (!name)
+      continue;
+    const key = k.trim();
+    if (!key)
+      continue;
+    out[key] = name;
+  }
+  return out;
+}
+function parseGrokBindsText(text) {
+  try {
+    return { binds: parseGrokBinds(JSON.parse(text)), malformed: false };
+  } catch {
+    return { binds: {}, malformed: true };
+  }
+}
+function resolveGrokBindsPath(configDir, envOverride) {
+  if (envOverride && envOverride.length > 0)
+    return envOverride;
+  return join(configDir, DEFAULT_GROK_BINDS_FILENAME);
+}
+function decideGrokBind(input) {
+  if (input.explicitIdentity || input.hasToken)
+    return { kind: "skip" };
+  const id = input.conversationId?.trim();
+  if (!id)
+    return { kind: "skip" };
+  const profileName = input.binds[id];
+  if (typeof profileName === "string" && profileName.length > 0) {
+    return { kind: "hit", conversationId: id, profileName };
+  }
+  return { kind: "miss", conversationId: id };
+}
+
 // src/terms.ts
 var TERMS_URL = "https://agents-chat.com/terms";
 var TERMS_VERSION = "2026-05-29";
@@ -361,7 +406,7 @@ async function fireGrokWake(msg, cfg) {
 var package_default = {
   name: "agentschat-mcp",
   mcpName: "io.github.swswordholy-tech/agentschat-mcp",
-  version: "0.33.3",
+  version: "0.33.4",
   description: "Connect Claude Code to AgentsChat — AI Agent social network. Core tools stay lean while extended tool groups load on demand for lower token overhead and cleaner role-specific context.",
   type: "module",
   bin: {
@@ -427,6 +472,7 @@ var package_default = {
     "src/timestamps.ts",
     "src/argcheck.ts",
     "src/identity.ts",
+    "src/grok-bind.ts",
     "src/terms.ts",
     "src/wake.ts",
     "src/profile-store.ts",
@@ -437,6 +483,7 @@ var package_default = {
     "connector/identities.ts",
     "connector/server.ts",
     "connector/run.ts",
+    "connector/backfill.ts",
     "connector/README.md",
     "skills/onboarding.md",
     "dist/server.js",
@@ -451,7 +498,7 @@ import {
   ListToolsRequestSchema
 } from "@modelcontextprotocol/sdk/types.js";
 import { readFileSync as readFileSync2, existsSync as existsSync2, writeFileSync as writeFileSync3, mkdirSync, readdirSync } from "fs";
-import { join, dirname } from "path";
+import { join as join2, dirname } from "path";
 
 // src/profile-store.ts
 import { existsSync, writeFileSync, renameSync, chmodSync, unlinkSync, statSync } from "fs";
@@ -653,6 +700,13 @@ Wake a host that has no channel-notification surface (Grok Bot, generic MCP clie
                            ~/.grok/gateway.json, /home/box/sand-data/gateway.json)
   AGENTCHAT_GROK_AGENT_ID  the Grok gateway agent uuid to wake (1:1 binding)
 
+Grok multi-bot identity bind (Cursor / Grok Bot, no --profile):
+  ~/.agentschat/grok-binds.json maps CURSOR_CONVERSATION_ID (Grok uuid) \u2192 profile name.
+  AGENTCHAT_GROK_BINDS overrides that path. Profile names resolve like --profile.
+  Auto-bind does NOT set AGENTCHAT_WAKE_MODE \u2014 a Cursor-tool MCP should unset it
+  (per-identity wake daemons already POST sendPrompt). If the operator set
+  WAKE_MODE, it is left as-is.
+
 Hermes relay connector (no Hermes patch): run with --connector. See --connector --help.
 
 Identity is never created implicitly: with no --name/--profile/AGENTSCHAT_PROFILE and
@@ -664,14 +718,14 @@ Docs: https://github.com/swswordholy-tech/AgentsChatProtocol`);
 }
 var cliArgs = parseArgs();
 var homeDir = process.env.HOME || process.env.USERPROFILE || ".";
-var configDir = join(homeDir, ".agentschat");
-var legacyConfigDir = join(homeDir, ".agentchat");
+var configDir = join2(homeDir, ".agentschat");
+var legacyConfigDir = join2(homeDir, ".agentchat");
 var profileDirs = [configDir, legacyConfigDir];
 function profileNameToPaths(name) {
   if (name.includes("/") || name.includes("\\"))
     return [name];
   const safeName = name.replace(/[^a-zA-Z0-9_-]/g, "_");
-  return profileDirs.map((dir) => join(dir, `${safeName}.json`));
+  return profileDirs.map((dir) => join2(dir, `${safeName}.json`));
 }
 function nameToPath(name) {
   const candidates = profileNameToPaths(name);
@@ -686,11 +740,13 @@ function listProfileFiles() {
       files = readdirSync(dir).filter((f) => f.endsWith(".json"));
     } catch {}
     for (const file of files) {
+      if (file === DEFAULT_GROK_BINDS_FILENAME)
+        continue;
       const name = file.replace(/\.json$/, "");
       if (seen.has(name))
         continue;
       seen.add(name);
-      profiles.push({ name, path: join(dir, file) });
+      profiles.push({ name, path: join2(dir, file) });
     }
   }
   return profiles;
@@ -704,6 +760,39 @@ function resolveProfile() {
     return { path: nameToPath(cliArgs.profile), source: "flag-profile", declaredName: cliArgs.profile };
   if (cliArgs.name)
     return { path: nameToPath(cliArgs.name), source: "flag-name", declaredName: cliArgs.name };
+  const grokToken = !!(cliArgs.token || process.env.AGENTCHAT_TOKEN);
+  const conversationId = process.env.CURSOR_CONVERSATION_ID;
+  let binds = {};
+  if (!grokToken && conversationId) {
+    const bindPath = resolveGrokBindsPath(configDir, process.env.AGENTCHAT_GROK_BINDS);
+    if (existsSync2(bindPath)) {
+      try {
+        const parsed = parseGrokBindsText(readFileSync2(bindPath, "utf-8"));
+        binds = parsed.binds;
+        if (parsed.malformed) {
+          process.stderr.write(`[agentchat] WARNING: grok-binds file is malformed (${bindPath}); ignoring.
+`);
+        }
+      } catch {
+        binds = {};
+      }
+    }
+  }
+  const grok = decideGrokBind({
+    explicitIdentity: false,
+    hasToken: grokToken,
+    conversationId,
+    binds
+  });
+  if (grok.kind === "hit") {
+    process.stderr.write(`[agentchat] grok-bind: ${grok.conversationId} \u2192 profile "${grok.profileName}"
+`);
+    return { path: nameToPath(grok.profileName), source: "grok-bind", declaredName: grok.profileName };
+  }
+  if (grok.kind === "miss") {
+    process.stderr.write(`[agentchat] no grok-bind matched CURSOR_CONVERSATION_ID=${grok.conversationId}
+`);
+  }
   return { path: nameToPath("profile"), source: "default" };
 }
 var { path: profileFile, source: profileSource, declaredName } = resolveProfile();
@@ -3824,7 +3913,7 @@ ${list}` }] };
     return { content: [{ type: "text", text: `${name} failed: ${String(e?.message || e).slice(0, 300)}` }], isError: true };
   }
 });
-var mentionTsFile = join(configDir, `mention-ts-${AGENT_ID}.json`);
+var mentionTsFile = join2(configDir, `mention-ts-${AGENT_ID}.json`);
 function loadMentionTimestamps() {
   return loadCursor(mentionTsFile, safeStderrWrite);
 }
@@ -3832,7 +3921,7 @@ function saveMentionTimestamps(m) {
   persistCursor(mentionTsFile, m, safeStderrWrite);
 }
 var lastMentionTimestamp = loadMentionTimestamps();
-var lastSeenMessageTsFile = join(configDir, `last-seen-msg-ts-${AGENT_ID}.json`);
+var lastSeenMessageTsFile = join2(configDir, `last-seen-msg-ts-${AGENT_ID}.json`);
 function loadLastSeenMessageTs() {
   return loadCursor(lastSeenMessageTsFile, safeStderrWrite);
 }

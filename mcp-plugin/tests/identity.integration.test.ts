@@ -64,7 +64,7 @@ const callTool = (id: number, name: string, args: any = {}) =>
   ({ jsonrpc: "2.0", id, method: "tools/call", params: { name, arguments: args } });
 
 /** Spawn the real server against the mock hub; send frames one at a time, awaiting each. */
-function drive(args: string[], home: string, frames: any[], waitMs = 3000) {
+function drive(args: string[], home: string, frames: any[], waitMs = 3000, extraEnv: Record<string, string> = {}) {
   return new Promise<{ res: Map<number, any>; err: string; code: number | null }>((done) => {
     const child = spawn(process.execPath, [ENTRY, "--url", BASE, ...args], {
       env: {
@@ -73,6 +73,7 @@ function drive(args: string[], home: string, frames: any[], waitMs = 3000) {
         AGENTCHAT_NO_PROXY: "1",
         AGENTCHAT_REST_URL: BASE, // belt-and-suspenders: never production
         AGENTCHAT_URL: "ws://127.0.0.1:1/ws", // dead WS; we only exercise stdio
+        ...extraEnv,
       },
       stdio: ["pipe", "pipe", "pipe"],
     });
@@ -345,5 +346,190 @@ describe("identity policy, end-to-end against a mock hub", () => {
     expect(text(3)).toMatch(/Profile file:.*alpha\.json/);
     expect(text(5)).toMatch(/Agent ID: beta-id/);
     expect(text(5)).toMatch(/Profile file:.*beta\.json/); // was stale: still reported alpha
+  }, 15_000);
+
+  test("grok-bind hit: CURSOR_CONVERSATION_ID selects that profile, not a sibling", async () => {
+    calls = [];
+    const home = freshHome("grokhit");
+    mkdirSync(join(home, ".agentschat"), { recursive: true });
+    writeFileSync(
+      join(home, ".agentschat", "Bot-A.json"),
+      JSON.stringify({ agent_id: "bot-a-id", display_name: "Bot-A", token: "ac_bot_a", capabilities: ["chat"] }),
+    );
+    writeFileSync(
+      join(home, ".agentschat", "Bot-B.json"),
+      JSON.stringify({ agent_id: "bot-b-id", display_name: "Bot-B", token: "ac_bot_b", capabilities: ["chat"] }),
+    );
+    writeFileSync(
+      join(home, ".agentschat", "grok-binds.json"),
+      JSON.stringify({ "grok-uuid-a": "Bot-A", "grok-uuid-b": "Bot-B" }),
+    );
+    const { err, res } = await drive(
+      [],
+      home,
+      [INIT, INITED, callTool(3, "whoami")],
+      4000,
+      { CURSOR_CONVERSATION_ID: "grok-uuid-a" },
+    );
+
+    expect(registerCalls()).toBe(0);
+    expect(err).toMatch(/grok-bind: grok-uuid-a/);
+    expect(err).toMatch(/Bot-A\.json/);
+    const text = res.get(3)?.result?.content?.[0]?.text ?? "";
+    expect(text).toMatch(/Agent ID: bot-a-id/);
+    expect(text).not.toMatch(/bot-b-id/);
+    // Auto-bind must not imply WAKE_MODE.
+    expect(err).not.toMatch(/WAKE_MODE/);
+  }, 15_000);
+
+  test("grok-bind miss: logs the uuid and stays anonymous (does not pick a sibling)", async () => {
+    calls = [];
+    const home = freshHome("grokmiss");
+    mkdirSync(join(home, ".agentschat"), { recursive: true });
+    writeFileSync(
+      join(home, ".agentschat", "Bot-A.json"),
+      JSON.stringify({ agent_id: "bot-a-id", display_name: "Bot-A", token: "ac_bot_a", capabilities: ["chat"] }),
+    );
+    writeFileSync(
+      join(home, ".agentschat", "grok-binds.json"),
+      JSON.stringify({ "grok-uuid-a": "Bot-A" }),
+    );
+    const { err, res, code } = await drive(
+      [],
+      home,
+      [INIT, INITED, LIST],
+      3000,
+      { CURSOR_CONVERSATION_ID: "grok-uuid-unknown" },
+    );
+
+    expect(registerCalls()).toBe(0);
+    expect(err).toMatch(/no grok-bind matched CURSOR_CONVERSATION_ID=grok-uuid-unknown/);
+    expect(err).toMatch(/Refusing to auto-register/);
+    expect(res.get(2)?.result?.tools?.length ?? 0).toBeGreaterThan(0);
+    expect(code).not.toBe(1);
+  }, 15_000);
+
+  test("grok-bind hit + missing profile: hard error, does not fall through to a sibling", async () => {
+    calls = [];
+    const home = freshHome("grokghost");
+    mkdirSync(join(home, ".agentschat"), { recursive: true });
+    writeFileSync(
+      join(home, ".agentschat", "Bot-B.json"),
+      JSON.stringify({ agent_id: "bot-b-id", display_name: "Bot-B", token: "ac_bot_b", capabilities: ["chat"] }),
+    );
+    writeFileSync(
+      join(home, ".agentschat", "grok-binds.json"),
+      JSON.stringify({ "grok-uuid-a": "Ghost" }),
+    );
+    const { err, code } = await drive(
+      [],
+      home,
+      [INIT],
+      2500,
+      { CURSOR_CONVERSATION_ID: "grok-uuid-a" },
+    );
+
+    expect(registerCalls()).toBe(0);
+    expect(code).toBe(1);
+    expect(err).toMatch(/Ghost/);
+    expect(err).toMatch(/Refusing to auto-register/);
+    expect(err).not.toMatch(/Bot-B\.json/);
+    expect(err).not.toMatch(/MCP server started/);
+  }, 15_000);
+
+  test("explicit --profile wins over grok-bind", async () => {
+    calls = [];
+    const home = freshHome("grokflag");
+    mkdirSync(join(home, ".agentschat"), { recursive: true });
+    writeFileSync(
+      join(home, ".agentschat", "Bot-A.json"),
+      JSON.stringify({ agent_id: "bot-a-id", display_name: "Bot-A", token: "ac_bot_a", capabilities: ["chat"] }),
+    );
+    writeFileSync(
+      join(home, ".agentschat", "Bot-B.json"),
+      JSON.stringify({ agent_id: "bot-b-id", display_name: "Bot-B", token: "ac_bot_b", capabilities: ["chat"] }),
+    );
+    writeFileSync(
+      join(home, ".agentschat", "grok-binds.json"),
+      JSON.stringify({ "grok-uuid-a": "Bot-A" }),
+    );
+    const { err, res } = await drive(
+      ["--profile", "Bot-B"],
+      home,
+      [INIT, INITED, callTool(3, "whoami")],
+      4000,
+      { CURSOR_CONVERSATION_ID: "grok-uuid-a" },
+    );
+
+    expect(err).not.toMatch(/grok-bind:/);
+    const text = res.get(3)?.result?.content?.[0]?.text ?? "";
+    expect(text).toMatch(/Agent ID: bot-b-id/);
+    expect(text).not.toMatch(/bot-a-id/);
+  }, 15_000);
+
+  test("no CURSOR_CONVERSATION_ID: grok-binds.json is ignored (Claude/Hermes unchanged)", async () => {
+    calls = [];
+    const home = freshHome("groknoid");
+    mkdirSync(join(home, ".agentschat"), { recursive: true });
+    writeFileSync(
+      join(home, ".agentschat", "Bot-A.json"),
+      JSON.stringify({ agent_id: "bot-a-id", display_name: "Bot-A", token: "ac_bot_a", capabilities: ["chat"] }),
+    );
+    writeFileSync(
+      join(home, ".agentschat", "grok-binds.json"),
+      JSON.stringify({ "grok-uuid-a": "Bot-A" }),
+    );
+    const { err, res } = await drive([], home, [INIT, INITED, LIST]);
+
+    expect(registerCalls()).toBe(0);
+    expect(err).not.toMatch(/grok-bind:/);
+    expect(err).not.toMatch(/no grok-bind matched/);
+    expect(err).toMatch(/Refusing to auto-register/);
+    expect(res.get(2)?.result?.tools?.length ?? 0).toBeGreaterThan(0);
+  }, 15_000);
+
+  test("malformed grok-binds.json: fall through to anonymous, do not crash", async () => {
+    calls = [];
+    const home = freshHome("grokbad");
+    mkdirSync(join(home, ".agentschat"), { recursive: true });
+    writeFileSync(join(home, ".agentschat", "grok-binds.json"), "{not json");
+    const { err, res, code } = await drive(
+      [],
+      home,
+      [INIT, INITED, LIST],
+      3000,
+      { CURSOR_CONVERSATION_ID: "grok-uuid-a" },
+    );
+
+    expect(code).not.toBe(1);
+    expect(registerCalls()).toBe(0);
+    expect(err).toMatch(/malformed/);
+    expect(err).toMatch(/no grok-bind matched CURSOR_CONVERSATION_ID=grok-uuid-a/);
+    expect(res.get(2)?.result?.tools?.length ?? 0).toBeGreaterThan(0);
+  }, 15_000);
+
+  test("AGENTCHAT_GROK_BINDS override path is consulted", async () => {
+    calls = [];
+    const home = freshHome("grokoverride");
+    mkdirSync(join(home, ".agentschat"), { recursive: true });
+    writeFileSync(
+      join(home, ".agentschat", "Bot-A.json"),
+      JSON.stringify({ agent_id: "bot-a-id", display_name: "Bot-A", token: "ac_bot_a", capabilities: ["chat"] }),
+    );
+    const alt = join(home, "alt-binds.json");
+    writeFileSync(alt, JSON.stringify({ "grok-uuid-a": "Bot-A" }));
+    // Default binds file, if consulted, would miss.
+    writeFileSync(join(home, ".agentschat", "grok-binds.json"), JSON.stringify({ "other": "Nope" }));
+    const { err, res } = await drive(
+      [],
+      home,
+      [INIT, INITED, callTool(3, "whoami")],
+      4000,
+      { CURSOR_CONVERSATION_ID: "grok-uuid-a", AGENTCHAT_GROK_BINDS: alt },
+    );
+
+    expect(err).toMatch(/grok-bind: grok-uuid-a/);
+    const text = res.get(3)?.result?.content?.[0]?.text ?? "";
+    expect(text).toMatch(/Agent ID: bot-a-id/);
   }, 15_000);
 });

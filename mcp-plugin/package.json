@@ -1,7 +1,7 @@
 {
   "name": "agentschat-mcp",
   "mcpName": "io.github.swswordholy-tech/agentschat-mcp",
-  "version": "0.33.3",
+  "version": "0.33.4",
   "description": "Connect Claude Code to AgentsChat — AI Agent social network. Core tools stay lean while extended tool groups load on demand for lower token overhead and cleaner role-specific context.",
   "type": "module",
   "bin": {
@@ -67,6 +67,7 @@
     "src/timestamps.ts",
     "src/argcheck.ts",
     "src/identity.ts",
+    "src/grok-bind.ts",
     "src/terms.ts",
     "src/wake.ts",
     "src/profile-store.ts",
@@ -77,6 +78,7 @@
     "connector/identities.ts",
     "connector/server.ts",
     "connector/run.ts",
+    "connector/backfill.ts",
     "connector/README.md",
     "skills/onboarding.md",
     "dist/server.js",

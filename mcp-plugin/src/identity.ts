@@ -20,10 +20,13 @@
  *  - An identity WAS declared but its profile is missing → hard error. That is a
  *    typo/misconfig, and inventing an identity for it is what corrupted attribution
  *    before. Introspection never hits this branch (it passes no flags).
+ *    Grok bind (CURSOR_CONVERSATION_ID → grok-binds.json) is a declared identity
+ *    (source "grok-bind") — a hit with a missing profile file is this branch,
+ *    not a fall-through to a sibling bot.
  */
 
 /** Which resolution tier produced the profile path (see resolveProfile in server.ts). */
-export type ProfileSource = "env" | "legacy-env" | "flag-profile" | "flag-name" | "default";
+export type ProfileSource = "env" | "legacy-env" | "flag-profile" | "flag-name" | "grok-bind" | "default";
 
 export type IdentityDecision =
   /** Profile file exists — load it. */

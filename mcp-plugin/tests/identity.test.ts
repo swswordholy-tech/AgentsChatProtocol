@@ -50,7 +50,7 @@ describe("decideIdentity — never registers implicitly", () => {
 });
 
 describe("decideIdentity — declared-but-missing is a hard error, not an invented identity", () => {
-  for (const source of ["env", "legacy-env", "flag-profile"] as const) {
+  for (const source of ["env", "legacy-env", "flag-profile", "grok-bind"] as const) {
     test(`${source}: profile missing → error, not register`, () => {
       const d = decideIdentity({ ...base, source, declaredName: "mellow-blessed-obsidian" });
       expect(d.mode).toBe("error");
@@ -78,7 +78,7 @@ describe("shouldMigrateDevToken — same opt-in gate as first-run registration",
   });
 
   test("declared identity → heal the key as before", () => {
-    for (const source of ["env", "legacy-env", "flag-profile", "flag-name"] as const) {
+    for (const source of ["env", "legacy-env", "flag-profile", "flag-name", "grok-bind"] as const) {
       expect(shouldMigrateDevToken({ source, hasToken: false })).toBe(true);
     }
   });
@@ -90,5 +90,22 @@ describe("shouldMigrateDevToken — same opt-in gate as first-run registration",
 
   test("--register overrides the bare default path", () => {
     expect(shouldMigrateDevToken({ source: "default", hasToken: false, registerFlag: true })).toBe(true);
+  });
+});
+
+describe("grok-bind is a declared identity", () => {
+  test("bind hit + missing profile file -> hard error, not a sibling / anonymous fallback", () => {
+    const d = decideIdentity({ ...base, source: "grok-bind", declaredName: "Ghost" });
+    expect(d.mode).toBe("error");
+    expect(d.mode === "error" && d.message).toContain("Ghost");
+    expect(d.mode === "error" && d.message).toContain("Refusing to auto-register");
+  });
+
+  test("bind hit + existing profile -> load it", () => {
+    expect(decideIdentity({ ...base, source: "grok-bind", profileExists: true, declaredName: "Bot-A" }).mode).toBe("profile");
+  });
+
+  test("shouldMigrateDevToken: grok-bind may heal a dev-token (source !== default)", () => {
+    expect(shouldMigrateDevToken({ source: "grok-bind", hasToken: false })).toBe(true);
   });
 });

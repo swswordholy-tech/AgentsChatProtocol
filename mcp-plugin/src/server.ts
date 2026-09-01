@@ -42,6 +42,7 @@ import { normalizeTimestampForCursor } from "./timestamps.ts";
 import { validateToolArgs } from "./argcheck.ts";
 import { decideIdentity, shouldMigrateDevToken } from "./identity.ts";
 import type { ProfileSource } from "./identity.ts";
+import { decideGrokBind, parseGrokBindsText, resolveGrokBindsPath, DEFAULT_GROK_BINDS_FILENAME } from "./grok-bind.ts";
 import { decideTermsConsent, TERMS_URL } from "./terms.ts";
 import { fireWake, fireGrokWake, resolveGrokAgentId, resolveGrokGatewayPath, grokBearerFromGatewayConfig, grokPortFromGatewayConfig } from "./wake.ts";
 import pkg from "../package.json";
@@ -107,6 +108,13 @@ Wake a host that has no channel-notification surface (Grok Bot, generic MCP clie
                            ~/.grok/gateway.json, /home/box/sand-data/gateway.json)
   AGENTCHAT_GROK_AGENT_ID  the Grok gateway agent uuid to wake (1:1 binding)
 
+Grok multi-bot identity bind (Cursor / Grok Bot, no --profile):
+  ~/.agentschat/grok-binds.json maps CURSOR_CONVERSATION_ID (Grok uuid) → profile name.
+  AGENTCHAT_GROK_BINDS overrides that path. Profile names resolve like --profile.
+  Auto-bind does NOT set AGENTCHAT_WAKE_MODE — a Cursor-tool MCP should unset it
+  (per-identity wake daemons already POST sendPrompt). If the operator set
+  WAKE_MODE, it is left as-is.
+
 Hermes relay connector (no Hermes patch): run with --connector. See --connector --help.
 
 Identity is never created implicitly: with no --name/--profile/AGENTSCHAT_PROFILE and
@@ -124,7 +132,9 @@ const cliArgs = parseArgs();
 //   2. AGENTCHAT_PROFILE env var (legacy singular)
 //   3. --profile <name> CLI arg
 //   4. --name <name> CLI arg (also used as profile name)
-//   5. default ~/.agentschat/profile.json, falling back to ~/.agentchat/profile.json
+//   5. Grok bind: CURSOR_CONVERSATION_ID → ~/.agentschat/grok-binds.json
+//      (skipped if an explicit token is set; does NOT imply AGENTCHAT_WAKE_MODE)
+//   6. default ~/.agentschat/profile.json, falling back to ~/.agentchat/profile.json
 const homeDir = process.env.HOME || process.env.USERPROFILE || ".";
 const configDir = join(homeDir, ".agentschat");
 const legacyConfigDir = join(homeDir, ".agentchat");
@@ -148,6 +158,7 @@ function listProfileFiles(): Array<{ name: string; path: string }> {
     let files: string[] = [];
     try { files = readdirSync(dir).filter((f: string) => f.endsWith(".json")); } catch {}
     for (const file of files) {
+      if (file === DEFAULT_GROK_BINDS_FILENAME) continue; // bind map, not a profile
       const name = file.replace(/\.json$/, "");
       if (seen.has(name)) continue;
       seen.add(name);
@@ -168,7 +179,45 @@ function resolveProfile(): { path: string; source: ProfileSource; declaredName?:
   if (cliArgs.profile) return { path: nameToPath(cliArgs.profile), source: "flag-profile", declaredName: cliArgs.profile };
   // 4. --name <name>
   if (cliArgs.name) return { path: nameToPath(cliArgs.name), source: "flag-name", declaredName: cliArgs.name };
-  // 5. default — nothing was declared. NOT a licence to invent an identity.
+
+  // 5. Grok outbound bind. Explicit env/flags already returned above. An
+  // explicit --token/AGENTCHAT_TOKEN also wins: do not steal identity from
+  // operator-supplied creds. CURSOR_CONVERSATION_ID unset → skip entirely
+  // (Claude Code / Hermes: zero change). A hit with a missing profile file
+  // is a declared identity (source grok-bind) so decideIdentity hard-errors
+  // rather than falling through to a sibling bot.
+  const grokToken = !!(cliArgs.token || process.env.AGENTCHAT_TOKEN);
+  const conversationId = process.env.CURSOR_CONVERSATION_ID;
+  let binds: Record<string, string> = {};
+  if (!grokToken && conversationId) {
+    const bindPath = resolveGrokBindsPath(configDir, process.env.AGENTCHAT_GROK_BINDS);
+    if (existsSync(bindPath)) {
+      try {
+        const parsed = parseGrokBindsText(readFileSync(bindPath, "utf-8"));
+        binds = parsed.binds;
+        if (parsed.malformed) {
+          process.stderr.write(`[agentchat] WARNING: grok-binds file is malformed (${bindPath}); ignoring.\n`);
+        }
+      } catch {
+        binds = {};
+      }
+    }
+  }
+  const grok = decideGrokBind({
+    explicitIdentity: false,
+    hasToken: grokToken,
+    conversationId,
+    binds,
+  });
+  if (grok.kind === "hit") {
+    process.stderr.write(`[agentchat] grok-bind: ${grok.conversationId} → profile "${grok.profileName}"\n`);
+    return { path: nameToPath(grok.profileName), source: "grok-bind", declaredName: grok.profileName };
+  }
+  if (grok.kind === "miss") {
+    process.stderr.write(`[agentchat] no grok-bind matched CURSOR_CONVERSATION_ID=${grok.conversationId}\n`);
+  }
+
+  // 6. default — nothing was declared. NOT a licence to invent an identity.
   return { path: nameToPath("profile"), source: "default" };
 }
 
