@@ -26,7 +26,12 @@
 import WS from "ws";
 import { startConnector } from "./server.ts";
 import type { Identity } from "./identities.ts";
+import { join } from "node:path";
 import { redactSecrets } from "../src/redact.ts";
+import { flushCursor, loadCursor, persistCursor } from "../src/read-cursor.ts";
+import { normalizeTimestampForCursor } from "../src/timestamps.ts";
+import { MessageDedup, messageDedupKey } from "../src/dedup.ts";
+import { planBackfill } from "./backfill.ts";
 
 const log = (m: string) => process.stderr.write(`[agentschat-connector] ${m}\n`);
 
@@ -97,6 +102,55 @@ for (const id of identities) {
 let broadcast: ((msg: any) => void) | null = null;
 const socketsByBot = new Map<string, WS>();
 const backoffByBot = new Map<string, number>();
+const backfillTimerByBot = new Map<string, ReturnType<typeof setTimeout>>();
+const dedup = new MessageDedup();
+
+// Per-identity last-seen cursor (channel → timestamp). Same files/shape as
+// stdio MCP (`last-seen-msg-ts-<agent>.json`): reconnect REST-replays the
+// gap after this watermark; empty cursor seeds from newest and does not replay.
+const CURSOR_DIR = process.env.AGENTCHAT_CURSOR_DIR || process.cwd();
+const cursorFlushMs = Math.max(500, Number(process.env.AGENTSCHAT_MCP_CURSOR_FLUSH_MS || 5000));
+
+type CursorStore = {
+  file: string;
+  map: Map<string, string>;
+  state: { dirty: boolean };
+  timer: ReturnType<typeof setTimeout> | null;
+};
+const cursors = new Map<string, CursorStore>();
+
+function cursorFor(id: Identity): CursorStore {
+  let s = cursors.get(id.botId);
+  if (s) return s;
+  const file = join(CURSOR_DIR, `last-seen-msg-ts-${id.botId}.json`);
+  s = { file, map: loadCursor(file, (m) => log(m.trimEnd())), state: { dirty: false }, timer: null };
+  cursors.set(id.botId, s);
+  return s;
+}
+
+function flushOne(s: CursorStore) {
+  if (s.timer) { clearTimeout(s.timer); s.timer = null; }
+  flushCursor(s.state, () => persistCursor(s.file, s.map, (m) => log(m.trimEnd())));
+}
+
+function scheduleSave(s: CursorStore) {
+  s.state.dirty = true;
+  if (s.timer) return;
+  s.timer = setTimeout(() => { s.timer = null; flushOne(s); }, cursorFlushMs);
+  (s.timer as any).unref?.();
+}
+
+function advanceCursor(id: Identity, channelId: string | undefined, timestamp: string | undefined) {
+  if (typeof channelId !== "string" || typeof timestamp !== "string" || !timestamp) return;
+  const s = cursorFor(id);
+  const prev = s.map.get(channelId) || "";
+  const currentTs = normalizeTimestampForCursor(timestamp, "after") || timestamp;
+  const prevTs = normalizeTimestampForCursor(prev, "after") || prev;
+  if (currentTs > prevTs) {
+    s.map.set(channelId, timestamp);
+    scheduleSave(s);
+  }
+}
 
 function joinChannel(ws: WS, id: Identity, channelId: string, name?: string) {
   try {
@@ -119,13 +173,58 @@ async function joinMemberships(ws: WS, id: Identity) {
     }
     const body = await r.json() as any;
     const channels = Array.isArray(body) ? body : (body.channels || []);
+    const joined: string[] = [];
     for (const ch of channels) {
       const channelId = ch?.id || ch?.channel_id;
       if (!channelId) continue;
       joinChannel(ws, id, channelId, ch?.name);
+      joined.push(channelId);
     }
+    // Same delay as MCP Task #119: let channel_created + gateway hello settle,
+    // then REST-replay anything after the persisted last-seen cursor.
+    const prev = backfillTimerByBot.get(id.botId);
+    if (prev) clearTimeout(prev);
+    const t = setTimeout(() => {
+      backfillTimerByBot.delete(id.botId);
+      if ((process as any).__shutdown) return;
+      void backfillIdentity(id, joined);
+    }, 2000);
+    (t as any).unref?.();
+    backfillTimerByBot.set(id.botId, t);
   } catch (e: any) {
     log(`join-on-auth failed: ${e?.message ?? e}`);
+  }
+}
+
+async function backfillIdentity(id: Identity, channelIds: string[]) {
+  const s = cursorFor(id);
+  for (const channelId of channelIds) {
+    try {
+      const after = s.map.get(channelId);
+      const params = after ? `?after=${encodeURIComponent(after)}&limit=50` : `?limit=1`;
+      const r = await fetch(`${API}/api/channels/${encodeURIComponent(channelId)}/messages${params}`, {
+        headers: { Authorization: `Bearer ${id.token}` },
+      });
+      if (!r.ok) continue;
+      const msgs = (((await r.json()) as any)?.messages ?? []) as any[];
+      const plan = planBackfill(after, msgs, id.agentId);
+      if (plan.seed) {
+        s.map.set(channelId, plan.seed);
+        scheduleSave(s);
+        continue;
+      }
+      if (!plan.replay.length) continue;
+      log(`backfill ${id.botId} ${channelId}: ${plan.replay.length} missed msg(s)`);
+      for (const m of plan.replay) {
+        const frame = { ...m, type: "message", channel_id: m.channel_id ?? channelId, __botId: id.botId, __source: "backfill" };
+        const key = messageDedupKey(frame);
+        if (key && dedup.recordOrSkip(key)) continue;
+        advanceCursor(id, frame.channel_id, frame.timestamp);
+        broadcast?.(frame);
+      }
+    } catch (e: any) {
+      log(`backfill failed for ${id.botId} ${channelId}: ${e?.message ?? e}`);
+    }
   }
 }
 
@@ -150,10 +249,16 @@ function connectIdentity(id: Identity) {
       joinChannel(ws, id, data.channel_id, data.name);
       return;
     }
-    if (data.type === "message" && data.sender_id !== id.agentId) {
-      // Tag which identity's socket this arrived on, so the connector routes it to
-      // the gateway fronting that identity (and only that one).
-      broadcast?.({ ...data, __botId: id.botId });
+    if (data.type === "message") {
+      if (!data.__source) data.__source = "live";
+      const key = messageDedupKey(data);
+      if (key && dedup.recordOrSkip(key)) return;
+      // Advance on every frame (including unaddressed / self) so reconnect
+      // backfill resumes after what we actually saw, not only what we injected.
+      if (data.content !== "__typing__") advanceCursor(id, data.channel_id, data.timestamp);
+      if (data.sender_id !== id.agentId && data.content !== "__typing__") {
+        broadcast?.({ ...data, __botId: id.botId });
+      }
     }
   });
   ws.on("close", () => {
@@ -238,6 +343,7 @@ for (const sig of ["SIGINT", "SIGTERM"] as const) {
     for (const ws of socketsByBot.values()) {
       try { ws.close(); } catch {}
     }
+    for (const s of cursors.values()) flushOne(s);
     connector.stop();
     process.exit(0);
   });

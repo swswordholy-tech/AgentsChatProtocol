@@ -365,9 +365,118 @@ function peekPayload(token) {
   }
 }
 
+// connector/run.ts
+import { join } from "node:path";
+
 // src/redact.ts
 function redactSecrets(text) {
   return text.replace(/ac_[A-Za-z0-9_-]{16,}/g, "ac_***REDACTED***").replace(/eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "***JWT_REDACTED***");
+}
+
+// src/read-cursor.ts
+import { readFileSync, writeFileSync } from "fs";
+function loadCursor(file, warn) {
+  try {
+    return new Map(Object.entries(JSON.parse(readFileSync(file, "utf-8"))));
+  } catch (e) {
+    if (e?.code !== "ENOENT") {
+      warn(`[agentchat] WARNING: could not read ${file} — resetting that state: ${e}
+`);
+    }
+    return new Map;
+  }
+}
+function persistCursor(file, cursor, warn) {
+  try {
+    writeFileSync(file, JSON.stringify(Object.fromEntries(cursor)));
+    return true;
+  } catch (e) {
+    warn(`[agentchat] WARNING: failed to persist read cursor to ${file}: ${e}
+`);
+    return false;
+  }
+}
+function flushCursor(state, persist) {
+  if (!state.dirty)
+    return false;
+  const ok = persist();
+  if (ok)
+    state.dirty = false;
+  return ok;
+}
+
+// src/timestamps.ts
+function normalizeTimestampForCursor(ts, mode) {
+  if (!ts || typeof ts !== "string")
+    return ts;
+  const padChar = mode === "before" ? "9" : "0";
+  const withFrac = ts.match(/^(.*\.)(\d+)(Z)$/);
+  if (withFrac) {
+    const frac = withFrac[2];
+    if (frac.length >= 9)
+      return ts;
+    return withFrac[1] + frac + padChar.repeat(9 - frac.length) + withFrac[3];
+  }
+  const noFrac = ts.match(/^(.*\d)(Z)$/);
+  if (noFrac) {
+    return noFrac[1] + "." + padChar.repeat(9) + noFrac[2];
+  }
+  return ts;
+}
+
+// src/dedup.ts
+function messageDedupKey(data) {
+  if (!data || typeof data.id !== "string" || typeof data.channel_id !== "string")
+    return null;
+  return `${data.channel_id}:${data.id}`;
+}
+
+class MessageDedup {
+  max;
+  dropOnEvict;
+  seen = new Set;
+  constructor(max = 5000, dropOnEvict = 1000) {
+    this.max = max;
+    this.dropOnEvict = dropOnEvict;
+  }
+  recordOrSkip(key) {
+    if (this.seen.has(key))
+      return true;
+    this.seen.add(key);
+    if (this.seen.size > this.max) {
+      const arr = [...this.seen];
+      this.seen.clear();
+      for (const item of arr.slice(this.dropOnEvict))
+        this.seen.add(item);
+    }
+    return false;
+  }
+  get size() {
+    return this.seen.size;
+  }
+}
+
+// connector/backfill.ts
+function planBackfill(after, msgs, agentId) {
+  const list = Array.isArray(msgs) ? msgs : [];
+  if (!after) {
+    let newest = "";
+    for (const m of list) {
+      const t = String(m?.timestamp || "");
+      if (t > newest)
+        newest = t;
+    }
+    return newest ? { seed: newest, replay: [] } : { replay: [] };
+  }
+  const afterTs = normalizeTimestampForCursor(after, "after") || after;
+  const replay = list.filter((m) => {
+    if (!m || m.sender_id === agentId || m.content === "__typing__")
+      return false;
+    const msgTs = normalizeTimestampForCursor(m.timestamp, "after");
+    return typeof msgTs === "string" && msgTs > afterTs;
+  });
+  replay.sort((a, b) => String(a.timestamp ?? "").localeCompare(String(b.timestamp ?? "")));
+  return { replay };
 }
 
 // connector/run.ts
@@ -429,6 +538,49 @@ for (const id of identities) {
 var broadcast = null;
 var socketsByBot = new Map;
 var backoffByBot = new Map;
+var backfillTimerByBot = new Map;
+var dedup = new MessageDedup;
+var CURSOR_DIR = process.env.AGENTCHAT_CURSOR_DIR || process.cwd();
+var cursorFlushMs = Math.max(500, Number(process.env.AGENTSCHAT_MCP_CURSOR_FLUSH_MS || 5000));
+var cursors = new Map;
+function cursorFor(id) {
+  let s = cursors.get(id.botId);
+  if (s)
+    return s;
+  const file = join(CURSOR_DIR, `last-seen-msg-ts-${id.botId}.json`);
+  s = { file, map: loadCursor(file, (m) => log(m.trimEnd())), state: { dirty: false }, timer: null };
+  cursors.set(id.botId, s);
+  return s;
+}
+function flushOne(s) {
+  if (s.timer) {
+    clearTimeout(s.timer);
+    s.timer = null;
+  }
+  flushCursor(s.state, () => persistCursor(s.file, s.map, (m) => log(m.trimEnd())));
+}
+function scheduleSave(s) {
+  s.state.dirty = true;
+  if (s.timer)
+    return;
+  s.timer = setTimeout(() => {
+    s.timer = null;
+    flushOne(s);
+  }, cursorFlushMs);
+  s.timer.unref?.();
+}
+function advanceCursor(id, channelId, timestamp) {
+  if (typeof channelId !== "string" || typeof timestamp !== "string" || !timestamp)
+    return;
+  const s = cursorFor(id);
+  const prev = s.map.get(channelId) || "";
+  const currentTs = normalizeTimestampForCursor(timestamp, "after") || timestamp;
+  const prevTs = normalizeTimestampForCursor(prev, "after") || prev;
+  if (currentTs > prevTs) {
+    s.map.set(channelId, timestamp);
+    scheduleSave(s);
+  }
+}
 function joinChannel(ws, id, channelId, name) {
   try {
     ws.send(JSON.stringify({ type: "join_channel", channel_id: channelId, agent_id: id.agentId }));
@@ -446,14 +598,61 @@ async function joinMemberships(ws, id) {
     }
     const body = await r.json();
     const channels = Array.isArray(body) ? body : body.channels || [];
+    const joined = [];
     for (const ch of channels) {
       const channelId = ch?.id || ch?.channel_id;
       if (!channelId)
         continue;
       joinChannel(ws, id, channelId, ch?.name);
+      joined.push(channelId);
     }
+    const prev = backfillTimerByBot.get(id.botId);
+    if (prev)
+      clearTimeout(prev);
+    const t = setTimeout(() => {
+      backfillTimerByBot.delete(id.botId);
+      if (process.__shutdown)
+        return;
+      backfillIdentity(id, joined);
+    }, 2000);
+    t.unref?.();
+    backfillTimerByBot.set(id.botId, t);
   } catch (e) {
     log(`join-on-auth failed: ${e?.message ?? e}`);
+  }
+}
+async function backfillIdentity(id, channelIds) {
+  const s = cursorFor(id);
+  for (const channelId of channelIds) {
+    try {
+      const after = s.map.get(channelId);
+      const params = after ? `?after=${encodeURIComponent(after)}&limit=50` : `?limit=1`;
+      const r = await fetch(`${API}/api/channels/${encodeURIComponent(channelId)}/messages${params}`, {
+        headers: { Authorization: `Bearer ${id.token}` }
+      });
+      if (!r.ok)
+        continue;
+      const msgs = (await r.json())?.messages ?? [];
+      const plan = planBackfill(after, msgs, id.agentId);
+      if (plan.seed) {
+        s.map.set(channelId, plan.seed);
+        scheduleSave(s);
+        continue;
+      }
+      if (!plan.replay.length)
+        continue;
+      log(`backfill ${id.botId} ${channelId}: ${plan.replay.length} missed msg(s)`);
+      for (const m of plan.replay) {
+        const frame = { ...m, type: "message", channel_id: m.channel_id ?? channelId, __botId: id.botId, __source: "backfill" };
+        const key = messageDedupKey(frame);
+        if (key && dedup.recordOrSkip(key))
+          continue;
+        advanceCursor(id, frame.channel_id, frame.timestamp);
+        broadcast?.(frame);
+      }
+    } catch (e) {
+      log(`backfill failed for ${id.botId} ${channelId}: ${e?.message ?? e}`);
+    }
   }
 }
 function connectIdentity(id) {
@@ -481,8 +680,17 @@ function connectIdentity(id) {
       joinChannel(ws, id, data.channel_id, data.name);
       return;
     }
-    if (data.type === "message" && data.sender_id !== id.agentId) {
-      broadcast?.({ ...data, __botId: id.botId });
+    if (data.type === "message") {
+      if (!data.__source)
+        data.__source = "live";
+      const key = messageDedupKey(data);
+      if (key && dedup.recordOrSkip(key))
+        return;
+      if (data.content !== "__typing__")
+        advanceCursor(id, data.channel_id, data.timestamp);
+      if (data.sender_id !== id.agentId && data.content !== "__typing__") {
+        broadcast?.({ ...data, __botId: id.botId });
+      }
     }
   });
   ws.on("close", () => {
@@ -565,6 +773,8 @@ for (const sig of ["SIGINT", "SIGTERM"]) {
         ws.close();
       } catch {}
     }
+    for (const s of cursors.values())
+      flushOne(s);
     connector.stop();
     process.exit(0);
   });

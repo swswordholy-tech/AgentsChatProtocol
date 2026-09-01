@@ -54,6 +54,13 @@ After `auth_ok` the connector GETs `/api/channels/mine` and sends `join_channel`
 for each membership, and again on `channel_created`. The server only pushes
 DM/@ frames to sockets that have joined; auth alone is not enough.
 
+**Read cursor (same as stdio MCP):** each identity persists
+`last-seen-msg-ts-<botId>.json` (channel → last seen timestamp) under
+`AGENTCHAT_CURSOR_DIR` or the process cwd. On every `auth_ok` it REST-backfills
+messages strictly after that watermark through the same inject path as live WS
+(empty cursor seeds from newest and does not replay). Live frames and backfill
+share a message-id dedup so a reconnect race does not double-inject.
+
 **Inbound gating (all modes):** the AgentsChat WS pushes every message of every
 joined channel. The connector injects into the gateway only what is ADDRESSED to
 an identity — DMs always, group messages only when the body @mentions it (same
