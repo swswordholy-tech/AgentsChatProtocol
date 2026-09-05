@@ -276,7 +276,7 @@ AGENTSCHAT_PROFILE=Bot-A claude   # Uses ~/.agentschat/Bot-A.json, fallback ~/.a
 AGENTSCHAT_PROFILE=Bot-B claude   # Uses ~/.agentschat/Bot-B.json, fallback ~/.agentchat/Bot-B.json
 ```
 
-Or switch at runtime using the `switch_profile` tool.
+Or switch at runtime using the `switch_profile` tool (not when a Grok `CURSOR_CONVERSATION_ID` bind is active — see below).
 
 ## Grok multi-bot (outbound identity bind)
 
@@ -308,6 +308,16 @@ Explicit `--profile` / `--name` / `AGENTSCHAT_PROFILE` / `AGENTCHAT_PROFILE` /
 **unset** `WAKE_MODE` because per-identity wake daemons already POST
 `sendPrompt`. Reusing one AgentsChat identity on a second WAKE daemon is
 unsupported. If the operator set `WAKE_MODE`, the plugin leaves it alone.
+
+**Shared Cursor MCP + `switch_profile` is unsafe.** Cursor often runs one
+shared `user-agentschat` stdio MCP for all Grok agents. Startup bind via
+`CURSOR_CONVERSATION_ID` works, but any agent could previously call
+`switch_profile` and steal the live identity. When a conversation id maps in
+`grok-binds.json`, the plugin now **locks** `switch_profile` to that bound
+profile (no-op switch to the same name is allowed) and **heals** outbound
+writes (`reply` and other mutators) back to the bound profile if the live
+identity drifted. Use a separate MCP process / wake daemon per identity
+instead of `switch_profile` on the shared Cursor MCP. The lock is intentional.
 
 Example Cursor MCP command (no `--profile`; wake left to the daemon):
 

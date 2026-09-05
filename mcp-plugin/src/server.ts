@@ -42,7 +42,16 @@ import { normalizeTimestampForCursor } from "./timestamps.ts";
 import { validateToolArgs } from "./argcheck.ts";
 import { decideIdentity, shouldMigrateDevToken } from "./identity.ts";
 import type { ProfileSource } from "./identity.ts";
-import { decideGrokBind, parseGrokBindsText, resolveGrokBindsPath, DEFAULT_GROK_BINDS_FILENAME } from "./grok-bind.ts";
+import {
+  decideGrokBind,
+  parseGrokBindsText,
+  resolveGrokBindsPath,
+  DEFAULT_GROK_BINDS_FILENAME,
+  boundProfileForConversation,
+  gateSwitchProfile,
+  profileNameFromPath,
+  shouldHealBoundIdentity,
+} from "./grok-bind.ts";
 import { decideTermsConsent, TERMS_URL } from "./terms.ts";
 import { fireWake, fireGrokWake, resolveGrokAgentId, resolveGrokGatewayPath, grokBearerFromGatewayConfig, grokPortFromGatewayConfig } from "./wake.ts";
 import pkg from "../package.json";
@@ -1987,6 +1996,75 @@ HANDLERS.set("transcribe", async (args) => {
   }
 });
 
+
+/** Reload grok-binds.json (or AGENTCHAT_GROK_BINDS) for runtime lock/heal checks. */
+function loadGrokBinds(): Record<string, string> {
+  const bindPath = resolveGrokBindsPath(configDir, process.env.AGENTCHAT_GROK_BINDS);
+  if (!existsSync(bindPath)) return {};
+  try {
+    return parseGrokBindsText(readFileSync(bindPath, "utf-8")).binds;
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Apply a profile file as the live identity and reconnect WS.
+ * Shared by `switch_profile` and grok-bind heal.
+ */
+function applyIdentityFromProfile(newProfile: any, targetFile: string): void {
+  heartbeat.stop();
+  if (backfillTimer) { clearTimeout(backfillTimer); backfillTimer = null; }
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+  if (ws) {
+    ws.onclose = null;
+    try { ws.close(); } catch {}
+    ws = null;
+  }
+  sessionId = null;
+  AGENT_ID = newProfile.agent_id;
+  TOKEN = newProfile.token || "dev-token";
+  CAPABILITIES = newProfile.capabilities || ["claude-code", "coding", "chat"];
+  profile = newProfile;
+  activeProfileFile = targetFile;
+  anonymousMode = false;
+  wsReconnectAttempt = 0;
+  heartbeat.start();
+  connectWS();
+}
+
+/**
+ * If CURSOR_CONVERSATION_ID is bound and live identity drifted (e.g. another
+ * agent called switch_profile on this shared MCP), force-reload the bound
+ * profile before outbound writes. Logs to stderr when healing.
+ */
+function ensureGrokBoundIdentity(): void {
+  const boundName = boundProfileForConversation(process.env.CURSOR_CONVERSATION_ID, loadGrokBinds());
+  if (!boundName) return;
+  const boundPath = nameToPath(boundName);
+  if (!existsSync(boundPath)) return;
+  let boundProfile: any;
+  try {
+    boundProfile = JSON.parse(readFileSync(boundPath, "utf-8"));
+  } catch {
+    return;
+  }
+  const liveName = profileNameFromPath(activeProfileFile);
+  if (!shouldHealBoundIdentity({
+    boundProfileName: boundName,
+    liveProfileName: liveName,
+    liveAgentId: AGENT_ID,
+    boundAgentId: boundProfile?.agent_id,
+  })) {
+    return;
+  }
+  process.stderr.write(
+    `[agentchat] grok-bind heal: live profile=${liveName ?? "?"} agent=${AGENT_ID || "?"} → bound "${boundName}" (${boundProfile.agent_id || "?"})\n`,
+  );
+  applyIdentityFromProfile(boundProfile, boundPath);
+}
+
+
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   let { name, arguments: args } = request.params;
   let viaExtendedCompat = false;
@@ -2002,6 +2080,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const argErr = validateToolArgs(TOOL_INPUT_SCHEMAS.get(name), args);
       if (argErr) return { content: [{ type: "text", text: `${name}: ${argErr}` }], isError: true };
     }
+
+    // Shared Cursor MCP: heal back to grok-bind identity if another agent
+    // stole the live profile via switch_profile. No-op when unbound.
+    ensureGrokBoundIdentity();
 
   if (name === "list_skills") {
     const { chat_id } = (args || {}) as { chat_id?: string };
@@ -3103,6 +3185,20 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       return { content: [{ type: "text", text: `Current: ${current}\nAvailable profiles:\n${list}` }] };
     }
 
+    // Shared Cursor MCP: grok-binds lock outbound identity — via conversation id
+    // when set, or via current profile when Cursor stdio started with --profile
+    // and no CURSOR_CONVERSATION_ID. Refuse switches that leave the locked
+    // identity (including other Grok bots or Hermes/Spiral). No-op allowed.
+    const switchGate = gateSwitchProfile({
+      conversationId: process.env.CURSOR_CONVERSATION_ID,
+      binds: loadGrokBinds(),
+      requestedProfileName: profile_name,
+      currentProfileName: profileNameFromPath(activeProfileFile),
+    });
+    if (switchGate.kind === "locked") {
+      return { content: [{ type: "text", text: switchGate.message }], isError: true };
+    }
+
     // Find and load the profile
     const targetFile = nameToPath(profile_name);
     if (!existsSync(targetFile)) {
@@ -3110,34 +3206,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
 
     const newProfile = JSON.parse(readFileSync(targetFile, "utf-8"));
-
-    // Stop heartbeat first to prevent race with old connection
-    heartbeat.stop();
-    // Cancel any pending backfill / reconnect from the old identity.
-    if (backfillTimer) { clearTimeout(backfillTimer); backfillTimer = null; }
-    if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
-
-    // Close old connection, disable its reconnect handler
-    if (ws) {
-      ws.onclose = null;
-      try { ws.close(); } catch {}
-      ws = null;
-    }
-    sessionId = null;
-
-    // Update identity. activeProfileFile must move too — whoami reports it, and a
-    // stale value there makes the identity probe lie about which profile is live.
-    AGENT_ID = newProfile.agent_id;
-    TOKEN = newProfile.token || "dev-token";
-    CAPABILITIES = newProfile.capabilities || ["claude-code", "coding", "chat"];
-    profile = newProfile;
-    activeProfileFile = targetFile;
-    anonymousMode = false;
-
-    // Restart heartbeat and connect with new identity
-    wsReconnectAttempt = 0;
-    heartbeat.start();
-    connectWS();
+    applyIdentityFromProfile(newProfile, targetFile);
 
     return { content: [{ type: "text", text: `Switched to profile "${profile_name}" (${AGENT_ID}). Reconnecting...` }] };
   }

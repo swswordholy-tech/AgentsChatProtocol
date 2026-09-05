@@ -219,6 +219,62 @@ function decideGrokBind(input) {
   }
   return { kind: "miss", conversationId: id };
 }
+function boundProfileForConversation(conversationId, binds) {
+  const id = conversationId?.trim();
+  if (!id)
+    return null;
+  const name = binds[id];
+  return typeof name === "string" && name.length > 0 ? name : null;
+}
+function profileNameFromPath(profilePath) {
+  if (!profilePath)
+    return null;
+  const base = profilePath.replace(/\\/g, "/").split("/").pop() || "";
+  const name = base.replace(/\.json$/i, "");
+  return name || null;
+}
+function gateSwitchProfile(input) {
+  const req = typeof input.requestedProfileName === "string" ? input.requestedProfileName.trim() : "";
+  if (!req)
+    return { kind: "allow" };
+  const bindValues = Object.values(input.binds).filter((v) => typeof v === "string" && v.length > 0);
+  if (bindValues.length === 0)
+    return { kind: "allow" };
+  const lockedMessage = (lockedName) => `Outbound identity is locked to grok-bind profile "${lockedName}" on this shared MCP; ` + `use a separate MCP process / wake daemon, do not switch_profile.`;
+  const bound = boundProfileForConversation(input.conversationId, input.binds);
+  if (bound) {
+    if (req === bound)
+      return { kind: "allow" };
+    return {
+      kind: "locked",
+      boundProfileName: bound,
+      requestedProfileName: req,
+      message: lockedMessage(bound)
+    };
+  }
+  const current = typeof input.currentProfileName === "string" ? input.currentProfileName.trim() : "";
+  if (current && bindValues.includes(current)) {
+    if (req === current)
+      return { kind: "allow" };
+    return {
+      kind: "locked",
+      boundProfileName: current,
+      requestedProfileName: req,
+      message: lockedMessage(current)
+    };
+  }
+  return { kind: "allow" };
+}
+function shouldHealBoundIdentity(input) {
+  if (!input.boundProfileName)
+    return false;
+  if (input.liveProfileName !== input.boundProfileName)
+    return true;
+  if (typeof input.boundAgentId === "string" && input.boundAgentId.length > 0 && input.liveAgentId !== input.boundAgentId) {
+    return true;
+  }
+  return false;
+}
 
 // src/terms.ts
 var TERMS_URL = "https://agents-chat.com/terms";
@@ -406,7 +462,7 @@ async function fireGrokWake(msg, cfg) {
 var package_default = {
   name: "agentschat-mcp",
   mcpName: "io.github.swswordholy-tech/agentschat-mcp",
-  version: "0.33.4",
+  version: "0.33.5",
   description: "Connect Claude Code to AgentsChat — AI Agent social network. Core tools stay lean while extended tool groups load on demand for lower token overhead and cleaner role-specific context.",
   type: "module",
   bin: {
@@ -2428,6 +2484,70 @@ HANDLERS.set("transcribe", async (args) => {
     return { content: [{ type: "text", text: `Error transcribing: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
   }
 });
+function loadGrokBinds() {
+  const bindPath = resolveGrokBindsPath(configDir, process.env.AGENTCHAT_GROK_BINDS);
+  if (!existsSync2(bindPath))
+    return {};
+  try {
+    return parseGrokBindsText(readFileSync2(bindPath, "utf-8")).binds;
+  } catch {
+    return {};
+  }
+}
+function applyIdentityFromProfile(newProfile, targetFile) {
+  heartbeat.stop();
+  if (backfillTimer) {
+    clearTimeout(backfillTimer);
+    backfillTimer = null;
+  }
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+  if (ws) {
+    ws.onclose = null;
+    try {
+      ws.close();
+    } catch {}
+    ws = null;
+  }
+  sessionId = null;
+  AGENT_ID = newProfile.agent_id;
+  TOKEN = newProfile.token || "dev-token";
+  CAPABILITIES = newProfile.capabilities || ["claude-code", "coding", "chat"];
+  profile = newProfile;
+  activeProfileFile = targetFile;
+  anonymousMode = false;
+  wsReconnectAttempt = 0;
+  heartbeat.start();
+  connectWS();
+}
+function ensureGrokBoundIdentity() {
+  const boundName = boundProfileForConversation(process.env.CURSOR_CONVERSATION_ID, loadGrokBinds());
+  if (!boundName)
+    return;
+  const boundPath = nameToPath(boundName);
+  if (!existsSync2(boundPath))
+    return;
+  let boundProfile;
+  try {
+    boundProfile = JSON.parse(readFileSync2(boundPath, "utf-8"));
+  } catch {
+    return;
+  }
+  const liveName = profileNameFromPath(activeProfileFile);
+  if (!shouldHealBoundIdentity({
+    boundProfileName: boundName,
+    liveProfileName: liveName,
+    liveAgentId: AGENT_ID,
+    boundAgentId: boundProfile?.agent_id
+  })) {
+    return;
+  }
+  process.stderr.write(`[agentchat] grok-bind heal: live profile=${liveName ?? "?"} agent=${AGENT_ID || "?"} \u2192 bound "${boundName}" (${boundProfile.agent_id || "?"})
+`);
+  applyIdentityFromProfile(boundProfile, boundPath);
+}
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   let { name, arguments: args } = request.params;
   let viaExtendedCompat = false;
@@ -2437,6 +2557,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (argErr)
         return { content: [{ type: "text", text: `${name}: ${argErr}` }], isError: true };
     }
+    ensureGrokBoundIdentity();
     if (name === "list_skills") {
       const { chat_id } = args || {};
       const out = {
@@ -3533,37 +3654,21 @@ ${list}` }] };
 Available profiles:
 ${list}` }] };
       }
+      const switchGate = gateSwitchProfile({
+        conversationId: process.env.CURSOR_CONVERSATION_ID,
+        binds: loadGrokBinds(),
+        requestedProfileName: profile_name,
+        currentProfileName: profileNameFromPath(activeProfileFile)
+      });
+      if (switchGate.kind === "locked") {
+        return { content: [{ type: "text", text: switchGate.message }], isError: true };
+      }
       const targetFile = nameToPath(profile_name);
       if (!existsSync2(targetFile)) {
         return { content: [{ type: "text", text: `Profile "${profile_name}" not found. Available: ${available.join(", ")}` }], isError: true };
       }
       const newProfile = JSON.parse(readFileSync2(targetFile, "utf-8"));
-      heartbeat.stop();
-      if (backfillTimer) {
-        clearTimeout(backfillTimer);
-        backfillTimer = null;
-      }
-      if (reconnectTimer) {
-        clearTimeout(reconnectTimer);
-        reconnectTimer = null;
-      }
-      if (ws) {
-        ws.onclose = null;
-        try {
-          ws.close();
-        } catch {}
-        ws = null;
-      }
-      sessionId = null;
-      AGENT_ID = newProfile.agent_id;
-      TOKEN = newProfile.token || "dev-token";
-      CAPABILITIES = newProfile.capabilities || ["claude-code", "coding", "chat"];
-      profile = newProfile;
-      activeProfileFile = targetFile;
-      anonymousMode = false;
-      wsReconnectAttempt = 0;
-      heartbeat.start();
-      connectWS();
+      applyIdentityFromProfile(newProfile, targetFile);
       return { content: [{ type: "text", text: `Switched to profile "${profile_name}" (${AGENT_ID}). Reconnecting...` }] };
     }
     if (name === "list_channel_docs") {
