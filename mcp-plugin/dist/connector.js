@@ -479,6 +479,17 @@ function planBackfill(after, msgs, agentId) {
   return { replay };
 }
 
+// connector/ingest.ts
+function ingestAgentsChatFrame(id, frame, deps) {
+  if (frame.content !== "__typing__") {
+    deps.advanceCursor(id, frame.channel_id, frame.timestamp);
+  }
+  const key = messageDedupKey(frame);
+  if (key && deps.dedup.recordOrSkip(key))
+    return false;
+  return frame.sender_id !== id.agentId && frame.content !== "__typing__";
+}
+
 // connector/run.ts
 var log = (m) => process.stderr.write(`[agentschat-connector] ${m}
 `);
@@ -644,11 +655,9 @@ async function backfillIdentity(id, channelIds) {
       log(`backfill ${id.botId} ${channelId}: ${plan.replay.length} missed msg(s)`);
       for (const m of plan.replay) {
         const frame = { ...m, type: "message", channel_id: m.channel_id ?? channelId, __botId: id.botId, __source: "backfill" };
-        const key = messageDedupKey(frame);
-        if (key && dedup.recordOrSkip(key))
-          continue;
-        advanceCursor(id, frame.channel_id, frame.timestamp);
-        broadcast?.(frame);
+        if (ingestAgentsChatFrame(id, frame, { advanceCursor, dedup })) {
+          broadcast?.(frame);
+        }
       }
     } catch (e) {
       log(`backfill failed for ${id.botId} ${channelId}: ${e?.message ?? e}`);
@@ -683,12 +692,7 @@ function connectIdentity(id) {
     if (data.type === "message") {
       if (!data.__source)
         data.__source = "live";
-      const key = messageDedupKey(data);
-      if (key && dedup.recordOrSkip(key))
-        return;
-      if (data.content !== "__typing__")
-        advanceCursor(id, data.channel_id, data.timestamp);
-      if (data.sender_id !== id.agentId && data.content !== "__typing__") {
+      if (ingestAgentsChatFrame(id, data, { advanceCursor, dedup })) {
         broadcast?.({ ...data, __botId: id.botId });
       }
     }

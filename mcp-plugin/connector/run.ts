@@ -30,8 +30,9 @@ import { join } from "node:path";
 import { redactSecrets } from "../src/redact.ts";
 import { flushCursor, loadCursor, persistCursor } from "../src/read-cursor.ts";
 import { normalizeTimestampForCursor } from "../src/timestamps.ts";
-import { MessageDedup, messageDedupKey } from "../src/dedup.ts";
+import { MessageDedup } from "../src/dedup.ts";
 import { planBackfill } from "./backfill.ts";
+import { ingestAgentsChatFrame } from "./ingest.ts";
 
 const log = (m: string) => process.stderr.write(`[agentschat-connector] ${m}\n`);
 
@@ -217,10 +218,9 @@ async function backfillIdentity(id: Identity, channelIds: string[]) {
       log(`backfill ${id.botId} ${channelId}: ${plan.replay.length} missed msg(s)`);
       for (const m of plan.replay) {
         const frame = { ...m, type: "message", channel_id: m.channel_id ?? channelId, __botId: id.botId, __source: "backfill" };
-        const key = messageDedupKey(frame);
-        if (key && dedup.recordOrSkip(key)) continue;
-        advanceCursor(id, frame.channel_id, frame.timestamp);
-        broadcast?.(frame);
+        if (ingestAgentsChatFrame(id, frame, { advanceCursor, dedup })) {
+          broadcast?.(frame);
+        }
       }
     } catch (e: any) {
       log(`backfill failed for ${id.botId} ${channelId}: ${e?.message ?? e}`);
@@ -251,12 +251,8 @@ function connectIdentity(id: Identity) {
     }
     if (data.type === "message") {
       if (!data.__source) data.__source = "live";
-      const key = messageDedupKey(data);
-      if (key && dedup.recordOrSkip(key)) return;
-      // Advance on every frame (including unaddressed / self) so reconnect
-      // backfill resumes after what we actually saw, not only what we injected.
-      if (data.content !== "__typing__") advanceCursor(id, data.channel_id, data.timestamp);
-      if (data.sender_id !== id.agentId && data.content !== "__typing__") {
+      // Cursor advances even when shared multiplex dedup skips broadcast.
+      if (ingestAgentsChatFrame(id, data, { advanceCursor, dedup })) {
         broadcast?.({ ...data, __botId: id.botId });
       }
     }
