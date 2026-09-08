@@ -490,6 +490,80 @@ function ingestAgentsChatFrame(id, frame, deps) {
   return frame.sender_id !== id.agentId && frame.content !== "__typing__";
 }
 
+// src/heartbeat.ts
+var WS_CONNECTING = 0;
+var WS_OPEN = 1;
+var WS_CLOSING = 2;
+var WS_CLOSED = 3;
+
+class HeartbeatMonitor {
+  deps;
+  pingInterval;
+  pongTimeout;
+  connectTimeout;
+  lastPong;
+  timer = null;
+  connectingSince = null;
+  reconnecting = false;
+  constructor(deps, pingInterval = 30000, pongTimeout = 90000, connectTimeout = 30000) {
+    this.deps = deps;
+    this.pingInterval = pingInterval;
+    this.pongTimeout = pongTimeout;
+    this.connectTimeout = connectTimeout;
+    this.lastPong = Date.now();
+  }
+  receivedPong() {
+    this.lastPong = Date.now();
+    this.connectingSince = null;
+    this.reconnecting = false;
+  }
+  start() {
+    this.stop();
+    this.lastPong = Date.now();
+    this.connectingSince = null;
+    this.reconnecting = false;
+    this.timer = setInterval(() => this.tick(), this.pingInterval);
+  }
+  stop() {
+    if (this.timer) {
+      clearInterval(this.timer);
+      this.timer = null;
+    }
+  }
+  resetReconnecting() {
+    this.reconnecting = false;
+  }
+  tick() {
+    const state = this.deps.getReadyState();
+    if (state === WS_OPEN) {
+      this.connectingSince = null;
+      if (Date.now() - this.lastPong > this.pongTimeout) {
+        this.safeReconnect("pong timeout");
+        return;
+      }
+      this.deps.sendPing();
+      return;
+    }
+    if (state === WS_CONNECTING) {
+      if (!this.connectingSince) {
+        this.connectingSince = Date.now();
+      } else if (Date.now() - this.connectingSince > this.connectTimeout) {
+        this.connectingSince = null;
+        this.safeReconnect("connect timeout");
+      }
+      return;
+    }
+    this.connectingSince = null;
+    this.safeReconnect(state === WS_CLOSING ? "stuck closing" : "closed");
+  }
+  safeReconnect(reason) {
+    if (this.reconnecting)
+      return;
+    this.reconnecting = true;
+    this.deps.reconnect();
+  }
+}
+
 // connector/run.ts
 var log = (m) => process.stderr.write(`[agentschat-connector] ${m}
 `);
@@ -550,7 +624,18 @@ var broadcast = null;
 var socketsByBot = new Map;
 var backoffByBot = new Map;
 var backfillTimerByBot = new Map;
+var heartbeatsByBot = new Map;
 var dedup = new MessageDedup;
+var HB_PING_MS = Math.max(5000, Number(process.env.AGENTSCHAT_CONNECTOR_PING_MS || 15000));
+var HB_PONG_MS = Math.max(HB_PING_MS + 5000, Number(process.env.AGENTSCHAT_CONNECTOR_PONG_TIMEOUT_MS || 45000));
+var HB_CONNECT_MS = Math.max(5000, Number(process.env.AGENTSCHAT_CONNECTOR_CONNECT_TIMEOUT_MS || 30000));
+function stopHeartbeat(botId) {
+  const hb = heartbeatsByBot.get(botId);
+  if (!hb)
+    return;
+  hb.stop();
+  heartbeatsByBot.delete(botId);
+}
 var CURSOR_DIR = process.env.AGENTCHAT_CURSOR_DIR || process.cwd();
 var cursorFlushMs = Math.max(500, Number(process.env.AGENTSCHAT_MCP_CURSOR_FLUSH_MS || 5000));
 var cursors = new Map;
@@ -665,8 +750,47 @@ async function backfillIdentity(id, channelIds) {
   }
 }
 function connectIdentity(id) {
+  stopHeartbeat(id.botId);
+  const prev = socketsByBot.get(id.botId);
+  if (prev) {
+    try {
+      prev.removeAllListeners("close");
+      prev.close();
+    } catch {}
+    socketsByBot.delete(id.botId);
+  }
+  let heartbeatForced = false;
   const ws = new WS(WS_URL);
   socketsByBot.set(id.botId, ws);
+  const hb = new HeartbeatMonitor({
+    sendPing: () => {
+      try {
+        if (ws.readyState === WS.OPEN) {
+          ws.send(JSON.stringify({ type: "ping", timestamp: new Date().toISOString() }));
+        }
+      } catch {}
+    },
+    reconnect: () => {
+      if (process.__shutdown || heartbeatForced)
+        return;
+      heartbeatForced = true;
+      log(`agentschat WS heartbeat timeout for ${id.botId}; forcing reconnect`);
+      backoffByBot.set(id.botId, 1000);
+      try {
+        ws.removeAllListeners("close");
+        ws.close();
+      } catch {}
+      socketsByBot.delete(id.botId);
+      stopHeartbeat(id.botId);
+      setTimeout(() => {
+        if (!process.__shutdown)
+          connectIdentity(id);
+      }, 500);
+    },
+    getReadyState: () => ws.readyState ?? WS_CLOSED
+  }, HB_PING_MS, HB_PONG_MS, HB_CONNECT_MS);
+  heartbeatsByBot.set(id.botId, hb);
+  hb.start();
   ws.on("open", () => {
     backoffByBot.set(id.botId, 1000);
     try {
@@ -680,16 +804,23 @@ function connectIdentity(id) {
     } catch {
       return;
     }
+    if (data.type === "pong") {
+      hb.receivedPong();
+      return;
+    }
     if (data.type === "auth_ok") {
+      hb.receivedPong();
       log(`connected to agentschat as ${id.agentId}`);
       joinMemberships(ws, id);
       return;
     }
     if (data.type === "channel_created" && data.channel_id) {
+      hb.receivedPong();
       joinChannel(ws, id, data.channel_id, data.name);
       return;
     }
     if (data.type === "message") {
+      hb.receivedPong();
       if (!data.__source)
         data.__source = "live";
       if (ingestAgentsChatFrame(id, data, { advanceCursor, dedup })) {
@@ -698,7 +829,10 @@ function connectIdentity(id) {
     }
   });
   ws.on("close", () => {
+    stopHeartbeat(id.botId);
     if (process.__shutdown)
+      return;
+    if (heartbeatForced)
       return;
     const delay = backoffByBot.get(id.botId) ?? 1000;
     log(`agentschat WS closed for ${id.botId}; reconnecting in ${delay}ms`);
@@ -772,6 +906,8 @@ for (const id of identities)
 for (const sig of ["SIGINT", "SIGTERM"]) {
   process.on(sig, () => {
     process.__shutdown = true;
+    for (const botId of [...heartbeatsByBot.keys()])
+      stopHeartbeat(botId);
     for (const ws of socketsByBot.values()) {
       try {
         ws.close();

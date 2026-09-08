@@ -33,6 +33,7 @@ import { normalizeTimestampForCursor } from "../src/timestamps.ts";
 import { MessageDedup } from "../src/dedup.ts";
 import { planBackfill } from "./backfill.ts";
 import { ingestAgentsChatFrame } from "./ingest.ts";
+import { HeartbeatMonitor, WS_CLOSED } from "../src/heartbeat.ts";
 
 const log = (m: string) => process.stderr.write(`[agentschat-connector] ${m}\n`);
 
@@ -104,7 +105,20 @@ let broadcast: ((msg: any) => void) | null = null;
 const socketsByBot = new Map<string, WS>();
 const backoffByBot = new Map<string, number>();
 const backfillTimerByBot = new Map<string, ReturnType<typeof setTimeout>>();
+const heartbeatsByBot = new Map<string, HeartbeatMonitor>();
 const dedup = new MessageDedup();
+
+// Same defaults as stdio MCP (src/server.ts): 15s ping / 45s pong / 30s connect.
+const HB_PING_MS = Math.max(5_000, Number(process.env.AGENTSCHAT_CONNECTOR_PING_MS || 15_000));
+const HB_PONG_MS = Math.max(HB_PING_MS + 5_000, Number(process.env.AGENTSCHAT_CONNECTOR_PONG_TIMEOUT_MS || 45_000));
+const HB_CONNECT_MS = Math.max(5_000, Number(process.env.AGENTSCHAT_CONNECTOR_CONNECT_TIMEOUT_MS || 30_000));
+
+function stopHeartbeat(botId: string) {
+  const hb = heartbeatsByBot.get(botId);
+  if (!hb) return;
+  hb.stop();
+  heartbeatsByBot.delete(botId);
+}
 
 // Per-identity last-seen cursor (channel → timestamp). Same files/shape as
 // stdio MCP (`last-seen-msg-ts-<agent>.json`): reconnect REST-replays the
@@ -229,8 +243,55 @@ async function backfillIdentity(id: Identity, channelIds: string[]) {
 }
 
 function connectIdentity(id: Identity) {
+  // Replace any prior socket/heartbeat for this identity (heartbeat-forced
+  // reconnect calls us again after closing the old socket).
+  stopHeartbeat(id.botId);
+  const prev = socketsByBot.get(id.botId);
+  if (prev) {
+    try {
+      prev.removeAllListeners("close");
+      prev.close();
+    } catch {}
+    socketsByBot.delete(id.botId);
+  }
+
+  let heartbeatForced = false;
   const ws = new WS(WS_URL);
   socketsByBot.set(id.botId, ws);
+
+  const hb = new HeartbeatMonitor(
+    {
+      sendPing: () => {
+        try {
+          if (ws.readyState === WS.OPEN) {
+            ws.send(JSON.stringify({ type: "ping", timestamp: new Date().toISOString() }));
+          }
+        } catch {}
+      },
+      reconnect: () => {
+        if ((process as any).__shutdown || heartbeatForced) return;
+        heartbeatForced = true;
+        log(`agentschat WS heartbeat timeout for ${id.botId}; forcing reconnect`);
+        backoffByBot.set(id.botId, 1000);
+        try {
+          ws.removeAllListeners("close");
+          ws.close();
+        } catch {}
+        socketsByBot.delete(id.botId);
+        stopHeartbeat(id.botId);
+        setTimeout(() => {
+          if (!(process as any).__shutdown) connectIdentity(id);
+        }, 500);
+      },
+      getReadyState: () => ws.readyState ?? WS_CLOSED,
+    },
+    HB_PING_MS,
+    HB_PONG_MS,
+    HB_CONNECT_MS,
+  );
+  heartbeatsByBot.set(id.botId, hb);
+  hb.start();
+
   ws.on("open", () => {
     backoffByBot.set(id.botId, 1000);
     try {
@@ -240,16 +301,23 @@ function connectIdentity(id: Identity) {
   ws.on("message", (raw: any) => {
     let data: any;
     try { data = JSON.parse(String(raw)); } catch { return; }
+    if (data.type === "pong") {
+      hb.receivedPong();
+      return;
+    }
     if (data.type === "auth_ok") {
+      hb.receivedPong(); // alive signal, same as stdio MCP
       log(`connected to agentschat as ${id.agentId}`);
       void joinMemberships(ws, id);
       return;
     }
     if (data.type === "channel_created" && data.channel_id) {
+      hb.receivedPong();
       joinChannel(ws, id, data.channel_id, data.name);
       return;
     }
     if (data.type === "message") {
+      hb.receivedPong(); // any live traffic counts as liveness
       if (!data.__source) data.__source = "live";
       // Cursor advances even when shared multiplex dedup skips broadcast.
       if (ingestAgentsChatFrame(id, data, { advanceCursor, dedup })) {
@@ -258,7 +326,9 @@ function connectIdentity(id: Identity) {
     }
   });
   ws.on("close", () => {
+    stopHeartbeat(id.botId);
     if ((process as any).__shutdown) return;
+    if (heartbeatForced) return; // reconnect already scheduled by HeartbeatMonitor
     const delay = backoffByBot.get(id.botId) ?? 1000;
     log(`agentschat WS closed for ${id.botId}; reconnecting in ${delay}ms`);
     setTimeout(() => connectIdentity(id), delay);
@@ -336,6 +406,7 @@ for (const id of identities) connectIdentity(id);
 for (const sig of ["SIGINT", "SIGTERM"] as const) {
   process.on(sig, () => {
     (process as any).__shutdown = true;
+    for (const botId of [...heartbeatsByBot.keys()]) stopHeartbeat(botId);
     for (const ws of socketsByBot.values()) {
       try { ws.close(); } catch {}
     }

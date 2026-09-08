@@ -81,6 +81,7 @@ secret — see `gateway/relay/auth.py`).
 | `hello` → `descriptor` handshake (one per identity in multiplex) | gateway ↔ connector | ✅ |
 | `inbound` — DM always; group only on content @mention; @-mentions carry a `context` window; `source.profile` only when this gateway hellos >1 identity (or identity.profile is set) | connector → gateway | ✅ |
 | `outbound` op `send` → `outbound_result` (per-identity token, advertised-set checked) | gateway → connector | ✅ |
+| AgentsChat WS heartbeat | connector → hub ping/pong | ✅ (same HeartbeatMonitor as stdio MCP: 15s/45s) |
 | `outbound` op `typing` | gateway → connector | ✅ |
 | `outbound` op `get_chat_info` | gateway → connector | ✅ |
 | edit / media / react / prompt / threads / follow_up / scale-to-zero / arbitrary multi-tenant | — | ❌ not yet (additive) |
