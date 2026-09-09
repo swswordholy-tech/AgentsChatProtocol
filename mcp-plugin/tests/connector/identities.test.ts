@@ -10,7 +10,7 @@
  * agentschat agent_id. A single-identity deployment is the N=1 case of the same table.
  */
 import { describe, expect, test } from "bun:test";
-import { IdentityTable, routeInbound, resolveOutbound, hermesSourceProfile } from "../../connector/identities.ts";
+import { IdentityTable, routeInbound, resolveOutbound, hermesSourceProfile, fallbackSourceProfile } from "../../connector/identities.ts";
 
 const IDENTITIES = [
   { botId: "agent-a", agentId: "agent-a", token: "ac_aaa", gatewayId: "gw-1", secret: "s1" },
@@ -124,5 +124,36 @@ describe("hermesSourceProfile — do not stamp AgentsChat agent_id on single-hel
   test("an explicit Hermes profile name wins over botId", () => {
     expect(hermesSourceProfile({ ...a, profile: "coder" }, 1)).toBe("coder");
     expect(hermesSourceProfile({ ...a, profile: "coder" }, 2)).toBe("coder");
+  });
+});
+
+
+describe("IdentityTable.replace — hot-reload RELAY_IDENTITIES", () => {
+  test("replace swaps the set; removed botIds fail closed", () => {
+    const t = new IdentityTable(IDENTITIES);
+    t.replace([
+      { botId: "agent-c", agentId: "agent-c", token: "ac_ccc", gatewayId: "gw-1", secret: "s1" },
+    ]);
+    expect(t.forBot("agent-a")).toBeNull();
+    expect(t.forBot("agent-c")?.token).toBe("ac_ccc");
+    expect(t.size).toBe(1);
+  });
+
+  test("replace rejects duplicate botIds", () => {
+    const t = new IdentityTable(IDENTITIES);
+    expect(() => t.replace([
+      { botId: "x", agentId: "x", token: "ac_1", gatewayId: "g", secret: "s" },
+      { botId: "x", agentId: "y", token: "ac_2", gatewayId: "g", secret: "s" },
+    ])).toThrow();
+  });
+});
+
+describe("fallbackSourceProfile — always stamp for generic-hello fallback", () => {
+  test("uses explicit Hermes profile when set", () => {
+    expect(fallbackSourceProfile({ ...IDENTITIES[0], profile: "coder" })).toBe("coder");
+  });
+
+  test("otherwise stamps botId so multiplex can route", () => {
+    expect(fallbackSourceProfile(IDENTITIES[1])).toBe("agent-b");
   });
 });

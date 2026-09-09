@@ -75,18 +75,21 @@ The connector then:
 
 - opens **one AgentsChat connection per identity** (each authenticating with its
   own token),
-- answers **one relay `hello` per identity** — Hermes's multiplex gateway
-  (Phase 1.5, one WS fronting N `(platform, botId)` identities) gets a
-  descriptor for each,
-- routes inbound by identity: a DM to identity B reaches only the socket(s)
-  fronting B, tagged `source.profile = B` so Hermes keys the right profile's
-  session; a group message routes to the @mentioned identity,
-- sends outbound with the **sending identity's own token**, and only when that
-  identity was advertised by the connecting gateway (the contract's
-  advertised-set check) — identity A can never speak as B.
+- answers a relay `hello` for each botId Hermes advertises — Hermes **may hello
+  only one** agentschat botId while the connector still holds N identities,
+- routes inbound by identity: prefer sockets that hello'd the target botId;
+  otherwise deliver via the first agentschat-fronted connection with
+  `source.profile = target.botId` so Hermes multiplex keys the right session,
+- sends outbound with the **sending identity's own token** whenever that
+  identity is in the table (precise hello preferred; un-hello'd identities
+  still work through a usable agentschat gateway connection) — identity A can
+  never speak as B.
 
-The invariant the tests pin: **identity A's traffic never crosses to identity B.**
-Single-tenant env (`AGENTCHAT_AGENT_ID`/…​) is the N=1 case and keeps working
+Hot-reload: `RELAY_IDENTITIES_FILE=…` + `SIGHUP` re-reads the JSON, opens WS for
+new botIds, disconnects removed ones — no need to grow the Hermes hello list.
+
+The invariant the tests pin: **identity A's credentials never send as identity B.**
+Single-tenant env (`AGENTCHAT_AGENT_ID`/…) is the N=1 case and keeps working
 unchanged.
 
 ### 2. Point Hermes at it

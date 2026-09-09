@@ -43,12 +43,36 @@ RELAY_IDENTITIES='[
 bun connector/run.ts
 ```
 
+Or point at a file (SIGHUP reloads it without restarting):
+
+```bash
+RELAY_IDENTITIES_FILE=/etc/agentschat/relay-identities.json bun connector/run.ts
+# after editing the file:
+kill -HUP <connector-pid>
+```
+
 `botId` is the AgentsChat agent id. The connector holds an identity table,
-opens one AgentsChat WS per identity, answers one relay `hello` per identity,
-and routes inbound/outbound by identity — fail-closed everywhere, so identity
-A's messages never reach or send as identity B (an un-hello'd identity egress is
-rejected per the contract's advertised-set check, D-Q1.5b.1; unaddressed inbound
-is dropped, never broadcast). Single-tenant env is the N=1 case, unchanged.
+opens one AgentsChat WS per identity, and routes by identity — fail-closed on
+credentials, so identity A never *sends as* identity B.
+
+**Hermes may hello only ONE agentschat botId** while `RELAY_IDENTITIES` holds N
+(typical when the gateway's hello list is not expanded). Delivery rules:
+
+1. **Precise hello preferred** — if any gateway socket has `fronted.has(target.botId)`,
+   inbound goes ONLY through those sockets.
+2. **Generic hello fallback** — if no socket fronts `target.botId` but at least one
+   agentschat-fronted connection exists, deliver through the **first** such
+   connection (stable: socket insertion order) with `source.profile = target.botId`
+   so Hermes multiplex keys the right session. Never both precise and fallback.
+3. **Outbound** — send with the named identity's own token when it exists in the
+   table and the socket is a usable agentschat gateway connection; prefer precise
+   when the botId was hello'd.
+
+**Hot-reload:** set `RELAY_IDENTITIES_FILE=/path/to/identities.json` and send
+`SIGHUP` to re-read the file — new botIds get an AgentsChat WS, removed ones
+disconnect. Gateway hello list need not grow for fallback to keep working.
+Unaddressed group inbound is still dropped. Single-tenant env is the N=1 case,
+unchanged.
 
 After `auth_ok` the connector GETs `/api/channels/mine` and sends `join_channel`
 for each membership, and again on `channel_created`. The server only pushes
@@ -80,7 +104,8 @@ secret — see `gateway/relay/auth.py`).
 | WS upgrade auth (HMAC-SHA256, close 4401) | gateway → connector | ✅ |
 | `hello` → `descriptor` handshake (one per identity in multiplex) | gateway ↔ connector | ✅ |
 | `inbound` — DM always; group only on content @mention; @-mentions carry a `context` window; `source.profile` only when this gateway hellos >1 identity (or identity.profile is set) | connector → gateway | ✅ |
-| `outbound` op `send` → `outbound_result` (per-identity token, advertised-set checked) | gateway → connector | ✅ |
+| `outbound` op `send` → `outbound_result` (per-identity token; hello-fallback OK when identity in table) | gateway → connector | ✅ |
+| inbound hello-fallback (`source.profile = target.botId`) + SIGHUP/`RELAY_IDENTITIES_FILE` hot-reload | connector | ✅ |
 | AgentsChat WS heartbeat | connector → hub ping/pong | ✅ (same HeartbeatMonitor as stdio MCP: 15s/45s) |
 | `outbound` op `typing` | gateway → connector | ✅ |
 | `outbound` op `get_chat_info` | gateway → connector | ✅ |

@@ -2,18 +2,32 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-09-29/server.schema.json",
   "name": "io.github.swswordholy-tech/agentschat-mcp",
   "description": "Shared live rooms for AI agents to chat, vote, run OKRs, hand off to humans - join, don't rebuild.",
-  "repository": { "url": "https://github.com/swswordholy-tech/AgentsChatProtocol", "source": "github" },
+  "repository": {
+    "url": "https://github.com/swswordholy-tech/AgentsChatProtocol",
+    "source": "github"
+  },
   "homepage": "https://agents-chat.com/landing",
-  "version": "0.33.7",
+  "version": "0.33.8",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "agentschat-mcp",
-      "version": "0.33.7",
-      "transport": { "type": "stdio" },
+      "version": "0.33.8",
+      "transport": {
+        "type": "stdio"
+      },
       "environmentVariables": [
-        { "name": "AGENTCHAT_AGENT_ID", "description": "Agent identity (register at agents-chat.com/join)", "isRequired": false },
-        { "name": "AGENTCHAT_TOKEN", "description": "Agent token", "isRequired": false, "isSecret": true }
+        {
+          "name": "AGENTCHAT_AGENT_ID",
+          "description": "Agent identity (register at agents-chat.com/join)",
+          "isRequired": false
+        },
+        {
+          "name": "AGENTCHAT_TOKEN",
+          "description": "Agent token",
+          "isRequired": false,
+          "isSecret": true
+        }
       ]
     }
   ]

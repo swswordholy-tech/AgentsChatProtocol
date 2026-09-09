@@ -105,18 +105,19 @@ describe("multiplex outbound — send uses the SENDING identity's token", () => 
     ws.close();
   });
 
-  test("outbound naming a REGISTERED identity this socket never hello'd is refused (advertised-set check)", async () => {
+  test("outbound naming a REGISTERED identity this socket never hello'd still sends with THAT identity's token (hello-fallback)", async () => {
     const ws = await dial();
     const hs = nextFrame(ws);
     ws.send(JSON.stringify({ type: "hello", platform: "agentschat", botId: "agent-a" }) + "\n");
-    await hs; // fronts ONLY agent-a
+    await hs; // fronts ONLY agent-a — Hermes may hello one botId while RELAY_IDENTITIES has N
     const p = nextFrame(ws);
-    // agent-b is a registered identity, but THIS socket never advertised it —
-    // sending as it would be a cross-identity egress. Contract D-Q1.5b.1.
+    // agent-b is registered; usable agentschat conn exists → send with B's own token
+    // (never A's). Prefer precise when present; here only fallback applies.
     ws.send(JSON.stringify({ type: "outbound", requestId: "r2", platform: "agentschat", botId: "agent-b", action: { op: "send", chat_id: "welcome", content: "as B?" } }) + "\n");
     const f = await p;
-    expect(f.result.success).toBe(false);
-    expect(sends["agent-b"].find((s) => s.content === "as B?")).toBeUndefined();
+    expect(f.result.success).toBe(true);
+    expect(sends["agent-b"]).toContainEqual({ chatId: "welcome", content: "as B?" });
+    expect(sends["agent-a"].find((s) => s.content === "as B?")).toBeUndefined();
     ws.close();
   });
 
@@ -148,7 +149,7 @@ describe("multiplex inbound — a message reaches only the addressed identity's 
     server.injectAgentsChatMessage({
       id: "m1", channel_id: "welcome", sender_id: "human-1", sender_name: "H",
       content: "@agent-b 看下", mentioned_ids: ["agent-b"],
-    });
+    } as any);
     const f = await p;
     expect(f.type).toBe("inbound");
     expect(f.event.text).toContain("@agent-b");
@@ -197,19 +198,125 @@ describe("multiplex inbound — a message reaches only the addressed identity's 
     ws.close();
   });
 
-  test("a message arriving on agent-b's socket is NEVER delivered to an agent-a gateway (cross-leak control)", async () => {
+  test("DM for agent-b via agent-a-only hello uses fallback with source.profile=agent-b (no credential cross)", async () => {
+    // Hermes hellos only A; RELAY_IDENTITIES still has B. Inbound for B must reach
+    // the agentschat-fronted socket with profile=B so multiplex keys B's session.
     const ws = await dial();
     const hs = nextFrame(ws);
     ws.send(JSON.stringify({ type: "hello", platform: "agentschat", botId: "agent-a" }) + "\n");
     await hs;
-    let got: any = null;
-    ws.on("message", (d) => { got = JSON.parse(d.toString()); });
+    const p = nextFrame(ws);
     server.injectAgentsChatMessage({
       id: "m3", channel_id: "dm-human-1-agent-b", sender_id: "human-1", sender_name: "H",
       content: "secret for b", __botId: "agent-b",
     } as any);
-    await new Promise((r) => setTimeout(r, 100));
+    const f = await p;
+    expect(f.type).toBe("inbound");
+    expect(f.event.text).toContain("secret for b");
+    expect(f.event.source.profile).toBe("agent-b");
+    ws.close();
+  });
+});
+
+describe("hello fallback — precise preferred, no double delivery", () => {
+  test("@mention of agent-b with only agent-a hello'd delivers once via fallback", async () => {
+    const ws = await dial();
+    const hs = nextFrame(ws);
+    ws.send(JSON.stringify({ type: "hello", platform: "agentschat", botId: "agent-a" }) + "\n");
+    await hs;
+    const frames: any[] = [];
+    ws.on("message", (d) => { frames.push(JSON.parse(d.toString())); });
+    await server.injectAgentsChatMessage({
+      id: "fb1", channel_id: "welcome", sender_id: "human-1", sender_name: "H",
+      content: "@agent-b 看下", mentioned_ids: ["agent-b"],
+    } as any);
+    await new Promise((r) => setTimeout(r, 80));
+    expect(frames.length).toBe(1);
+    expect(frames[0].type).toBe("inbound");
+    expect(frames[0].event.source.profile).toBe("agent-b");
+    ws.close();
+  });
+
+  test("precise hello preferred: when B is fronted, do NOT also deliver via A-only sibling", async () => {
+    const wsA = await dial();
+    const hsA = nextFrame(wsA);
+    wsA.send(JSON.stringify({ type: "hello", platform: "agentschat", botId: "agent-a" }) + "\n");
+    await hsA;
+    const wsB = await dial();
+    const hsB = nextFrame(wsB);
+    wsB.send(JSON.stringify({ type: "hello", platform: "agentschat", botId: "agent-b" }) + "\n");
+    await hsB;
+
+    let gotA: any = null;
+    let gotB: any = null;
+    wsA.on("message", (d) => { gotA = JSON.parse(d.toString()); });
+    const pB = nextFrame(wsB);
+
+    await server.injectAgentsChatMessage({
+      id: "fb2", channel_id: "welcome", sender_id: "human-1", sender_name: "H",
+      content: "@agent-b precise", mentioned_ids: ["agent-b"],
+    } as any);
+    const fB = await pB;
+    await new Promise((r) => setTimeout(r, 80));
+    expect(fB.type).toBe("inbound");
+    expect(fB.event.text).toContain("precise");
+    // Single-hello on B: profile unset (clarify-safe); A must not get a fallback copy.
+    expect(fB.event.source.profile).toBeUndefined();
+    expect(gotA).toBeNull();
+    wsA.close();
+    wsB.close();
+  });
+
+  test("unknown outbound botId is still refused (fail closed on credentials)", async () => {
+    const ws = await dial();
+    const hs = nextFrame(ws);
+    ws.send(JSON.stringify({ type: "hello", platform: "agentschat", botId: "agent-a" }) + "\n");
+    await hs;
+    const p = nextFrame(ws);
+    ws.send(JSON.stringify({ type: "outbound", requestId: "rX", platform: "agentschat", botId: "agent-unknown", action: { op: "send", chat_id: "welcome", content: "nope" } }) + "\n");
+    const f = await p;
+    expect(f.result.success).toBe(false);
+    ws.close();
+  });
+});
+
+
+describe("reloadIdentities — hot-swap table without restart", () => {
+  test("after reload, new botId is routable via fallback; removed botId fails closed", async () => {
+    const ws = await dial();
+    const hs = nextFrame(ws);
+    ws.send(JSON.stringify({ type: "hello", platform: "agentschat", botId: "agent-a" }) + "\n");
+    await hs;
+
+    server.reloadIdentities([
+      { botId: "agent-a", agentId: "agent-a", token: "ac_aaa", gatewayId: GWID, secret: SECRET },
+      { botId: "agent-c", agentId: "agent-c", token: "ac_ccc", gatewayId: GWID, secret: SECRET },
+    ]);
+
+    const p = nextFrame(ws);
+    await server.injectAgentsChatMessage({
+      id: "rl1", channel_id: "welcome", sender_id: "human-1", sender_name: "H",
+      content: "@agent-c hi", mentioned_ids: ["agent-c"],
+    } as any);
+    const f = await p;
+    expect(f.type).toBe("inbound");
+    expect(f.event.source.profile).toBe("agent-c");
+
+    // agent-b was removed — @mention must not inject
+    let got: any = null;
+    ws.on("message", (d) => { got = JSON.parse(d.toString()); });
+    await server.injectAgentsChatMessage({
+      id: "rl2", channel_id: "welcome", sender_id: "human-1", sender_name: "H",
+      content: "@agent-b gone", mentioned_ids: ["agent-b"],
+    } as any);
+    await new Promise((r) => setTimeout(r, 80));
     expect(got).toBeNull();
+
+    // restore for sibling tests that share the server
+    server.reloadIdentities([
+      { botId: "agent-a", agentId: "agent-a", token: "ac_aaa", gatewayId: GWID, secret: SECRET },
+      { botId: "agent-b", agentId: "agent-b", token: "ac_bbb", gatewayId: GWID, secret: SECRET },
+    ]);
     ws.close();
   });
 });
