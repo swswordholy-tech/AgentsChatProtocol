@@ -10,20 +10,29 @@
  * Multiplex (N identities, one per Hermes profile/agent):
  *   RELAY_IDENTITIES = JSON array, one entry per identity:
  *     [{"botId":"<agentschat agent_id>","token":"ac_...","gatewayId":"...","secret":"...","profile":"<hermes profile>"}, ...]
+ *   OR RELAY_IDENTITIES_FILE = path to that JSON array (preferred for hot-reload).
  *   Each botId is an agentschat agent_id. Optional `profile` is the Hermes profile
  *   name (for gateway.multiplex_profiles). Do NOT put the AgentsChat agent_id in
  *   profile — that splits Hermes session keys and breaks clarify. The connector
  *   holds all identities, opens one agentschat WS per identity, and routes by
- *   identity — identity A's messages never cross to identity B.
+ *   identity. Hermes may hello only ONE agentschat botId; un-hello'd identities
+ *   still receive inbound via a stable fallback (source.profile = target.botId)
+ *   and can send outbound with their own token.
+ *
+ * Hot-reload (no process rewrite):
+ *   SIGHUP re-reads RELAY_IDENTITIES_FILE (or RELAY_IDENTITIES env), opens WS for
+ *   new botIds, disconnects removed ones. Gateway hello list need not grow.
  *
  * Common:
  *   AGENTCHAT_API_URL      REST base (default https://agents-chat.com)
  *   AGENTCHAT_WS_URL       WebSocket (default wss://agents-chat.com/ws)
  *   RELAY_PORT             port to listen on (default 8765)
  *   RELAY_HOST             bind host (default 127.0.0.1)
+ *   RELAY_IDENTITIES_FILE  path to JSON identities array (SIGHUP reloads it)
  */
 
 import WS from "ws";
+import { readFileSync } from "node:fs";
 import { startConnector } from "./server.ts";
 import type { Identity } from "./identities.ts";
 import { join } from "node:path";
@@ -51,36 +60,42 @@ const WS_URL = process.env.AGENTCHAT_WS_URL || API.replace(/^http/, "ws") + "/ws
 const PORT = Number(process.env.RELAY_PORT || 8765);
 const HOST = process.env.RELAY_HOST || "127.0.0.1";
 
-// ── Resolve identities: multiplex (RELAY_IDENTITIES) or single-tenant (legacy env) ──
+// ── Resolve identities: multiplex (RELAY_IDENTITIES[_FILE]) or single-tenant (legacy env) ──
 
-function resolveIdentities(): Identity[] {
+function parseIdentitiesJson(raw: string, source: string): Identity[] {
+  let parsed: any;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (e) {
+    throw new Error(`${source} is not valid JSON: ${e}`);
+  }
+  if (!Array.isArray(parsed) || parsed.length === 0) {
+    throw new Error(`${source} must be a non-empty JSON array`);
+  }
+  for (const it of parsed) {
+    if (!it?.botId || !it?.token || !it?.gatewayId || !it?.secret) {
+      throw new Error(`each ${source} entry needs botId, token, gatewayId, secret — got: ${JSON.stringify(it).slice(0, 80)}`);
+    }
+  }
+  return parsed.map((it: any) => ({
+    botId: String(it.botId),
+    agentId: String(it.agentId ?? it.botId),
+    token: String(it.token),
+    gatewayId: String(it.gatewayId),
+    secret: String(it.secret),
+    ...(it.profile ? { profile: String(it.profile) } : {}),
+  }));
+}
+
+/** Load identities; throws on bad JSON/shape (SIGHUP keeps prior set). */
+function loadIdentities(): Identity[] {
+  const file = (process.env.RELAY_IDENTITIES_FILE || "").trim();
+  if (file) {
+    return parseIdentitiesJson(readFileSync(file, "utf8"), `RELAY_IDENTITIES_FILE (${file})`);
+  }
   const raw = (process.env.RELAY_IDENTITIES || "").trim();
   if (raw) {
-    let parsed: any;
-    try {
-      parsed = JSON.parse(raw);
-    } catch (e) {
-      log(`ERROR: RELAY_IDENTITIES is not valid JSON: ${e}`);
-      process.exit(1);
-    }
-    if (!Array.isArray(parsed) || parsed.length === 0) {
-      log(`ERROR: RELAY_IDENTITIES must be a non-empty JSON array`);
-      process.exit(1);
-    }
-    for (const it of parsed) {
-      if (!it?.botId || !it?.token || !it?.gatewayId || !it?.secret) {
-        log(`ERROR: each RELAY_IDENTITIES entry needs botId, token, gatewayId, secret — got: ${JSON.stringify(it).slice(0, 80)}`);
-        process.exit(1);
-      }
-    }
-    return parsed.map((it: any) => ({
-      botId: String(it.botId),
-      agentId: String(it.agentId ?? it.botId),
-      token: String(it.token),
-      gatewayId: String(it.gatewayId),
-      secret: String(it.secret),
-      ...(it.profile ? { profile: String(it.profile) } : {}),
-    }));
+    return parseIdentitiesJson(raw, "RELAY_IDENTITIES");
   }
   // Single-tenant legacy env.
   const agentId = need("AGENTCHAT_AGENT_ID");
@@ -90,10 +105,20 @@ function resolveIdentities(): Identity[] {
   return [{ botId: agentId, agentId, token, gatewayId, secret }];
 }
 
-const identities = resolveIdentities();
-const single = identities.length === 1;
+function resolveIdentitiesAtStartup(): Identity[] {
+  try {
+    return loadIdentities();
+  } catch (e: any) {
+    log(`ERROR: ${e?.message ?? e}`);
+    process.exit(1);
+  }
+}
+
+/** Mutable identity list — hooks and reload close over this binding. */
+let identities = resolveIdentitiesAtStartup();
 
 // The per-gateway secret table for the relay upgrade auth (gatewayId → secrets).
+// Mutated in place on hot-reload so startConnector's closed-over object stays valid.
 const secrets: Record<string, string[]> = {};
 for (const id of identities) {
   (secrets[id.gatewayId] ??= []).push(id.secret);
@@ -402,6 +427,65 @@ broadcast = (msg) => connector.injectAgentsChatMessage(msg);
 log(`listening on ${HOST}:${connector.port} (contract v1, ${identities.length} identit${identities.length === 1 ? "y" : "ies"})`);
 
 for (const id of identities) connectIdentity(id);
+
+/**
+ * Hot-reload RELAY_IDENTITIES without rewriting the connector process.
+ * Prefer RELAY_IDENTITIES_FILE so SIGHUP re-reads disk; env-only deployments
+ * re-parse RELAY_IDENTITIES (unchanged unless the supervisor rewrote the env).
+ * Opens AgentsChat WS for new botIds, disconnects removed ones. Gateway hello
+ * list need not grow — inbound fallback covers un-hello'd identities.
+ */
+function reloadIdentitiesFromConfig() {
+  const next = loadIdentities();
+  const prevByBot = new Map(identities.map((i) => [i.botId, i]));
+  const nextByBot = new Map(next.map((i) => [i.botId, i]));
+  const added = next.filter((i) => !prevByBot.has(i.botId));
+  const removed = identities.filter((i) => !nextByBot.has(i.botId));
+  const kept = next.filter((i) => prevByBot.has(i.botId));
+
+  // Table first — if replace throws, leave AgentsChat sockets / `identities` untouched.
+  connector.reloadIdentities(next);
+  identities = next;
+
+  for (const id of removed) {
+    log(`hot-reload: disconnecting removed identity ${id.botId}`);
+    stopHeartbeat(id.botId);
+    const t = backfillTimerByBot.get(id.botId);
+    if (t) { clearTimeout(t); backfillTimerByBot.delete(id.botId); }
+    const ws = socketsByBot.get(id.botId);
+    if (ws) {
+      try {
+        ws.removeAllListeners("close");
+        ws.close();
+      } catch {}
+      socketsByBot.delete(id.botId);
+    }
+    backoffByBot.delete(id.botId);
+    // Keep cursor files on disk (reconnect watermark survives a temporary remove).
+  }
+  for (const id of kept) {
+    // Token/gateway rotation: update in-memory row already done via `identities = next`.
+    // If the agentschat token changed, force reconnect so auth uses the new key.
+    const prev = prevByBot.get(id.botId)!;
+    if (prev.token !== id.token || prev.agentId !== id.agentId) {
+      log(`hot-reload: reconnecting ${id.botId} (credentials changed)`);
+      connectIdentity(id);
+    }
+  }
+  for (const id of added) {
+    log(`hot-reload: connecting new identity ${id.botId}`);
+    connectIdentity(id);
+  }
+  log(`hot-reload complete: ${identities.length} identit${identities.length === 1 ? "y" : "ies"} (${added.length} added, ${removed.length} removed)`);
+}
+
+process.on("SIGHUP", () => {
+  try {
+    reloadIdentitiesFromConfig();
+  } catch (e: any) {
+    log(`hot-reload FAILED (keeping previous identities): ${e?.message ?? e}`);
+  }
+});
 
 for (const sig of ["SIGINT", "SIGTERM"] as const) {
   process.on(sig, () => {

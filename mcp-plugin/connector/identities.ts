@@ -63,6 +63,22 @@ export class IdentityTable {
   all(): Identity[] {
     return [...this.byBot.values()];
   }
+
+  /**
+   * Hot-replace the identity set (RELAY_IDENTITIES reload). Fails closed on
+   * duplicate botIds the same way the constructor does.
+   */
+  replace(identities: Identity[]): void {
+    const next = new Map<string, Identity>();
+    for (const id of identities) {
+      if (next.has(id.botId)) {
+        throw new Error(`duplicate identity botId "${id.botId}" — ambiguous routing`);
+      }
+      next.set(id.botId, id);
+    }
+    this.byBot.clear();
+    for (const [k, v] of next) this.byBot.set(k, v);
+  }
 }
 
 export interface InboundContext {
@@ -142,4 +158,15 @@ export function hermesSourceProfile(id: Identity, frontedCount: number): string 
   if (named) return named;
   if (frontedCount > 1) return id.botId;
   return undefined;
+}
+
+/**
+ * Profile stamp when inbound is delivered via the generic-hello fallback
+ * (gateway never hello'd `target.botId`, but an agentschat-fronted socket
+ * exists). Always set so Hermes multiplex can key the right session even
+ * though the wire hello list stayed at one botId.
+ */
+export function fallbackSourceProfile(id: Identity): string {
+  const named = typeof id.profile === "string" ? id.profile.trim() : "";
+  return named || id.botId;
 }

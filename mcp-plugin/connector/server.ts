@@ -16,10 +16,15 @@
  * Auth is fail-closed: anything wrong with the upgrade token closes 4401 before the
  * socket is admitted.
  *
- * The single highest-correctness invariant (multiplex): identity A's messages are
- * NEVER routed to or sent as identity B. Inbound routes to the socket(s) fronting the
- * addressed identity; outbound uses the sending identity's own token; an identity the
- * connector has no credentials for is rejected at hello (fail closed).
+ * The single highest-correctness invariant (multiplex): identity A's credentials are
+ * NEVER used to send as identity B. Inbound prefers sockets that hello'd the
+ * addressed identity; if none do, a stable agentschat-fronted fallback delivers
+ * with `source.profile = target.botId` so Hermes multiplex still keys the right
+ * session — Hermes may hello only one botId while RELAY_IDENTITIES holds N.
+ * Outbound uses the sending identity's own token whenever that identity is in
+ * the table and the socket is a usable agentschat gateway connection (prefer
+ * precise hello when present). An identity the connector has no credentials for
+ * is rejected at hello (fail closed).
  */
 
 import { createServer, type Server as HttpServer, type IncomingMessage } from "node:http";
@@ -27,7 +32,7 @@ import { WebSocketServer, WebSocket } from "ws";
 import { verifyUpgradeToken, CLOSE_UNAUTHORIZED } from "./auth.ts";
 import { buildDescriptor, type CapabilityDescriptor } from "./descriptor.ts";
 import { toWireEvent, type AgentsChatMessage } from "./normalize.ts";
-import { IdentityTable, routeInbound, hermesSourceProfile, type Identity } from "./identities.ts";
+import { IdentityTable, routeInbound, hermesSourceProfile, fallbackSourceProfile, type Identity } from "./identities.ts";
 
 /** What the connector needs from agentschat to fulfil outbound ops, per identity. */
 export interface AgentsChatHooks {
@@ -77,6 +82,11 @@ export interface ConnectorHandle {
   /** Push an agentschat message to the gateway socket(s) fronting its addressed identity. */
   injectAgentsChatMessage(msg: AgentsChatMessage): void | Promise<void>;
   connections(): number;
+  /**
+   * Hot-replace the identity table (and upgrade-auth secrets derived from it).
+   * Used when RELAY_IDENTITIES is reloaded without restarting the process.
+   */
+  reloadIdentities(identities: Identity[]): void;
 }
 
 /** A connected gateway socket and the set of identities it has hello'd (fronts). */
@@ -99,9 +109,10 @@ export function startConnector(config: ConnectorConfig): ConnectorHandle {
   const table = new IdentityTable(
     legacy ? [{ botId: "default", agentId: "default", token: "", gatewayId: "", secret: "" }] : config.identities!,
   );
-  const single = table.isSingle();
   // Normalize hooks to the per-identity shape. Legacy single-tenant hooks take
   // (chatId, ...); wrap them to ignore the botId. Per-identity hooks take botId first.
+  // Note: call table.isSingle() at use sites (not a cached flag) so hot-reload of
+  // RELAY_IDENTITIES can grow/shrink the table without restarting the process.
   const hooks: AgentsChatHooks = legacy
     ? {
         sendMessage: (_b, chatId, content, replyTo) => (config.agentschat as LegacyHooks).sendMessage(chatId, content, replyTo),
@@ -179,7 +190,7 @@ export function startConnector(config: ConnectorConfig): ConnectorHandle {
       // Single-tenant (no identity table configured): front whatever identity the
       // gateway declares — there's exactly one. Multiplex: the botId MUST be a
       // registered identity (fail closed — never front an identity we can't send as).
-      const identity = single
+      const identity = table.isSingle()
         ? table.all()[0]
         : botId
           ? table.forBot(botId)
@@ -204,23 +215,26 @@ export function startConnector(config: ConnectorConfig): ConnectorHandle {
     const action = frame?.action ?? {};
     const op = action?.op;
     const chatId = action?.chat_id ?? "";
-    // Which identity sends? The frame's botId picks the egress identity for a
-    // multi-identity gateway (contract D-Q1.5b.1: the connector validates the
-    // per-frame egress target against the SET of identities THIS socket
-    // advertised via hello). Untagged outbound falls back to the FIRST hello'd
-    // identity (the session default). Fail closed when the named identity isn't
-    // registered or wasn't fronted by this socket — never send with another
-    // identity's credentials.
+    // Which identity sends?
+    //   - Prefer precise: requested botId is in this socket's hello set.
+    //   - Fallback: identity exists in the table AND this socket is a usable
+    //     agentschat gateway connection (fronted.size > 0). Hermes may hello
+    //     only one botId while RELAY_IDENTITIES holds N — still send with the
+    //     named identity's own token (never another identity's credentials).
+    // Untagged outbound falls back to the FIRST hello'd identity (session default).
     const firstFronted = [...conn.fronted][0];
     const requested = typeof frame?.botId === "string" && frame.botId ? frame.botId : firstFronted ?? null;
-    const identity = single
-      ? table.all()[0]
-      : requested && conn.fronted.has(requested)
-        ? table.forBot(requested)
-        : null;
+    let identity: Identity | null = null;
+    if (table.isSingle()) {
+      identity = table.all()[0] ?? null;
+    } else if (requested && conn.fronted.has(requested)) {
+      identity = table.forBot(requested); // precise
+    } else if (requested && conn.fronted.size > 0) {
+      identity = table.forBot(requested); // table hit + usable agentschat conn
+    }
     if (!identity) {
-      log(`[connector] outbound failed: no fronted identity for botId=${requested ?? "?"}`);
-      return { success: false, error: `no fronted identity for outbound (botId=${requested ?? "?"})` };
+      log(`[connector] outbound failed: no usable identity for botId=${requested ?? "?"}`);
+      return { success: false, error: `no usable identity for outbound (botId=${requested ?? "?"})` };
     }
     switch (op) {
       case "send": {
@@ -313,18 +327,54 @@ export function startConnector(config: ConnectorConfig): ConnectorHandle {
         }
         if (msg.timestamp) lastAddressed.set(key, msg.timestamp);
       }
-      for (const conn of sockets) {
-        if (!conn.fronted.has(target.botId)) continue;
+      // Precise hello preferred: if ANY socket fronts target.botId, deliver
+      // ONLY via those sockets. Otherwise generic-hello fallback: first
+      // agentschat-fronted connection (stable: socket insertion order) carries
+      // the event with source.profile = target.botId. Never both paths.
+      const precise = [...sockets].filter((c) => c.fronted.has(target.botId));
+      let deliverTo: GatewayConn[];
+      let viaFallback = false;
+      if (precise.length > 0) {
+        deliverTo = precise;
+      } else {
+        const fallback = [...sockets].find((c) => c.fronted.size > 0);
+        deliverTo = fallback ? [fallback] : [];
+        viaFallback = deliverTo.length > 0;
+        if (viaFallback) {
+          log(`[connector] inbound fallback for botId=${target.botId} via gateway ${deliverTo[0].gatewayId} (no precise hello; first agentschat-fronted conn)`);
+        }
+      }
+      if (deliverTo.length === 0) {
+        log(`[connector] inbound dropped for botId=${target.botId}: no agentschat-fronted gateway socket`);
+        return;
+      }
+      for (const conn of deliverTo) {
         // Per-connection clone: a single-hello gateway must NOT inherit a
         // profile stamp meant for a multiplexed sibling socket.
         const event = { ...baseEvent, source: { ...baseEvent.source } };
-        const profile = hermesSourceProfile(target, conn.fronted.size);
-        if (profile) (event.source as any).profile = profile;
+        if (viaFallback) {
+          (event.source as any).profile = fallbackSourceProfile(target);
+        } else {
+          const profile = hermesSourceProfile(target, conn.fronted.size);
+          if (profile) (event.source as any).profile = profile;
+        }
         send(conn.ws, { type: "inbound", event });
       }
     },
     connections() {
       return sockets.size;
+    },
+    reloadIdentities(next: Identity[]) {
+      if (!next || next.length === 0) {
+        throw new Error("reloadIdentities requires a non-empty identity list");
+      }
+      table.replace(next);
+      // Rebuild upgrade-auth secrets in place so the upgrade handler sees them.
+      for (const k of Object.keys(config.secrets)) delete config.secrets[k];
+      for (const id of next) {
+        (config.secrets[id.gatewayId] ??= []).push(id.secret);
+      }
+      log(`[connector] identities reloaded: ${table.size}`);
     },
   };
 }
