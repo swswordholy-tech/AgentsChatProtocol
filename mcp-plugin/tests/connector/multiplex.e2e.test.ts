@@ -218,6 +218,59 @@ describe("multiplex inbound — a message reaches only the addressed identity's 
   });
 });
 
+describe("sticky egress hint — reply as last inbound identity when Hermes stamps hello'd botId", () => {
+  test("after fallback inbound to agent-b, outbound with frame.botId=agent-a sends as agent-b for that chat_id", async () => {
+    // Hermes hellos only A; inbound for B arrives via fallback. Hermes then
+    // stamps outbound frame.botId=A (the single hello'd bot). Connector must
+    // use the sticky chat hint and send with B's token for that chat.
+    for (const k of Object.keys(sends)) sends[k] = [];
+    const ws = await dial();
+    const hs = nextFrame(ws);
+    ws.send(JSON.stringify({ type: "hello", platform: "agentschat", botId: "agent-a" }) + "\n");
+    await hs;
+
+    const inboundP = nextFrame(ws);
+    await server.injectAgentsChatMessage({
+      id: "hint1", channel_id: "welcome-hint", sender_id: "human-1", sender_name: "H",
+      content: "@agent-b please reply", mentioned_ids: ["agent-b"],
+    } as any);
+    const inbound = await inboundP;
+    expect(inbound.type).toBe("inbound");
+    expect(inbound.event.source.profile).toBe("agent-b");
+
+    // typing should also use the hinted mouth (hint not cleared yet)
+    const typingP = nextFrame(ws);
+    ws.send(JSON.stringify({
+      type: "outbound", requestId: "tHint", platform: "agentschat", botId: "agent-a",
+      action: { op: "typing", chat_id: "welcome-hint" },
+    }) + "\n");
+    const typing = await typingP;
+    expect(typing.result.success).toBe(true);
+
+    const sendP = nextFrame(ws);
+    ws.send(JSON.stringify({
+      type: "outbound", requestId: "rHint", platform: "agentschat", botId: "agent-a",
+      action: { op: "send", chat_id: "welcome-hint", content: "reply as B" },
+    }) + "\n");
+    const sent = await sendP;
+    expect(sent.result.success).toBe(true);
+    expect(sends["agent-b"]).toContainEqual({ chatId: "welcome-hint", content: "reply as B" });
+    expect(sends["agent-a"].find((s) => s.content === "reply as B")).toBeUndefined();
+
+    // hint cleared after successful send — next outbound for same chat uses frame.botId again
+    const send2P = nextFrame(ws);
+    ws.send(JSON.stringify({
+      type: "outbound", requestId: "rHint2", platform: "agentschat", botId: "agent-a",
+      action: { op: "send", chat_id: "welcome-hint", content: "now as A" },
+    }) + "\n");
+    const sent2 = await send2P;
+    expect(sent2.result.success).toBe(true);
+    expect(sends["agent-a"]).toContainEqual({ chatId: "welcome-hint", content: "now as A" });
+    expect(sends["agent-b"].find((s) => s.content === "now as A")).toBeUndefined();
+    ws.close();
+  });
+});
+
 describe("hello fallback — precise preferred, no double delivery", () => {
   test("@mention of agent-b with only agent-a hello'd delivers once via fallback", async () => {
     const ws = await dial();
