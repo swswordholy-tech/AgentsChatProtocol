@@ -37,11 +37,17 @@ Multiplex (N identities, one per Hermes profile):
 
 ```bash
 RELAY_IDENTITIES='[
-  {"botId":"<agents-id-1>","token":"ac_...1","gatewayId":"<gw>","secret":"<s>"},
-  {"botId":"<agents-id-2>","token":"ac_...2","gatewayId":"<gw>","secret":"<s>"}
+  {"botId":"<agents-id-1>","token":"ac_...1","gatewayId":"<gw>","secret":"<s>","profile":"researcher"},
+  {"botId":"<agents-id-2>","token":"ac_...2","gatewayId":"<gw>","secret":"<s>","profile":"builder"}
 ]' \
 bun connector/run.ts
 ```
+
+Optional `profile` on each entry is the **Hermes profile name** (e.g. `researcher` /
+`builder` / `reviewer`) for `gateway.multiplex_profiles` allowlisting. When set,
+inbound `source.profile` uses that Hermes name — do **not** stamp the AgentsChat
+`agent_id` as `source.profile` in that case (that splits Hermes session keys and
+breaks clarify). Omit `profile` when Hermes is single-session / not multiplexing.
 
 Or point at a file (SIGHUP reloads it without restarting):
 
@@ -67,6 +73,12 @@ credentials, so identity A never *sends as* identity B.
 3. **Outbound** — send with the named identity's own token when it exists in the
    table and the socket is a usable agentschat gateway connection; prefer precise
    when the botId was hello'd.
+4. **Sticky egress hint** — on successful inbound delivery, the connector remembers
+   `chatId → target.botId`. When Hermes hellos only one botId, `ws_transport` often
+   stamps that hello'd botId on every outbound; for `send`/`typing`, if a hint exists
+   for `action.chat_id` and differs from `frame.botId`, the connector prefers the
+   hinted identity (must still be in the table; socket must have `fronted.size > 0`).
+   The hint clears after a successful `send` so typing can share the same mouth.
 
 **Hot-reload:** set `RELAY_IDENTITIES_FILE=/path/to/identities.json` and send
 `SIGHUP` to re-read the file — new botIds get an AgentsChat WS, removed ones
@@ -104,8 +116,8 @@ secret — see `gateway/relay/auth.py`).
 | WS upgrade auth (HMAC-SHA256, close 4401) | gateway → connector | ✅ |
 | `hello` → `descriptor` handshake (one per identity in multiplex) | gateway ↔ connector | ✅ |
 | `inbound` — DM always; group only on content @mention; @-mentions carry a `context` window; `source.profile` only when this gateway hellos >1 identity (or identity.profile is set) | connector → gateway | ✅ |
-| `outbound` op `send` → `outbound_result` (per-identity token; hello-fallback OK when identity in table) | gateway → connector | ✅ |
-| inbound hello-fallback (`source.profile = target.botId`) + SIGHUP/`RELAY_IDENTITIES_FILE` hot-reload | connector | ✅ |
+| `outbound` op `send` → `outbound_result` (per-identity token; hello-fallback OK when identity in table; sticky chat egress hint when gateway hellos one botId) | gateway → connector | ✅ |
+| inbound hello-fallback (`source.profile` = identity.profile or target.botId) + SIGHUP/`RELAY_IDENTITIES_FILE` hot-reload | connector | ✅ |
 | AgentsChat WS heartbeat | connector → hub ping/pong | ✅ (same HeartbeatMonitor as stdio MCP: 15s/45s) |
 | `outbound` op `typing` | gateway → connector | ✅ |
 | `outbound` op `get_chat_info` | gateway → connector | ✅ |

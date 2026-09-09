@@ -23,8 +23,11 @@
  * session — Hermes may hello only one botId while RELAY_IDENTITIES holds N.
  * Outbound uses the sending identity's own token whenever that identity is in
  * the table and the socket is a usable agentschat gateway connection (prefer
- * precise hello when present). An identity the connector has no credentials for
- * is rejected at hello (fail closed).
+ * precise hello when present). When Hermes hellos only one botId, a per-chat
+ * sticky egress hint (set on successful inbound delivery) can override the
+ * frame.botId mouth so replies leave as the identity that just received the
+ * message — still only with that identity's own credentials. An identity the
+ * connector has no credentials for is rejected at hello (fail closed).
  */
 
 import { createServer, type Server as HttpServer, type IncomingMessage } from "node:http";
@@ -126,6 +129,13 @@ export function startConnector(config: ConnectorConfig): ConnectorHandle {
   // `${botId}:${chatId}` → timestamp of the last message ADDRESSED to that
   // identity in that channel. Drives the getChannelContext `sinceTs` window.
   const lastAddressed = new Map<string, string>();
+  // Per-chat sticky egress mouth: when inbound is successfully delivered to a
+  // target identity, remember that botId for the chat so a subsequent outbound
+  // whose frame.botId is only the single hello'd identity still sends with the
+  // addressed identity's token (Hermes ws_transport often stamps the hello'd
+  // botId on every outbound). Cleared after a successful send so typing can
+  // share the same mouth before the reply lands.
+  const egressHint = new Map<string, string>();
 
   const http: HttpServer = createServer((_req, res) => {
     res.writeHead(200, { "Content-Type": "application/json" });
@@ -222,6 +232,8 @@ export function startConnector(config: ConnectorConfig): ConnectorHandle {
     //     only one botId while RELAY_IDENTITIES holds N — still send with the
     //     named identity's own token (never another identity's credentials).
     // Untagged outbound falls back to the FIRST hello'd identity (session default).
+    //   - Sticky chat hint: if inbound just addressed another identity in this
+    //     chat, prefer that mouth when Hermes still stamps the hello'd botId.
     const firstFronted = [...conn.fronted][0];
     const requested = typeof frame?.botId === "string" && frame.botId ? frame.botId : firstFronted ?? null;
     let identity: Identity | null = null;
@@ -232,6 +244,16 @@ export function startConnector(config: ConnectorConfig): ConnectorHandle {
     } else if (requested && conn.fronted.size > 0) {
       identity = table.forBot(requested); // table hit + usable agentschat conn
     }
+    if (identity && (op === "send" || op === "typing") && chatId && conn.fronted.size > 0) {
+      const hintedBotId = egressHint.get(chatId);
+      if (hintedBotId && hintedBotId !== identity.botId) {
+        const hinted = table.forBot(hintedBotId);
+        if (hinted) {
+          log(`[connector] outbound egress hint: chat=${chatId} frame.botId=${identity.botId} → ${hinted.botId}`);
+          identity = hinted;
+        }
+      }
+    }
     if (!identity) {
       log(`[connector] outbound failed: no usable identity for botId=${requested ?? "?"}`);
       return { success: false, error: `no usable identity for outbound (botId=${requested ?? "?"})` };
@@ -239,6 +261,7 @@ export function startConnector(config: ConnectorConfig): ConnectorHandle {
     switch (op) {
       case "send": {
         const r = await hooks.sendMessage(identity.botId, chatId, action.content ?? "", action.reply_to);
+        if (chatId) egressHint.delete(chatId);
         return { success: true, message_id: r?.id };
       }
       case "typing": {
@@ -348,6 +371,10 @@ export function startConnector(config: ConnectorConfig): ConnectorHandle {
         log(`[connector] inbound dropped for botId=${target.botId}: no agentschat-fronted gateway socket`);
         return;
       }
+      // Sticky egress mouth for this chat: next send/typing should speak as the
+      // identity that received the inbound, even if Hermes stamps the hello'd botId.
+      const chatKey = typeof msg.channel_id === "string" ? msg.channel_id : "";
+      if (chatKey) egressHint.set(chatKey, target.botId);
       for (const conn of deliverTo) {
         // Per-connection clone: a single-hello gateway must NOT inherit a
         // profile stamp meant for a multiplexed sibling socket.

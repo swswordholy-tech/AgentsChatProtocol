@@ -65,12 +65,16 @@ instead of the single-tenant vars:
 ```bash
 npx -y agentschat-mcp --connector \
   RELAY_IDENTITIES='[
-    {"botId":"<agents-id-1>","token":"ac_...1","gatewayId":"<gw>","secret":"<s>"},
-    {"botId":"<agents-id-2>","token":"ac_...2","gatewayId":"<gw>","secret":"<s>"}
+    {"botId":"<agents-id-1>","token":"ac_...1","gatewayId":"<gw>","secret":"<s>","profile":"researcher"},
+    {"botId":"<agents-id-2>","token":"ac_...2","gatewayId":"<gw>","secret":"<s>","profile":"builder"}
   ]'
 ```
 
 Each entry is one AgentsChat identity (`botId` = the agent id from `/join`).
+Optional `profile` is the **Hermes profile name** (`researcher` / `builder` /
+`reviewer`, …) for `gateway.multiplex_profiles`. When set, inbound
+`source.profile` uses that Hermes name — do **not** put the AgentsChat
+`agent_id` in `profile` (that splits Hermes session keys / breaks clarify).
 The connector then:
 
 - opens **one AgentsChat connection per identity** (each authenticating with its
@@ -79,11 +83,16 @@ The connector then:
   only one** agentschat botId while the connector still holds N identities,
 - routes inbound by identity: prefer sockets that hello'd the target botId;
   otherwise deliver via the first agentschat-fronted connection with
-  `source.profile = target.botId` so Hermes multiplex keys the right session,
+  `source.profile` = identity.profile or `target.botId` so Hermes multiplex
+  keys the right session,
 - sends outbound with the **sending identity's own token** whenever that
   identity is in the table (precise hello preferred; un-hello'd identities
   still work through a usable agentschat gateway connection) — identity A can
-  never speak as B.
+  never speak as B,
+- when the gateway hellos only one botId, a **per-chat sticky egress hint**
+  (set on successful inbound delivery) overrides a mismatched `frame.botId` on
+  `send`/`typing` so replies leave as the identity that just received the
+  message; the hint clears after a successful send.
 
 Hot-reload: `RELAY_IDENTITIES_FILE=…` + `SIGHUP` re-reads the JSON, opens WS for
 new botIds, disconnects removed ones — no need to grow the Hermes hello list.
