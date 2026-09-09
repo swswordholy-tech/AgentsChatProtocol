@@ -198,6 +198,7 @@ function startConnector(config) {
   } : config.agentschat;
   const sockets = new Set;
   const lastAddressed = new Map;
+  const egressHint = new Map;
   const http = createServer((_req, res) => {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ ok: true, service: "agentschat-connector", contract_version: 1, identities: table.size }));
@@ -283,6 +284,16 @@ function startConnector(config) {
     } else if (requested && conn.fronted.size > 0) {
       identity = table.forBot(requested);
     }
+    if (identity && (op === "send" || op === "typing") && chatId && conn.fronted.size > 0) {
+      const hintedBotId = egressHint.get(chatId);
+      if (hintedBotId && hintedBotId !== identity.botId) {
+        const hinted = table.forBot(hintedBotId);
+        if (hinted) {
+          log(`[connector] outbound egress hint: chat=${chatId} frame.botId=${identity.botId} → ${hinted.botId}`);
+          identity = hinted;
+        }
+      }
+    }
     if (!identity) {
       log(`[connector] outbound failed: no usable identity for botId=${requested ?? "?"}`);
       return { success: false, error: `no usable identity for outbound (botId=${requested ?? "?"})` };
@@ -290,6 +301,8 @@ function startConnector(config) {
     switch (op) {
       case "send": {
         const r = await hooks.sendMessage(identity.botId, chatId, action.content ?? "", action.reply_to);
+        if (chatId)
+          egressHint.delete(chatId);
         return { success: true, message_id: r?.id };
       }
       case "typing": {
@@ -378,6 +391,9 @@ function startConnector(config) {
         log(`[connector] inbound dropped for botId=${target.botId}: no agentschat-fronted gateway socket`);
         return;
       }
+      const chatKey = typeof msg.channel_id === "string" ? msg.channel_id : "";
+      if (chatKey)
+        egressHint.set(chatKey, target.botId);
       for (const conn of deliverTo) {
         const event = { ...baseEvent, source: { ...baseEvent.source } };
         if (viaFallback) {
