@@ -105,23 +105,22 @@ describe("multiplex outbound — send uses the SENDING identity's token", () => 
     ws.close();
   });
 
-  test("outbound naming a REGISTERED identity this socket never hello'd still sends with THAT identity's token (hello-fallback)", async () => {
+  test("outbound naming a registered identity without hello is rejected", async () => {
     const ws = await dial();
     const hs = nextFrame(ws);
     ws.send(JSON.stringify({ type: "hello", platform: "agentschat", botId: "agent-a" }) + "\n");
-    await hs; // fronts ONLY agent-a — Hermes may hello one botId while RELAY_IDENTITIES has N
+    await hs; // fronts ONLY agent-a
     const p = nextFrame(ws);
-    // agent-b is registered; usable agentschat conn exists → send with B's own token
-    // (never A's). Prefer precise when present; here only fallback applies.
+    // Being in the global table does not authorize an un-hello'd identity.
     ws.send(JSON.stringify({ type: "outbound", requestId: "r2", platform: "agentschat", botId: "agent-b", action: { op: "send", chat_id: "welcome", content: "as B?" } }) + "\n");
     const f = await p;
-    expect(f.result.success).toBe(true);
-    expect(sends["agent-b"]).toContainEqual({ chatId: "welcome", content: "as B?" });
+    expect(f.result.success).toBe(false);
+    expect(sends["agent-b"].find((s) => s.content === "as B?")).toBeUndefined();
     expect(sends["agent-a"].find((s) => s.content === "as B?")).toBeUndefined();
     ws.close();
   });
 
-  test("untagged outbound on a two-identity socket falls back to the FIRST hello'd identity", async () => {
+  test("untagged outbound on a two-identity socket is rejected as ambiguous", async () => {
     const ws = await dial();
     const h1 = nextFrame(ws);
     ws.send(JSON.stringify({ type: "hello", platform: "agentschat", botId: "agent-b" }) + "\n");
@@ -132,8 +131,8 @@ describe("multiplex outbound — send uses the SENDING identity's token", () => 
     const p = nextFrame(ws);
     ws.send(JSON.stringify({ type: "outbound", requestId: "r3", action: { op: "send", chat_id: "welcome", content: "untagged" } }) + "\n");
     const f = await p;
-    expect(f.result.success).toBe(true);
-    expect(sends["agent-b"]).toContainEqual({ chatId: "welcome", content: "untagged" }); // first hello'd
+    expect(f.result.success).toBe(false);
+    expect(sends["agent-b"].find((s) => s.content === "untagged")).toBeUndefined();
     expect(sends["agent-a"].find((s) => s.content === "untagged")).toBeUndefined();
     ws.close();
   });
@@ -198,81 +197,24 @@ describe("multiplex inbound — a message reaches only the addressed identity's 
     ws.close();
   });
 
-  test("DM for agent-b via agent-a-only hello uses fallback with source.profile=agent-b (no credential cross)", async () => {
-    // Hermes hellos only A; RELAY_IDENTITIES still has B. Inbound for B must reach
-    // the agentschat-fronted socket with profile=B so multiplex keys B's session.
+  test("DM for B is not delivered to an A-only hello", async () => {
     const ws = await dial();
     const hs = nextFrame(ws);
-    ws.send(JSON.stringify({ type: "hello", platform: "agentschat", botId: "agent-a" }) + "\n");
+    ws.send(JSON.stringify({ type: "hello", platform: "agentschat", botId: "agent-a" }));
     await hs;
-    const p = nextFrame(ws);
-    server.injectAgentsChatMessage({
-      id: "m3", channel_id: "dm-human-1-agent-b", sender_id: "human-1", sender_name: "H",
-      content: "secret for b", __botId: "agent-b",
-    } as any);
-    const f = await p;
-    expect(f.type).toBe("inbound");
-    expect(f.event.text).toContain("secret for b");
-    expect(f.event.source.profile).toBe("agent-b");
+    const frames: any[] = [];
+    ws.on("message", d => frames.push(JSON.parse(d.toString())));
+    await server.injectAgentsChatMessage({ id: "m3", channel_id: "dm-human-b", sender_id: "human", content: "secret for b", __botId: "agent-b" } as any);
+    await new Promise(r => setTimeout(r, 40));
+    expect(frames).toEqual([]);
     ws.close();
   });
 });
 
-describe("sticky egress hint — reply as last inbound identity when Hermes stamps hello'd botId", () => {
-  test("after fallback inbound to agent-b, outbound with frame.botId=agent-a sends as agent-b for that chat_id", async () => {
-    // Hermes hellos only A; inbound for B arrives via fallback. Hermes then
-    // stamps outbound frame.botId=A (the single hello'd bot). Connector must
-    // use the sticky chat hint and send with B's token for that chat.
-    for (const k of Object.keys(sends)) sends[k] = [];
-    const ws = await dial();
-    const hs = nextFrame(ws);
-    ws.send(JSON.stringify({ type: "hello", platform: "agentschat", botId: "agent-a" }) + "\n");
-    await hs;
+// Reverse-order concurrent egress regression lives in hardening.e2e.test.ts.
 
-    const inboundP = nextFrame(ws);
-    await server.injectAgentsChatMessage({
-      id: "hint1", channel_id: "welcome-hint", sender_id: "human-1", sender_name: "H",
-      content: "@agent-b please reply", mentioned_ids: ["agent-b"],
-    } as any);
-    const inbound = await inboundP;
-    expect(inbound.type).toBe("inbound");
-    expect(inbound.event.source.profile).toBe("agent-b");
-
-    // typing should also use the hinted mouth (hint not cleared yet)
-    const typingP = nextFrame(ws);
-    ws.send(JSON.stringify({
-      type: "outbound", requestId: "tHint", platform: "agentschat", botId: "agent-a",
-      action: { op: "typing", chat_id: "welcome-hint" },
-    }) + "\n");
-    const typing = await typingP;
-    expect(typing.result.success).toBe(true);
-
-    const sendP = nextFrame(ws);
-    ws.send(JSON.stringify({
-      type: "outbound", requestId: "rHint", platform: "agentschat", botId: "agent-a",
-      action: { op: "send", chat_id: "welcome-hint", content: "reply as B" },
-    }) + "\n");
-    const sent = await sendP;
-    expect(sent.result.success).toBe(true);
-    expect(sends["agent-b"]).toContainEqual({ chatId: "welcome-hint", content: "reply as B" });
-    expect(sends["agent-a"].find((s) => s.content === "reply as B")).toBeUndefined();
-
-    // hint cleared after successful send — next outbound for same chat uses frame.botId again
-    const send2P = nextFrame(ws);
-    ws.send(JSON.stringify({
-      type: "outbound", requestId: "rHint2", platform: "agentschat", botId: "agent-a",
-      action: { op: "send", chat_id: "welcome-hint", content: "now as A" },
-    }) + "\n");
-    const sent2 = await send2P;
-    expect(sent2.result.success).toBe(true);
-    expect(sends["agent-a"]).toContainEqual({ chatId: "welcome-hint", content: "now as A" });
-    expect(sends["agent-b"].find((s) => s.content === "now as A")).toBeUndefined();
-    ws.close();
-  });
-});
-
-describe("hello fallback — precise preferred, no double delivery", () => {
-  test("@mention of agent-b with only agent-a hello'd delivers once via fallback", async () => {
+describe("explicit hello required — no fallback or double delivery", () => {
+  test("@mention of agent-b with only agent-a hello'd is dropped", async () => {
     const ws = await dial();
     const hs = nextFrame(ws);
     ws.send(JSON.stringify({ type: "hello", platform: "agentschat", botId: "agent-a" }) + "\n");
@@ -284,9 +226,7 @@ describe("hello fallback — precise preferred, no double delivery", () => {
       content: "@agent-b 看下", mentioned_ids: ["agent-b"],
     } as any);
     await new Promise((r) => setTimeout(r, 80));
-    expect(frames.length).toBe(1);
-    expect(frames[0].type).toBe("inbound");
-    expect(frames[0].event.source.profile).toBe("agent-b");
+    expect(frames).toEqual([]);
     ws.close();
   });
 
@@ -335,7 +275,7 @@ describe("hello fallback — precise preferred, no double delivery", () => {
 
 
 describe("reloadIdentities — hot-swap table without restart", () => {
-  test("after reload, new botId is routable via fallback; removed botId fails closed", async () => {
+  test("after reload, new botId requires a new hello; removed botId fails closed", async () => {
     const ws = await dial();
     const hs = nextFrame(ws);
     ws.send(JSON.stringify({ type: "hello", platform: "agentschat", botId: "agent-a" }) + "\n");
@@ -346,6 +286,9 @@ describe("reloadIdentities — hot-swap table without restart", () => {
       { botId: "agent-c", agentId: "agent-c", token: "ac_ccc", gatewayId: GWID, secret: SECRET },
     ]);
 
+    const hello = nextFrame(ws);
+    ws.send(JSON.stringify({ type: "hello", platform: "agentschat", botId: "agent-c" }));
+    expect((await hello).type).toBe("descriptor");
     const p = nextFrame(ws);
     await server.injectAgentsChatMessage({
       id: "rl1", channel_id: "welcome", sender_id: "human-1", sender_name: "H",

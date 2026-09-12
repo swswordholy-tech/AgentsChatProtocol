@@ -100,6 +100,18 @@ export function decideIdentity(i: IdentityInputs): IdentityDecision {
   };
 }
 
+/** Validate effective credentials without including credential values in errors. */
+export function validateIdentityProfile(profile: any, file: string, allowDevToken = false): void {
+  const nonempty = (value: unknown) => typeof value === "string" && value.trim().length > 0;
+  if (!profile || typeof profile !== "object" || Array.isArray(profile) ||
+      !nonempty(profile.agent_id) || !nonempty(profile.token) ||
+      (!allowDevToken && profile.token === "dev-token") ||
+      (profile.capabilities !== undefined && (!Array.isArray(profile.capabilities) ||
+        !profile.capabilities.every(nonempty)))) {
+    throw new Error(`Invalid identity profile at ${file}. Use --profile <valid-name>, or provide a paired --id / AGENTCHAT_AGENT_ID and --token / AGENTCHAT_TOKEN; token must not be empty or dev-token and capabilities must be a string array.`);
+  }
+}
+
 /**
  * Second auto-register trigger: a profile that loaded successfully but still carries
  * the placeholder `dev-token`. Legacy behavior re-registered it to heal the key —

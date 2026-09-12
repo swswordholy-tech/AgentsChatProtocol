@@ -81,6 +81,13 @@ export class IdentityTable {
   }
 }
 
+/** Platform hooks must never substitute another identity's credentials. */
+export function requireIdentity(identities: readonly Identity[], botId: string): Identity {
+  const id = identities.find(id => id.botId === botId);
+  if (!id) throw new Error(`unknown identity: ${botId}`);
+  return id;
+}
+
 export interface InboundContext {
   channel_id?: string;
   mentioned_ids?: string[];
@@ -106,6 +113,23 @@ export interface InboundContext {
  * the agent's session and burn its tokens on chatter not addressed to it.
  * `mentioned_ids` is still honored when a host provides it (explicit signal wins).
  */
+function matchesExactMention(content: string, id: string): boolean {
+  if (!id) return false;
+  const escaped = id.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`(?:^|[^\\p{L}\\p{N}_@-])@(?:${escaped}(?![\\p{L}\\p{N}_(-])|[^\\s@()]+\\(${escaped}\\))`, "u").test(content);
+}
+
+/** All exact addressed targets, once each, in identity-table order. */
+export function routeInboundTargets(table: IdentityTable, ctx: InboundContext): Identity[] {
+  if (ctx.channel_id?.startsWith("dm-")) {
+    const owner = ctx.dmOwnerBotId ? table.forBot(ctx.dmOwnerBotId) : null;
+    return owner ? [owner] : [];
+  }
+  const mentioned = Array.isArray(ctx.mentioned_ids) ? ctx.mentioned_ids : [];
+  return table.all().filter(id => mentioned.includes(id.botId) ||
+    matchesExactMention(ctx.content ?? "", id.agentId) || matchesExactMention(ctx.content ?? "", id.botId));
+}
+
 export function routeInbound(table: IdentityTable, ctx: InboundContext): Identity | null {
   // DM: route to the identity that owns the DM channel.
   if (ctx.channel_id?.startsWith("dm-")) {
@@ -158,15 +182,4 @@ export function hermesSourceProfile(id: Identity, frontedCount: number): string 
   if (named) return named;
   if (frontedCount > 1) return id.botId;
   return undefined;
-}
-
-/**
- * Profile stamp when inbound is delivered via the generic-hello fallback
- * (gateway never hello'd `target.botId`, but an agentschat-fronted socket
- * exists). Always set so Hermes multiplex can key the right session even
- * though the wire hello list stayed at one botId.
- */
-export function fallbackSourceProfile(id: Identity): string {
-  const named = typeof id.profile === "string" ? id.profile.trim() : "";
-  return named || id.botId;
 }

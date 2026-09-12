@@ -48,6 +48,18 @@ function collectRaw(ws: WebSocket, n: number, ms = 3000): Promise<string[]> {
 }
 
 describe("wire framing is newline-delimited (matches gateway ws_transport)", () => {
+  test("legacy hooks accept tagged replies using their declared hello alias", async () => {
+    const ws = new WebSocket(url, { headers: { Authorization: `Bearer ${makeUpgradeToken(GWID, SECRET, 0)}` } });
+    await new Promise((r) => ws.on("open", r));
+    try {
+      const raw = collectRaw(ws, 2);
+      ws.send(JSON.stringify({ type: "hello", platform: "agentschat", botId: "ac-bot" }) + "\n");
+      ws.send(JSON.stringify({ type: "outbound", botId: "ac-bot", requestId: "legacy", action: { op: "send", chat_id: "welcome", content: "x" } }) + "\n");
+      const frames = await raw;
+      expect(JSON.parse(frames[1]).result.success).toBe(true);
+    } finally { ws.close(); }
+  });
+
   test("the descriptor frame ends with a newline", async () => {
     const ws = new WebSocket(url, { headers: { Authorization: `Bearer ${makeUpgradeToken(GWID, SECRET, 0)}` } });
     await new Promise((r) => ws.on("open", r));

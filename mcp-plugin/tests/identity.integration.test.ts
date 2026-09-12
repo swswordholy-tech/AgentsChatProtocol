@@ -15,13 +15,14 @@
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { spawn } from "node:child_process";
-import { mkdtempSync, existsSync, mkdirSync, writeFileSync, readdirSync, chmodSync, statSync } from "node:fs";
+import { mkdtempSync, existsSync, mkdirSync, writeFileSync, readFileSync, readdirSync, chmodSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { TERMS_VERSION } from "../src/terms.ts";
 
 const ENTRY = resolve(import.meta.dir, "../src/server.ts");
 let calls: string[] = [];
+let authRequests: Array<{ path: string; authorization: string | null }> = [];
 let registerBodies: any[] = [];
 let hub: ReturnType<typeof Bun.serve>;
 let BASE = "";
@@ -32,6 +33,7 @@ beforeAll(() => {
     async fetch(req) {
       const u = new URL(req.url);
       calls.push(`${req.method} ${u.pathname}`);
+      authRequests.push({ path: u.pathname, authorization: req.headers.get("Authorization") });
       if (req.method === "POST" && u.pathname === "/api/account/register") {
         // Mirror production: agent registration requires accepted_terms. The old mock
         // accepted ANY payload, which is why the client could ship without the field
@@ -130,6 +132,48 @@ describe("identity policy, end-to-end against a mock hub", () => {
     expect(res.get(1)?.result).toBeTruthy();
     expect(res.get(2)?.result?.tools?.length ?? 0).toBeGreaterThan(0);
   }, 15_000);
+
+  test("paired environment credentials resist runtime Grok binding", async () => {
+    calls = [];
+    const home = freshHome("env-grok");
+    mkdirSync(join(home, ".agentschat"));
+    writeFileSync(join(home, ".agentschat", "A.json"), JSON.stringify({ agent_id: "a-id", token: "ac_a" }));
+    writeFileSync(join(home, ".agentschat", "grok-binds.json"), JSON.stringify({ conversation: "A" }));
+    const { res } = await drive([], home, [INIT, INITED, callTool(3, "whoami")], 3000, {
+      AGENTCHAT_AGENT_ID: "explicit-id", AGENTCHAT_TOKEN: "ac_explicit", CURSOR_CONVERSATION_ID: "conversation",
+    });
+    expect(res.get(3)?.result?.content?.[0]?.text ?? "").toContain("Agent ID: explicit-id");
+    expect(calls).toContain("GET /api/account/explicit-id");
+    expect(calls).not.toContain("GET /api/account/a-id");
+    expect(registerCalls()).toBe(0);
+  });
+
+  test("switch_profile rejects invalid credentials without changing live identity", async () => {
+    const home = freshHome("bad-switch");
+    mkdirSync(join(home, ".agentschat"));
+    writeFileSync(join(home, ".agentschat", "A.json"), JSON.stringify({ agent_id: "a-id", token: "ac_a" }));
+    writeFileSync(join(home, ".agentschat", "bad.json"), "{}");
+    const { res } = await drive(["--profile", "A"], home, [INIT, INITED, callTool(3, "switch_profile", { profile_name: "bad" }), callTool(4, "whoami")], 3000);
+    expect(res.get(3)?.result?.isError).toBe(true);
+    expect(res.get(4)?.result?.content?.[0]?.text ?? "").toContain("Agent ID: a-id");
+  });
+
+  test("explicit token repairs a dev-token profile without migration", async () => {
+    calls = [];
+    authRequests = [];
+    const home = freshHome("override");
+    mkdirSync(join(home, ".agentschat"));
+    const file = join(home, ".agentschat", "A.json");
+    writeFileSync(file, JSON.stringify({ agent_id: "a-id", token: "dev-token" }));
+    const { res, err } = await drive(["--profile", "A"], home, [INIT, INITED, callTool(3, "whoami")], 3000, { AGENTCHAT_TOKEN: "ac_override" });
+    expect(res.get(3)?.result?.content?.[0]?.text).toContain("Agent ID: a-id");
+    expect(registerCalls()).toBe(0);
+    expect(err).not.toContain("no identity was declared");
+    const accountRequests = authRequests.filter(r => r.path === "/api/account/a-id");
+    expect(accountRequests.length).toBeGreaterThan(0);
+    expect(accountRequests.every(r => r.authorization === "Bearer ac_override")).toBe(true);
+    expect(JSON.parse(readFileSync(file, "utf8")).token).toBe("dev-token");
+  });
 
   test("--name opts in: exactly one register call, profile persisted", async () => {
     calls = [];

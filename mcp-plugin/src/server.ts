@@ -40,7 +40,7 @@ import { messageDedupKey, MessageDedup } from "./dedup.ts";
 import { computeReconnectDelay } from "./reconnect.ts";
 import { normalizeTimestampForCursor } from "./timestamps.ts";
 import { validateToolArgs } from "./argcheck.ts";
-import { decideIdentity, shouldMigrateDevToken } from "./identity.ts";
+import { decideIdentity, shouldMigrateDevToken, validateIdentityProfile } from "./identity.ts";
 import type { ProfileSource } from "./identity.ts";
 import {
   decideGrokBind,
@@ -73,20 +73,29 @@ import { randomUUID } from "crypto";
 function parseArgs() {
   const args = process.argv.slice(2);
   const parsed: Record<string, string> = {};
+  const values = new Set(["name", "id", "url", "token", "caps", "profile"]);
   for (let i = 0; i < args.length; i++) {
-    if (args[i] === "--name" && args[i + 1]) parsed.name = args[++i];
-    else if (args[i] === "--id" && args[i + 1]) parsed.id = args[++i];
-    else if (args[i] === "--url" && args[i + 1]) parsed.url = args[++i];
-    else if (args[i] === "--token" && args[i + 1]) parsed.token = args[++i];
-    else if (args[i] === "--caps" && args[i + 1]) parsed.caps = args[++i];
-    else if (args[i] === "--profile" && args[i + 1]) parsed.profile = args[++i];
-    // Boolean flag: explicit opt-in to creating a NEW account (see src/identity.ts).
-    else if (args[i] === "--register") parsed.register = "1";
-    // Boolean flag: explicit acceptance of the terms registration requires (src/terms.ts).
-    else if (args[i] === "--accept-terms") parsed.acceptTerms = "1";
+    const arg = args[i];
+    if (arg === "--help" || arg === "-h") continue;
+    if (arg === "--register") { parsed.register = "1"; continue; }
+    if (arg === "--accept-terms") { parsed.acceptTerms = "1"; continue; }
+    const equal = arg.indexOf("=");
+    const key = (equal < 0 ? arg : arg.slice(0, equal)).slice(2);
+    if (!arg.startsWith("--") || !values.has(key)) {
+      process.stderr.write("[agentchat] ERROR: unknown option or unexpected argument. See --help.\n");
+      process.exit(1);
+    }
+    const value = equal < 0 ? args[++i] : arg.slice(equal + 1);
+    if (!value?.trim() || value.startsWith("-")) {
+      process.stderr.write(`[agentchat] ERROR: missing value for --${key}. See --help.\n`);
+      process.exit(1);
+    }
+    parsed[key] = value;
   }
   return parsed;
 }
+
+const cliArgs = parseArgs();
 
 if (process.argv.includes("--help") || process.argv.includes("-h")) {
   console.log(`agentschat-mcp — AgentsChat MCP Plugin for Claude Code
@@ -101,9 +110,10 @@ Options:
   --register         Explicitly opt in to registering a new agent (implied by --name)
   --accept-terms     Accept the terms at https://agents-chat.com/terms. REQUIRED to
                      register (or AGENTSCHAT_ACCEPT_TERMS=1); never assumed for you.
-  --id <id>          Agent ID (default: auto-generated)
+  --id <id>          Existing agent ID paired with the token (or AGENTCHAT_AGENT_ID)
   --url <url>        Server URL (default: production)
-  --token <token>    Auth token (skips registration entirely)
+  --token <token>    Auth token (or AGENTCHAT_TOKEN); requires its paired ID or an
+                     explicitly selected profile. Skips registration entirely.
   --caps <a,b,c>     Capabilities (comma-separated)
   -h, --help         Show this help
 
@@ -126,15 +136,14 @@ Grok multi-bot identity bind (Cursor / Grok Bot, no --profile):
 
 Hermes relay connector (no Hermes patch): run with --connector. See --connector --help.
 
-Identity is never created implicitly: with no --name/--profile/AGENTSCHAT_PROFILE and
-no token, the server runs ANONYMOUS (lists tools, but never registers an account).
+Identity is never created implicitly. Without explicit selectors, an existing
+default profile or Grok binding is loaded; only when neither exists and no
+credentials are supplied does the server run ANONYMOUS (lists tools, no account).
 
 Profiles stored in: ~/.agentschat/ (legacy fallback: ~/.agentchat/)
 Docs: https://github.com/swswordholy-tech/AgentsChatProtocol`);
   process.exit(0);
 }
-
-const cliArgs = parseArgs();
 
 // Profile resolution priority:
 //   1. AGENTSCHAT_PROFILE env var (name or path; canonical plural)
@@ -290,7 +299,12 @@ async function apiFetch(
   }
 }
 
-const hasToken = !!(cliArgs.token || process.env.AGENTCHAT_TOKEN);
+const hasToken = cliArgs.token !== undefined || process.env.AGENTCHAT_TOKEN !== undefined;
+const explicitAgentId = cliArgs.id ?? process.env.AGENTCHAT_AGENT_ID;
+if (hasToken && !explicitAgentId && profileSource === "default") {
+  process.stderr.write("[agentchat] ERROR: token-only authentication requires its paired --id / AGENTCHAT_AGENT_ID (or an explicitly selected --profile). No token identity lookup is supported; refusing to borrow a default profile ID.\n");
+  process.exit(1);
+}
 const identity = decideIdentity({
   profileExists: existsSync(profileFile),
   source: profileSource,
@@ -302,8 +316,27 @@ const identity = decideIdentity({
   fallbackName: `Claude-${randomUUID().slice(0, 6)}`,
 });
 
+function readIdentityProfile(file: string): any {
+  try {
+    return JSON.parse(readFileSync(file, "utf-8"));
+  } catch {
+    throw new Error(`Cannot read identity profile at ${file}. Repair its JSON/permissions or select --profile <valid-name>.`);
+  }
+}
+
 if (identity.mode === "profile") {
-  profile = JSON.parse(readFileSync(profileFile, "utf-8"));
+  try {
+    profile = readIdentityProfile(profileFile);
+    validateIdentityProfile(profile && !Array.isArray(profile) ? {
+      ...profile,
+      agent_id: cliArgs.id ?? process.env.AGENTCHAT_AGENT_ID ?? profile.agent_id,
+      token: cliArgs.token ?? process.env.AGENTCHAT_TOKEN ?? profile.token,
+      capabilities: cliArgs.caps?.split(",") ?? profile.capabilities,
+    } : profile, profileFile, !hasToken);
+  } catch (e) {
+    process.stderr.write(`[agentchat] ERROR: ${(e as Error).message}\n`);
+    process.exit(1);
+  }
   process.stderr.write(`[agentchat] Profile loaded: ${profileFile}\n`);
 } else if (identity.mode === "env-creds") {
   // Token handed to us directly — authenticate with it, register nothing, write nothing.
@@ -395,12 +428,12 @@ if (identity.mode === "profile") {
 // Second auto-register trigger: a loaded profile still carrying the `dev-token`
 // placeholder. Healing it is intended for a declared identity, but on the bare
 // shared default path it mints an anonymous account just like the first trigger.
-if (profile.token === "dev-token" && !shouldMigrateDevToken({ source: profileSource, hasToken, registerFlag: !!cliArgs.register })) {
+if (!hasToken && profile.token === "dev-token" && !shouldMigrateDevToken({ source: profileSource, hasToken, registerFlag: !!cliArgs.register })) {
   process.stderr.write(
     `[agentchat] Profile at ${profileFile} carries a dev-token but no identity was declared — ` +
       `refusing to auto-register. Pass --name <name> or --register to create a real agent.\n`,
   );
-} else if (profile.token === "dev-token") {
+} else if (!hasToken && profile.token === "dev-token") {
   // Healing a dev-token profile registers a real account too, so it needs the same
   // consent. Without this gate it just 400s on `accepted_terms` and leaves the
   // placeholder in place — the dead-agent state this whole path exists to escape.
@@ -466,7 +499,7 @@ if (profile.token === "dev-token" && !shouldMigrateDevToken({ source: profileSou
 //
 // Anonymous mode is deliberately NOT caught: it loads no profile (profile.token is
 // undefined), so zero-config registry introspection keeps working.
-if (profile.token === "dev-token") {
+if (!hasToken && profile.token === "dev-token") {
   process.stderr.write(
     `[agentchat] ERROR: profile ${profileFile} holds a placeholder dev-token, which cannot authenticate.\n` +
       `  Not starting — a server that lists tools it cannot use is worse than one that fails.\n` +
@@ -478,9 +511,17 @@ if (profile.token === "dev-token") {
 }
 
 // Now that the identity block has settled `profile`, bind the runtime identity.
-AGENT_ID = cliArgs.id || process.env.AGENTCHAT_AGENT_ID || profile.agent_id || randomUUID();
-TOKEN = cliArgs.token || process.env.AGENTCHAT_TOKEN || profile.token || "dev-token";
-CAPABILITIES = cliArgs.caps?.split(",") || profile.capabilities || ["claude-code", "coding", "chat"];
+AGENT_ID = explicitAgentId ?? profile.agent_id ?? "";
+TOKEN = cliArgs.token ?? process.env.AGENTCHAT_TOKEN ?? profile.token ?? "";
+CAPABILITIES = cliArgs.caps?.split(",") ?? profile.capabilities ?? ["claude-code", "coding", "chat"];
+if (!anonymousMode || explicitAgentId !== undefined || hasToken) {
+  try {
+    validateIdentityProfile({ agent_id: AGENT_ID, token: TOKEN, capabilities: CAPABILITIES }, activeProfileFile ?? "explicit credentials");
+  } catch (e) {
+    process.stderr.write(`[agentchat] ERROR: ${(e as Error).message}\n`);
+    process.exit(1);
+  }
+}
 
 // Update display name if provided via CLI
 if (cliArgs.name && profile.display_name !== cliArgs.name) {
@@ -488,13 +529,13 @@ if (cliArgs.name && profile.display_name !== cliArgs.name) {
 }
 
 // Check claim status — only show claim URL if NOT yet owned
-if (profile.token && profile.token !== "dev-token") {
+if (TOKEN && TOKEN !== "dev-token") {
   try {
     // /api/account/:id now requires auth (server tick 88 info-leak
     // fix). Without the Bearer header the welcome/claim banner
     // silently skipped on every MCP startup.
     const acctRes = await apiFetch(`${REST_URL}/api/account/${encodeURIComponent(AGENT_ID)}`, {
-      headers: { "Authorization": `Bearer ${profile.token}` },
+      headers: { "Authorization": `Bearer ${TOKEN}` },
     });
     if (acctRes.ok) {
       const acct = await acctRes.json() as any;
@@ -503,7 +544,7 @@ if (profile.token && profile.token !== "dev-token") {
       // Use a simple heuristic: if account status is active and no owner info, show claim URL
       // Only print key-containing URL on first run (not every restart)
       if (!profile._claimed) {
-        const keyMasked = profile.token.slice(0, 6) + "..." + profile.token.slice(-4);
+        const keyMasked = TOKEN.slice(0, 6) + "..." + TOKEN.slice(-4);
         process.stderr.write(`[agentchat] Key: ${keyMasked}\n`);
         process.stderr.write(`[agentchat] Claim URL: ${REST_URL}/chat/${encodeURIComponent(AGENT_ID)}?key=<your-agent-key>\n`);
       }
@@ -2013,6 +2054,7 @@ function loadGrokBinds(): Record<string, string> {
  * Shared by `switch_profile` and grok-bind heal.
  */
 function applyIdentityFromProfile(newProfile: any, targetFile: string): void {
+  validateIdentityProfile(newProfile, targetFile);
   heartbeat.stop();
   if (backfillTimer) { clearTimeout(backfillTimer); backfillTimer = null; }
   if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
@@ -2023,7 +2065,7 @@ function applyIdentityFromProfile(newProfile: any, targetFile: string): void {
   }
   sessionId = null;
   AGENT_ID = newProfile.agent_id;
-  TOKEN = newProfile.token || "dev-token";
+  TOKEN = newProfile.token;
   CAPABILITIES = newProfile.capabilities || ["claude-code", "coding", "chat"];
   profile = newProfile;
   activeProfileFile = targetFile;
@@ -2039,13 +2081,15 @@ function applyIdentityFromProfile(newProfile: any, targetFile: string): void {
  * profile before outbound writes. Logs to stderr when healing.
  */
 function ensureGrokBoundIdentity(): void {
+  // Runtime recovery must honor the same explicit identity precedence as startup.
+  if (profileSource !== "grok-bind" || hasToken || cliArgs.id || process.env.AGENTCHAT_AGENT_ID) return;
   const boundName = boundProfileForConversation(process.env.CURSOR_CONVERSATION_ID, loadGrokBinds());
   if (!boundName) return;
   const boundPath = nameToPath(boundName);
   if (!existsSync(boundPath)) return;
   let boundProfile: any;
   try {
-    boundProfile = JSON.parse(readFileSync(boundPath, "utf-8"));
+    boundProfile = readIdentityProfile(boundPath);
   } catch {
     return;
   }
@@ -3205,7 +3249,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       return { content: [{ type: "text", text: `Profile "${profile_name}" not found. Available: ${available.join(", ")}` }], isError: true };
     }
 
-    const newProfile = JSON.parse(readFileSync(targetFile, "utf-8"));
+    const newProfile = readIdentityProfile(targetFile);
     applyIdentityFromProfile(newProfile, targetFile);
 
     return { content: [{ type: "text", text: `Switched to profile "${profile_name}" (${AGENT_ID}). Reconnecting...` }] };

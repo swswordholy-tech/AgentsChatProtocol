@@ -105,15 +105,36 @@ function toWireEvent(msg, platform = "agentschat") {
   };
 }
 
-// src/mentions.ts
-function matchesMention(content, agentId) {
-  if (!content || !agentId)
+// src/dedup.ts
+function messageDedupKey(data) {
+  if (!data || typeof data.id !== "string" || typeof data.channel_id !== "string")
+    return null;
+  return `${data.channel_id}:${data.id}`;
+}
+
+class MessageDedup {
+  max;
+  dropOnEvict;
+  seen = new Set;
+  constructor(max = 5000, dropOnEvict = 1000) {
+    this.max = max;
+    this.dropOnEvict = dropOnEvict;
+  }
+  recordOrSkip(key) {
+    if (this.seen.has(key))
+      return true;
+    this.seen.add(key);
+    if (this.seen.size > this.max) {
+      const arr = [...this.seen];
+      this.seen.clear();
+      for (const item of arr.slice(this.dropOnEvict))
+        this.seen.add(item);
+    }
     return false;
-  if (content.includes(`@${agentId}`))
-    return true;
-  const idEsc = agentId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const displayMentionRe = new RegExp(`@[^(\\n]+\\(${idEsc}\\)`);
-  return displayMentionRe.test(content);
+  }
+  get size() {
+    return this.seen.size;
+  }
 }
 
 // connector/identities.ts
@@ -152,24 +173,25 @@ class IdentityTable {
       this.byBot.set(k, v);
   }
 }
-function routeInbound(table, ctx) {
+function requireIdentity(identities, botId) {
+  const id = identities.find((id2) => id2.botId === botId);
+  if (!id)
+    throw new Error(`unknown identity: ${botId}`);
+  return id;
+}
+function matchesExactMention(content, id) {
+  if (!id)
+    return false;
+  const escaped = id.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`(?:^|[^\\p{L}\\p{N}_@-])@(?:${escaped}(?![\\p{L}\\p{N}_(-])|[^\\s@()]+\\(${escaped}\\))`, "u").test(content);
+}
+function routeInboundTargets(table, ctx) {
   if (ctx.channel_id?.startsWith("dm-")) {
-    return ctx.dmOwnerBotId ? table.forBot(ctx.dmOwnerBotId) : null;
+    const owner = ctx.dmOwnerBotId ? table.forBot(ctx.dmOwnerBotId) : null;
+    return owner ? [owner] : [];
   }
   const mentioned = Array.isArray(ctx.mentioned_ids) ? ctx.mentioned_ids : [];
-  for (const mid of mentioned) {
-    const id = table.forBot(mid);
-    if (id)
-      return id;
-  }
-  const content = ctx.content ?? "";
-  if (content) {
-    for (const id of table.all()) {
-      if (matchesMention(content, id.agentId) || matchesMention(content, id.botId))
-        return id;
-    }
-  }
-  return null;
+  return table.all().filter((id) => mentioned.includes(id.botId) || matchesExactMention(ctx.content ?? "", id.agentId) || matchesExactMention(ctx.content ?? "", id.botId));
 }
 function hermesSourceProfile(id, frontedCount) {
   const named = typeof id.profile === "string" ? id.profile.trim() : "";
@@ -179,17 +201,34 @@ function hermesSourceProfile(id, frontedCount) {
     return id.botId;
   return;
 }
-function fallbackSourceProfile(id) {
-  const named = typeof id.profile === "string" ? id.profile.trim() : "";
-  return named || id.botId;
-}
 
 // connector/server.ts
+class PlatformHttpError extends Error {
+  status;
+  constructor(status) {
+    super("platform HTTP failure");
+    this.status = status;
+  }
+}
+
+class PlatformNetworkError extends Error {
+  constructor() {
+    super("platform network failure");
+  }
+}
 function startConnector(config) {
   const log = config.logger ?? (() => {});
   const descriptor = buildDescriptor(config.descriptor);
   const legacy = !config.identities || config.identities.length === 0;
   const table = new IdentityTable(legacy ? [{ botId: "default", agentId: "default", token: "", gatewayId: "", secret: "" }] : config.identities);
+  function safeLabel(value) {
+    for (const id of table.all())
+      for (const secret of [id.token, id.secret]) {
+        if (secret)
+          value = value.split(secret).join("[redacted]");
+      }
+    return JSON.stringify(value.slice(0, 128));
+  }
   const hooks = legacy ? {
     sendMessage: (_b, chatId, content, replyTo) => config.agentschat.sendMessage(chatId, content, replyTo),
     getChatInfo: (_b, chatId) => config.agentschat.getChatInfo(chatId),
@@ -198,7 +237,8 @@ function startConnector(config) {
   } : config.agentschat;
   const sockets = new Set;
   const lastAddressed = new Map;
-  const egressHint = new Map;
+  const delivered = new MessageDedup;
+  const inboundQueues = new Map;
   const http = createServer((_req, res) => {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ ok: true, service: "agentschat-connector", contract_version: 1, identities: table.size }));
@@ -214,7 +254,8 @@ function startConnector(config) {
     const token = auth.startsWith("Bearer ") ? auth.slice(7).trim() : "";
     const payload = peekPayload(token);
     const secrets = payload ? config.secrets[payload] : undefined;
-    const gatewayId = secrets ? verifyUpgradeToken(token, secrets) : null;
+    const secret = secrets?.find((s) => verifyUpgradeToken(token, [s]) === payload);
+    const gatewayId = secret ? payload : null;
     if (!gatewayId) {
       log(`[connector] rejecting upgrade: bad/absent token (path=${pathname})`);
       wss.handleUpgrade(req, socket, head, (ws) => {
@@ -223,13 +264,13 @@ function startConnector(config) {
       return;
     }
     wss.handleUpgrade(req, socket, head, (ws) => {
-      onConnection(ws, gatewayId);
+      onConnection(ws, gatewayId, secret);
     });
   });
-  function onConnection(ws, gatewayId) {
-    const conn = { ws, gatewayId, fronted: new Set };
+  function onConnection(ws, gatewayId, secret) {
+    const conn = { ws, gatewayId, secret, fronted: new Set };
     sockets.add(conn);
-    log(`[connector] gateway connected: ${gatewayId} (${sockets.size} total)`);
+    log(`[connector] gateway connected: ${safeLabel(gatewayId)} (${sockets.size} total)`);
     ws.on("message", async (data) => {
       const text = data.toString();
       for (const line of text.split(`
@@ -247,7 +288,7 @@ function startConnector(config) {
     });
     ws.on("close", () => {
       sockets.delete(conn);
-      log(`[connector] gateway disconnected: ${gatewayId} (${sockets.size} left)`);
+      log(`[connector] gateway disconnected: ${safeLabel(gatewayId)} (${sockets.size} left)`);
     });
     ws.on("error", () => sockets.delete(conn));
   }
@@ -255,17 +296,32 @@ function startConnector(config) {
     const t = frame?.type;
     if (t === "hello") {
       const botId = String(frame.botId ?? "");
-      const identity = table.isSingle() ? table.all()[0] : botId ? table.forBot(botId) : null;
-      if (!identity) {
-        send(conn.ws, { type: "error", error: `unknown identity botId: ${botId || "(none)"}` });
+      const identity = legacy ? table.all()[0] : table.forBot(botId);
+      const reason = frame.platform !== "agentschat" ? "unsupported_platform" : !identity ? "unknown_identity" : !legacy && (identity.gatewayId !== conn.gatewayId || identity.secret !== conn.secret) ? "credential_mismatch" : null;
+      const labels = `gatewayId=${safeLabel(conn.gatewayId)} platform=${safeLabel(frame.platform === "agentschat" ? "agentschat" : "(unsupported)")} botId=${safeLabel(identity ? botId : "(unknown)")}`;
+      if (reason) {
+        log(`[connector] hello rejected ${labels} reason=${reason}`);
+        conn.fronted.clear();
+        send(conn.ws, { type: "error", error: `hello rejected: ${reason}` });
+        conn.ws.close(1002, `hello rejected: ${reason}`);
         return;
       }
       conn.fronted.add(identity.botId);
+      if (legacy)
+        conn.legacyAlias = botId;
+      log(`[connector] hello accepted ${labels}`);
       send(conn.ws, { type: "descriptor", descriptor: { ...descriptor, platform: "agentschat" } });
       return;
     }
     if (t === "outbound") {
-      const result = await handleOutbound(conn, frame);
+      let result;
+      try {
+        result = await handleOutbound(conn, frame);
+      } catch (error) {
+        const status = error instanceof PlatformHttpError && Number.isInteger(error.status) && error.status >= 400 && error.status <= 599 ? error.status : undefined;
+        result = status !== undefined ? { success: false, error: `agentschat HTTP ${status}`, code: "platform_http_error", status, ambiguous: status >= 500 } : error instanceof PlatformNetworkError ? { success: false, error: "agentschat network failure; outcome unknown", code: "platform_network_error", ambiguous: true } : { success: false, error: "platform operation failed; outcome unknown", code: "platform_operation_failed", ambiguous: true };
+        log(`[connector] outbound failed: ${result.code}${status ? ` status=${status}` : ""}`);
+      }
       send(conn.ws, { type: "outbound_result", requestId: frame.requestId, result });
       return;
     }
@@ -274,26 +330,13 @@ function startConnector(config) {
     const action = frame?.action ?? {};
     const op = action?.op;
     const chatId = action?.chat_id ?? "";
-    const firstFronted = [...conn.fronted][0];
-    const requested = typeof frame?.botId === "string" && frame.botId ? frame.botId : firstFronted ?? null;
-    let identity = null;
-    if (table.isSingle()) {
-      identity = table.all()[0] ?? null;
-    } else if (requested && conn.fronted.has(requested)) {
-      identity = table.forBot(requested);
-    } else if (requested && conn.fronted.size > 0) {
-      identity = table.forBot(requested);
-    }
-    if (identity && (op === "send" || op === "typing") && chatId && conn.fronted.size > 0) {
-      const hintedBotId = egressHint.get(chatId);
-      if (hintedBotId && hintedBotId !== identity.botId) {
-        const hinted = table.forBot(hintedBotId);
-        if (hinted) {
-          log(`[connector] outbound egress hint: chat=${chatId} frame.botId=${identity.botId} → ${hinted.botId}`);
-          identity = hinted;
-        }
-      }
-    }
+    const firstFronted = conn.fronted.size === 1 ? [...conn.fronted][0] : undefined;
+    let requested = frame.botId === undefined ? firstFronted ?? null : typeof frame.botId === "string" && frame.botId ? frame.botId : null;
+    if (legacy && requested && requested === conn.legacyAlias)
+      requested = "default";
+    let identity = requested && conn.fronted.has(requested) ? table.forBot(requested) : null;
+    if (identity && (!legacy && (identity.gatewayId !== conn.gatewayId || identity.secret !== conn.secret) || frame.platform !== undefined && frame.platform !== "agentschat"))
+      identity = null;
     if (!identity) {
       log(`[connector] outbound failed: no usable identity for botId=${requested ?? "?"}`);
       return { success: false, error: `no usable identity for outbound (botId=${requested ?? "?"})` };
@@ -301,8 +344,6 @@ function startConnector(config) {
     switch (op) {
       case "send": {
         const r = await hooks.sendMessage(identity.botId, chatId, action.content ?? "", action.reply_to);
-        if (chatId)
-          egressHint.delete(chatId);
         return { success: true, message_id: r?.id };
       }
       case "typing": {
@@ -323,11 +364,17 @@ function startConnector(config) {
       ws.send(JSON.stringify(obj) + `
 `);
   }
+  const ready = new Promise((resolve, reject) => {
+    http.once("listening", resolve);
+    http.once("error", reject);
+  });
   http.listen(config.port, config.host ?? "127.0.0.1");
-  const address = http.address();
-  const port = typeof address === "object" && address ? address.port : config.port;
   return {
-    port,
+    ready,
+    get port() {
+      const address = http.address();
+      return typeof address === "object" && address ? address.port : config.port;
+    },
     stop() {
       for (const c of sockets) {
         try {
@@ -339,72 +386,80 @@ function startConnector(config) {
     },
     async injectAgentsChatMessage(msg) {
       const isDm = typeof msg.channel_id === "string" && msg.channel_id.startsWith("dm-");
-      const bySocket = msg.__botId ? table.forBot(String(msg.__botId)) : null;
-      const target = isDm ? bySocket ?? routeInbound(table, {
-        channel_id: msg.channel_id,
-        dmOwnerBotId: msg.dm_owner
-      }) ?? (table.isSingle() ? table.all()[0] : null) : routeInbound(table, {
+      const owner = msg.__botId ?? msg.dm_owner;
+      const targets = isDm ? [owner !== undefined ? typeof owner === "string" ? table.forBot(owner) : null : table.isSingle() ? table.all()[0] : null].filter((id) => !!id) : routeInboundTargets(table, {
         channel_id: msg.channel_id,
         mentioned_ids: msg.mentioned_ids,
         content: msg.content
       });
-      if (!target) {
+      if (!targets.length) {
         log(`[connector] inbound unaddressed (channel=${msg.channel_id ?? "?"} mentions=${JSON.stringify(msg.mentioned_ids ?? [])}) — dropped`);
         return;
       }
-      const baseEvent = toWireEvent(msg, "agentschat");
-      if (!baseEvent)
-        return;
-      if (!isDm) {
-        const key = `${target.botId}:${msg.channel_id}`;
-        const since = lastAddressed.get(key);
-        if (hooks.getChannelContext) {
-          try {
-            const ctx = await hooks.getChannelContext(target.botId, msg.channel_id, since, msg.id);
-            if (ctx && ctx.length) {
-              baseEvent.context = ctx.slice(-10).map((c) => ({
-                text: String(c?.text ?? "").slice(0, 500),
-                source: { user_name: c?.user_name, user_id: c?.user_id }
-              }));
+      await Promise.all(targets.map((target) => {
+        const key = JSON.stringify([target.botId, msg.channel_id]);
+        const previous = inboundQueues.get(key) ?? Promise.resolve();
+        const job = previous.catch(() => {}).then(async () => {
+          if (msg.sender_id === target.agentId)
+            return;
+          const baseEvent = toWireEvent(msg, "agentschat");
+          if (!baseEvent)
+            return;
+          if (![...sockets].some((c) => c.ws.readyState === WebSocket.OPEN && c.fronted.has(target.botId)))
+            return;
+          const deliveryKey = typeof msg.id === "string" && msg.id ? JSON.stringify([msg.channel_id, msg.id, target.botId]) : null;
+          if (deliveryKey && delivered.recordOrSkip(deliveryKey))
+            return;
+          if (!isDm) {
+            const since = lastAddressed.get(key);
+            if (hooks.getChannelContext) {
+              const controller = new AbortController;
+              let timer;
+              try {
+                const ctx = await Promise.race([
+                  hooks.getChannelContext(target.botId, msg.channel_id, since, msg.id, controller.signal),
+                  new Promise((resolve) => {
+                    timer = setTimeout(() => {
+                      controller.abort();
+                      resolve(null);
+                    }, 1000);
+                  })
+                ]);
+                if (ctx && ctx.length) {
+                  baseEvent.context = ctx.slice(-10).map((c) => ({
+                    text: String(c?.text ?? "").slice(0, 500),
+                    source: { user_name: c?.user_name, user_id: c?.user_id }
+                  }));
+                }
+              } catch {
+                log(`[connector] context fetch failed (delivering without it)`);
+              } finally {
+                if (timer)
+                  clearTimeout(timer);
+              }
             }
-          } catch (e) {
-            log(`[connector] context fetch failed for ${key} (delivering without it): ${e}`);
+            if (msg.timestamp && Number.isFinite(Date.parse(msg.timestamp)) && (!since || Date.parse(msg.timestamp) > Date.parse(since)))
+              lastAddressed.set(key, msg.timestamp);
           }
-        }
-        if (msg.timestamp)
-          lastAddressed.set(key, msg.timestamp);
-      }
-      const precise = [...sockets].filter((c) => c.fronted.has(target.botId));
-      let deliverTo;
-      let viaFallback = false;
-      if (precise.length > 0) {
-        deliverTo = precise;
-      } else {
-        const fallback = [...sockets].find((c) => c.fronted.size > 0);
-        deliverTo = fallback ? [fallback] : [];
-        viaFallback = deliverTo.length > 0;
-        if (viaFallback) {
-          log(`[connector] inbound fallback for botId=${target.botId} via gateway ${deliverTo[0].gatewayId} (no precise hello; first agentschat-fronted conn)`);
-        }
-      }
-      if (deliverTo.length === 0) {
-        log(`[connector] inbound dropped for botId=${target.botId}: no agentschat-fronted gateway socket`);
-        return;
-      }
-      const chatKey = typeof msg.channel_id === "string" ? msg.channel_id : "";
-      if (chatKey)
-        egressHint.set(chatKey, target.botId);
-      for (const conn of deliverTo) {
-        const event = { ...baseEvent, source: { ...baseEvent.source } };
-        if (viaFallback) {
-          event.source.profile = fallbackSourceProfile(target);
-        } else {
-          const profile = hermesSourceProfile(target, conn.fronted.size);
-          if (profile)
-            event.source.profile = profile;
-        }
-        send(conn.ws, { type: "inbound", event });
-      }
+          const deliverTo = [...sockets].filter((c) => c.ws.readyState === WebSocket.OPEN && c.fronted.has(target.botId)).slice(0, 1);
+          if (deliverTo.length === 0) {
+            log(`[connector] inbound dropped for botId=${target.botId}: no agentschat-fronted gateway socket`);
+            return;
+          }
+          for (const conn of deliverTo) {
+            const event = { ...baseEvent, source: { ...baseEvent.source } };
+            const profile = hermesSourceProfile(target, conn.fronted.size);
+            if (profile)
+              event.source.profile = profile;
+            send(conn.ws, { type: "inbound", event });
+          }
+        });
+        inboundQueues.set(key, job);
+        return job.finally(() => {
+          if (inboundQueues.get(key) === job)
+            inboundQueues.delete(key);
+        });
+      }));
     },
     connections() {
       return sockets.size;
@@ -414,6 +469,13 @@ function startConnector(config) {
         throw new Error("reloadIdentities requires a non-empty identity list");
       }
       table.replace(next);
+      for (const conn of sockets) {
+        for (const botId of conn.fronted) {
+          const id = table.forBot(botId);
+          if (!id || id.gatewayId !== conn.gatewayId || id.secret !== conn.secret)
+            conn.fronted.delete(botId);
+        }
+      }
       for (const k of Object.keys(config.secrets))
         delete config.secrets[k];
       for (const id of next) {
@@ -494,38 +556,6 @@ function normalizeTimestampForCursor(ts, mode) {
   return ts;
 }
 
-// src/dedup.ts
-function messageDedupKey(data) {
-  if (!data || typeof data.id !== "string" || typeof data.channel_id !== "string")
-    return null;
-  return `${data.channel_id}:${data.id}`;
-}
-
-class MessageDedup {
-  max;
-  dropOnEvict;
-  seen = new Set;
-  constructor(max = 5000, dropOnEvict = 1000) {
-    this.max = max;
-    this.dropOnEvict = dropOnEvict;
-  }
-  recordOrSkip(key) {
-    if (this.seen.has(key))
-      return true;
-    this.seen.add(key);
-    if (this.seen.size > this.max) {
-      const arr = [...this.seen];
-      this.seen.clear();
-      for (const item of arr.slice(this.dropOnEvict))
-        this.seen.add(item);
-    }
-    return false;
-  }
-  get size() {
-    return this.seen.size;
-  }
-}
-
 // connector/backfill.ts
 function planBackfill(after, msgs, agentId) {
   const list = Array.isArray(msgs) ? msgs : [];
@@ -555,9 +585,11 @@ function ingestAgentsChatFrame(id, frame, deps) {
     deps.advanceCursor(id, frame.channel_id, frame.timestamp);
   }
   const key = messageDedupKey(frame);
-  if (key && deps.dedup.recordOrSkip(key))
+  const isDm = frame.channel_id?.startsWith("dm-");
+  const scopedKey = key && (isDm ? JSON.stringify([id.botId, frame.channel_id, frame.id]) : key);
+  if (scopedKey && deps.dedup.recordOrSkip(scopedKey))
     return false;
-  return frame.sender_id !== id.agentId && frame.content !== "__typing__";
+  return (!frame.channel_id?.startsWith("dm-") || frame.sender_id !== id.agentId) && frame.content !== "__typing__";
 }
 
 // src/heartbeat.ts
@@ -653,16 +685,24 @@ function parseIdentitiesJson(raw, source) {
   let parsed;
   try {
     parsed = JSON.parse(raw);
-  } catch (e) {
-    throw new Error(`${source} is not valid JSON: ${e}`);
+  } catch {
+    throw new Error(`${source} is not valid JSON`);
   }
   if (!Array.isArray(parsed) || parsed.length === 0) {
     throw new Error(`${source} must be a non-empty JSON array`);
   }
-  for (const it of parsed) {
-    if (!it?.botId || !it?.token || !it?.gatewayId || !it?.secret) {
-      throw new Error(`each ${source} entry needs botId, token, gatewayId, secret — got: ${JSON.stringify(it).slice(0, 80)}`);
+  const seen = new Set;
+  for (const [index, it] of parsed.entries()) {
+    const invalid = ["botId", "token", "gatewayId", "secret"].filter((k) => typeof it?.[k] !== "string" || !it[k].trim());
+    for (const k of ["agentId", "profile"]) {
+      if (it?.[k] !== undefined && (typeof it[k] !== "string" || !it[k].trim()))
+        invalid.push(k);
     }
+    if (invalid.length)
+      throw new Error(`${source} entry ${index}: missing or invalid string fields: ${invalid.join(", ")}`);
+    if (seen.has(it.botId))
+      throw new Error(`${source} entry ${index}: duplicate botId`);
+    seen.add(it.botId);
   }
   return parsed.map((it) => ({
     botId: String(it.botId),
@@ -676,7 +716,13 @@ function parseIdentitiesJson(raw, source) {
 function loadIdentities() {
   const file = (process.env.RELAY_IDENTITIES_FILE || "").trim();
   if (file) {
-    return parseIdentitiesJson(readFileSync2(file, "utf8"), `RELAY_IDENTITIES_FILE (${file})`);
+    let raw2;
+    try {
+      raw2 = readFileSync2(file, "utf8");
+    } catch {
+      throw new Error("RELAY_IDENTITIES_FILE could not be read");
+    }
+    return parseIdentitiesJson(raw2, "RELAY_IDENTITIES_FILE");
   }
   const raw = (process.env.RELAY_IDENTITIES || "").trim();
   if (raw) {
@@ -703,6 +749,27 @@ for (const id of identities) {
 }
 var broadcast = null;
 var socketsByBot = new Map;
+var reconnectTimerByBot = new Map;
+var currentIdentity = (id) => !process.__shutdown && identities.includes(id);
+function cancelReconnect(botId) {
+  const timer = reconnectTimerByBot.get(botId);
+  if (timer)
+    clearTimeout(timer);
+  reconnectTimerByBot.delete(botId);
+}
+function scheduleReconnect(id, delay) {
+  if (!currentIdentity(id))
+    return;
+  cancelReconnect(id.botId);
+  const timer = setTimeout(() => {
+    if (reconnectTimerByBot.get(id.botId) !== timer)
+      return;
+    reconnectTimerByBot.delete(id.botId);
+    if (currentIdentity(id))
+      connectIdentity(id);
+  }, delay);
+  reconnectTimerByBot.set(id.botId, timer);
+}
 var backoffByBot = new Map;
 var backfillTimerByBot = new Map;
 var heartbeatsByBot = new Map;
@@ -774,6 +841,8 @@ async function joinMemberships(ws, id) {
       return;
     }
     const body = await r.json();
+    if (!currentIdentity(id) || socketsByBot.get(id.botId) !== ws)
+      return;
     const channels = Array.isArray(body) ? body : body.channels || [];
     const joined = [];
     for (const ch of channels) {
@@ -788,7 +857,7 @@ async function joinMemberships(ws, id) {
       clearTimeout(prev);
     const t = setTimeout(() => {
       backfillTimerByBot.delete(id.botId);
-      if (process.__shutdown)
+      if (!currentIdentity(id) || socketsByBot.get(id.botId) !== ws)
         return;
       backfillIdentity(id, joined);
     }, 2000);
@@ -801,6 +870,8 @@ async function joinMemberships(ws, id) {
 async function backfillIdentity(id, channelIds) {
   const s = cursorFor(id);
   for (const channelId of channelIds) {
+    if (!currentIdentity(id))
+      return;
     try {
       const after = s.map.get(channelId);
       const params = after ? `?after=${encodeURIComponent(after)}&limit=50` : `?limit=1`;
@@ -810,6 +881,8 @@ async function backfillIdentity(id, channelIds) {
       if (!r.ok)
         continue;
       const msgs = (await r.json())?.messages ?? [];
+      if (!currentIdentity(id))
+        return;
       const plan = planBackfill(after, msgs, id.agentId);
       if (plan.seed) {
         s.map.set(channelId, plan.seed);
@@ -831,6 +904,9 @@ async function backfillIdentity(id, channelIds) {
   }
 }
 function connectIdentity(id) {
+  if (!currentIdentity(id))
+    return;
+  cancelReconnect(id.botId);
   stopHeartbeat(id.botId);
   const prev = socketsByBot.get(id.botId);
   if (prev) {
@@ -852,7 +928,7 @@ function connectIdentity(id) {
       } catch {}
     },
     reconnect: () => {
-      if (process.__shutdown || heartbeatForced)
+      if (!currentIdentity(id) || socketsByBot.get(id.botId) !== ws || heartbeatForced)
         return;
       heartbeatForced = true;
       log(`agentschat WS heartbeat timeout for ${id.botId}; forcing reconnect`);
@@ -863,22 +939,25 @@ function connectIdentity(id) {
       } catch {}
       socketsByBot.delete(id.botId);
       stopHeartbeat(id.botId);
-      setTimeout(() => {
-        if (!process.__shutdown)
-          connectIdentity(id);
-      }, 500);
+      scheduleReconnect(id, 500);
     },
     getReadyState: () => ws.readyState ?? WS_CLOSED
   }, HB_PING_MS, HB_PONG_MS, HB_CONNECT_MS);
   heartbeatsByBot.set(id.botId, hb);
   hb.start();
   ws.on("open", () => {
+    if (!currentIdentity(id) || socketsByBot.get(id.botId) !== ws) {
+      ws.close();
+      return;
+    }
     backoffByBot.set(id.botId, 1000);
     try {
       ws.send(JSON.stringify({ type: "auth", agent_id: id.agentId, token: id.token, capabilities: ["chat"] }));
     } catch {}
   });
   ws.on("message", (raw) => {
+    if (!currentIdentity(id) || socketsByBot.get(id.botId) !== ws)
+      return;
     let data;
     try {
       data = JSON.parse(String(raw));
@@ -910,6 +989,8 @@ function connectIdentity(id) {
     }
   });
   ws.on("close", () => {
+    if (!currentIdentity(id) || socketsByBot.get(id.botId) !== ws)
+      return;
     stopHeartbeat(id.botId);
     if (process.__shutdown)
       return;
@@ -917,7 +998,7 @@ function connectIdentity(id) {
       return;
     const delay = backoffByBot.get(id.botId) ?? 1000;
     log(`agentschat WS closed for ${id.botId}; reconnecting in ${delay}ms`);
-    setTimeout(() => connectIdentity(id), delay);
+    scheduleReconnect(id, delay);
     backoffByBot.set(id.botId, Math.min(delay * 2, 30000));
   });
   ws.on("error", (e) => log(`agentschat WS error (${id.botId}): ${e?.message ?? e}`));
@@ -929,19 +1010,21 @@ var connector = startConnector({
   identities,
   agentschat: {
     async sendMessage(botId, chatId, content, replyTo) {
-      const id = identities.find((i) => i.botId === botId) ?? identities[0];
+      const id = requireIdentity(identities, botId);
       const res = await fetch(`${API}/api/channels/${encodeURIComponent(chatId)}/messages`, {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${id.token}` },
         body: JSON.stringify({ sender_id: id.agentId, content_type: "text", content, ...replyTo ? { parent_id: replyTo } : {} })
+      }).catch(() => {
+        throw new PlatformNetworkError;
       });
       if (!res.ok)
-        throw new Error(`agentschat send failed: ${res.status}`);
+        throw new PlatformHttpError(res.status);
       const data = await res.json();
       return { id: data?.id };
     },
     async getChatInfo(botId, chatId) {
-      const id = identities.find((i) => i.botId === botId) ?? identities[0];
+      const id = requireIdentity(identities, botId);
       const res = await fetch(`${API}/api/channels/${encodeURIComponent(chatId)}`, {
         headers: { Authorization: `Bearer ${id.token}` }
       });
@@ -951,7 +1034,7 @@ var connector = startConnector({
       return { name: data?.name ?? chatId, type: chatId.startsWith("dm-") ? "dm" : "group" };
     },
     async sendTyping(botId, chatId) {
-      const id = identities.find((i) => i.botId === botId) ?? identities[0];
+      const id = requireIdentity(identities, botId);
       const ws = socketsByBot.get(id.botId);
       if (ws && ws.readyState === WS.OPEN) {
         try {
@@ -959,9 +1042,10 @@ var connector = startConnector({
         } catch {}
       }
     },
-    async getChannelContext(botId, chatId, sinceTs, excludeId) {
-      const id = identities.find((i) => i.botId === botId) ?? identities[0];
+    async getChannelContext(botId, chatId, sinceTs, excludeId, signal) {
+      const id = requireIdentity(identities, botId);
       const res = await fetch(`${API}/api/channels/${encodeURIComponent(chatId)}/messages?limit=50`, {
+        signal,
         headers: { Authorization: `Bearer ${id.token}` }
       });
       if (!res.ok)
@@ -981,11 +1065,12 @@ var connector = startConnector({
   logger: log
 });
 broadcast = (msg) => connector.injectAgentsChatMessage(msg);
+await connector.ready;
 log(`listening on ${HOST}:${connector.port} (contract v1, ${identities.length} identit${identities.length === 1 ? "y" : "ies"})`);
 for (const id of identities)
   connectIdentity(id);
 function reloadIdentitiesFromConfig() {
-  const next = loadIdentities();
+  const next = loadIdentities().map((id) => identities.find((prev) => prev.botId === id.botId && prev.agentId === id.agentId && prev.token === id.token && prev.gatewayId === id.gatewayId && prev.secret === id.secret && prev.profile === id.profile) ?? id);
   const prevByBot = new Map(identities.map((i) => [i.botId, i]));
   const nextByBot = new Map(next.map((i) => [i.botId, i]));
   const added = next.filter((i) => !prevByBot.has(i.botId));
@@ -994,6 +1079,7 @@ function reloadIdentitiesFromConfig() {
   connector.reloadIdentities(next);
   identities = next;
   for (const id of removed) {
+    cancelReconnect(id.botId);
     log(`hot-reload: disconnecting removed identity ${id.botId}`);
     stopHeartbeat(id.botId);
     const t = backfillTimerByBot.get(id.botId);
@@ -1013,7 +1099,12 @@ function reloadIdentitiesFromConfig() {
   }
   for (const id of kept) {
     const prev = prevByBot.get(id.botId);
-    if (prev.token !== id.token || prev.agentId !== id.agentId) {
+    if (prev !== id) {
+      cancelReconnect(id.botId);
+      const timer = backfillTimerByBot.get(id.botId);
+      if (timer)
+        clearTimeout(timer);
+      backfillTimerByBot.delete(id.botId);
       log(`hot-reload: reconnecting ${id.botId} (credentials changed)`);
       connectIdentity(id);
     }
@@ -1034,6 +1125,8 @@ process.on("SIGHUP", () => {
 for (const sig of ["SIGINT", "SIGTERM"]) {
   process.on(sig, () => {
     process.__shutdown = true;
+    for (const botId of reconnectTimerByBot.keys())
+      cancelReconnect(botId);
     for (const botId of [...heartbeatsByBot.keys()])
       stopHeartbeat(botId);
     for (const ws of socketsByBot.values()) {

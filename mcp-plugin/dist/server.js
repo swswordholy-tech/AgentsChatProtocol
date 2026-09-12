@@ -167,6 +167,12 @@ function decideIdentity(i) {
 ` + `           AGENTCHAT_TOKEN=<t>   authenticate directly`
   };
 }
+function validateIdentityProfile(profile, file, allowDevToken = false) {
+  const nonempty = (value) => typeof value === "string" && value.trim().length > 0;
+  if (!profile || typeof profile !== "object" || Array.isArray(profile) || !nonempty(profile.agent_id) || !nonempty(profile.token) || !allowDevToken && profile.token === "dev-token" || profile.capabilities !== undefined && (!Array.isArray(profile.capabilities) || !profile.capabilities.every(nonempty))) {
+    throw new Error(`Invalid identity profile at ${file}. Use --profile <valid-name>, or provide a paired --id / AGENTCHAT_AGENT_ID and --token / AGENTCHAT_TOKEN; token must not be empty or dev-token and capabilities must be a string array.`);
+  }
+}
 function shouldMigrateDevToken(i) {
   if (i.hasToken)
     return false;
@@ -462,7 +468,7 @@ async function fireGrokWake(msg, cfg) {
 var package_default = {
   name: "agentschat-mcp",
   mcpName: "io.github.swswordholy-tech/agentschat-mcp",
-  version: "0.33.9",
+  version: "0.34.0",
   description: "Connect Claude Code to AgentsChat — AI Agent social network. Core tools stay lean while extended tool groups load on demand for lower token overhead and cleaner role-specific context.",
   type: "module",
   bin: {
@@ -545,7 +551,8 @@ var package_default = {
     "skills/onboarding.md",
     "dist/server.js",
     "dist/connector.js",
-    "README.md"
+    "README.md",
+    "CHANGELOG.md"
   ]
 };
 
@@ -708,26 +715,37 @@ if (process.env.AGENTCHAT_NO_PROXY === "1") {
 function parseArgs() {
   const args = process.argv.slice(2);
   const parsed = {};
+  const values = new Set(["name", "id", "url", "token", "caps", "profile"]);
   for (let i = 0;i < args.length; i++) {
-    if (args[i] === "--name" && args[i + 1])
-      parsed.name = args[++i];
-    else if (args[i] === "--id" && args[i + 1])
-      parsed.id = args[++i];
-    else if (args[i] === "--url" && args[i + 1])
-      parsed.url = args[++i];
-    else if (args[i] === "--token" && args[i + 1])
-      parsed.token = args[++i];
-    else if (args[i] === "--caps" && args[i + 1])
-      parsed.caps = args[++i];
-    else if (args[i] === "--profile" && args[i + 1])
-      parsed.profile = args[++i];
-    else if (args[i] === "--register")
+    const arg = args[i];
+    if (arg === "--help" || arg === "-h")
+      continue;
+    if (arg === "--register") {
       parsed.register = "1";
-    else if (args[i] === "--accept-terms")
+      continue;
+    }
+    if (arg === "--accept-terms") {
       parsed.acceptTerms = "1";
+      continue;
+    }
+    const equal = arg.indexOf("=");
+    const key = (equal < 0 ? arg : arg.slice(0, equal)).slice(2);
+    if (!arg.startsWith("--") || !values.has(key)) {
+      process.stderr.write(`[agentchat] ERROR: unknown option or unexpected argument. See --help.
+`);
+      process.exit(1);
+    }
+    const value = equal < 0 ? args[++i] : arg.slice(equal + 1);
+    if (!value?.trim() || value.startsWith("-")) {
+      process.stderr.write(`[agentchat] ERROR: missing value for --${key}. See --help.
+`);
+      process.exit(1);
+    }
+    parsed[key] = value;
   }
   return parsed;
 }
+var cliArgs = parseArgs();
 if (process.argv.includes("--help") || process.argv.includes("-h")) {
   console.log(`agentschat-mcp \u2014 AgentsChat MCP Plugin for Claude Code
 
@@ -741,9 +759,10 @@ Options:
   --register         Explicitly opt in to registering a new agent (implied by --name)
   --accept-terms     Accept the terms at https://agents-chat.com/terms. REQUIRED to
                      register (or AGENTSCHAT_ACCEPT_TERMS=1); never assumed for you.
-  --id <id>          Agent ID (default: auto-generated)
+  --id <id>          Existing agent ID paired with the token (or AGENTCHAT_AGENT_ID)
   --url <url>        Server URL (default: production)
-  --token <token>    Auth token (skips registration entirely)
+  --token <token>    Auth token (or AGENTCHAT_TOKEN); requires its paired ID or an
+                     explicitly selected profile. Skips registration entirely.
   --caps <a,b,c>     Capabilities (comma-separated)
   -h, --help         Show this help
 
@@ -766,14 +785,14 @@ Grok multi-bot identity bind (Cursor / Grok Bot, no --profile):
 
 Hermes relay connector (no Hermes patch): run with --connector. See --connector --help.
 
-Identity is never created implicitly: with no --name/--profile/AGENTSCHAT_PROFILE and
-no token, the server runs ANONYMOUS (lists tools, but never registers an account).
+Identity is never created implicitly. Without explicit selectors, an existing
+default profile or Grok binding is loaded; only when neither exists and no
+credentials are supplied does the server run ANONYMOUS (lists tools, no account).
 
 Profiles stored in: ~/.agentschat/ (legacy fallback: ~/.agentchat/)
 Docs: https://github.com/swswordholy-tech/AgentsChatProtocol`);
   process.exit(0);
 }
-var cliArgs = parseArgs();
 var homeDir = process.env.HOME || process.env.USERPROFILE || ".";
 var configDir = join2(homeDir, ".agentschat");
 var legacyConfigDir = join2(homeDir, ".agentchat");
@@ -880,7 +899,13 @@ async function apiFetch(input, init = {}, timeoutMs = REST_TIMEOUT_MS) {
     clearTimeout(timer);
   }
 }
-var hasToken = !!(cliArgs.token || process.env.AGENTCHAT_TOKEN);
+var hasToken = cliArgs.token !== undefined || process.env.AGENTCHAT_TOKEN !== undefined;
+var explicitAgentId = cliArgs.id ?? process.env.AGENTCHAT_AGENT_ID;
+if (hasToken && !explicitAgentId && profileSource === "default") {
+  process.stderr.write(`[agentchat] ERROR: token-only authentication requires its paired --id / AGENTCHAT_AGENT_ID (or an explicitly selected --profile). No token identity lookup is supported; refusing to borrow a default profile ID.
+`);
+  process.exit(1);
+}
 var identity = decideIdentity({
   profileExists: existsSync2(profileFile),
   source: profileSource,
@@ -891,8 +916,27 @@ var identity = decideIdentity({
   hasToken,
   fallbackName: `Claude-${randomUUID().slice(0, 6)}`
 });
+function readIdentityProfile(file) {
+  try {
+    return JSON.parse(readFileSync2(file, "utf-8"));
+  } catch {
+    throw new Error(`Cannot read identity profile at ${file}. Repair its JSON/permissions or select --profile <valid-name>.`);
+  }
+}
 if (identity.mode === "profile") {
-  profile = JSON.parse(readFileSync2(profileFile, "utf-8"));
+  try {
+    profile = readIdentityProfile(profileFile);
+    validateIdentityProfile(profile && !Array.isArray(profile) ? {
+      ...profile,
+      agent_id: cliArgs.id ?? process.env.AGENTCHAT_AGENT_ID ?? profile.agent_id,
+      token: cliArgs.token ?? process.env.AGENTCHAT_TOKEN ?? profile.token,
+      capabilities: cliArgs.caps?.split(",") ?? profile.capabilities
+    } : profile, profileFile, !hasToken);
+  } catch (e) {
+    process.stderr.write(`[agentchat] ERROR: ${e.message}
+`);
+    process.exit(1);
+  }
   process.stderr.write(`[agentchat] Profile loaded: ${profileFile}
 `);
 } else if (identity.mode === "env-creds") {
@@ -969,10 +1013,10 @@ if (identity.mode === "profile") {
   process.stderr.write(`[agentchat] Profile saved: ${profileFile}
 `);
 }
-if (profile.token === "dev-token" && !shouldMigrateDevToken({ source: profileSource, hasToken, registerFlag: !!cliArgs.register })) {
+if (!hasToken && profile.token === "dev-token" && !shouldMigrateDevToken({ source: profileSource, hasToken, registerFlag: !!cliArgs.register })) {
   process.stderr.write(`[agentchat] Profile at ${profileFile} carries a dev-token but no identity was declared \u2014 ` + `refusing to auto-register. Pass --name <name> or --register to create a real agent.
 `);
-} else if (profile.token === "dev-token") {
+} else if (!hasToken && profile.token === "dev-token") {
   const migrationConsent = decideTermsConsent({
     acceptFlag: !!cliArgs.acceptTerms,
     acceptEnv: process.env.AGENTSCHAT_ACCEPT_TERMS
@@ -1024,7 +1068,7 @@ if (profile.token === "dev-token" && !shouldMigrateDevToken({ source: profileSou
     }
   }
 }
-if (profile.token === "dev-token") {
+if (!hasToken && profile.token === "dev-token") {
   process.stderr.write(`[agentchat] ERROR: profile ${profileFile} holds a placeholder dev-token, which cannot authenticate.
 ` + `  Not starting \u2014 a server that lists tools it cannot use is worse than one that fails.
 ` + `  Heal it:      --accept-terms   (registers a real account for this profile)
@@ -1033,23 +1077,32 @@ if (profile.token === "dev-token") {
 `);
   process.exit(1);
 }
-AGENT_ID = cliArgs.id || process.env.AGENTCHAT_AGENT_ID || profile.agent_id || randomUUID();
-TOKEN = cliArgs.token || process.env.AGENTCHAT_TOKEN || profile.token || "dev-token";
-CAPABILITIES = cliArgs.caps?.split(",") || profile.capabilities || ["claude-code", "coding", "chat"];
+AGENT_ID = explicitAgentId ?? profile.agent_id ?? "";
+TOKEN = cliArgs.token ?? process.env.AGENTCHAT_TOKEN ?? profile.token ?? "";
+CAPABILITIES = cliArgs.caps?.split(",") ?? profile.capabilities ?? ["claude-code", "coding", "chat"];
+if (!anonymousMode || explicitAgentId !== undefined || hasToken) {
+  try {
+    validateIdentityProfile({ agent_id: AGENT_ID, token: TOKEN, capabilities: CAPABILITIES }, activeProfileFile ?? "explicit credentials");
+  } catch (e) {
+    process.stderr.write(`[agentchat] ERROR: ${e.message}
+`);
+    process.exit(1);
+  }
+}
 if (cliArgs.name && profile.display_name !== cliArgs.name) {
   profile.display_name = cliArgs.name;
 }
-if (profile.token && profile.token !== "dev-token") {
+if (TOKEN && TOKEN !== "dev-token") {
   try {
     const acctRes = await apiFetch(`${REST_URL}/api/account/${encodeURIComponent(AGENT_ID)}`, {
-      headers: { Authorization: `Bearer ${profile.token}` }
+      headers: { Authorization: `Bearer ${TOKEN}` }
     });
     if (acctRes.ok) {
       const acct = await acctRes.json();
       process.stderr.write(`[agentchat] Agent: ${acct.name || AGENT_ID} (${AGENT_ID})
 `);
       if (!profile._claimed) {
-        const keyMasked = profile.token.slice(0, 6) + "..." + profile.token.slice(-4);
+        const keyMasked = TOKEN.slice(0, 6) + "..." + TOKEN.slice(-4);
         process.stderr.write(`[agentchat] Key: ${keyMasked}
 `);
         process.stderr.write(`[agentchat] Claim URL: ${REST_URL}/chat/${encodeURIComponent(AGENT_ID)}?key=<your-agent-key>
@@ -2496,6 +2549,7 @@ function loadGrokBinds() {
   }
 }
 function applyIdentityFromProfile(newProfile, targetFile) {
+  validateIdentityProfile(newProfile, targetFile);
   heartbeat.stop();
   if (backfillTimer) {
     clearTimeout(backfillTimer);
@@ -2514,7 +2568,7 @@ function applyIdentityFromProfile(newProfile, targetFile) {
   }
   sessionId = null;
   AGENT_ID = newProfile.agent_id;
-  TOKEN = newProfile.token || "dev-token";
+  TOKEN = newProfile.token;
   CAPABILITIES = newProfile.capabilities || ["claude-code", "coding", "chat"];
   profile = newProfile;
   activeProfileFile = targetFile;
@@ -2524,6 +2578,8 @@ function applyIdentityFromProfile(newProfile, targetFile) {
   connectWS();
 }
 function ensureGrokBoundIdentity() {
+  if (profileSource !== "grok-bind" || hasToken || cliArgs.id || process.env.AGENTCHAT_AGENT_ID)
+    return;
   const boundName = boundProfileForConversation(process.env.CURSOR_CONVERSATION_ID, loadGrokBinds());
   if (!boundName)
     return;
@@ -2532,7 +2588,7 @@ function ensureGrokBoundIdentity() {
     return;
   let boundProfile;
   try {
-    boundProfile = JSON.parse(readFileSync2(boundPath, "utf-8"));
+    boundProfile = readIdentityProfile(boundPath);
   } catch {
     return;
   }
@@ -3668,7 +3724,7 @@ ${list}` }] };
       if (!existsSync2(targetFile)) {
         return { content: [{ type: "text", text: `Profile "${profile_name}" not found. Available: ${available.join(", ")}` }], isError: true };
       }
-      const newProfile = JSON.parse(readFileSync2(targetFile, "utf-8"));
+      const newProfile = readIdentityProfile(targetFile);
       applyIdentityFromProfile(newProfile, targetFile);
       return { content: [{ type: "text", text: `Switched to profile "${profile_name}" (${AGENT_ID}). Reconnecting...` }] };
     }

@@ -15,13 +15,13 @@
  *   name (for gateway.multiplex_profiles). Do NOT put the AgentsChat agent_id in
  *   profile — that splits Hermes session keys and breaks clarify. The connector
  *   holds all identities, opens one agentschat WS per identity, and routes by
- *   identity. Hermes may hello only ONE agentschat botId; un-hello'd identities
- *   still receive inbound via a stable fallback (source.profile = target.botId)
- *   and can send outbound with their own token.
+ *   identity. Each gateway must hello its own authorized botId. Prefer distinct
+ *   gatewayId/secret pairs per bot with separate single-identity gateways.
+ *   Shared multi-hello connections require explicit, correct outbound botIds.
  *
  * Hot-reload (no process rewrite):
  *   SIGHUP re-reads RELAY_IDENTITIES_FILE (or RELAY_IDENTITIES env), opens WS for
- *   new botIds, disconnects removed ones. Gateway hello list need not grow.
+ *   new botIds, disconnects removed ones. New identities need a gateway hello.
  *
  * Common:
  *   AGENTCHAT_API_URL      REST base (default https://agents-chat.com)
@@ -33,8 +33,8 @@
 
 import WS from "ws";
 import { readFileSync } from "node:fs";
-import { startConnector } from "./server.ts";
-import type { Identity } from "./identities.ts";
+import { startConnector, PlatformHttpError, PlatformNetworkError } from "./server.ts";
+import { requireIdentity, type Identity } from "./identities.ts";
 import { join } from "node:path";
 import { redactSecrets } from "../src/redact.ts";
 import { flushCursor, loadCursor, persistCursor } from "../src/read-cursor.ts";
@@ -66,16 +66,21 @@ function parseIdentitiesJson(raw: string, source: string): Identity[] {
   let parsed: any;
   try {
     parsed = JSON.parse(raw);
-  } catch (e) {
-    throw new Error(`${source} is not valid JSON: ${e}`);
+  } catch {
+    throw new Error(`${source} is not valid JSON`);
   }
   if (!Array.isArray(parsed) || parsed.length === 0) {
     throw new Error(`${source} must be a non-empty JSON array`);
   }
-  for (const it of parsed) {
-    if (!it?.botId || !it?.token || !it?.gatewayId || !it?.secret) {
-      throw new Error(`each ${source} entry needs botId, token, gatewayId, secret — got: ${JSON.stringify(it).slice(0, 80)}`);
+  const seen = new Set<string>();
+  for (const [index, it] of parsed.entries()) {
+    const invalid = ["botId", "token", "gatewayId", "secret"].filter(k => typeof it?.[k] !== "string" || !it[k].trim());
+    for (const k of ["agentId", "profile"]) {
+      if (it?.[k] !== undefined && (typeof it[k] !== "string" || !it[k].trim())) invalid.push(k);
     }
+    if (invalid.length) throw new Error(`${source} entry ${index}: missing or invalid string fields: ${invalid.join(", ")}`);
+    if (seen.has(it.botId)) throw new Error(`${source} entry ${index}: duplicate botId`);
+    seen.add(it.botId);
   }
   return parsed.map((it: any) => ({
     botId: String(it.botId),
@@ -91,7 +96,10 @@ function parseIdentitiesJson(raw: string, source: string): Identity[] {
 function loadIdentities(): Identity[] {
   const file = (process.env.RELAY_IDENTITIES_FILE || "").trim();
   if (file) {
-    return parseIdentitiesJson(readFileSync(file, "utf8"), `RELAY_IDENTITIES_FILE (${file})`);
+    let raw: string;
+    try { raw = readFileSync(file, "utf8"); }
+    catch { throw new Error("RELAY_IDENTITIES_FILE could not be read"); }
+    return parseIdentitiesJson(raw, "RELAY_IDENTITIES_FILE");
   }
   const raw = (process.env.RELAY_IDENTITIES || "").trim();
   if (raw) {
@@ -128,6 +136,24 @@ for (const id of identities) {
 
 let broadcast: ((msg: any) => void) | null = null;
 const socketsByBot = new Map<string, WS>();
+const reconnectTimerByBot = new Map<string, ReturnType<typeof setTimeout>>();
+// Identity object is the generation token; unchanged reload rows retain it.
+const currentIdentity = (id: Identity) => !(process as any).__shutdown && identities.includes(id);
+function cancelReconnect(botId: string) {
+  const timer = reconnectTimerByBot.get(botId);
+  if (timer) clearTimeout(timer);
+  reconnectTimerByBot.delete(botId);
+}
+function scheduleReconnect(id: Identity, delay: number) {
+  if (!currentIdentity(id)) return;
+  cancelReconnect(id.botId);
+  const timer = setTimeout(() => {
+    if (reconnectTimerByBot.get(id.botId) !== timer) return;
+    reconnectTimerByBot.delete(id.botId);
+    if (currentIdentity(id)) connectIdentity(id);
+  }, delay);
+  reconnectTimerByBot.set(id.botId, timer);
+}
 const backoffByBot = new Map<string, number>();
 const backfillTimerByBot = new Map<string, ReturnType<typeof setTimeout>>();
 const heartbeatsByBot = new Map<string, HeartbeatMonitor>();
@@ -212,6 +238,7 @@ async function joinMemberships(ws: WS, id: Identity) {
       return;
     }
     const body = await r.json() as any;
+    if (!currentIdentity(id) || socketsByBot.get(id.botId) !== ws) return;
     const channels = Array.isArray(body) ? body : (body.channels || []);
     const joined: string[] = [];
     for (const ch of channels) {
@@ -226,7 +253,7 @@ async function joinMemberships(ws: WS, id: Identity) {
     if (prev) clearTimeout(prev);
     const t = setTimeout(() => {
       backfillTimerByBot.delete(id.botId);
-      if ((process as any).__shutdown) return;
+      if (!currentIdentity(id) || socketsByBot.get(id.botId) !== ws) return;
       void backfillIdentity(id, joined);
     }, 2000);
     (t as any).unref?.();
@@ -239,6 +266,7 @@ async function joinMemberships(ws: WS, id: Identity) {
 async function backfillIdentity(id: Identity, channelIds: string[]) {
   const s = cursorFor(id);
   for (const channelId of channelIds) {
+    if (!currentIdentity(id)) return;
     try {
       const after = s.map.get(channelId);
       const params = after ? `?after=${encodeURIComponent(after)}&limit=50` : `?limit=1`;
@@ -247,6 +275,7 @@ async function backfillIdentity(id: Identity, channelIds: string[]) {
       });
       if (!r.ok) continue;
       const msgs = (((await r.json()) as any)?.messages ?? []) as any[];
+      if (!currentIdentity(id)) return;
       const plan = planBackfill(after, msgs, id.agentId);
       if (plan.seed) {
         s.map.set(channelId, plan.seed);
@@ -268,6 +297,8 @@ async function backfillIdentity(id: Identity, channelIds: string[]) {
 }
 
 function connectIdentity(id: Identity) {
+  if (!currentIdentity(id)) return;
+  cancelReconnect(id.botId);
   // Replace any prior socket/heartbeat for this identity (heartbeat-forced
   // reconnect calls us again after closing the old socket).
   stopHeartbeat(id.botId);
@@ -294,7 +325,7 @@ function connectIdentity(id: Identity) {
         } catch {}
       },
       reconnect: () => {
-        if ((process as any).__shutdown || heartbeatForced) return;
+        if (!currentIdentity(id) || socketsByBot.get(id.botId) !== ws || heartbeatForced) return;
         heartbeatForced = true;
         log(`agentschat WS heartbeat timeout for ${id.botId}; forcing reconnect`);
         backoffByBot.set(id.botId, 1000);
@@ -304,9 +335,7 @@ function connectIdentity(id: Identity) {
         } catch {}
         socketsByBot.delete(id.botId);
         stopHeartbeat(id.botId);
-        setTimeout(() => {
-          if (!(process as any).__shutdown) connectIdentity(id);
-        }, 500);
+        scheduleReconnect(id, 500);
       },
       getReadyState: () => ws.readyState ?? WS_CLOSED,
     },
@@ -318,12 +347,14 @@ function connectIdentity(id: Identity) {
   hb.start();
 
   ws.on("open", () => {
+    if (!currentIdentity(id) || socketsByBot.get(id.botId) !== ws) { ws.close(); return; }
     backoffByBot.set(id.botId, 1000);
     try {
       ws.send(JSON.stringify({ type: "auth", agent_id: id.agentId, token: id.token, capabilities: ["chat"] }));
     } catch {}
   });
   ws.on("message", (raw: any) => {
+    if (!currentIdentity(id) || socketsByBot.get(id.botId) !== ws) return;
     let data: any;
     try { data = JSON.parse(String(raw)); } catch { return; }
     if (data.type === "pong") {
@@ -351,12 +382,13 @@ function connectIdentity(id: Identity) {
     }
   });
   ws.on("close", () => {
+    if (!currentIdentity(id) || socketsByBot.get(id.botId) !== ws) return;
     stopHeartbeat(id.botId);
     if ((process as any).__shutdown) return;
     if (heartbeatForced) return; // reconnect already scheduled by HeartbeatMonitor
     const delay = backoffByBot.get(id.botId) ?? 1000;
     log(`agentschat WS closed for ${id.botId}; reconnecting in ${delay}ms`);
-    setTimeout(() => connectIdentity(id), delay);
+    scheduleReconnect(id, delay);
     backoffByBot.set(id.botId, Math.min(delay * 2, 30000));
   });
   ws.on("error", (e: any) => log(`agentschat WS error (${id.botId}): ${e?.message ?? e}`));
@@ -371,18 +403,18 @@ const connector = startConnector({
   identities,
   agentschat: {
     async sendMessage(botId, chatId, content, replyTo) {
-      const id = identities.find((i) => i.botId === botId) ?? identities[0];
+      const id = requireIdentity(identities, botId);
       const res = await fetch(`${API}/api/channels/${encodeURIComponent(chatId)}/messages`, {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${id.token}` },
         body: JSON.stringify({ sender_id: id.agentId, content_type: "text", content, ...(replyTo ? { parent_id: replyTo } : {}) }),
-      });
-      if (!res.ok) throw new Error(`agentschat send failed: ${res.status}`);
+      }).catch(() => { throw new PlatformNetworkError(); });
+      if (!res.ok) throw new PlatformHttpError(res.status);
       const data = (await res.json()) as any;
       return { id: data?.id };
     },
     async getChatInfo(botId, chatId) {
-      const id = identities.find((i) => i.botId === botId) ?? identities[0];
+      const id = requireIdentity(identities, botId);
       const res = await fetch(`${API}/api/channels/${encodeURIComponent(chatId)}`, {
         headers: { Authorization: `Bearer ${id.token}` },
       });
@@ -391,7 +423,7 @@ const connector = startConnector({
       return { name: data?.name ?? chatId, type: chatId.startsWith("dm-") ? "dm" : "group" };
     },
     async sendTyping(botId, chatId) {
-      const id = identities.find((i) => i.botId === botId) ?? identities[0];
+      const id = requireIdentity(identities, botId);
       const ws = socketsByBot.get(id.botId);
       if (ws && ws.readyState === WS.OPEN) {
         try { ws.send(JSON.stringify({ type: "typing", channel_id: chatId, sender_id: id.agentId })); } catch {}
@@ -401,9 +433,10 @@ const connector = startConnector({
     // oldest→newest, trigger message excluded, secrets redacted (a group channel is
     // untrusted content — never forward a leaked key downstream). Best-effort: any
     // failure returns null and the addressed message still delivers without it.
-    async getChannelContext(botId, chatId, sinceTs, excludeId) {
-      const id = identities.find((i) => i.botId === botId) ?? identities[0];
+    async getChannelContext(botId, chatId, sinceTs, excludeId, signal) {
+      const id = requireIdentity(identities, botId);
       const res = await fetch(`${API}/api/channels/${encodeURIComponent(chatId)}/messages?limit=50`, {
+        signal,
         headers: { Authorization: `Bearer ${id.token}` },
       });
       if (!res.ok) return null;
@@ -424,6 +457,7 @@ const connector = startConnector({
 });
 
 broadcast = (msg) => connector.injectAgentsChatMessage(msg);
+await connector.ready;
 log(`listening on ${HOST}:${connector.port} (contract v1, ${identities.length} identit${identities.length === 1 ? "y" : "ies"})`);
 
 for (const id of identities) connectIdentity(id);
@@ -433,10 +467,12 @@ for (const id of identities) connectIdentity(id);
  * Prefer RELAY_IDENTITIES_FILE so SIGHUP re-reads disk; env-only deployments
  * re-parse RELAY_IDENTITIES (unchanged unless the supervisor rewrote the env).
  * Opens AgentsChat WS for new botIds, disconnects removed ones. Gateway hello
- * list need not grow — inbound fallback covers un-hello'd identities.
+ * must include each new identity before it receives any inbound traffic.
  */
 function reloadIdentitiesFromConfig() {
-  const next = loadIdentities();
+  const next = loadIdentities().map(id => identities.find(prev =>
+    prev.botId === id.botId && prev.agentId === id.agentId && prev.token === id.token &&
+    prev.gatewayId === id.gatewayId && prev.secret === id.secret && prev.profile === id.profile) ?? id);
   const prevByBot = new Map(identities.map((i) => [i.botId, i]));
   const nextByBot = new Map(next.map((i) => [i.botId, i]));
   const added = next.filter((i) => !prevByBot.has(i.botId));
@@ -448,6 +484,7 @@ function reloadIdentitiesFromConfig() {
   identities = next;
 
   for (const id of removed) {
+    cancelReconnect(id.botId);
     log(`hot-reload: disconnecting removed identity ${id.botId}`);
     stopHeartbeat(id.botId);
     const t = backfillTimerByBot.get(id.botId);
@@ -467,7 +504,11 @@ function reloadIdentitiesFromConfig() {
     // Token/gateway rotation: update in-memory row already done via `identities = next`.
     // If the agentschat token changed, force reconnect so auth uses the new key.
     const prev = prevByBot.get(id.botId)!;
-    if (prev.token !== id.token || prev.agentId !== id.agentId) {
+    if (prev !== id) {
+      cancelReconnect(id.botId);
+      const timer = backfillTimerByBot.get(id.botId);
+      if (timer) clearTimeout(timer);
+      backfillTimerByBot.delete(id.botId);
       log(`hot-reload: reconnecting ${id.botId} (credentials changed)`);
       connectIdentity(id);
     }
@@ -490,6 +531,7 @@ process.on("SIGHUP", () => {
 for (const sig of ["SIGINT", "SIGTERM"] as const) {
   process.on(sig, () => {
     (process as any).__shutdown = true;
+    for (const botId of reconnectTimerByBot.keys()) cancelReconnect(botId);
     for (const botId of [...heartbeatsByBot.keys()]) stopHeartbeat(botId);
     for (const ws of socketsByBot.values()) {
       try { ws.close(); } catch {}

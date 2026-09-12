@@ -1,33 +1,14 @@
 /**
- * agentschat connector — the connector side of the Hermes relay contract.
+ * AgentsChat relay connector. Repeated hello frames register identities on a
+ * connection authenticated with a gatewayId AND a specific signing secret.
+ * Every identity must match both credentials; outbound additionally requires
+ * that identity's hello on the sending connection. There is no global fallback
+ * and no chat-sticky identity inference.
  *
- * Single-tenant AND multiplex: one relay WS server fronts one OR MORE agentschat
- * identities (one per Hermes profile/agent). Hermes fronts multiple identities on
- * one WS by sending one `hello` per (platform, botId); here platform is always
- * "agentschat" and botId is the agentschat agent_id.
- *
- * Frame exchange (see gateway ws_transport.py):
- *   gateway  → hello           {type:"hello", platform, botId}
- *   connector→ descriptor      {type:"descriptor", descriptor:{...}}   (one per hello)
- *   connector→ inbound         {type:"inbound", event:{...}}           (agentschat → gateway)
- *   gateway  → outbound        {type:"outbound", requestId, platform?, action}
- *   connector→ outbound_result {type:"outbound_result", requestId, result}
- *
- * Auth is fail-closed: anything wrong with the upgrade token closes 4401 before the
- * socket is admitted.
- *
- * The single highest-correctness invariant (multiplex): identity A's credentials are
- * NEVER used to send as identity B. Inbound prefers sockets that hello'd the
- * addressed identity; if none do, a stable agentschat-fronted fallback delivers
- * with `source.profile = target.botId` so Hermes multiplex still keys the right
- * session — Hermes may hello only one botId while RELAY_IDENTITIES holds N.
- * Outbound uses the sending identity's own token whenever that identity is in
- * the table and the socket is a usable agentschat gateway connection (prefer
- * precise hello when present). When Hermes hellos only one botId, a per-chat
- * sticky egress hint (set on successful inbound delivery) can override the
- * frame.botId mouth so replies leave as the identity that just received the
- * message — still only with that identity's own credentials. An identity the
- * connector has no credentials for is rejected at hello (fail closed).
+ * Use separate single-identity gateways for Hermes transports that stamp the
+ * first botId for a platform on all outbound actions. A shared multi-hello WS
+ * requires a client that supplies the correct explicit outbound botId.
+ * All connector frames are newline-terminated (relay wire contract v1).
  */
 
 import { createServer, type Server as HttpServer, type IncomingMessage } from "node:http";
@@ -35,7 +16,8 @@ import { WebSocketServer, WebSocket } from "ws";
 import { verifyUpgradeToken, CLOSE_UNAUTHORIZED } from "./auth.ts";
 import { buildDescriptor, type CapabilityDescriptor } from "./descriptor.ts";
 import { toWireEvent, type AgentsChatMessage } from "./normalize.ts";
-import { IdentityTable, routeInbound, hermesSourceProfile, fallbackSourceProfile, type Identity } from "./identities.ts";
+import { MessageDedup } from "../src/dedup.ts";
+import { IdentityTable, routeInboundTargets, hermesSourceProfile, type Identity } from "./identities.ts";
 
 /** What the connector needs from agentschat to fulfil outbound ops, per identity. */
 export interface AgentsChatHooks {
@@ -51,7 +33,15 @@ export interface AgentsChatHooks {
    * [] when there is nothing worth attaching. Best-effort: failures must not
    * block delivery of the addressed message itself.
    */
-  getChannelContext?(botId: string, chatId: string, sinceTs?: string, excludeId?: string): Promise<Array<{ text: string; user_name?: string; user_id?: string }> | null>;
+  getChannelContext?(botId: string, chatId: string, sinceTs?: string, excludeId?: string, signal?: AbortSignal): Promise<Array<{ text: string; user_name?: string; user_id?: string }> | null>;
+}
+
+/** Only a structured status may be exposed, never a response body. */
+export class PlatformHttpError extends Error {
+  constructor(readonly status: number) { super("platform HTTP failure"); }
+}
+export class PlatformNetworkError extends Error {
+  constructor() { super("platform network failure"); }
 }
 
 /** Legacy single-tenant hook shape (no botId first arg) — adapted to the per-identity one. */
@@ -81,6 +71,7 @@ export interface ConnectorConfig {
 
 export interface ConnectorHandle {
   port: number;
+  ready: Promise<void>;
   stop(): void;
   /** Push an agentschat message to the gateway socket(s) fronting its addressed identity. */
   injectAgentsChatMessage(msg: AgentsChatMessage): void | Promise<void>;
@@ -96,6 +87,8 @@ export interface ConnectorHandle {
 interface GatewayConn {
   ws: WebSocket;
   gatewayId: string;
+  secret: string;
+  legacyAlias?: string;
   /** botIds this socket has declared via hello. */
   fronted: Set<string>;
 }
@@ -103,19 +96,20 @@ interface GatewayConn {
 export function startConnector(config: ConnectorConfig): ConnectorHandle {
   const log = config.logger ?? (() => {});
   const descriptor = buildDescriptor(config.descriptor);
-  // "legacy" = no identity table configured (the pre-multiplex test/embedding
-  // path): a single derived identity and chatId-first hooks. "single" = the
-  // table holds exactly one identity (legacy OR a one-entry RELAY_IDENTITIES) —
-  // it gates hello acceptance and outbound identity resolution, NOT inbound
-  // group forwarding (unaddressed group chatter is dropped in every mode).
+  // No identity table: legacy single-tenant embedding with chatId-first hooks.
+  // Configured tables, including N=1, require an exact authenticated botId.
   const legacy = !config.identities || config.identities.length === 0;
   const table = new IdentityTable(
     legacy ? [{ botId: "default", agentId: "default", token: "", gatewayId: "", secret: "" }] : config.identities!,
   );
+  function safeLabel(value: string) {
+    for (const id of table.all()) for (const secret of [id.token, id.secret]) {
+      if (secret) value = value.split(secret).join("[redacted]");
+    }
+    return JSON.stringify(value.slice(0, 128));
+  }
   // Normalize hooks to the per-identity shape. Legacy single-tenant hooks take
   // (chatId, ...); wrap them to ignore the botId. Per-identity hooks take botId first.
-  // Note: call table.isSingle() at use sites (not a cached flag) so hot-reload of
-  // RELAY_IDENTITIES can grow/shrink the table without restarting the process.
   const hooks: AgentsChatHooks = legacy
     ? {
         sendMessage: (_b, chatId, content, replyTo) => (config.agentschat as LegacyHooks).sendMessage(chatId, content, replyTo),
@@ -126,17 +120,11 @@ export function startConnector(config: ConnectorConfig): ConnectorHandle {
       }
     : (config.agentschat as AgentsChatHooks);
   const sockets = new Set<GatewayConn>();
-  // `${botId}:${chatId}` → timestamp of the last message ADDRESSED to that
+  // JSON [botId, chatId] → timestamp of the last message ADDRESSED to that
   // identity in that channel. Drives the getChannelContext `sinceTs` window.
   const lastAddressed = new Map<string, string>();
-  // Per-chat sticky egress mouth: when inbound is successfully delivered to a
-  // target identity, remember that botId for the chat so a subsequent outbound
-  // whose frame.botId is only the single hello'd identity still sends with the
-  // addressed identity's token (Hermes ws_transport often stamps the hello'd
-  // botId on every outbound). Cleared after a successful send so typing can
-  // share the same mouth before the reply lands.
-  const egressHint = new Map<string, string>();
-
+  const delivered = new MessageDedup();
+  const inboundQueues = new Map<string, Promise<void>>();
   const http: HttpServer = createServer((_req, res) => {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ ok: true, service: "agentschat-connector", contract_version: 1, identities: table.size }));
@@ -154,7 +142,8 @@ export function startConnector(config: ConnectorConfig): ConnectorHandle {
     const token = auth.startsWith("Bearer ") ? auth.slice(7).trim() : "";
     const payload = peekPayload(token);
     const secrets = payload ? config.secrets[payload] : undefined;
-    const gatewayId = secrets ? verifyUpgradeToken(token, secrets) : null;
+    const secret = secrets?.find((s) => verifyUpgradeToken(token, [s]) === payload);
+    const gatewayId = secret ? payload : null;
     if (!gatewayId) {
       log(`[connector] rejecting upgrade: bad/absent token (path=${pathname})`);
       wss.handleUpgrade(req, socket, head, (ws) => {
@@ -163,14 +152,14 @@ export function startConnector(config: ConnectorConfig): ConnectorHandle {
       return;
     }
     wss.handleUpgrade(req, socket, head, (ws) => {
-      onConnection(ws, gatewayId);
+      onConnection(ws, gatewayId, secret!);
     });
   });
 
-  function onConnection(ws: WebSocket, gatewayId: string) {
-    const conn: GatewayConn = { ws, gatewayId, fronted: new Set() };
+  function onConnection(ws: WebSocket, gatewayId: string, secret: string) {
+    const conn: GatewayConn = { ws, gatewayId, secret, fronted: new Set() };
     sockets.add(conn);
-    log(`[connector] gateway connected: ${gatewayId} (${sockets.size} total)`);
+    log(`[connector] gateway connected: ${safeLabel(gatewayId)} (${sockets.size} total)`);
 
     ws.on("message", async (data) => {
       // Newline-delimited: the gateway may batch frames; split and handle each.
@@ -188,7 +177,7 @@ export function startConnector(config: ConnectorConfig): ConnectorHandle {
     });
     ws.on("close", () => {
       sockets.delete(conn);
-      log(`[connector] gateway disconnected: ${gatewayId} (${sockets.size} left)`);
+      log(`[connector] gateway disconnected: ${safeLabel(gatewayId)} (${sockets.size} left)`);
     });
     ws.on("error", () => sockets.delete(conn));
   }
@@ -200,21 +189,39 @@ export function startConnector(config: ConnectorConfig): ConnectorHandle {
       // Single-tenant (no identity table configured): front whatever identity the
       // gateway declares — there's exactly one. Multiplex: the botId MUST be a
       // registered identity (fail closed — never front an identity we can't send as).
-      const identity = table.isSingle()
-        ? table.all()[0]
-        : botId
-          ? table.forBot(botId)
-          : null;
-      if (!identity) {
-        send(conn.ws, { type: "error", error: `unknown identity botId: ${botId || "(none)"}` });
+      const identity = legacy ? table.all()[0] : table.forBot(botId);
+      const reason = frame.platform !== "agentschat" ? "unsupported_platform" : !identity ? "unknown_identity"
+        : !legacy && (identity.gatewayId !== conn.gatewayId || identity.secret !== conn.secret) ? "credential_mismatch" : null;
+      const labels = `gatewayId=${safeLabel(conn.gatewayId)} platform=${safeLabel(frame.platform === "agentschat" ? "agentschat" : "(unsupported)")} botId=${safeLabel(identity ? botId : "(unknown)")}`;
+      if (reason) {
+        log(`[connector] hello rejected ${labels} reason=${reason}`);
+        conn.fronted.clear();
+        send(conn.ws, { type: "error", error: `hello rejected: ${reason}` });
+        // Upgrade credentials were accepted; this hello does not match the
+        // configured identity/protocol. Fail closed, but allow configuration repair
+        // to recover through Hermes's normal reconnect path. Repeated 4401 after
+        // a prior descriptor latches credential revocation in ws_transport.py.
+        conn.ws.close(1002, `hello rejected: ${reason}`);
         return;
       }
-      conn.fronted.add(identity.botId);
+      conn.fronted.add(identity!.botId);
+      if (legacy) conn.legacyAlias = botId;
+      log(`[connector] hello accepted ${labels}`);
       send(conn.ws, { type: "descriptor", descriptor: { ...descriptor, platform: "agentschat" } });
       return;
     }
     if (t === "outbound") {
-      const result = await handleOutbound(conn, frame);
+      let result;
+      try { result = await handleOutbound(conn, frame); }
+      catch (error) {
+        const status = error instanceof PlatformHttpError && Number.isInteger(error.status) && error.status >= 400 && error.status <= 599 ? error.status : undefined;
+        result = status !== undefined
+          ? { success: false, error: `agentschat HTTP ${status}`, code: "platform_http_error", status, ambiguous: status >= 500 }
+          : error instanceof PlatformNetworkError
+          ? { success: false, error: "agentschat network failure; outcome unknown", code: "platform_network_error", ambiguous: true }
+          : { success: false, error: "platform operation failed; outcome unknown", code: "platform_operation_failed", ambiguous: true };
+        log(`[connector] outbound failed: ${result.code}${status ? ` status=${status}` : ""}`);
+      }
       send(conn.ws, { type: "outbound_result", requestId: frame.requestId, result });
       return;
     }
@@ -225,35 +232,13 @@ export function startConnector(config: ConnectorConfig): ConnectorHandle {
     const action = frame?.action ?? {};
     const op = action?.op;
     const chatId = action?.chat_id ?? "";
-    // Which identity sends?
-    //   - Prefer precise: requested botId is in this socket's hello set.
-    //   - Fallback: identity exists in the table AND this socket is a usable
-    //     agentschat gateway connection (fronted.size > 0). Hermes may hello
-    //     only one botId while RELAY_IDENTITIES holds N — still send with the
-    //     named identity's own token (never another identity's credentials).
-    // Untagged outbound falls back to the FIRST hello'd identity (session default).
-    //   - Sticky chat hint: if inbound just addressed another identity in this
-    //     chat, prefer that mouth when Hermes still stamps the hello'd botId.
-    const firstFronted = [...conn.fronted][0];
-    const requested = typeof frame?.botId === "string" && frame.botId ? frame.botId : firstFronted ?? null;
-    let identity: Identity | null = null;
-    if (table.isSingle()) {
-      identity = table.all()[0] ?? null;
-    } else if (requested && conn.fronted.has(requested)) {
-      identity = table.forBot(requested); // precise
-    } else if (requested && conn.fronted.size > 0) {
-      identity = table.forBot(requested); // table hit + usable agentschat conn
-    }
-    if (identity && (op === "send" || op === "typing") && chatId && conn.fronted.size > 0) {
-      const hintedBotId = egressHint.get(chatId);
-      if (hintedBotId && hintedBotId !== identity.botId) {
-        const hinted = table.forBot(hintedBotId);
-        if (hinted) {
-          log(`[connector] outbound egress hint: chat=${chatId} frame.botId=${identity.botId} → ${hinted.botId}`);
-          identity = hinted;
-        }
-      }
-    }
+    const firstFronted = conn.fronted.size === 1 ? [...conn.fronted][0] : undefined;
+    let requested = frame.botId === undefined ? firstFronted ?? null
+      : typeof frame.botId === "string" && frame.botId ? frame.botId : null;
+    if (legacy && requested && requested === conn.legacyAlias) requested = "default";
+    let identity = requested && conn.fronted.has(requested) ? table.forBot(requested) : null;
+    if (identity && ((!legacy && (identity.gatewayId !== conn.gatewayId || identity.secret !== conn.secret)) ||
+        (frame.platform !== undefined && frame.platform !== "agentschat"))) identity = null;
     if (!identity) {
       log(`[connector] outbound failed: no usable identity for botId=${requested ?? "?"}`);
       return { success: false, error: `no usable identity for outbound (botId=${requested ?? "?"})` };
@@ -261,7 +246,6 @@ export function startConnector(config: ConnectorConfig): ConnectorHandle {
     switch (op) {
       case "send": {
         const r = await hooks.sendMessage(identity.botId, chatId, action.content ?? "", action.reply_to);
-        if (chatId) egressHint.delete(chatId);
         return { success: true, message_id: r?.id };
       }
       case "typing": {
@@ -284,12 +268,18 @@ export function startConnector(config: ConnectorConfig): ConnectorHandle {
     if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj) + "\n");
   }
 
+  const ready = new Promise<void>((resolve, reject) => {
+    http.once("listening", resolve);
+    http.once("error", reject);
+  });
   http.listen(config.port, config.host ?? "127.0.0.1");
-  const address = http.address();
-  const port = typeof address === "object" && address ? address.port : config.port;
 
   return {
-    port,
+    ready,
+    get port() {
+      const address = http.address();
+      return typeof address === "object" && address ? address.port : config.port;
+    },
     stop() {
       for (const c of sockets) {
         try { c.ws.close(1001, "connector shutdown"); } catch {}
@@ -310,83 +300,80 @@ export function startConnector(config: ConnectorConfig): ConnectorHandle {
       //   unaddressed is dropped — injecting joined-channel chatter into the
       //   agent's session would burn its tokens on messages not meant for it.
       const isDm = typeof msg.channel_id === "string" && msg.channel_id.startsWith("dm-");
-      const bySocket = (msg as any).__botId ? table.forBot(String((msg as any).__botId)) : null;
-      const target = isDm
-        ? bySocket ?? routeInbound(table, {
-            channel_id: msg.channel_id,
-            dmOwnerBotId: (msg as any).dm_owner,
-          }) ?? (table.isSingle() ? table.all()[0] : null)
-        : routeInbound(table, {
+      const owner = (msg as any).__botId ?? (msg as any).dm_owner;
+      const targets = isDm
+        ? [owner !== undefined ? (typeof owner === "string" ? table.forBot(owner) : null)
+          : table.isSingle() ? table.all()[0] : null].filter((id): id is Identity => !!id)
+        : routeInboundTargets(table, {
             channel_id: msg.channel_id,
             mentioned_ids: (msg as any).mentioned_ids,
             content: msg.content,
           });
-      if (!target) {
+      if (!targets.length) {
         log(`[connector] inbound unaddressed (channel=${(msg as any).channel_id ?? "?"} mentions=${JSON.stringify((msg as any).mentioned_ids ?? [])}) — dropped`);
         return;
       }
-      const baseEvent = toWireEvent(msg, "agentschat");
-      if (!baseEvent) return;
-      if (!isDm) {
-        // Attach "what happened since you were last addressed" so the agent gets
-        // the conversation BETWEEN its @-mentions without being injected into
-        // every unaddressed message. Upstream renders event.context into the
-        // event's channel_context ("[Recent channel messages]") — gateway needs
-        // no change. Best-effort: a context failure never delays the message.
-        const key = `${target.botId}:${msg.channel_id}`;
-        const since = lastAddressed.get(key);
-        if (hooks.getChannelContext) {
-          try {
-            const ctx = await hooks.getChannelContext(target.botId, msg.channel_id!, since, msg.id);
-            if (ctx && ctx.length) {
-              baseEvent.context = ctx.slice(-10).map((c) => ({
-                text: String(c?.text ?? "").slice(0, 500),
-                source: { user_name: c?.user_name, user_id: c?.user_id },
-              }));
+      await Promise.all(targets.map(target => {
+        const key = JSON.stringify([target.botId, msg.channel_id]);
+        const previous = inboundQueues.get(key) ?? Promise.resolve();
+        const job = previous.catch(() => {}).then(async () => {
+          if (msg.sender_id === target.agentId) return;
+          const baseEvent = toWireEvent(msg, "agentschat");
+          if (!baseEvent) return;
+          if (![...sockets].some(c => c.ws.readyState === WebSocket.OPEN && c.fronted.has(target.botId))) return;
+          const deliveryKey = typeof msg.id === "string" && msg.id
+            ? JSON.stringify([msg.channel_id, msg.id, target.botId]) : null;
+          // Reserve synchronously, before async context fetch, across mirrored sockets.
+          if (deliveryKey && delivered.recordOrSkip(deliveryKey)) return;
+          if (!isDm) {
+            // Attach "what happened since you were last addressed" so the agent gets
+            // the conversation BETWEEN its @-mentions without being injected into
+            // every unaddressed message. Upstream renders event.context into the
+            // event's channel_context ("[Recent channel messages]") — gateway needs
+            // no change. Fetch errors fall back to delivering without context.
+            const since = lastAddressed.get(key);
+            if (hooks.getChannelContext) {
+              const controller = new AbortController();
+              let timer: ReturnType<typeof setTimeout> | undefined;
+              try {
+                const ctx = await Promise.race([
+                  hooks.getChannelContext(target.botId, msg.channel_id!, since, msg.id, controller.signal),
+                  new Promise<null>(resolve => { timer = setTimeout(() => { controller.abort(); resolve(null); }, 1000); }),
+                ]);
+                if (ctx && ctx.length) {
+                  baseEvent.context = ctx.slice(-10).map((c) => ({
+                    text: String(c?.text ?? "").slice(0, 500),
+                    source: { user_name: c?.user_name, user_id: c?.user_id },
+                  }));
+                }
+              } catch {
+                log(`[connector] context fetch failed (delivering without it)`);
+              } finally {
+                if (timer) clearTimeout(timer);
+              }
             }
-          } catch (e) {
-            log(`[connector] context fetch failed for ${key} (delivering without it): ${e}`);
+            if (msg.timestamp && Number.isFinite(Date.parse(msg.timestamp)) &&
+                (!since || Date.parse(msg.timestamp) > Date.parse(since))) lastAddressed.set(key, msg.timestamp);
           }
-        }
-        if (msg.timestamp) lastAddressed.set(key, msg.timestamp);
-      }
-      // Precise hello preferred: if ANY socket fronts target.botId, deliver
-      // ONLY via those sockets. Otherwise generic-hello fallback: first
-      // agentschat-fronted connection (stable: socket insertion order) carries
-      // the event with source.profile = target.botId. Never both paths.
-      const precise = [...sockets].filter((c) => c.fronted.has(target.botId));
-      let deliverTo: GatewayConn[];
-      let viaFallback = false;
-      if (precise.length > 0) {
-        deliverTo = precise;
-      } else {
-        const fallback = [...sockets].find((c) => c.fronted.size > 0);
-        deliverTo = fallback ? [fallback] : [];
-        viaFallback = deliverTo.length > 0;
-        if (viaFallback) {
-          log(`[connector] inbound fallback for botId=${target.botId} via gateway ${deliverTo[0].gatewayId} (no precise hello; first agentschat-fronted conn)`);
-        }
-      }
-      if (deliverTo.length === 0) {
-        log(`[connector] inbound dropped for botId=${target.botId}: no agentschat-fronted gateway socket`);
-        return;
-      }
-      // Sticky egress mouth for this chat: next send/typing should speak as the
-      // identity that received the inbound, even if Hermes stamps the hello'd botId.
-      const chatKey = typeof msg.channel_id === "string" ? msg.channel_id : "";
-      if (chatKey) egressHint.set(chatKey, target.botId);
-      for (const conn of deliverTo) {
-        // Per-connection clone: a single-hello gateway must NOT inherit a
-        // profile stamp meant for a multiplexed sibling socket.
-        const event = { ...baseEvent, source: { ...baseEvent.source } };
-        if (viaFallback) {
-          (event.source as any).profile = fallbackSourceProfile(target);
-        } else {
-          const profile = hermesSourceProfile(target, conn.fronted.size);
-          if (profile) (event.source as any).profile = profile;
-        }
-        send(conn.ws, { type: "inbound", event });
-      }
+          const deliverTo = [...sockets].filter((c) => c.ws.readyState === WebSocket.OPEN && c.fronted.has(target.botId)).slice(0, 1);
+          if (deliverTo.length === 0) {
+            log(`[connector] inbound dropped for botId=${target.botId}: no agentschat-fronted gateway socket`);
+            return;
+          }
+          for (const conn of deliverTo) {
+            // Per-connection clone: a single-hello gateway must NOT inherit a
+            // profile stamp meant for a multiplexed sibling socket.
+            const event = { ...baseEvent, source: { ...baseEvent.source } };
+            const profile = hermesSourceProfile(target, conn.fronted.size);
+            if (profile) (event.source as any).profile = profile;
+            send(conn.ws, { type: "inbound", event });
+          }
+        });
+        inboundQueues.set(key, job);
+        return job.finally(() => {
+          if (inboundQueues.get(key) === job) inboundQueues.delete(key);
+        });
+      }));
     },
     connections() {
       return sockets.size;
@@ -396,6 +383,12 @@ export function startConnector(config: ConnectorConfig): ConnectorHandle {
         throw new Error("reloadIdentities requires a non-empty identity list");
       }
       table.replace(next);
+      for (const conn of sockets) {
+        for (const botId of conn.fronted) {
+          const id = table.forBot(botId);
+          if (!id || id.gatewayId !== conn.gatewayId || id.secret !== conn.secret) conn.fronted.delete(botId);
+        }
+      }
       // Rebuild upgrade-auth secrets in place so the upgrade handler sees them.
       for (const k of Object.keys(config.secrets)) delete config.secrets[k];
       for (const id of next) {

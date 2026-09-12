@@ -33,6 +33,10 @@ export function ingestAgentsChatFrame(
     deps.advanceCursor(id, frame.channel_id, frame.timestamp);
   }
   const key = messageDedupKey(frame as { id?: string; channel_id?: string });
-  if (key && deps.dedup.recordOrSkip(key)) return false;
-  return frame.sender_id !== id.agentId && frame.content !== "__typing__";
+  const isDm = frame.channel_id?.startsWith("dm-");
+  const scopedKey = key && (isDm ? JSON.stringify([id.botId, frame.channel_id, frame.id]) : key);
+  if (scopedKey && deps.dedup.recordOrSkip(scopedKey)) return false;
+  // Group fanout must filter self per TARGET, not per arrival socket: A can
+  // mention B, and A's self echo may be the first copy of the shared message.
+  return (!frame.channel_id?.startsWith("dm-") || frame.sender_id !== id.agentId) && frame.content !== "__typing__";
 }
