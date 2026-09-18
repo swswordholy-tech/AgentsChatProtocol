@@ -339,6 +339,20 @@ describe("identity policy, end-to-end against a mock hub", () => {
     expect(written(home, ".agentchat")).toEqual([]);
   }, 15_000);
 
+  test("tools/list emits MCP annotations on every visible tool (OpenAI directory requirement)", async () => {
+    const home = freshHome("annotations");
+    const { res } = await drive([], home, [INIT, INITED, LIST]);
+    const tools = res.get(2)?.result?.tools ?? [];
+    expect(tools.length).toBeGreaterThan(5);
+    const unannotated = tools.filter((t: any) => !t.annotations || typeof t.annotations.readOnlyHint !== "boolean");
+    expect(unannotated.map((t: any) => t.name)).toEqual([]);
+    const whoami = tools.find((t: any) => t.name === "whoami");
+    expect(whoami?.annotations?.readOnlyHint).toBe(true);
+    const reply = tools.find((t: any) => t.name === "reply");
+    expect(reply?.annotations?.readOnlyHint).toBe(false);
+    expect(reply?.annotations?.openWorldHint).toBe(true);
+  }, 15_000);
+
   test("whoami's claim hint spells the FULL claim URL (?key= required), never the real key", async () => {
     // Boss hit this with the Hermes identity: whoami pointed at a bare /chat/<id>,
     // the room opened with an EMPTY claim form (chat.html renders it only when

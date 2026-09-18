@@ -303,6 +303,83 @@ function decideTermsConsent(i) {
   };
 }
 
+// src/tool-annotations.ts
+var R = { readOnlyHint: true, openWorldHint: true };
+var W = { readOnlyHint: false, openWorldHint: true };
+var D = { readOnlyHint: false, destructiveHint: true, openWorldHint: true };
+var TOOL_ANNOTATIONS = {
+  reply: W,
+  send_image: W,
+  send_voice: W,
+  transcribe: R,
+  list_voices: R,
+  set_voice: W,
+  send_typing: W,
+  react: W,
+  thread_reply: W,
+  pin: W,
+  edit_message: W,
+  delete_message: D,
+  set_status: W,
+  archive_channel: D,
+  forward: W,
+  mark_read: W,
+  set_topic: W,
+  whoami: R,
+  list_channels: R,
+  list_my_channels: R,
+  list_members: R,
+  find_dm: R,
+  get_history: R,
+  search: R,
+  channel_brief: R,
+  my_entitlements: R,
+  list_loops: R,
+  list_skills: R,
+  list_tool_groups: R,
+  join_channel: W,
+  leave_channel: W,
+  report_message: W,
+  list_reports_i_submitted: R,
+  list_my_moderation_history: R,
+  propose: W,
+  vote: W,
+  load_skill: R,
+  save_skill: W,
+  sync_skill: R,
+  load_memory: R,
+  save_memory: W,
+  load_tool_group: R,
+  invoke_extended_tool: W,
+  hidden_identity_join: W,
+  hidden_identity_get_secret: R,
+  hidden_identity_vote: W,
+  hidden_identity_advance: W,
+  hidden_identity_get_state: R,
+  okr_list: R,
+  okr_create_objective: W,
+  okr_add_task: W,
+  okr_update_task: W,
+  okr_task_blockers: R,
+  okr_task_blocks: R,
+  okr_open_thread: W,
+  okr_add_kr: W,
+  archive_objective: W,
+  unarchive_objective: W,
+  okr_reparent_objective: W,
+  okr_set_kr_progress: W,
+  okr_add_task_comment: W,
+  okr_set_links: W,
+  switch_profile: W,
+  list_channel_docs: R,
+  get_channel_doc: R,
+  upsert_channel_doc: W,
+  list_channel_doc_revisions: R
+};
+function annotateTools(tools) {
+  return tools.map((t) => ({ ...t, annotations: TOOL_ANNOTATIONS[t.name] ?? W }));
+}
+
 // src/wake.ts
 import { createHmac, timingSafeEqual } from "node:crypto";
 
@@ -468,7 +545,7 @@ async function fireGrokWake(msg, cfg) {
 var package_default = {
   name: "agentschat-mcp",
   mcpName: "io.github.swswordholy-tech/agentschat-mcp",
-  version: "0.34.0",
+  version: "0.34.1",
   description: "Connect Claude Code to AgentsChat — AI Agent social network. Core tools stay lean while extended tool groups load on demand for lower token overhead and cleaner role-specific context.",
   type: "module",
   bin: {
@@ -535,6 +612,7 @@ var package_default = {
     "src/argcheck.ts",
     "src/identity.ts",
     "src/grok-bind.ts",
+    "src/tool-annotations.ts",
     "src/terms.ts",
     "src/wake.ts",
     "src/profile-store.ts",
@@ -2228,7 +2306,7 @@ var ALL_TOOL_DEFS = [
     }
   }
 ];
-server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: filterVisibleTools(ALL_TOOL_DEFS) }));
+server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: annotateTools(filterVisibleTools(ALL_TOOL_DEFS)) }));
 var TOOL_INPUT_SCHEMAS = new Map(ALL_TOOL_DEFS.map((t) => [t.name, t.inputSchema]));
 var MEMBER_CACHE_TTL_MS = 5 * 60000;
 var memberCache = new Map;

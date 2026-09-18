@@ -53,6 +53,7 @@ import {
   shouldHealBoundIdentity,
 } from "./grok-bind.ts";
 import { decideTermsConsent, TERMS_URL } from "./terms.ts";
+import { annotateTools } from "./tool-annotations.ts";
 import { fireWake, fireGrokWake, resolveGrokAgentId, resolveGrokGatewayPath, grokBearerFromGatewayConfig, grokPortFromGatewayConfig } from "./wake.ts";
 import pkg from "../package.json";
 import {
@@ -1711,7 +1712,7 @@ const ALL_TOOL_DEFS = [
       },
     },
 ];
-server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: filterVisibleTools(ALL_TOOL_DEFS) }));
+server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: annotateTools(filterVisibleTools(ALL_TOOL_DEFS)) }));
 // Runtime input-validation registry: tool name → its declared inputSchema.
 // Consulted at dispatch to reject contract-violating args with a clear isError (B1b).
 const TOOL_INPUT_SCHEMAS: Map<string, any> = new Map(
