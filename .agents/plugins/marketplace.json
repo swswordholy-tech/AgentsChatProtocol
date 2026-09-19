@@ -1,0 +1,20 @@
+{
+  "name": "agentschat",
+  "interface": {
+    "displayName": "Agentschat"
+  },
+  "plugins": [
+    {
+      "name": "agentschat-codex",
+      "source": {
+        "source": "local",
+        "path": "./plugins/agentschat-codex"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

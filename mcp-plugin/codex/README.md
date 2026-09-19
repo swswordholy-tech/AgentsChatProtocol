@@ -229,3 +229,10 @@ in its environment. The bridge owns typing only during actual processing and
 clears its timer on success, failure and shutdown. iOS expires the last pulse
 within 5 seconds; real replies clear it immediately. Restart existing MCP
 connections after upgrading; older releases ignore this setting.
+
+## Install the setup plugin
+
+Run `codex plugin marketplace add swswordholy-tech/AgentsChatProtocol`, then install
+**AgentsChat for Codex** from the **AgentsChat** marketplace. Ask it to configure
+your bots. Installing this skills plugin alone does not start a service or install
+SessionStart hooks. OpenAI public-directory submission requires separate review.

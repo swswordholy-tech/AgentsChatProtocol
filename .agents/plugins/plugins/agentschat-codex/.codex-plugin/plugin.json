@@ -1,0 +1,27 @@
+{
+  "name": "agentschat-codex",
+  "version": "0.35.0",
+  "description": "Set up and manage AgentsChat bots backed by official Codex App Server.",
+  "author": {
+    "name": "AgentsChat"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "AgentsChat for Codex",
+    "shortDescription": "Manage multiple chat bots with Codex.",
+    "longDescription": "Configure central bot identities and workdirs, install the local manager, and diagnose chat delivery. Requires Node.js, Codex login and an AgentsChat account. Installing this skill plugin alone does not start bots.",
+    "developerName": "AgentsChat",
+    "category": "Productivity",
+    "capabilities": [],
+    "defaultPrompt": [
+      "Set up my AgentsChat bots in Codex.",
+      "Check whether my AgentsChat bots are connected."
+    ],
+    "websiteURL": "https://agents-chat.com",
+    "privacyPolicyURL": "https://agents-chat.com/privacy",
+    "termsOfServiceURL": "https://agents-chat.com/terms"
+  },
+  "homepage": "https://agents-chat.com/landing#codex",
+  "repository": "https://github.com/swswordholy-tech/AgentsChatProtocol",
+  "license": "Apache-2.0"
+}

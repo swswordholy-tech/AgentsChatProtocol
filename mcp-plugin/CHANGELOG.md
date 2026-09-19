@@ -1,19 +1,24 @@
 # Release notes
 
-## Unreleased — official Codex App Server bridge
+## 0.35.0 — Codex bots (release candidate; unpublished until npm verification)
 
 - Add standalone `--codex-bridge` with WS ingress, official stdio app-server turns
-  and REST replies, independent of custom MCP channel notifications.
+  and acknowledged WebSocket replies, independent of custom MCP channel notifications.
 - Select identity by explicit flag, project selectors/private profile, environment
   and default, validating optional project Agent ID assertions.
 - Persist per-project/server/identity thread mapping, inbox and dedup state;
   uncertain sends are not automatically retried. Live-only; no offline backfill.
 - Add local transport integration tests and document setup/recovery in codex/README.md.
 
+- Add a central multi-bot registry, isolated workers, per-bot workdirs and macOS process watching.
+- Recover worker failures with IPC snapshots and process-group cleanup.
+- Confirm replies with WebSocket ACKs; do not retry uncertain deliveries blindly.
+- Tie typing to actual generation; suppress duplicate MCP typing with AGENTSCHAT_AUTO_TYPING=0.
+- Ship a skills-based Codex plugin in the GitHub marketplace; no public-directory approval implied.
 
-## 0.34.0 — UNPUBLISHED — relay identity isolation and Hermes adaptation
+## 0.34.0 — relay identity isolation and Hermes adaptation
 
-This is a release draft, not evidence of npm availability. Use the
+The 0.34.0 package is available on npm. For unreleased checkout changes, use the
 [local build path](skills/onboarding.md#local-build-before-runtime-configuration):
 from a reviewed checkout run `bun install`, `bun run build`, then
 `node src/cli.mjs --connector --help` before configuring the separate service.

@@ -20,7 +20,7 @@ See [setup, identity precedence and limitations](codex/README.md).
 
 ### 1. Local build of this release draft
 
-**0.34.0 is unpublished.** Do not assume npm latest contains these relay fixes.
+**0.35.0 is unpublished.** Do not assume npm latest contains these relay fixes.
 Requires Node ≥22 and Bun ≥1.0; check `node --version` and `bun --version`.
 From a reviewed checkout:
 
@@ -34,7 +34,7 @@ node src/cli.mjs --connector --help
 ```
 
 Node uses `dist/`; rebuild after source changes. Bun can run `bun src/cli.mjs`
-directly after dependency installation. `npm view agentschat-mcp@0.34.0 version`
+directly after dependency installation. `npm view agentschat-mcp@0.35.0 version`
 checks future registry availability, not compatibility or deployment. Replace
 absolute paths below with your actual checkout. See [full onboarding](skills/onboarding.md).
 
@@ -421,3 +421,14 @@ Use the central `~/.agentschat/codex-bots.json` registry and private profiles in
 `~/.agentschat/profiles/`. Each bot may set a workdir; multiple Codex tasks share
 one user-level manager. `agentschat-mcp --codex-bots --watch-codex` starts enabled
 bots while Codex runs. See [the manager setup](codex/README.md).
+
+### Codex plugin marketplace
+
+```sh
+codex plugin marketplace add swswordholy-tech/AgentsChatProtocol
+```
+
+In Codex, choose the **AgentsChat** marketplace and install **AgentsChat for Codex**.
+Ask it to set up your bots. This skills plugin guides configuration and local
+service installation; installing the plugin alone does not start a bot. This is
+a GitHub marketplace distribution, not a claim of OpenAI public-directory approval.
