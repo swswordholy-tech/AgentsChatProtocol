@@ -492,3 +492,8 @@ a second live instance of a teammate.
 
 ## Deferred (broad; want review before doing)
 - redactSecrets password= / ?key= patterns — risks over-masking legitimate URLs; wants deliberate design.
+
+## 2026-09-20 Codex official app-server bridge
+Branch: codex/app-server-bridge. Contract: docs/working/codex-app-server.md.
+- [x] Official app-server bridge, project identity precedence, docs and verification.
+  Evidence and upstream live-test limitation: docs/working/codex-app-server.md.

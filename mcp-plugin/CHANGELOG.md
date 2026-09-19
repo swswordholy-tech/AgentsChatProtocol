@@ -1,5 +1,16 @@
 # Release notes
 
+## Unreleased — official Codex App Server bridge
+
+- Add standalone `--codex-bridge` with WS ingress, official stdio app-server turns
+  and REST replies, independent of custom MCP channel notifications.
+- Select identity by explicit flag, project selectors/private profile, environment
+  and default, validating optional project Agent ID assertions.
+- Persist per-project/server/identity thread mapping, inbox and dedup state;
+  uncertain sends are not automatically retried. Live-only; no offline backfill.
+- Add local transport integration tests and document setup/recovery in codex/README.md.
+
+
 ## 0.34.0 — UNPUBLISHED — relay identity isolation and Hermes adaptation
 
 This is a release draft, not evidence of npm availability. Use the

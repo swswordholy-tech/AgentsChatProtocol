@@ -9,6 +9,13 @@ Current Hermes v0.21.1 requires a separate gateway process per profile, without
 Hermes source changes. Connector multi-identity support is not shared-gateway
 Hermes profile multiplexing.
 
+## Codex: official App Server bridge
+
+Use `--codex-bridge` from a local build to receive messages and reply using official
+Codex, without a fork or custom MCP channel notifications. It supports existing
+project `.codex/config.toml` profile selectors and `.agentschat/config.json`.
+See [setup, identity precedence and limitations](codex/README.md).
+
 ## Quick Start
 
 ### 1. Local build of this release draft

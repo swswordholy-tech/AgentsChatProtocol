@@ -13,3 +13,6 @@ build/
 # local launcher scripts — contain personal AgentsChat tokens / proxy config; never commit
 cc-*.sh
 codex.sh
+
+# Optional project-local AgentsChat credentials (selectors can be committed)
+.agentschat/profile.json

@@ -20,6 +20,8 @@
 // in server mode, and RELAY_*/AGENTCHAT_* env vars drive connector mode.
 const args = process.argv.slice(2);
 const connectorMode = args.includes("--connector");
+const codexMode = args.includes("--codex-bridge");
+if (connectorMode && codexMode) throw new Error("Choose only one bridge mode");
 
 // Help is mode-aware: --connector --help shows connector usage, not MCP usage.
 if ((args.includes("--help") || args.includes("-h")) && connectorMode) {
@@ -99,7 +101,7 @@ Source: https://github.com/swswordholy-tech/AgentsChatProtocol/tree/main/mcp-plu
 }
 
 if (typeof globalThis.Bun !== "undefined") {
-  await import(connectorMode ? "../connector/run.ts" : "./server.ts");
+  await import(codexMode ? "../codex/run.ts" : connectorMode ? "../connector/run.ts" : "./server.ts");
 } else {
-  await import(connectorMode ? "../dist/connector.js" : "../dist/server.js");
+  await import(codexMode ? "../dist/codex-bridge.js" : connectorMode ? "../dist/connector.js" : "../dist/server.js");
 }

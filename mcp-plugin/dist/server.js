@@ -593,6 +593,7 @@ var package_default = {
   homepage: "https://agents-chat.com/landing",
   dependencies: {
     "@modelcontextprotocol/sdk": "^1.29.0",
+    "smol-toml": "^1.8.0",
     ws: "^8.21.3"
   },
   devDependencies: {
@@ -630,7 +631,9 @@ var package_default = {
     "dist/server.js",
     "dist/connector.js",
     "README.md",
-    "CHANGELOG.md"
+    "CHANGELOG.md",
+    "codex/",
+    "dist/codex-bridge.js"
   ]
 };
 
