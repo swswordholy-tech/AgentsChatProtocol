@@ -1,3 +1,5 @@
+import { loadBots } from "./bots-config.ts";
+import type { BridgeConfig } from "./config.ts";
 import { parseArgs } from "node:util";
 import { resolveConfig } from "./config.ts";
 import { AppServer } from "./app-server.ts";
@@ -26,20 +28,28 @@ See codex/README.md for setup, verification, limitations and recovery.
 let codex: AppServer | undefined, bridge: Bridge | undefined, transport: AgentsChatTransport | undefined;
 async function main() {
   const { values } = parseArgs({ options: { "codex-bridge": { type: "boolean" }, cwd: { type: "string" },
-    profile: { type: "string" }, "codex-bin": { type: "string" }, check: { type: "boolean" },
+    "managed-worker": { type: "boolean" }, registry: { type: "string" }, bot: { type: "string" }, profile: { type: "string" }, "codex-bin": { type: "string" }, check: { type: "boolean" },
     help: { type: "boolean", short: "h" } }, strict: true });
   if (values.help) { console.log(HELP); return; }
-  const c = resolveConfig({ cwd: values.cwd, profile: values.profile, codexBin: values["codex-bin"] });
+  const snapshot = values["managed-worker"] ? await new Promise<BridgeConfig>((resolve, reject) => {
+    if (!process.connected) { reject(new Error("Managed worker needs parent IPC")); return; }
+    const timer = setTimeout(() => reject(new Error("Parent configuration missing")), 10000);
+    process.once("message", config => { clearTimeout(timer); resolve(config as BridgeConfig); });
+  }) : undefined;
+  const c = snapshot ?? (values.bot ? loadBots(values.registry).find(b => b.name === values.bot) : resolveConfig({ cwd: values.cwd, profile: values.profile, codexBin: values["codex-bin"] }));
+  if (!c) throw new Error("Bot is absent or disabled");
   console.log(JSON.stringify({ cwd: c.cwd, agent_id: c.agentId, profile: c.profileFile, source: c.source, stateDir: c.stateDir }));
   codex = new AppServer(c.codexBin);
   if (values.check) { await codex.start(); console.log("Official app-server initialization: OK (no chat connection or generation)"); codex.close(); return; }
   transport = new AgentsChatTransport(c, m => { bridge!.accept(m); });
   bridge = new Bridge(c, codex, (chat, text) => transport!.send(chat, text));
   let stopping = false;
-  const stop = async () => { if (stopping) return; stopping = true; bridge?.pause(); transport?.stop(); codex?.close(); await bridge?.stop(); };
+  const stop = async () => { if (stopping) return; stopping = true; if (values["managed-worker"]) { const deadline = setTimeout(() => { try { process.kill(-process.pid, "SIGKILL"); } catch {} }, 20000); deadline.unref(); } bridge?.pause(); transport?.stop(); codex?.close(); await bridge?.stop(); if (process.connected) process.disconnect?.(); };
   codex.onFatal = () => { console.error("Codex backend stopped; pending inbox preserved. Restart the bridge after checking failed entries."); process.exitCode = 1; void stop(); };
+  process.once("disconnect", () => void stop());
   process.once("SIGINT", () => void stop()); process.once("SIGTERM", () => void stop());
   await codex.start();
+  if (values["managed-worker"] && !process.connected) { await stop(); return; }
   void bridge.drain(); transport.start();
 }
 main().catch(async e => {

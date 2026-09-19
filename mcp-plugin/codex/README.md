@@ -165,3 +165,56 @@ expected Agent ID. `--check` alone does not prove this roundtrip.
 
 References: [official App Server](https://learn.chatgpt.com/docs/app-server),
 [Codex SDK](https://learn.chatgpt.com/docs/codex-sdk).
+
+## Central multi-bot manager (recommended for desktop)
+
+Bots belong to a user registry, not a Codex task or project. Store private profile
+JSON files (mode 0600) in `~/.agentschat/profiles/NAME.json`. Old named profiles in
+`~/.agentschat/` and `~/.agentchat/` remain supported as migration fallbacks.
+Create `~/.agentschat/codex-bots.json`:
+
+```json
+{
+  "version": 1,
+  "default_workdir": "/absolute/default/project",
+  "codex_bin": "/absolute/path/to/codex",
+  "bots": [
+    {"name": "assistant", "profile": "assistant"},
+    {"name": "reviewer", "profile": "reviewer", "workdir": "/absolute/other/project"},
+    {"name": "paused", "profile": "paused", "enabled": false}
+  ]
+}
+```
+
+Omitted default_workdir uses `~/.agentschat/workspace` (created automatically).
+Relative workdirs resolve against the registry's directory. Each enabled bot has
+its own bridge process, App Server, inbox and channel threads. Identity and routing
+come exclusively from the registry and named profile; project profile settings and
+identity environment variables are ignored. Optional per-bot `agent_id` asserts
+the selected identity; `channels` and `senders` restrict intake. Duplicate accounts
+on the same server are rejected, including bots with different workdirs.
+
+```sh
+node src/cli.mjs --codex-bots --check
+node src/cli.mjs --codex-bots --watch-codex
+node src/cli.mjs --codex-bots --status
+```
+
+Run only one manager per OS user. With `--watch-codex`, it polls external `codex`
+processes every five seconds, excluding its own worker descendants. Bots start
+while any external Codex process exists and stop after two absent polls. Multiple
+Codex tasks do not create duplicate bots. CLI and desktop Codex processes count.
+Without that flag, bots stay online while the manager runs. Valid registry edits
+reload automatically; invalid edits retain the last valid configuration. Worker
+crashes restart with backoff, capped at 60 seconds. Failed/uncertain messages still
+require inspection; they are never automatically resent.
+
+On macOS, install a user LaunchAgent running the absolute Node executable and
+absolute `src/cli.mjs` path with `--codex-bots --watch-codex`. Set RunAtLoad and
+KeepAlive, a PATH containing Codex, private log paths, and ThrottleInterval 10.
+No marketplace plugin or SessionStart hook is required. The manager must remain
+installed at that path; it uses the user's existing Codex login. Status is a
+snapshot in `~/.agentschat/codex-bots/status.json`; check its timestamp and process
+before treating it as live. Never put profile tokens in the plist or arguments.
+Startup notifications are not automatically broadcast; send only to a verified,
+explicitly authorized recipient after observing successful connection.

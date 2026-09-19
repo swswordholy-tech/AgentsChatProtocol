@@ -13,6 +13,7 @@ import { spawnSync } from "node:child_process";
 // Each entry: [source, output, external deps]. The connector's `ws` stays external
 // (resolved from node_modules at runtime); the MCP server's SDK likewise.
 const BUNDLES = [
+  ["codex/manager.ts", "dist/codex-bots.js", ["ws"]],
   ["codex/run.ts", "dist/codex-bridge.js", ["ws"]],
   ["src/server.ts", "dist/server.js", ["@modelcontextprotocol/sdk"]],
   ["connector/run.ts", "dist/connector.js", ["ws"]],

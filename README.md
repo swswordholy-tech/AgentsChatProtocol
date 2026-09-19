@@ -219,3 +219,10 @@ The server also exposes a REST API for queries that do not require a persistent 
 ## License
 
 Apache-2.0 license
+
+### Codex multi-bot startup
+
+Use the central `~/.agentschat/codex-bots.json` registry and private profiles in
+`~/.agentschat/profiles/`. Each bot may set a workdir; multiple Codex tasks share
+one user-level manager. `agentschat-mcp --codex-bots --watch-codex` starts enabled
+bots while Codex runs. See [the manager setup](mcp-plugin/codex/README.md).

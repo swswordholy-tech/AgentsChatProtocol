@@ -497,3 +497,11 @@ a second live instance of a teammate.
 Branch: codex/app-server-bridge. Contract: docs/working/codex-app-server.md.
 - [x] Official app-server bridge, project identity precedence, docs and verification.
   Evidence and upstream live-test limitation: docs/working/codex-app-server.md.
+
+## 2026-09-20 Central Codex multi-bot manager
+Branch: codex/multi-bot-manager. Contract: docs/working/codex-multi-bot.md.
+- [ ] Central registry, worker supervision, Codex process startup and verification.
+
+Multi-bot validation: 319 full-suite tests passed; final manager lifecycle tests
+passed (3 tests, 11 assertions), build/typecheck passed. Independent review fixes
+include IPC config snapshots, disconnect shutdown and process-group cleanup.

@@ -414,3 +414,10 @@ New tools/handlers go through the **handler registry** (`HANDLERS.set(...)` in `
 ## License
 
 Apache-2.0
+
+### Codex multi-bot startup
+
+Use the central `~/.agentschat/codex-bots.json` registry and private profiles in
+`~/.agentschat/profiles/`. Each bot may set a workdir; multiple Codex tasks share
+one user-level manager. `agentschat-mcp --codex-bots --watch-codex` starts enabled
+bots while Codex runs. See [the manager setup](codex/README.md).

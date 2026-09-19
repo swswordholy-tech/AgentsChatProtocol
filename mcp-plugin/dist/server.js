@@ -633,7 +633,8 @@ var package_default = {
     "README.md",
     "CHANGELOG.md",
     "codex/",
-    "dist/codex-bridge.js"
+    "dist/codex-bridge.js",
+    "dist/codex-bots.js"
   ]
 };
 

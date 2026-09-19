@@ -10,6 +10,7 @@ export interface BridgeConfig {
   apiUrl: string; wsUrl: string; channels: string[]; senders: string[];
   codexBin: string; stateDir: string;
 }
+export interface IdentitySettings { profile?: string; agent_id?: string; channels?: string[]; senders?: string[]; api_url?: string; ws_url?: string }
 function readJson(file: string): any {
   try { return JSON.parse(readFileSync(file, "utf8")); }
   catch { throw new Error(`Cannot read valid JSON: ${file}`); }
@@ -20,11 +21,11 @@ function strings(value: unknown, name: string): string[] {
     throw new Error(`${name} must be an array of nonempty strings`);
   return value;
 }
-export function resolveConfig(opts: { cwd?: string; profile?: string; codexBin?: string },
+export function resolveConfig(opts: { cwd?: string; profile?: string; codexBin?: string; settings?: IdentitySettings },
   env: NodeJS.ProcessEnv = process.env, home = homedir()): BridgeConfig {
   const cwd = realpathSync(opts.cwd ?? process.cwd());
   const configFile = join(cwd, ".agentschat/config.json");
-  const project = existsSync(configFile) ? readJson(configFile) : {};
+  const project = opts.settings ?? (existsSync(configFile) ? readJson(configFile) : {});
   if (!project || typeof project !== "object" || Array.isArray(project)) throw new Error("Invalid project config");
   const allowed = new Set(["profile", "agent_id", "channels", "senders", "api_url", "ws_url"]);
   if (Object.keys(project).some(k => !allowed.has(k))) throw new Error("Unknown project config field (credentials belong in a private profile)");
@@ -35,7 +36,7 @@ export function resolveConfig(opts: { cwd?: string; profile?: string; codexBin?:
   // must not execute the configured MCP command or inherit its token overrides.
   let codexProfile: string | undefined;
   const codexFile = join(cwd, ".codex/config.toml");
-  if (existsSync(codexFile)) {
+  if (opts.settings === undefined && existsSync(codexFile)) {
     let doc: any;
     try { doc = parseToml(readFileSync(codexFile, "utf8")); }
     catch { throw new Error("Invalid project .codex/config.toml"); }
@@ -49,7 +50,7 @@ export function resolveConfig(opts: { cwd?: string; profile?: string; codexBin?:
   }
   const choices = [
     [opts.profile, "flag"], [project.profile, "project-config"],
-    [existsSync(localProfile) ? localProfile : undefined, "project-profile"],
+    [opts.settings === undefined && existsSync(localProfile) ? localProfile : undefined, "project-profile"],
     [codexProfile, "project-codex"],
     [env.AGENTSCHAT_PROFILE, "env"], [env.AGENTCHAT_PROFILE, "legacy-env"], ["profile", "default"],
   ];
@@ -59,7 +60,8 @@ export function resolveConfig(opts: { cwd?: string; profile?: string; codexBin?:
   else if (isAbsolute(selector) || selector.includes("/")) profileFile = resolve(cwd, selector);
   else {
     const name = selector.endsWith(".json") ? selector : `${selector}.json`;
-    profileFile = join(home, ".agentschat", name);
+    profileFile = join(home, ".agentschat/profiles", name);
+    if (!existsSync(profileFile)) profileFile = join(home, ".agentschat", name);
     if (!existsSync(profileFile)) profileFile = join(home, ".agentchat", name);
   }
   if (!existsSync(profileFile)) throw new Error(`Selected profile missing: ${profileFile}; no identity fallback or registration`);
@@ -74,9 +76,10 @@ export function resolveConfig(opts: { cwd?: string; profile?: string; codexBin?:
     if (!(protocols as readonly string[]).includes(url.protocol) || url.username || url.password || url.search || url.hash ||
       (!url.protocol.endsWith("s:") && !["127.0.0.1", "localhost", "[::1]"].includes(url.hostname))) throw new Error("Server URLs must use TLS (except loopback) and contain no credentials/query");
   }
-  const key = createHash("sha256").update(JSON.stringify([cwd, apiUrl, profile.agent_id])).digest("hex").slice(0, 24);
+  const canonicalApi = new URL(apiUrl).href.replace(/\/$/, "");
+  const key = createHash("sha256").update(JSON.stringify([cwd, canonicalApi, profile.agent_id])).digest("hex").slice(0, 24);
   return { cwd, profileFile, source, agentId: profile.agent_id, token: profile.token,
-    apiUrl: apiUrl.replace(/\/$/, ""), wsUrl, channels: strings(project.channels, "channels"),
+    apiUrl: canonicalApi, wsUrl, channels: strings(project.channels, "channels"),
     senders: strings(project.senders, "senders"), codexBin: opts.codexBin ?? "codex",
     stateDir: join(home, ".agentschat/codex-bridge", key) };
 }
