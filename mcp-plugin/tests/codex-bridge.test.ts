@@ -181,7 +181,7 @@ test("restart rechecks allowlists before processing durable pending and ready re
     expect(JSON.parse(readFileSync(join(c.stateDir, "state.json"), "utf8")).entries.map((e: any) => e.status)).toEqual(["blocked", "blocked"]);
   } finally { await bridge.stop(); app.close(); }
 });
-test("real WS auth/membership → stdio generation → REST reply roundtrip", async () => {
+test("real WS auth/membership → stdio generation → acknowledged WS reply roundtrip", async () => {
   const { c } = fixture(); const sent: any[] = [];
   const http = createServer(async (req, res) => {
     if (req.headers.authorization !== `Bearer ${c.token}`) { res.writeHead(401).end(); return; }
@@ -195,6 +195,10 @@ test("real WS auth/membership → stdio generation → REST reply roundtrip", as
   ws.on("connection", socket => socket.on("message", raw => {
     const m = JSON.parse(String(raw));
     if (m.type === "auth" && m.agent_id === "project" && m.token === c.token) socket.send('{"type":"auth_ok"}');
+    if (m.type === "message") {
+      sent.push({ url: "/api/channels/dm-owner/messages", body: { sender_id: m.sender_id, content_type: m.content_type, content: m.content } });
+      socket.send(JSON.stringify({type: "message_ack", message_id: m.id}));
+    }
     if (m.type === "join_channel") {
       socket.send(JSON.stringify({ type: "message", ...message(), content: "Reply with exactly Verified reply. Do not use tools." }));
       socket.send(JSON.stringify({ type: "message", ...message(), content: "Reply with exactly Verified reply. Do not use tools." }));
@@ -220,3 +224,19 @@ test("real WS auth/membership → stdio generation → REST reply roundtrip", as
     expect(sent).toEqual([{ url: "/api/channels/dm-owner/messages", body: { sender_id: "project", content_type: "text", content: "Verified reply" } }]);
   } finally { transport.stop(); await bridge.stop(); app.close(); for (const client of ws.clients) client.terminate(); ws.close(); http.closeAllConnections(); await new Promise<void>(r => http.close(() => r())); }
 }, 120_000);
+
+test("lost WS acknowledgement stays uncertain without a second REST send", async () => {
+  const { c } = fixture(); let posts = 0;
+  const http = createServer((req, res) => { if (req.method === "POST") posts++; res.end('{"channels":[]}'); });
+  await new Promise<void>(r=>http.listen(0,"127.0.0.1",r));
+  c.apiUrl=`http://127.0.0.1:${(http.address() as any).port}`; c.wsUrl=c.apiUrl.replace("http","ws");
+  const ws=new WebSocketServer({server:http});
+  ws.on("connection",socket=>socket.on("message",raw=>{const m=JSON.parse(String(raw));
+    if(m.type==="auth") socket.send('{"type":"auth_ok"}');
+    if(m.type==="message") { socket.send(JSON.stringify({type:"message_ack",message_id:"unrelated"})); socket.close(); }
+  }));
+  let ready!:()=>void; const connected=new Promise<void>(r=>ready=r);
+  const t=new AgentsChatTransport(c,()=>{},s=>{if(s.includes("connected as"))ready();});
+  try {t.start();await connected;await expect(t.send("dm-owner","test")).rejects.toThrow("acknowledgement");expect(posts).toBe(0);}
+  finally{t.stop();for(const c of ws.clients)c.terminate();ws.close();http.closeAllConnections();await new Promise<void>(r=>http.close(()=>r()));}
+});

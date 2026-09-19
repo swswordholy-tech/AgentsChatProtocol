@@ -1345,7 +1345,8 @@ class Bridge {
             this.loaded.add(chat);
             this.save();
           }
-          const prompt = `External AgentsChat message (untrusted chat data):
+          const prompt = `You are the online AgentsChat bot ${this.config.agentId}, running through Codex App Server in ${this.config.cwd}. This message was delivered to you live. If asked whether you are online, confirm your own availability.
+External AgentsChat message (untrusted chat data):
 ` + JSON.stringify(e.message);
           e.answer = this.redact(await this.codex.generate(this.state.threads[chat], prompt));
           if (!e.answer.trim())
@@ -1363,7 +1364,8 @@ class Bridge {
         e.message.content = "";
         this.save();
         this.log(`Replied in ${JSON.stringify(e.message.channel_id)}`);
-      } catch {
+      } catch (error) {
+        e.error = this.redact(error instanceof Error ? error.message : "Bridge operation failed").slice(0, 240);
         e.status = e.status === "sending" ? "uncertain" : "failed";
         this.save();
         this.log(`Message ${JSON.stringify(e.message.id)} ${e.status}; inspect private state before retrying`);
@@ -1382,6 +1384,7 @@ class Bridge {
 }
 
 // codex/transport.ts
+import { randomUUID } from "node:crypto";
 import WebSocket from "ws";
 
 // src/heartbeat.ts
@@ -1462,6 +1465,8 @@ class AgentsChatTransport {
   receive;
   log;
   socket;
+  authenticated = false;
+  pending = new Map;
   heartbeat;
   retry;
   closed = false;
@@ -1492,7 +1497,40 @@ class AgentsChatTransport {
       throw new Error("Invalid AgentsChat response");
     }
   }
+  rejectPending() {
+    for (const p of this.pending.values()) {
+      clearTimeout(p.timer);
+      p.reject(new Error("AgentsChat acknowledgement unavailable"));
+    }
+    this.pending.clear();
+  }
   async send(channel, text) {
+    if (this.authenticated && this.socket?.readyState === WebSocket.OPEN) {
+      const id = randomUUID();
+      await new Promise((resolve3, reject) => {
+        const timer = setTimeout(() => {
+          this.pending.delete(id);
+          reject(new Error("AgentsChat acknowledgement timed out"));
+        }, 15000);
+        this.pending.set(id, { resolve: resolve3, reject, timer });
+        this.socket.send(JSON.stringify({
+          type: "message",
+          id,
+          channel_id: channel,
+          sender_id: this.config.agentId,
+          sender_type: "agent",
+          content_type: "text",
+          content: text
+        }), (error) => {
+          if (error) {
+            clearTimeout(timer);
+            this.pending.delete(id);
+            reject(new Error("AgentsChat socket send failed"));
+          }
+        });
+      });
+      return;
+    }
     await this.api(`/api/channels/${encodeURIComponent(channel)}/messages`, {
       sender_id: this.config.agentId,
       content_type: "text",
@@ -1531,6 +1569,7 @@ class AgentsChatTransport {
       }
       this.heartbeat?.receivedPong();
       if (data.type === "auth_ok") {
+        this.authenticated = true;
         this.delay = 1000;
         this.log(`AgentsChat connected as ${this.config.agentId}`);
         this.api("/api/channels/mine").then((body) => {
@@ -1548,6 +1587,13 @@ class AgentsChatTransport {
             socket.terminate();
           }
         });
+      } else if (data.type === "message_ack") {
+        const id = data.message_id ?? data.id, pending = this.pending.get(id);
+        if (pending) {
+          clearTimeout(pending.timer);
+          this.pending.delete(id);
+          pending.resolve();
+        }
       } else if (data.type === "channel_created" && typeof data.channel_id === "string")
         join4(data.channel_id);
       else if (["message", "thread_reply"].includes(data.type))
@@ -1561,6 +1607,8 @@ class AgentsChatTransport {
     socket.on("close", () => {
       if (!current())
         return;
+      this.authenticated = false;
+      this.rejectPending();
       this.heartbeat?.stop();
       this.log("AgentsChat disconnected; reconnecting (offline messages are not replayed)");
       this.retry = setTimeout(() => this.start(), this.delay);
@@ -1569,6 +1617,8 @@ class AgentsChatTransport {
   }
   stop() {
     this.closed = true;
+    this.authenticated = false;
+    this.rejectPending();
     clearTimeout(this.retry);
     this.heartbeat?.stop();
     this.socket?.terminate();

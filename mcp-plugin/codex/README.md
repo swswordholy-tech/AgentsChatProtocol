@@ -218,3 +218,8 @@ snapshot in `~/.agentschat/codex-bots/status.json`; check its timestamp and proc
 before treating it as live. Never put profile tokens in the plist or arguments.
 Startup notifications are not automatically broadcast; send only to a verified,
 explicitly authorized recipient after observing successful connection.
+
+Replies prefer the authenticated WebSocket and require a matching `message_ack`.
+REST is used only when no authenticated socket is available before sending. A
+missing ACK never triggers a second send via REST. Delivery failures retain a
+redacted error in private inbox state for diagnosis and explicit recovery.

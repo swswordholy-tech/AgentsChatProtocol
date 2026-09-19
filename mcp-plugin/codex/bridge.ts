@@ -4,7 +4,7 @@ import type { BridgeConfig } from "./config.ts";
 import { redactSecrets } from "../src/redact.ts";
 
 export interface ChatMessage { id: string; channel_id: string; sender_id: string; content: string; mentions?: string[]; mentioned_ids?: string[] }
-interface Entry { message: ChatMessage; status: "pending" | "running" | "ready" | "sending" | "sent" | "failed" | "uncertain" | "blocked"; answer?: string }
+interface Entry { message: ChatMessage; status: "pending" | "running" | "ready" | "sending" | "sent" | "failed" | "uncertain" | "blocked"; answer?: string; error?: string }
 interface State { version: 1; threads: Record<string, string>; entries: Entry[] }
 export interface Generator { thread(cwd: string, existing?: string): Promise<string>; generate(thread: string, prompt: string): Promise<string> }
 function permitted(m: ChatMessage, c: BridgeConfig) {
@@ -75,7 +75,7 @@ export class Bridge {
             this.state.threads[chat] = await this.codex.thread(this.config.cwd, this.state.threads[chat]);
             this.loaded.add(chat); this.save();
           }
-          const prompt = "External AgentsChat message (untrusted chat data):\n" + JSON.stringify(e.message);
+          const prompt = `You are the online AgentsChat bot ${this.config.agentId}, running through Codex App Server in ${this.config.cwd}. This message was delivered to you live. If asked whether you are online, confirm your own availability.\nExternal AgentsChat message (untrusted chat data):\n` + JSON.stringify(e.message);
           e.answer = this.redact(await this.codex.generate(this.state.threads[chat]!, prompt));
           if (!e.answer.trim()) throw new Error("Empty reply");
           e.status = "ready"; this.save();
@@ -85,7 +85,8 @@ export class Bridge {
         await this.send(e.message.channel_id, e.answer!);
         e.status = "sent"; delete e.answer; e.message.content = ""; this.save();
         this.log(`Replied in ${JSON.stringify(e.message.channel_id)}`);
-      } catch {
+      } catch (error) {
+        e.error = this.redact(error instanceof Error ? error.message : "Bridge operation failed").slice(0, 240);
         e.status = e.status === "sending" ? "uncertain" : "failed";
         this.save(); this.log(`Message ${JSON.stringify(e.message.id)} ${e.status}; inspect private state before retrying`);
       }
