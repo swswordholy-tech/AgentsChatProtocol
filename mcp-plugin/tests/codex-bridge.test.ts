@@ -240,3 +240,13 @@ test("lost WS acknowledgement stays uncertain without a second REST send", async
   try {t.start();await connected;await expect(t.send("dm-owner","test")).rejects.toThrow("acknowledgement");expect(posts).toBe(0);}
   finally{t.stop();for(const c of ws.clients)c.terminate();ws.close();http.closeAllConnections();await new Promise<void>(r=>http.close(()=>r()));}
 });
+
+test("typing follows actual processing and clears on success or either failure", async () => {
+  for (const failure of ["none", "generation", "send"]) {
+    const { c } = fixture(); const activity: boolean[] = [];
+    const bridge = new Bridge(c, { thread: async()=>"t", generate: async()=>{if(failure==="generation")throw Error("generation failed");return "reply";} },
+      async()=>{if(failure==="send")throw Error("send failed");},()=>{},(_channel,active)=>activity.push(active));
+    try {bridge.accept(message());await bridge.drain();expect(activity).toEqual([true,false]);}
+    finally {await bridge.stop();}
+  }
+});

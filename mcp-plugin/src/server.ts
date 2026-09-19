@@ -583,7 +583,7 @@ function sendTypingFrame(channelId: string) {
   }
 }
 function startTypingHeartbeat(channelId: string) {
-  if (!channelId) return;
+  if (!channelId || process.env.AGENTSCHAT_AUTO_TYPING === "0") return;
   stopTypingHeartbeat(channelId); // reset if one is already running for this channel
   sendTypingFrame(channelId); // immediate first pulse
   const interval = setInterval(() => sendTypingFrame(channelId), TYPING_HEARTBEAT_MS);
@@ -4016,6 +4016,11 @@ function connectWS() {
         backfillTimer = null;
         if (!shuttingDown) void backfillAllChannels();
       }, 2000);
+    } else if ((data.type === "message" || data.type === "thread_reply") &&
+      data.sender_id === AGENT_ID && typeof data.content === "string" && data.content !== "__typing__" &&
+      !["loop_tick", "slash_input", "loop_status", "slash_response"].includes(data.meta?.kind)) {
+      // A separate connection of this identity may have produced the reply.
+      stopTypingHeartbeat(data.channel_id);
     } else if (
       // thread_reply is a bidirectional protocol frame (Server -> Client too).
       // Route it through the same @mention / notification / cursor path as a

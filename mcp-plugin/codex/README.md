@@ -223,3 +223,9 @@ Replies prefer the authenticated WebSocket and require a matching `message_ack`.
 REST is used only when no authenticated socket is available before sending. A
 missing ACK never triggers a second send via REST. Delivery failures retain a
 redacted error in private inbox state for diagnosis and explicit recovery.
+
+With an MCP connection for the same identity, set `AGENTSCHAT_AUTO_TYPING=0`
+in its environment. The bridge owns typing only during actual processing and
+clears its timer on success, failure and shutdown. iOS expires the last pulse
+within 5 seconds; real replies clear it immediately. Restart existing MCP
+connections after upgrading; older releases ignore this setting.

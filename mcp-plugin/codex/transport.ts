@@ -6,6 +6,7 @@ import { HeartbeatMonitor } from "../src/heartbeat.ts";
 export class AgentsChatTransport {
   private socket?: WebSocket;
   private authenticated = false;
+  private typing = new Map<string, ReturnType<typeof setInterval>>();
   private pending = new Map<string, { resolve: () => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> }>();
   private heartbeat?: HeartbeatMonitor;
   private retry?: ReturnType<typeof setTimeout>;
@@ -21,6 +22,15 @@ export class AgentsChatTransport {
     } catch { throw new Error("AgentsChat request failed or timed out"); }
     if (!response.ok) throw new Error(`AgentsChat HTTP ${response.status}`);
     try { return await response.json(); } catch { throw new Error("Invalid AgentsChat response"); }
+  }
+  setTyping(channel: string, active: boolean) {
+    clearInterval(this.typing.get(channel)); this.typing.delete(channel);
+    if (!active || this.closed) return;
+    const pulse = () => {
+      if (this.authenticated && this.socket?.readyState === WebSocket.OPEN)
+        this.socket.send(JSON.stringify({ type: "typing", channel_id: channel, sender_id: this.config.agentId, cross_pod: true }));
+    };
+    pulse(); this.typing.set(channel, setInterval(pulse, 2000));
   }
   private rejectPending() {
     for (const p of this.pending.values()) { clearTimeout(p.timer); p.reject(new Error("AgentsChat acknowledgement unavailable")); }
@@ -85,5 +95,5 @@ export class AgentsChatTransport {
       this.retry = setTimeout(() => this.start(), this.delay); this.delay = Math.min(this.delay * 2, 30_000);
     });
   }
-  stop() { this.closed = true; this.authenticated = false; this.rejectPending(); clearTimeout(this.retry); this.heartbeat?.stop(); this.socket?.terminate(); }
+  stop() { for (const timer of this.typing.values()) clearInterval(timer); this.typing.clear(); this.closed = true; this.authenticated = false; this.rejectPending(); clearTimeout(this.retry); this.heartbeat?.stop(); this.socket?.terminate(); }
 }

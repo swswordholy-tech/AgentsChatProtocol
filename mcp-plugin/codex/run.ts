@@ -42,7 +42,7 @@ async function main() {
   codex = new AppServer(c.codexBin);
   if (values.check) { await codex.start(); console.log("Official app-server initialization: OK (no chat connection or generation)"); codex.close(); return; }
   transport = new AgentsChatTransport(c, m => { bridge!.accept(m); });
-  bridge = new Bridge(c, codex, (chat, text) => transport!.send(chat, text));
+  bridge = new Bridge(c, codex, (chat, text) => transport!.send(chat, text), console.error, (chat, active) => transport!.setTyping(chat, active));
   let stopping = false;
   const stop = async () => { if (stopping) return; stopping = true; if (values["managed-worker"]) { const deadline = setTimeout(() => { try { process.kill(-process.pid, "SIGKILL"); } catch {} }, 20000); deadline.unref(); } bridge?.pause(); transport?.stop(); codex?.close(); await bridge?.stop(); if (process.connected) process.disconnect?.(); };
   codex.onFatal = () => { console.error("Codex backend stopped; pending inbox preserved. Restart the bridge after checking failed entries."); process.exitCode = 1; void stop(); };

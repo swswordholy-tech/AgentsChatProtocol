@@ -26,7 +26,8 @@ export class Bridge {
   private stopped = false;
   private loaded = new Set<string>();
   constructor(private config: BridgeConfig, private codex: Generator,
-    private send: (channel: string, text: string) => Promise<void>, private log: (s: string) => void = console.error) {
+    private send: (channel: string, text: string) => Promise<void>, private log: (s: string) => void = console.error,
+    private activity: (channel: string, active: boolean) => void = () => {}) {
     mkdirSync(config.stateDir, { recursive: true, mode: 0o700 });
     this.file = join(config.stateDir, "state.json"); this.lock = join(config.stateDir, "bridge.lock");
     try { const fd = openSync(this.lock, "wx", 0o600); writeFileSync(fd, String(process.pid)); closeSync(fd); }
@@ -68,6 +69,7 @@ export class Bridge {
       if (!e) return;
       if (!permitted(e.message, this.config)) { e.status = "blocked"; this.save(); continue; }
       try {
+        this.activity(e.message.channel_id, true);
         if (e.status === "pending") {
           e.status = "running"; this.save();
           const chat = e.message.channel_id;
@@ -89,7 +91,7 @@ export class Bridge {
         e.error = this.redact(error instanceof Error ? error.message : "Bridge operation failed").slice(0, 240);
         e.status = e.status === "sending" ? "uncertain" : "failed";
         this.save(); this.log(`Message ${JSON.stringify(e.message.id)} ${e.status}; inspect private state before retrying`);
-      }
+      } finally { this.activity(e.message.channel_id, false); }
     }
   }
   pause() { this.stopped = true; }

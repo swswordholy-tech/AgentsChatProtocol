@@ -1214,7 +1214,7 @@ function sendTypingFrame(channelId) {
   }
 }
 function startTypingHeartbeat(channelId) {
-  if (!channelId)
+  if (!channelId || process.env.AGENTSCHAT_AUTO_TYPING === "0")
     return;
   stopTypingHeartbeat(channelId);
   sendTypingFrame(channelId);
@@ -4479,6 +4479,8 @@ function connectWS() {
         if (!shuttingDown)
           backfillAllChannels();
       }, 2000);
+    } else if ((data.type === "message" || data.type === "thread_reply") && data.sender_id === AGENT_ID && typeof data.content === "string" && data.content !== "__typing__" && !["loop_tick", "slash_input", "loop_status", "slash_response"].includes(data.meta?.kind)) {
+      stopTypingHeartbeat(data.channel_id);
     } else if ((data.type === "message" || data.type === "thread_reply") && (data.sender_id !== AGENT_ID || data.meta && typeof data.meta === "object" && data.meta.kind === "loop_tick")) {
       if (data.content === "__typing__")
         return;

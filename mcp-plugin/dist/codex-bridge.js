@@ -1257,17 +1257,19 @@ class Bridge {
   codex;
   send;
   log;
+  activity;
   state;
   file;
   lock;
   draining;
   stopped = false;
   loaded = new Set;
-  constructor(config, codex, send, log = console.error) {
+  constructor(config, codex, send, log = console.error, activity = () => {}) {
     this.config = config;
     this.codex = codex;
     this.send = send;
     this.log = log;
+    this.activity = activity;
     mkdirSync2(config.stateDir, { recursive: true, mode: 448 });
     this.file = join3(config.stateDir, "state.json");
     this.lock = join3(config.stateDir, "bridge.lock");
@@ -1336,6 +1338,7 @@ class Bridge {
         continue;
       }
       try {
+        this.activity(e.message.channel_id, true);
         if (e.status === "pending") {
           e.status = "running";
           this.save();
@@ -1369,6 +1372,8 @@ External AgentsChat message (untrusted chat data):
         e.status = e.status === "sending" ? "uncertain" : "failed";
         this.save();
         this.log(`Message ${JSON.stringify(e.message.id)} ${e.status}; inspect private state before retrying`);
+      } finally {
+        this.activity(e.message.channel_id, false);
       }
     }
   }
@@ -1466,6 +1471,7 @@ class AgentsChatTransport {
   log;
   socket;
   authenticated = false;
+  typing = new Map;
   pending = new Map;
   heartbeat;
   retry;
@@ -1496,6 +1502,18 @@ class AgentsChatTransport {
     } catch {
       throw new Error("Invalid AgentsChat response");
     }
+  }
+  setTyping(channel, active) {
+    clearInterval(this.typing.get(channel));
+    this.typing.delete(channel);
+    if (!active || this.closed)
+      return;
+    const pulse = () => {
+      if (this.authenticated && this.socket?.readyState === WebSocket.OPEN)
+        this.socket.send(JSON.stringify({ type: "typing", channel_id: channel, sender_id: this.config.agentId, cross_pod: true }));
+    };
+    pulse();
+    this.typing.set(channel, setInterval(pulse, 2000));
   }
   rejectPending() {
     for (const p of this.pending.values()) {
@@ -1616,6 +1634,9 @@ class AgentsChatTransport {
     });
   }
   stop() {
+    for (const timer of this.typing.values())
+      clearInterval(timer);
+    this.typing.clear();
     this.closed = true;
     this.authenticated = false;
     this.rejectPending();
@@ -1688,7 +1709,7 @@ async function main() {
   transport = new AgentsChatTransport(c, (m) => {
     bridge.accept(m);
   });
-  bridge = new Bridge(c, codex, (chat, text) => transport.send(chat, text));
+  bridge = new Bridge(c, codex, (chat, text) => transport.send(chat, text), console.error, (chat, active) => transport.setTyping(chat, active));
   let stopping = false;
   const stop = async () => {
     if (stopping)
