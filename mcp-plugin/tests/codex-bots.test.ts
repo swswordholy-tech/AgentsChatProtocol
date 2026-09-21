@@ -25,6 +25,11 @@ test("central registry ignores project identity; workdir defaults and duplicate 
   const write=(bots:any[],extra:any={})=>writeFileSync(file,JSON.stringify({version:1,default_workdir:cwd,bots,...extra}));
   write([{name:"one",profile:"one"},{name:"disabled",enabled:false}]);
   expect(loadBots(file,home).map(c=>[c.agentId,c.cwd])).toEqual([["test-bot",realpathSync(cwd)]]);
+  expect(loadBots(file,home)[0]!.permissions).toBe("full-access");
+  write([{name:"one",profile:"one",permissions:"read-only"}]);
+  expect(loadBots(file,home)[0]!.permissions).toBe("read-only");
+  write([{name:"one",profile:"one",permissions:"typo"}]);
+  expect(()=>loadBots(file,home)).toThrow("permissions");
   write([{name:"one",profile:"one"},{name:"two",profile:"one",workdir:home}]);
   expect(()=>loadBots(file,home)).toThrow("Duplicate");
   write([{name:"one",profile:"../one"}]); expect(()=>loadBots(file,home)).toThrow("central profile");

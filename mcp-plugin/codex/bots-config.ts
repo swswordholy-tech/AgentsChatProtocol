@@ -21,7 +21,7 @@ export function loadBots(file = defaultRegistry(), home = homedir()): BotConfig[
   const names = new Set<string>(), identities = new Set<string>();
   const bots: BotConfig[] = [];
   for (const bot of doc.bots) {
-    fields(bot, ["name", "profile", "workdir", "enabled", "agent_id", "channels", "senders", "api_url", "ws_url"]);
+    fields(bot, ["name", "profile", "workdir", "enabled", "agent_id", "channels", "senders", "api_url", "ws_url", "permissions"]);
     if (!text(bot.name) || !/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/.test(bot.name) || names.has(bot.name)) throw new Error("Bot names must be unique simple labels");
     names.add(bot.name);
     if (bot.enabled !== undefined && typeof bot.enabled !== "boolean") throw new Error("Invalid bot enabled flag");
@@ -32,7 +32,7 @@ export function loadBots(file = defaultRegistry(), home = homedir()): BotConfig[
     if (!doc.default_workdir && !bot.workdir) mkdirSync(defaultDir, { recursive: true, mode: 0o700 });
     const cwd = realpathSync(bot.workdir ? path(bot.workdir) : defaultDir);
     const settings: IdentitySettings = {};
-    for (const k of ["agent_id", "channels", "senders", "api_url", "ws_url"] as const) if (bot[k] !== undefined) (settings as any)[k] = bot[k];
+    for (const k of ["agent_id", "channels", "senders", "api_url", "ws_url", "permissions"] as const) if (bot[k] !== undefined) (settings as any)[k] = bot[k];
     const config = resolveConfig({ cwd, profile: bot.profile, settings, codexBin: doc.codex_bin }, {}, home);
     const identity = JSON.stringify([config.apiUrl, config.agentId]);
     if (identities.has(identity)) throw new Error("Duplicate AgentsChat account in enabled bots (even with different workdirs)");

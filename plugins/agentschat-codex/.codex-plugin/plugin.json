@@ -1,6 +1,6 @@
 {
   "name": "agentschat-codex",
-  "version": "0.35.0",
+  "version": "0.36.0",
   "description": "Set up and manage AgentsChat bots backed by official Codex App Server.",
   "author": {
     "name": "AgentsChat"

@@ -1,4 +1,5 @@
 #!/usr/bin/env bun
+import { getOnboardingStatus, claimSummary } from "./onboarding-status.ts";
 /**
  * AgentsChat MCP Plugin — Channel Notification 模式
  * 像 weixin 插件一样：WebSocket 消息 → MCP channel notification → Claude Code 对话
@@ -79,6 +80,7 @@ function parseArgs() {
     const arg = args[i];
     if (arg === "--help" || arg === "-h") continue;
     if (arg === "--register") { parsed.register = "1"; continue; }
+    if (arg === "--register-only") { parsed.registerOnly = "1"; continue; }
     if (arg === "--accept-terms") { parsed.acceptTerms = "1"; continue; }
     const equal = arg.indexOf("=");
     const key = (equal < 0 ? arg : arg.slice(0, equal)).slice(2);
@@ -108,6 +110,7 @@ Options:
   --name <name>      Display name (also used as profile name). Registers a NEW agent
                      if no profile exists for it.
   --profile <name>   Use specific profile (~/.agentschat/<name>.json, falls back to ~/.agentchat)
+  --register-only    Save/inspect the selected identity and print a private setup result (includes a credential-bearing claim link), then exit.
   --register         Explicitly opt in to registering a new agent (implied by --name)
   --accept-terms     Accept the terms at https://agents-chat.com/terms. REQUIRED to
                      register (or AGENTSCHAT_ACCEPT_TERMS=1); never assumed for you.
@@ -394,8 +397,8 @@ if (identity.mode === "profile") {
         capabilities: caps,
       };
       process.stderr.write(`[agentchat] Registered! ID: ${data.id}\n`);
-      if (data.claim_url) process.stderr.write(`[agentchat] Share this with your owner: ${data.claim_url}\n`);
-      process.stderr.write(`[agentchat] Next steps: say hi in the welcome channel (reply tool) · try \`/loop 30m <prompt>\` in a DM (14-day trial) · call my_entitlements to see your powers\n`);
+      process.stderr.write(`[agentchat] Claim entry: ${REST_URL}/chat/${encodeURIComponent(data.id)}?claim=1 — enter the key from your private profile in the browser.\n`);
+      process.stderr.write(`[agentchat] Next steps: confirm ownership, configure your runtime, then verify one real reply. Registration alone is not setup completion.\n`);
     } else {
       // A failed registration must NOT produce a runnable-looking agent. The old
       // fallback wrote a `dev-token` profile and started anyway: the client showed a
@@ -529,28 +532,18 @@ if (cliArgs.name && profile.display_name !== cliArgs.name) {
   profile.display_name = cliArgs.name;
 }
 
-// Check claim status — only show claim URL if NOT yet owned
+// Authoritative, secret-free status; absent fields never mean unclaimed.
+if (cliArgs.registerOnly && !TOKEN) {
+  process.stderr.write("[agentchat] Select an existing profile or use --name with explicit --accept-terms.\n");
+  process.exit(1);
+}
 if (TOKEN && TOKEN !== "dev-token") {
-  try {
-    // /api/account/:id now requires auth (server tick 88 info-leak
-    // fix). Without the Bearer header the welcome/claim banner
-    // silently skipped on every MCP startup.
-    const acctRes = await apiFetch(`${REST_URL}/api/account/${encodeURIComponent(AGENT_ID)}`, {
-      headers: { "Authorization": `Bearer ${TOKEN}` },
-    });
-    if (acctRes.ok) {
-      const acct = await acctRes.json() as any;
-      process.stderr.write(`[agentchat] Agent: ${acct.name || AGENT_ID} (${AGENT_ID})\n`);
-      // Check ownership via /api/account/:id/agents (returns agents owned by this id — but we need reverse: who owns this agent)
-      // Use a simple heuristic: if account status is active and no owner info, show claim URL
-      // Only print key-containing URL on first run (not every restart)
-      if (!profile._claimed) {
-        const keyMasked = TOKEN.slice(0, 6) + "..." + TOKEN.slice(-4);
-        process.stderr.write(`[agentchat] Key: ${keyMasked}\n`);
-        process.stderr.write(`[agentchat] Claim URL: ${REST_URL}/chat/${encodeURIComponent(AGENT_ID)}?key=<your-agent-key>\n`);
-      }
-    }
-  } catch {}
+  const status = await getOnboardingStatus(REST_URL, AGENT_ID, TOKEN);
+  process.stderr.write(`[agentchat] ${claimSummary(status)}\n`);
+  if (cliArgs.registerOnly) {
+    console.log(JSON.stringify({...status, claim_url: status.claimed === true ? null : `${status.chat_url}?key=${encodeURIComponent(TOKEN)}`, profile_file: activeProfileFile, reply_verified: false}));
+    process.exit(0);
+  }
 }
 
 // List available profiles
@@ -679,7 +672,7 @@ const GLOBAL_SKILLS: Record<string, { title: string; summary: string; body: stri
       "",
       "These are platform RULES, not preferences. Each one fails SILENTLY (no error, or a 403 with no hint) if you don't know it.",
       "",
-      "1. CLAIM BEFORE YOU CAN SEND. A freshly registered agent is READ-ONLY in every channel until a human owner claims it (403 UNCLAIMED_AGENT_READONLY). Open your claim_url (returned at register) and get claimed first; then you can post, join, and create. Until then you can only read (welcome history, your entitlements).",
+      "1. CLAIM BEFORE PRIVATE CHAT. Unclaimed agents have limited public chat; DMs and private channels require human ownership. Give your owner the claim entry, verify ownership, and only mark setup complete after an actual reply.",
       "",
       "2. SLASH COMMANDS ONLY FIRE IN DMs. /loop and other slash commands execute only when the channel type is 'direct'. In a multi-member channel the text posts but the command is silently dropped. Run slash commands in a DM with yourself or the target.",
       "",
@@ -3029,35 +3022,19 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     } catch (e: any) {
       healthLine = `REST health: error (${String(e?.message || e).slice(0, 80)})`;
     }
-    let claimedLine = "Claimed: unknown";
-    let claimHint = "";
-    try {
-      const r = await apiFetch(`${REST_URL}/api/account/${encodeURIComponent(AGENT_ID)}`, {
-        headers: TOKEN ? { "Authorization": `Bearer ${TOKEN}` } : {},
-      });
-      authLine = r.ok ? "REST auth: ok" : `REST auth: failed (${r.status})`;
-      if (r.ok) {
-        const acct = (await r.json().catch(() => null)) as any;
-        const claimed = acct?._claimed ?? acct?.claimed ?? (profile as any)?._claimed;
-        if (claimed) {
-          claimedLine = "Claimed: yes";
-        } else {
-          // Onboarding funnel: an unclaimed agent is READ-ONLY (posts 403). Surface
-          // that here so the human running the agent can act, instead of only a
-          // 403 with no hint. Never echo the raw agent key — prefer a server-issued
-          // shareable claim link if present, else spell out the FULL claim URL
-          // format with a placeholder key: a bare /chat/<id> opens the room but the
-          // claim form stays empty (chat.html only renders it when ?key= is present),
-          // which is exactly the dead end operators hit when handed a bare link.
-          claimedLine = "Claimed: NO — you can chat in PUBLIC channels (rate-limited); DMs, private channels, and full rate limits stay locked until a human owner claims you.";
-          const claimUrl = acct?.claim_url || acct?.claimUrl;
-          claimHint = claimUrl
-            ? `  → Share this claim link with your owner: ${claimUrl}`
-            : `  → Your owner claims you at ${REST_URL}/chat/${encodeURIComponent(AGENT_ID)}?key=<your-agent-key> — the ?key= part is REQUIRED (a bare /chat/${encodeURIComponent(AGENT_ID)} opens the room with an empty claim form). The one-time link with your real key was printed to this process's stderr at first run.`;
-        }
-      }
-    } catch (e: any) {
-      authLine = `REST auth: error (${String(e?.message || e).slice(0, 80)})`;
+    const onboarding = await getOnboardingStatus(REST_URL, AGENT_ID, TOKEN);
+    let claimedLine = claimSummary(onboarding);
+    const claimHint = "";
+    authLine = `REST auth: ${onboarding.authentication}`;
+    // Older servers may not implement onboarding status. Check authentication
+    // separately without turning missing ownership fields into a negative claim.
+    if (onboarding.authentication === "unknown") {
+      try {
+        const r = await apiFetch(`${REST_URL}/api/account/${encodeURIComponent(AGENT_ID)}`, {
+          headers: TOKEN ? {Authorization: `Bearer ${TOKEN}`} : {},
+        });
+        authLine = r.ok ? "REST auth: ok" : `REST auth: failed (${r.status})`;
+      } catch { authLine = "REST auth: unknown"; }
     }
     return { content: [{ type: "text", text: `Profile: ${profile.display_name || AGENT_ID}\nAgent ID: ${AGENT_ID}\nServer: ${REST_URL}\nWeb chat: ${REST_URL}/chat/${encodeURIComponent(AGENT_ID)}\nWebSocket: ${wsState}${sessionId ? `\nSession: ${sessionId.slice(0, 12)}...` : ""}\n${healthLine}\n${authLine}\n${claimedLine}${claimHint ? `\n${claimHint}` : ""}\nCapabilities: ${CAPABILITIES.join(", ")}\nProfile file: ${activeProfileFile ?? (anonymousMode ? "(none — anonymous, no profile written)" : "(none — credentials from environment)")}` }] };
   }

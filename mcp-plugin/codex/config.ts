@@ -5,12 +5,18 @@ import { createHash } from "node:crypto";
 import { validateIdentityProfile } from "../src/identity.ts";
 import { parse as parseToml } from "smol-toml";
 
+export type PermissionMode = "full-access" | "read-only";
+export function permissionMode(value: unknown): PermissionMode {
+  if (value === undefined) return "full-access";
+  if (value !== "full-access" && value !== "read-only") throw new Error("permissions must be full-access or read-only");
+  return value;
+}
 export interface BridgeConfig {
   cwd: string; profileFile: string; source: string; agentId: string; token: string;
   apiUrl: string; wsUrl: string; channels: string[]; senders: string[];
-  codexBin: string; stateDir: string;
+  codexBin: string; stateDir: string; permissions: PermissionMode;
 }
-export interface IdentitySettings { profile?: string; agent_id?: string; channels?: string[]; senders?: string[]; api_url?: string; ws_url?: string }
+export interface IdentitySettings { permissions?: PermissionMode; profile?: string; agent_id?: string; channels?: string[]; senders?: string[]; api_url?: string; ws_url?: string }
 function readJson(file: string): any {
   try { return JSON.parse(readFileSync(file, "utf8")); }
   catch { throw new Error(`Cannot read valid JSON: ${file}`); }
@@ -27,7 +33,7 @@ export function resolveConfig(opts: { cwd?: string; profile?: string; codexBin?:
   const configFile = join(cwd, ".agentschat/config.json");
   const project = opts.settings ?? (existsSync(configFile) ? readJson(configFile) : {});
   if (!project || typeof project !== "object" || Array.isArray(project)) throw new Error("Invalid project config");
-  const allowed = new Set(["profile", "agent_id", "channels", "senders", "api_url", "ws_url"]);
+  const allowed = new Set(["profile", "agent_id", "channels", "senders", "api_url", "ws_url", "permissions"]);
   if (Object.keys(project).some(k => !allowed.has(k))) throw new Error("Unknown project config field (credentials belong in a private profile)");
   for (const k of ["profile", "agent_id", "api_url", "ws_url"])
     if (project[k] !== undefined && (typeof project[k] !== "string" || !project[k].trim())) throw new Error(`Invalid project ${k}`);
@@ -78,7 +84,7 @@ export function resolveConfig(opts: { cwd?: string; profile?: string; codexBin?:
   }
   const canonicalApi = new URL(apiUrl).href.replace(/\/$/, "");
   const key = createHash("sha256").update(JSON.stringify([cwd, canonicalApi, profile.agent_id])).digest("hex").slice(0, 24);
-  return { cwd, profileFile, source, agentId: profile.agent_id, token: profile.token,
+  return { cwd, profileFile, source, permissions: permissionMode(project.permissions), agentId: profile.agent_id, token: profile.token,
     apiUrl: canonicalApi, wsUrl, channels: strings(project.channels, "channels"),
     senders: strings(project.senders, "senders"), codexBin: opts.codexBin ?? "codex",
     stateDir: join(home, ".agentschat/codex-bridge", key) };

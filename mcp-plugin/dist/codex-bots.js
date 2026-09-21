@@ -26,7 +26,7 @@ function validateIdentityProfile(profile, file, allowDevToken = false) {
   }
 }
 
-// ../../AgentsChatProtocol/mcp-plugin/node_modules/smol-toml/dist/date.js
+// node_modules/smol-toml/dist/date.js
 /*!
  * Copyright (c) Squirrel Chat et al., All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
@@ -146,7 +146,7 @@ class TomlDate extends Date {
   }
 }
 
-// ../../AgentsChatProtocol/mcp-plugin/node_modules/smol-toml/dist/error.js
+// node_modules/smol-toml/dist/error.js
 /*!
  * Copyright (c) Squirrel Chat et al., All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
@@ -216,7 +216,7 @@ ${codeblock}`, options);
   }
 }
 
-// ../../AgentsChatProtocol/mcp-plugin/node_modules/smol-toml/dist/util.js
+// node_modules/smol-toml/dist/util.js
 /*!
  * Copyright (c) Squirrel Chat et al., All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
@@ -299,7 +299,7 @@ function skipUntil(ctx, sep, end) {
   });
 }
 
-// ../../AgentsChatProtocol/mcp-plugin/node_modules/smol-toml/dist/primitive.js
+// node_modules/smol-toml/dist/primitive.js
 /*!
  * Copyright (c) Squirrel Chat et al., All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
@@ -474,7 +474,7 @@ function parseValue(ctx, integersAsBigInt, end) {
   return date;
 }
 
-// ../../AgentsChatProtocol/mcp-plugin/node_modules/smol-toml/dist/extract.js
+// node_modules/smol-toml/dist/extract.js
 /*!
  * Copyright (c) Squirrel Chat et al., All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
@@ -534,7 +534,7 @@ function extractValue(ctx, end, integersAsBigInt) {
   return parseValue(ctx, integersAsBigInt, end);
 }
 
-// ../../AgentsChatProtocol/mcp-plugin/node_modules/smol-toml/dist/struct.js
+// node_modules/smol-toml/dist/struct.js
 /*!
  * Copyright (c) Squirrel Chat et al., All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
@@ -703,7 +703,7 @@ function parseArray(ctx, integersAsBigInt) {
   });
 }
 
-// ../../AgentsChatProtocol/mcp-plugin/node_modules/smol-toml/dist/parse.js
+// node_modules/smol-toml/dist/parse.js
 /*!
  * Copyright (c) Squirrel Chat et al., All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
@@ -845,7 +845,7 @@ function parse(toml, { maxDepth = 1000, integersAsBigInt } = {}) {
   return res;
 }
 
-// ../../AgentsChatProtocol/mcp-plugin/node_modules/smol-toml/dist/stringify.js
+// node_modules/smol-toml/dist/stringify.js
 /*!
  * Copyright (c) Squirrel Chat et al., All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
@@ -874,7 +874,7 @@ function parse(toml, { maxDepth = 1000, integersAsBigInt } = {}) {
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-// ../../AgentsChatProtocol/mcp-plugin/node_modules/smol-toml/dist/index.js
+// node_modules/smol-toml/dist/index.js
 /*!
  * Copyright (c) Squirrel Chat et al., All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
@@ -904,6 +904,13 @@ function parse(toml, { maxDepth = 1000, integersAsBigInt } = {}) {
  */
 
 // codex/config.ts
+function permissionMode(value) {
+  if (value === undefined)
+    return "full-access";
+  if (value !== "full-access" && value !== "read-only")
+    throw new Error("permissions must be full-access or read-only");
+  return value;
+}
 function readJson(file) {
   try {
     return JSON.parse(readFileSync(file, "utf8"));
@@ -924,7 +931,7 @@ function resolveConfig(opts, env = process.env, home = homedir()) {
   const project = opts.settings ?? (existsSync(configFile) ? readJson(configFile) : {});
   if (!project || typeof project !== "object" || Array.isArray(project))
     throw new Error("Invalid project config");
-  const allowed = new Set(["profile", "agent_id", "channels", "senders", "api_url", "ws_url"]);
+  const allowed = new Set(["profile", "agent_id", "channels", "senders", "api_url", "ws_url", "permissions"]);
   if (Object.keys(project).some((k) => !allowed.has(k)))
     throw new Error("Unknown project config field (credentials belong in a private profile)");
   for (const k of ["profile", "agent_id", "api_url", "ws_url"])
@@ -993,6 +1000,7 @@ function resolveConfig(opts, env = process.env, home = homedir()) {
     cwd,
     profileFile,
     source,
+    permissions: permissionMode(project.permissions),
     agentId: profile.agent_id,
     token: profile.token,
     apiUrl: canonicalApi,
@@ -1032,7 +1040,7 @@ function loadBots(file = defaultRegistry(), home = homedir2()) {
   const names = new Set, identities = new Set;
   const bots = [];
   for (const bot of doc.bots) {
-    fields(bot, ["name", "profile", "workdir", "enabled", "agent_id", "channels", "senders", "api_url", "ws_url"]);
+    fields(bot, ["name", "profile", "workdir", "enabled", "agent_id", "channels", "senders", "api_url", "ws_url", "permissions"]);
     if (!text(bot.name) || !/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/.test(bot.name) || names.has(bot.name))
       throw new Error("Bot names must be unique simple labels");
     names.add(bot.name);
@@ -1048,7 +1056,7 @@ function loadBots(file = defaultRegistry(), home = homedir2()) {
       mkdirSync(defaultDir, { recursive: true, mode: 448 });
     const cwd = realpathSync2(bot.workdir ? path(bot.workdir) : defaultDir);
     const settings = {};
-    for (const k of ["agent_id", "channels", "senders", "api_url", "ws_url"])
+    for (const k of ["agent_id", "channels", "senders", "api_url", "ws_url", "permissions"])
       if (bot[k] !== undefined)
         settings[k] = bot[k];
     const config = resolveConfig({ cwd, profile: bot.profile, settings, codexBin: doc.codex_bin }, {}, home);

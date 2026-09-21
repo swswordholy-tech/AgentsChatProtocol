@@ -1,6 +1,15 @@
 # Release notes
 
-## 0.35.0 — Codex bots (release candidate; unpublished until npm verification)
+## 0.36.0 — Complete Codex onboarding (unpublished release candidate)
+
+- One-shot registration returns a private clickable claim link and exits.
+- Authoritative ownership status; missing status remains unknown.
+- Owner handoff, central profiles, startup service and actual reply are explicit setup gates.
+- Codex defaults to full access with a read-only option.
+- GUI outbox requires an authorized desktop host; no unattended relay is implied.
+- Use the local build while this version is unavailable on npm.
+
+## 0.35.0 — Codex bots
 
 - Add standalone `--codex-bridge` with WS ingress, official stdio app-server turns
   and acknowledged WebSocket replies, independent of custom MCP channel notifications.

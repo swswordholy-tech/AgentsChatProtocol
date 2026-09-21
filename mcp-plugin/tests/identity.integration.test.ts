@@ -48,7 +48,7 @@ beforeAll(() => {
         if (body?.name === "RejectMe") {
           return Response.json({ error: "name unavailable" }, { status: 400 });
         }
-        return Response.json({ id: "srv-assigned-id", key: "ac_mock_key" });
+        return Response.json({ id: "srv-assigned-id", key: "ac_mock_key", claim_url: BASE + "/chat/srv-assigned-id?key=ac_mock_key" });
       }
       return Response.json({});
     },
@@ -353,7 +353,7 @@ describe("identity policy, end-to-end against a mock hub", () => {
     expect(reply?.annotations?.openWorldHint).toBe(true);
   }, 15_000);
 
-  test("whoami's claim hint spells the FULL claim URL (?key= required), never the real key", async () => {
+  test("whoami preserves unknown ownership and offers a secret-free claim entry", async () => {
     // Boss hit this with the Hermes identity: whoami pointed at a bare /chat/<id>,
     // the room opened with an EMPTY claim form (chat.html renders it only when
     // ?key= is present). The hint must carry the full format with a placeholder —
@@ -373,11 +373,11 @@ describe("identity policy, end-to-end against a mock hub", () => {
     );
     const text = res.get(3)?.result?.content?.[0]?.text ?? "";
 
-    expect(text).toMatch(/Claimed: NO/);
+    expect(text).toMatch(/Claimed: unknown/);
     // The actionable claim format with the placeholder key (the mock hub returns
     // no claim_url, so the fallback hint is what an operator sees).
-    expect(text).toContain(`/chat/unclaimed-id?key=<your-agent-key>`);
-    expect(text).toMatch(/\?key= part is REQUIRED/);
+    expect(text).toContain(`/chat/unclaimed-id?claim=1`);
+    expect(text).not.toContain("?key=");
     // The real key never appears — this is the "key out of prose" leak surface.
     expect(text).not.toContain("ac_realsecretkey");
   }, 15_000);

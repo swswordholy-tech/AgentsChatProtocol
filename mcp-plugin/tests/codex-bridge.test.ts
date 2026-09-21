@@ -94,11 +94,12 @@ rl.on('line', line => {
  if(m.method==='initialize') emit({id:m.id,result:{}});
  if(m.method==='config/read') { configCwd=p.cwd; emit({id:m.id,result:{config:{mcp_servers:{agentschat:{command:'must-disable'}}}}}); }
  if(m.method==='thread/start'||m.method==='thread/resume') {
-  if(configCwd!==p.cwd || p.config?.mcp_servers?.agentschat?.enabled!==false || p.approvalPolicy!=='never' || p.sandbox!=='read-only')
+  if(configCwd!==p.cwd || p.config?.mcp_servers?.agentschat?.command!=='must-disable' || p.approvalPolicy!=='never' || p.sandbox!=='danger-full-access')
    return emit({id:m.id,error:{code:-32602,message:'unsafe'}});
   emit({id:m.id,result:{thread:{id:p.threadId||'thread-'+(++next)}}});
  }
  if(m.method==='turn/start') {
+  if(p.approvalPolicy!=='never'||p.sandboxPolicy?.type!=='dangerFullAccess') return emit({id:m.id,error:{code:-32602,message:'wrong turn permissions'}});
   const t='turn-'+(++next);
   const done=(method,extra)=>emit({method,params:{threadId:p.threadId,turnId:t,...extra}});
   // Notifications deliberately race ahead of the response; unrelated turns must not leak.
@@ -248,5 +249,28 @@ test("typing follows actual processing and clears on success or either failure",
       async()=>{if(failure==="send")throw Error("send failed");},()=>{},(_channel,active)=>activity.push(active));
     try {bridge.accept(message());await bridge.drain();expect(activity).toEqual([true,false]);}
     finally {await bridge.stop();}
+  }
+});
+
+
+test("full access is default, read-only is explicit, invalid modes fail closed", () => {
+  const f = fixture(); expect(f.c.permissions).toBe("full-access");
+  f.config({profile: "project", permissions: "read-only"});
+  expect(resolveConfig({cwd:f.cwd}, {}, f.root).permissions).toBe("read-only");
+  f.config({profile: "project", permissions: "typo"});
+  expect(() => resolveConfig({cwd:f.cwd}, {}, f.root)).toThrow("permissions");
+});
+test("create and resume both apply permissions and each turn preserves them", async () => {
+  for (const mode of ["full-access", "read-only"] as const) {
+    const script = mode === "full-access" ? fakeAppServer : fakeAppServer
+      .replace("p.config?.mcp_servers?.agentschat?.command!=='must-disable'", "p.config?.mcp_servers?.agentschat?.enabled!==false")
+      .replace("p.sandbox!=='danger-full-access'", "p.sandbox!=='read-only'")
+      .replace("p.sandboxPolicy?.type!=='dangerFullAccess'", "p.sandboxPolicy?.type!=='readOnly'");
+    const app = new AppServer("node", ["-e", script], 2000, mode);
+    try {
+      await app.start(); const id = await app.thread("/tmp");
+      expect(await app.thread("/tmp", id)).toBe(id);
+      expect(await app.generate(id, "test")).toBe("Verified reply");
+    } finally { app.close(); }
   }
 });
