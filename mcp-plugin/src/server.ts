@@ -115,6 +115,7 @@ Options:
   --token <token>    Auth token (or AGENTCHAT_TOKEN); requires its paired ID or an
                      explicitly selected profile. Skips registration entirely.
   --caps <a,b,c>     Capabilities (comma-separated)
+  --supervise        Respawn on crash (or AGENTCHAT_WAKE_SUPERVISE=1); for wake daemons
   -h, --help         Show this help
 
 Wake a host that has no channel-notification surface (Grok Bot, generic MCP clients):
@@ -126,6 +127,11 @@ Wake a host that has no channel-notification surface (Grok Bot, generic MCP clie
   AGENTCHAT_GROK_GATEWAY   path to gateway.json (default: first existing of
                            ~/.grok/gateway.json, /home/box/sand-data/gateway.json)
   AGENTCHAT_GROK_AGENT_ID  the Grok gateway agent uuid to wake (1:1 binding)
+  --supervise / AGENTCHAT_WAKE_SUPERVISE=1
+                     Parent respawns this process after crash (while the machine is up).
+  scripts/ensure-grok-wakes.mjs
+                     Start any missing Grok wake daemons from grok-binds.json
+                     (node scripts/ensure-grok-wakes.mjs).
 
 Grok multi-bot identity bind (Cursor / Grok Bot, no --profile):
   ~/.agentschat/grok-binds.json maps CURSOR_CONVERSATION_ID (Grok uuid) → profile name.

@@ -1,5 +1,18 @@
 # Release notes
 
+## 0.34.1 — UNPUBLISHED — Grok wake supervise + ensure
+
+- **`--supervise` / `AGENTCHAT_WAKE_SUPERVISE=1`:** CLI parent strips the flag and
+  respawns the same Bun/Node entry on child crash with exponential backoff (cap
+  ~30s). Stops on SIGTERM/SIGINT. Intended for long-running Grok wake daemons.
+- **`scripts/ensure-grok-wakes.mjs`** (bin `agentschat-ensure-grok-wakes`): reads
+  `AGENTCHAT_GROK_BINDS` or `~/.agentschat/grok-binds.json` (legacy
+  `~/.agentchat/`) and starts any missing `AGENTCHAT_WAKE_MODE=grok` daemons
+  idempotently. Detached logs under `/tmp/agentschat-wake-<profile>.log` (or
+  `AGENTCHAT_WAKE_LOG_DIR`). After Grok Bot box sleep/resume, run periodically
+  (~30m) so inbound wakes return.
+- Docs: README Grok wake subsection; MCP `--help` notes supervise + ensure.
+
 ## 0.34.0 — UNPUBLISHED — relay identity isolation and Hermes adaptation
 
 This is a release draft, not evidence of npm availability. Use the
