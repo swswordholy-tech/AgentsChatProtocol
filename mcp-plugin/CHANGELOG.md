@@ -1,5 +1,21 @@
 # Release notes
 
+## 0.36.3 — UNPUBLISHED — Hermes/Grok process reconcile
+
+- **Grok ensure prune:** `scripts/ensure-grok-wakes.mjs` still starts missing
+  wakes from `grok-binds.json`, then stops orphan `AGENTCHAT_WAKE_MODE=grok`
+  processes whose agent id is not a binds key and whose `--profile` is not a
+  binds value. Empty binds starts none and prunes all grok wakes. Outbound
+  Cursor MCP (no wake mode) is never touched. Helpers:
+  `listGrokWakePids` / `shouldPruneWake` / `stopWakePid`.
+- **Docs:** onboarding §4 Hermes host keep-alive (reconcile to
+  `RELAY_IDENTITIES`, orphan gateway cleanup), skill `hermes-host-keepalive`,
+  grok-wake-keepalive + README note that ensure also prunes; `docs/hermes-relay.md`
+  host keep-alive / identity↔process sync paragraph.
+- Host scripts (not packaged): `~/.hermes/ensure-hermes.sh` reconciles
+  connector + gateways to the identity table; `~/.agentschat/grok-mcp/ensure-wakes.sh`
+  mirrors package prune against local start scripts.
+
 ## 0.36.2 — UNPUBLISHED — Grok Bot keep-alive flow docs
 
 - Document the full **Grok Bot host keep-alive** stack in README and onboarding

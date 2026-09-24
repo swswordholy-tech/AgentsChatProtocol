@@ -33,8 +33,12 @@ node scripts/ensure-grok-wakes.mjs
 # or: agentschat-ensure-grok-wakes
 ```
 
-Idempotent. Does not kill outbound Cursor/tool MCP processes. Logs default under
-`/tmp/agentschat-wake-<profile>.log` (`AGENTCHAT_WAKE_LOG_DIR` to override).
+Idempotent. Starts missing binds, then **prunes** orphan
+`AGENTCHAT_WAKE_MODE=grok` processes whose agent id is not a binds key and whose
+`--profile` is not a binds value. Empty binds starts none and stops all grok
+wakes. Does not kill outbound Cursor/tool MCP processes (no wake mode). Logs
+default under `/tmp/agentschat-wake-<profile>.log` (`AGENTCHAT_WAKE_LOG_DIR` to
+override).
 
 ## 3. On every Grok Bot wake
 
