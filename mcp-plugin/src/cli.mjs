@@ -18,14 +18,25 @@
 // defined); npx honors the shebang and runs it under Node. CLI args in argv are
 // inherited by the imported entrypoint, so --name/--profile/etc. work unchanged
 // in server mode, and RELAY_*/AGENTCHAT_* env vars drive connector mode.
+//
+// Optional --supervise (or AGENTCHAT_WAKE_SUPERVISE=1): parent keeps the same
+// runtime entry alive across crashes (for long-running Grok wake daemons).
+import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
+
 const args = process.argv.slice(2);
 const connectorMode = args.includes("--connector");
 const botsMode = args.includes("--codex-bots");
 const codexMode = args.includes("--codex-bridge");
-if ([connectorMode, codexMode, botsMode].filter(Boolean).length > 1) throw new Error("Choose only one bridge mode");
+if ([connectorMode, codexMode, botsMode].filter(Boolean).length > 1) {
+  throw new Error("Choose only one bridge mode");
+}
+const helpRequested = args.includes("--help") || args.includes("-h");
+const superviseRequested =
+  args.includes("--supervise") || process.env.AGENTCHAT_WAKE_SUPERVISE === "1";
 
 // Help is mode-aware: --connector --help shows connector usage, not MCP usage.
-if ((args.includes("--help") || args.includes("-h")) && connectorMode) {
+if (helpRequested && connectorMode) {
   console.log(`agentschat-mcp --connector — run the AgentsChat ↔ Hermes relay connector
 
 Standalone WebSocket service, NOT a stdio MCP launch item or Hermes plugin.
@@ -101,8 +112,90 @@ Source: https://github.com/swswordholy-tech/AgentsChatProtocol/tree/main/mcp-plu
   process.exit(0);
 }
 
+const filteredArgs = args.filter((a) => a !== "--supervise");
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+/**
+ * Parent strips --supervise / AGENTCHAT_WAKE_SUPERVISE and respawns the same
+ * runtime entry on crash until SIGTERM/SIGINT.
+ */
+async function runSupervised(childArgs) {
+  let stopping = false;
+  /** @type {import("node:child_process").ChildProcess | null} */
+  let child = null;
+
+  const requestStop = () => {
+    stopping = true;
+    if (child && child.pid && !child.killed) {
+      try {
+        child.kill("SIGTERM");
+      } catch {
+        /* ignore */
+      }
+    }
+  };
+  process.on("SIGTERM", requestStop);
+  process.on("SIGINT", requestStop);
+
+  const selfPath = fileURLToPath(import.meta.url);
+  const childEnv = { ...process.env };
+  delete childEnv.AGENTCHAT_WAKE_SUPERVISE;
+
+  let delayMs = 1000;
+  const maxDelayMs = 30_000;
+
+  while (!stopping) {
+    child = spawn(process.execPath, [selfPath, ...childArgs], {
+      env: childEnv,
+      stdio: "inherit",
+    });
+    const exitCode = await new Promise((resolve) => {
+      child.on("exit", (code, signal) => {
+        if (signal) resolve(128);
+        else resolve(code ?? 0);
+      });
+      child.on("error", () => resolve(1));
+    });
+    child = null;
+    if (stopping) process.exit(exitCode);
+    process.stderr.write(`[agentchat] supervise: restarting after exit ${exitCode}\n`);
+    await sleep(delayMs);
+    delayMs = Math.min(delayMs * 2, maxDelayMs);
+  }
+  process.exit(0);
+}
+
+if (superviseRequested && !helpRequested) {
+  process.argv = [process.argv[0], process.argv[1], ...filteredArgs];
+  await runSupervised(filteredArgs);
+  process.exit(0);
+}
+
+if (filteredArgs.length !== args.length) {
+  process.argv = [process.argv[0], process.argv[1], ...filteredArgs];
+}
+
 if (typeof globalThis.Bun !== "undefined") {
-  await import(botsMode ? "../codex/manager.ts" : codexMode ? "../codex/run.ts" : connectorMode ? "../connector/run.ts" : "./server.ts");
+  await import(
+    botsMode
+      ? "../codex/manager.ts"
+      : codexMode
+        ? "../codex/run.ts"
+        : connectorMode
+          ? "../connector/run.ts"
+          : "./server.ts"
+  );
 } else {
-  await import(botsMode ? "../dist/codex-bots.js" : codexMode ? "../dist/codex-bridge.js" : connectorMode ? "../dist/connector.js" : "../dist/server.js");
+  await import(
+    botsMode
+      ? "../dist/codex-bots.js"
+      : codexMode
+        ? "../dist/codex-bridge.js"
+        : connectorMode
+          ? "../dist/connector.js"
+          : "../dist/server.js"
+  );
 }
