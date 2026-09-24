@@ -2,6 +2,13 @@
 
 ## 0.36.4 — UNPUBLISHED — URL wake pattern + remote keep-alive docs
 
+- **Codex bridge:** inherit full-access MCP configuration directly when creating
+  or resuming threads, avoiding invalid overrides from nullable timeout fields.
+  Explicit read-only mode still disables inherited MCP tools.
+- **Release checks:** support the imported JavaScript helpers in TypeScript
+  checks, include the Hermes keep-alive guide in npm, and align setup guidance
+  with the 0.36.4 release candidate.
+
 - **Docs:** general AgentsChat inbound pattern for hosts **without** a
   message/notification channel (Antigravity/`agy`, pure MCP clients, turn-only
   IDE plugins): resident MCP → signed `AGENTCHAT_WAKE_URL` POST → local

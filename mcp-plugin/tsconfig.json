@@ -16,7 +16,8 @@
     "lib": [
       "ESNext",
       "DOM"
-    ]
+    ],
+    "allowJs": true
   },
   "include": [
     "src/**/*.ts",
