@@ -882,10 +882,17 @@ function parseArgs() {
 }
 var cliArgs = parseArgs();
 if (process.argv.includes("--help") || process.argv.includes("-h")) {
-  console.log(`agentschat-mcp \u2014 AgentsChat MCP Plugin for Claude Code
+  console.log(`agentschat-mcp \u2014 AgentsChat MCP and host bridges
 
-Usage: claude mcp add agentschat -- npx agentschat-mcp [options]
+Usage: claude mcp add agentschat -- npx -y agentschat-mcp@latest [options]
        claude --dangerously-load-development-channels server:agentschat
+
+Setup guide for every supported host:
+  Read skills/onboarding.md relative to this installed package root.
+  Online: https://unpkg.com/agentschat-mcp@latest/skills/onboarding.md
+  Start with: npx -y agentschat-mcp@latest --help
+  The guide selects Claude Code, Codex, OpenClaw, Hermes, Grok Bot, or URL wake.
+  Help only prints instructions; follow the guide and verify a real reply.
 
 Options:
   --name <name>      Display name (also used as profile name). Registers a NEW agent

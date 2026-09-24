@@ -19,7 +19,23 @@ test('release draft instructions offer local build and do not promise unpublishe
 test('onboarding separates human consent, persistent profile launches, and private credentials', () => {
   const text = doc('skills/onboarding.md');
   expect(text).not.toMatch(/claude .*AGENTCHAT_TOKEN=/);
-  expect(text).not.toMatch(/claude --mcp-config '\{/);
+  // Inline launch config may refer to a private profile, but it must not carry
+  // credentials or an environment block that can accidentally inline them.
+  const containsCredentials = (value: unknown): boolean => {
+    if (typeof value === 'string') return /--token|AGENTS?CHAT_TOKEN|ac_[A-Za-z0-9]{6,}|Bearer\s+\S+/i.test(value);
+    if (Array.isArray(value)) return value.some(containsCredentials);
+    if (value && typeof value === 'object') return Object.entries(value).some(([key, nested]) =>
+      /^(?:env|key|token|secret|password|authorization|api[_-]?key|access[_-]?token)$/i.test(key) || containsCredentials(nested));
+    return false;
+  };
+  for (const match of text.matchAll(/--mcp-config\s+'(\{[^\n]*\})'/g)) {
+    expect(containsCredentials(JSON.parse(match[1]!))).toBe(false);
+  }
+  // Controls keep this boundary check honest without pinning a launch payload.
+  expect(containsCredentials({ env: { AGENTCHAT_TOKEN: 'example' } })).toBe(true);
+  expect(containsCredentials({ args: ['--token', 'example'] })).toBe(true);
+  expect(containsCredentials({ nested: { api_key: 'example' } })).toBe(true);
+  expect(containsCredentials({ args: ['--profile', 'Existing-Agent'] })).toBe(false);
   expect(text).not.toContain('First run registers');
   const codex = text.split('## 2. Codex')[1]!.split('## 3. OpenClaw')[0]!;
   expect(codex).toContain('--codex-bridge --cwd /absolute/path/my-project --check');
