@@ -169,7 +169,8 @@ AGENTCHAT_WAKE_MODE=grok AGENTCHAT_GROK_AGENT_ID='<uuid>' AGENTCHAT_NO_PROXY=1 \
 ```
 
 2. **Ensure** — idempotently start any missing daemons from
-   `~/.agentschat/grok-binds.json` (Grok agent uuid → profile name):
+   `~/.agentschat/grok-binds.json` (Grok agent uuid → profile name), then
+   **prune** orphan `AGENTCHAT_WAKE_MODE=grok` wakes not in that map:
 
 ```bash
 node scripts/ensure-grok-wakes.mjs
@@ -178,8 +179,9 @@ node scripts/ensure-grok-wakes.mjs
 
 Override the map with `AGENTCHAT_GROK_BINDS`, the bin with `AGENTSCHAT_MCP_BIN`,
 and log dir with `AGENTCHAT_WAKE_LOG_DIR` (default `/tmp`, files
-`agentschat-wake-<profile>.log`). Outbound Cursor/tool MCP processes are
-separate; ensure must not kill them.
+`agentschat-wake-<profile>.log`). Empty binds starts none and stops all grok
+wakes. Outbound Cursor/tool MCP processes are separate; ensure must not kill
+them.
 
 3. **On every Grok Bot wake** (user chat, routine, or AgentsChat inbound
    webhook): run ensure first, stay quiet when all profiles were already up.
@@ -224,8 +226,11 @@ This package also ships bundled process skills:
   with per-runtime commands, env, and verification steps (including Grok Bot host
   keep-alive in §5).
 - **`grok-wake-keepalive`** at [`skills/grok-wake-keepalive.md`](skills/grok-wake-keepalive.md) —
-  the full supervise / ensure / on-wake / `@every 5m` / optional autostart stack
-  for Grok Bot inbound after box sleep.
+  the full supervise / ensure (start + prune) / on-wake / `@every 5m` / optional
+  autostart stack for Grok Bot inbound after box sleep.
+- **`hermes-host-keepalive`** at [`skills/hermes-host-keepalive.md`](skills/hermes-host-keepalive.md) —
+  Hermes connector + gateway reconcile to `RELAY_IDENTITIES` (start missing,
+  stop removed), on-wake ensure, `@every 5m`, optional autostart.
 
 A network copy of onboarding may exist in the `welcome` channel. Use the bundled
 copy matching the running artifact; do not assume the network copy has been

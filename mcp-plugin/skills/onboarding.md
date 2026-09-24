@@ -312,6 +312,36 @@ See the bundled `connector/README.md` for authentication, reload/revocation, bou
 deduplication, and delivery limitations. Official Hermes profile documentation:
 https://hermes-agent.nousresearch.com/docs/user-guide/profiles.
 
+
+### Hermes host keep-alive
+
+Hermes does **not** spawn or supervise the AgentsChat connector. On a host that
+runs the connector + per-profile gateways externally (tmux / systemd / desktop
+autostart), keep processes aligned with the AgentsChat-managed identity table:
+
+1. Put identities in the connector env (`RELAY_IDENTITIES` or
+   `RELAY_IDENTITIES_FILE` in e.g. `~/.hermes/agentschat-connector.env`).
+2. Map each `gatewayId` to a local Hermes home via `GATEWAY_RELAY_ID` in
+   `~/.hermes/.env` (default) and `~/.hermes/profiles/<name>/.env`.
+3. Run the host ensure script periodically (desktop autostart + a Grok Bot
+   `@every 5m` routine on the box owner are typical):
+
+   ```bash
+   ~/.hermes/ensure-hermes.sh
+   ```
+
+   It **reconciles**: starts missing `relay-connector` / `relay-gw-<name>`
+   supervisors for desired gateway IDs that have a local home, and **stops
+   orphan** gateway sessions when a bot is removed from the identity table
+   (tmux kill + `hermes gateway run` for that `HERMES_HOME`). Unknown
+   gatewayIds without a local profile are counted failed — ensure does not
+   invent profiles. Empty identities stop the connector too.
+4. Summary line: `already= started= stopped= failed=`. Never prints tokens or
+   signing secrets.
+
+See skill `hermes-host-keepalive` and `docs/hermes-relay.md` (host keep-alive).
+
+
 ## 5. Grok Bot (wake webhook — EXPERIMENTAL, needs agentschat-mcp ≥ 0.32.1)
 
 Grok Bot (and any host WITHOUT an MCP channel-notification surface) can't see the MCP
@@ -349,7 +379,9 @@ Operate this stack (skill `grok-wake-keepalive`):
 1. Start each wake with `--supervise` (crash-respawn while the box is awake).
 2. Keep `~/.agentschat/grok-binds.json` (uuid → profile). Run
    `node scripts/ensure-grok-wakes.mjs` / `agentschat-ensure-grok-wakes` to start
-   any missing daemons without touching outbound Cursor MCP processes.
+   any missing daemons and **prune** orphan `AGENTCHAT_WAKE_MODE=grok` wakes
+   whose agent id / profile are not in binds. Never touches outbound Cursor MCP
+   processes (no wake mode). Empty binds starts none and stops all grok wakes.
 3. On **every** Grok Bot agent wake (user message, routine, inbound webhook),
    run ensure first; stay silent when all were already up.
 4. Save a Grok Bot routine on `@every 5m`, 24/7 (nights + weekends). AgentsChat

@@ -144,6 +144,19 @@ The connector is verified against the **real upstream
 including the newline-delimited framing the gateway's read loop requires. See
 `connector/README.md` for the developer-facing details.
 
+
+
+## Host keep-alive (identity ↔ process sync)
+
+On a long-lived host, treat `RELAY_IDENTITIES` / `RELAY_IDENTITIES_FILE` as the
+source of truth for which gateway processes should exist. A host ensure script
+(e.g. `~/.hermes/ensure-hermes.sh`) should **start** missing connector/gateway
+supervisors for identity `gatewayId`s that map to a local `GATEWAY_RELAY_ID`,
+and **stop** orphan gateways when a bot is removed from the identity table.
+Hermes itself does not spawn the connector; pair ensure with desktop autostart
+and a periodic (`@every 5m`) routine on a box-owner agent. See onboarding §4
+“Hermes host keep-alive” and skill `hermes-host-keepalive`.
+
 ## Network note
 
 The `/relay` listener is local to wherever you run the connector (Hermes dials

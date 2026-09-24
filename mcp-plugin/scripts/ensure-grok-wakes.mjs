@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 /**
- * Idempotent: ensure each Grok AgentsChat inbound wake daemon is up.
+ * Idempotent reconcile: ensure each Grok AgentsChat inbound wake daemon is up,
+ * then prune orphans not present in the binds map.
  *
  * Reads uuid → profile from AGENTCHAT_GROK_BINDS or ~/.agentschat/grok-binds.json
  * (legacy ~/.agentchat/). For each entry, if no live process has
@@ -10,7 +11,12 @@
  *   AGENTCHAT_WAKE_MODE=grok AGENTCHAT_GROK_AGENT_ID=<uuid> AGENTCHAT_NO_PROXY=1 \
  *     <agentschat-mcp> --profile <profileName>
  *
- * Prints one line per profile: already-up|started|failed. Exit 0 if all ok.
+ * After starts (or when binds are empty), prunes any AGENTCHAT_WAKE_MODE=grok
+ * process whose AGENTCHAT_GROK_AGENT_ID is not a binds key AND whose --profile
+ * is not a binds value. Never kills processes without WAKE_MODE=grok (outbound
+ * Cursor MCP).
+ *
+ * Prints already-up|started|stopped|failed lines. Exit 0 if no failures.
  * Never prints tokens.
  */
 import { spawn, spawnSync } from "node:child_process";
@@ -95,7 +101,6 @@ export function isLiveWakeDaemon(environNullSep, cmdlineNullSep, uuid, profileNa
   const args = cmdlineNullSep.split("\0").filter(Boolean);
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--profile" && args[i + 1] === profileName) return true;
-    // bun/node sometimes pass --profile=Name
     if (args[i] === `--profile=${profileName}`) return true;
   }
   return false;
@@ -145,6 +150,103 @@ export function findLiveWake(uuid, profileName, snapshots) {
 }
 
 /**
+ * List PIDs of processes with AGENTCHAT_WAKE_MODE=grok.
+ * @param {ReturnType<typeof listProcSnapshots>} [snapshots]
+ * @returns {number[]}
+ */
+export function listGrokWakePids(snapshots) {
+  const snaps = snapshots ?? listProcSnapshots();
+  /** @type {number[]} */
+  const out = [];
+  for (const s of snaps) {
+    if (s.environ.split("\0").includes("AGENTCHAT_WAKE_MODE=grok")) out.push(s.pid);
+  }
+  return out;
+}
+
+/**
+ * Extract --profile from null-separated cmdline.
+ * @param {string} cmdlineNullSep
+ */
+export function profileFromCmdline(cmdlineNullSep) {
+  const args = cmdlineNullSep.split("\0").filter(Boolean);
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === "--profile" && args[i + 1]) return args[i + 1];
+    if (args[i].startsWith("--profile=")) return args[i].slice("--profile=".length);
+  }
+  return "";
+}
+
+/**
+ * Extract AGENTCHAT_GROK_AGENT_ID from null-separated environ.
+ * @param {string} environNullSep
+ */
+export function agentIdFromEnviron(environNullSep) {
+  for (const line of environNullSep.split("\0")) {
+    if (line.startsWith("AGENTCHAT_GROK_AGENT_ID=")) {
+      return line.slice("AGENTCHAT_GROK_AGENT_ID=".length);
+    }
+  }
+  return "";
+}
+
+/**
+ * True when a WAKE_MODE=grok process should be pruned (not represented in binds).
+ * Keep if agent id is a binds key OR --profile is a binds value.
+ * Processes without WAKE_MODE=grok must never be pruned (caller should filter).
+ * @param {string} environNullSep
+ * @param {string} cmdlineNullSep
+ * @param {Record<string, string>} binds
+ */
+export function shouldPruneWake(environNullSep, cmdlineNullSep, binds) {
+  const envLines = environNullSep.split("\0");
+  if (!envLines.includes("AGENTCHAT_WAKE_MODE=grok")) return false;
+  const uuids = new Set(Object.keys(binds));
+  const profiles = new Set(Object.values(binds));
+  const agentId = agentIdFromEnviron(environNullSep);
+  const profile = profileFromCmdline(cmdlineNullSep);
+  if (agentId && uuids.has(agentId)) return false;
+  if (profile && profiles.has(profile)) return false;
+  return true;
+}
+
+/**
+ * Best-effort stop a wake pid (and obvious parent setsid shell).
+ * @param {number} pid
+ * @returns {boolean}
+ */
+export function stopWakePid(pid) {
+  let parentHint = null;
+  try {
+    const status = readFileSync(`/proc/${pid}/status`, "utf8");
+    const m = status.match(/^PPid:\s+(\d+)/m);
+    if (m) parentHint = Number(m[1]);
+  } catch {
+    /* gone */
+  }
+  try {
+    process.kill(pid, "SIGTERM");
+  } catch {
+    return false;
+  }
+  if (parentHint && parentHint > 1) {
+    try {
+      const pcmd = readFileSync(`/proc/${parentHint}/cmdline`, "utf8");
+      if (pcmd.includes("agentschat-mcp") || pcmd.includes("tail -f /dev/null")) {
+        try {
+          process.kill(parentHint, "SIGTERM");
+        } catch {
+          /* ignore */
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+  return true;
+}
+
+/**
  * Start a detached wake daemon. Returns true on spawn success (best-effort).
  * @param {{ bin: string, uuid: string, profileName: string, logDir: string, env?: NodeJS.ProcessEnv }} opts
  */
@@ -169,8 +271,6 @@ export function startWakeDaemon(opts) {
     AGENTCHAT_GROK_AGENT_ID: opts.uuid,
     AGENTCHAT_NO_PROXY: "1",
   };
-  // Avoid recursive supervise-on-supervise unless caller asked via env.
-  // Do not inject tokens; profile file supplies credentials.
   delete env.AGENTCHAT_TOKEN;
   delete env.AGENTCHAT_AGENT_ID;
 
@@ -212,37 +312,37 @@ function sleep(ms) {
 async function main() {
   const envOverride = process.env[BINDS_ENV];
   const bindsPath = resolveBindsPath({ envOverride });
+  /** @type {Record<string, string>} */
+  let binds = {};
+
   if (envOverride && !existsSync(bindsPath)) {
     console.error(`failed binds-missing path=${bindsPath}`);
     process.exit(1);
   }
-  if (!existsSync(bindsPath)) {
-    console.log(`no-binds path=${bindsPath}`);
-    process.exit(0);
-  }
 
-  let text;
-  try {
-    text = readFileSync(bindsPath, "utf8");
-  } catch (err) {
-    console.error(`failed binds-read path=${bindsPath}`);
-    process.exit(1);
-  }
-  const { binds, malformed } = parseBindsText(text);
-  if (malformed) {
-    console.error(`failed binds-malformed path=${bindsPath}`);
-    process.exit(1);
+  if (existsSync(bindsPath)) {
+    let text;
+    try {
+      text = readFileSync(bindsPath, "utf8");
+    } catch {
+      console.error(`failed binds-read path=${bindsPath}`);
+      process.exit(1);
+    }
+    const parsed = parseBindsText(text);
+    if (parsed.malformed) {
+      console.error(`failed binds-malformed path=${bindsPath}`);
+      process.exit(1);
+    }
+    binds = parsed.binds;
+  } else {
+    console.log(`no-binds path=${bindsPath}`);
   }
 
   const entries = Object.entries(binds);
-  if (entries.length === 0) {
-    console.log(`no-binds-empty path=${bindsPath}`);
-    process.exit(0);
-  }
-
   const bin = resolveMcpBin({ envBin: process.env[BIN_ENV] });
   const logDir = process.env[LOG_DIR_ENV] || "/tmp";
   let failed = 0;
+  let stopped = 0;
 
   for (const [uuid, profileName] of entries) {
     const existing = findLiveWake(uuid, profileName);
@@ -256,7 +356,6 @@ async function main() {
       failed++;
       continue;
     }
-    // Brief settle so setsid child appears in /proc
     await sleep(800);
     const pid = findLiveWake(uuid, profileName);
     if (pid != null) {
@@ -265,6 +364,24 @@ async function main() {
       console.log(`failed profile=${profileName}`);
       failed++;
     }
+  }
+
+  if (entries.length === 0) {
+    console.log(`no-binds-empty path=${bindsPath} (pruning orphans)`);
+  }
+
+  // Prune orphans (also when binds empty)
+  const snaps = listProcSnapshots();
+  for (const s of snaps) {
+    if (!shouldPruneWake(s.environ, s.cmdline, binds)) continue;
+    if (stopWakePid(s.pid)) {
+      console.log(`stopped orphan pid=${s.pid}`);
+      stopped++;
+    }
+  }
+
+  if (stopped === 0 && entries.length === 0 && !existsSync(bindsPath)) {
+    /* already logged no-binds */
   }
 
   process.exit(failed > 0 ? 1 : 0);
