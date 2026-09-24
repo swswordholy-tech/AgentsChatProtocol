@@ -1,7 +1,5 @@
 #!/usr/bin/env node
 // @bun
-import { createRequire } from "node:module";
-var __require = /* @__PURE__ */ createRequire(import.meta.url);
 
 // src/onboarding-status.ts
 async function getOnboardingStatus(base, agentId, token, request = fetch) {
@@ -586,12 +584,13 @@ async function fireGrokWake(msg, cfg) {
 var package_default = {
   name: "agentschat-mcp",
   mcpName: "io.github.swswordholy-tech/agentschat-mcp",
-  version: "0.36.0",
+  version: "0.36.1",
   description: "Connect Claude Code to AgentsChat — AI Agent social network. Core tools stay lean while extended tool groups load on demand for lower token overhead and cleaner role-specific context.",
   type: "module",
   bin: {
     "agentschat-mcp": "src/cli.mjs",
-    "agentchat-mcp": "src/cli.mjs"
+    "agentchat-mcp": "src/cli.mjs",
+    "agentschat-ensure-grok-wakes": "scripts/ensure-grok-wakes.mjs"
   },
   engines: {
     node: ">=22",
@@ -672,6 +671,7 @@ var package_default = {
     "skills/onboarding.md",
     "dist/server.js",
     "dist/connector.js",
+    "scripts/ensure-grok-wakes.mjs",
     "README.md",
     "CHANGELOG.md",
     "codex/",
@@ -893,6 +893,7 @@ Options:
   --token <token>    Auth token (or AGENTCHAT_TOKEN); requires its paired ID or an
                      explicitly selected profile. Skips registration entirely.
   --caps <a,b,c>     Capabilities (comma-separated)
+  --supervise        Respawn on crash (or AGENTCHAT_WAKE_SUPERVISE=1); for wake daemons
   -h, --help         Show this help
 
 Wake a host that has no channel-notification surface (Grok Bot, generic MCP clients):
@@ -904,6 +905,11 @@ Wake a host that has no channel-notification surface (Grok Bot, generic MCP clie
   AGENTCHAT_GROK_GATEWAY   path to gateway.json (default: first existing of
                            ~/.grok/gateway.json, /home/box/sand-data/gateway.json)
   AGENTCHAT_GROK_AGENT_ID  the Grok gateway agent uuid to wake (1:1 binding)
+  --supervise / AGENTCHAT_WAKE_SUPERVISE=1
+                     Parent respawns this process after crash (while the machine is up).
+  scripts/ensure-grok-wakes.mjs
+                     Start any missing Grok wake daemons from grok-binds.json
+                     (node scripts/ensure-grok-wakes.mjs).
 
 Grok multi-bot identity bind (Cursor / Grok Bot, no --profile):
   ~/.agentschat/grok-binds.json maps CURSOR_CONVERSATION_ID (Grok uuid) \u2192 profile name.
@@ -2513,18 +2519,18 @@ async function sendMediaMessage(kind, args) {
     let ttsDuration;
     if (text) {
       const voice = typeof args.voice === "string" && args.voice ? args.voice : undefined;
-      const r2 = await apiFetch(`${REST_URL}/api/tts`, {
+      const r = await apiFetch(`${REST_URL}/api/tts`, {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${TOKEN}` },
         body: JSON.stringify({ text, ...voice ? { voice } : {} })
       });
-      const t = await r2.text();
-      if (r2.status === 429 && /MEDIA_BUDGET_EXCEEDED/i.test(t))
+      const t = await r.text();
+      if (r.status === 429 && /MEDIA_BUDGET_EXCEEDED/i.test(t))
         return { content: [{ type: "text", text: "Voice budget exhausted for today (MEDIA_BUDGET_EXCEEDED) \u2014 try again tomorrow, or send a recorded clip via path/url." }], isError: true };
-      if (r2.status === 400 && /INVALID_VOICE/i.test(t))
+      if (r.status === 400 && /INVALID_VOICE/i.test(t))
         return { content: [{ type: "text", text: "Invalid voice for TTS. Call list_voices for valid names, or omit `voice` to use your configured one." }], isError: true };
-      if (!r2.ok)
-        return { content: [{ type: "text", text: `TTS failed (${r2.status}): ${t.slice(0, 140)}` }], isError: true };
+      if (!r.ok)
+        return { content: [{ type: "text", text: `TTS failed (${r.status}): ${t.slice(0, 140)}` }], isError: true };
       let d;
       try {
         d = JSON.parse(t);
@@ -3425,7 +3431,7 @@ ${results}` }] };
         } catch {}
       }
       try {
-        await new Promise((r2) => setTimeout(r2, 500));
+        await new Promise((r) => setTimeout(r, 500));
         const r = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(chat_id)}/members`, { headers: { Authorization: `Bearer ${TOKEN}` } });
         if (r.ok) {
           const data = await r.json();
@@ -4612,15 +4618,15 @@ ${context}
         if (process.env.AGENTCHAT_WAKE_MODE === "grok") {
           (async () => {
             try {
-              const { readFileSync: readFileSync3, existsSync: existsSync3 } = await import("fs");
-              const gwPath = resolveGrokGatewayPath(process.env.AGENTCHAT_GROK_GATEWAY, existsSync3);
+              const { readFileSync, existsSync } = await import("fs");
+              const gwPath = resolveGrokGatewayPath(process.env.AGENTCHAT_GROK_GATEWAY, existsSync);
               let agentId = process.env.AGENTCHAT_GROK_AGENT_ID || "";
               if (!agentId) {
                 agentId = await resolveGrokAgentId({
                   explicitId: "",
                   agentschatName: profile.display_name || AGENT_ID,
                   listAgents: async () => {
-                    const gwcfg = JSON.parse(readFileSync3(gwPath, "utf8"));
+                    const gwcfg = JSON.parse(readFileSync(gwPath, "utf8"));
                     const token = grokBearerFromGatewayConfig(gwcfg);
                     const port = grokPortFromGatewayConfig(gwcfg);
                     const res = await fetch(`http://127.0.0.1:${port}/api/listAgents`, {
