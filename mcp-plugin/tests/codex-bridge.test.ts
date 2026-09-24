@@ -92,9 +92,9 @@ let next=0, configCwd;
 rl.on('line', line => {
  const m=JSON.parse(line), p=m.params;
  if(m.method==='initialize') emit({id:m.id,result:{}});
- if(m.method==='config/read') { configCwd=p.cwd; emit({id:m.id,result:{config:{mcp_servers:{agentschat:{command:'must-disable'}}}}}); }
+ if(m.method==='config/read') { configCwd=p.cwd; emit({id:m.id,result:{config:{mcp_servers:{agentschat:{command:'must-disable',tool_timeout_sec:null}}}}}); }
  if(m.method==='thread/start'||m.method==='thread/resume') {
-  if(configCwd!==p.cwd || p.config?.mcp_servers?.agentschat?.command!=='must-disable' || p.approvalPolicy!=='never' || p.sandbox!=='danger-full-access')
+  if(configCwd!==p.cwd || p.config!==undefined || p.approvalPolicy!=='never' || p.sandbox!=='danger-full-access')
    return emit({id:m.id,error:{code:-32602,message:'unsafe'}});
   emit({id:m.id,result:{thread:{id:p.threadId||'thread-'+(++next)}}});
  }
@@ -263,7 +263,7 @@ test("full access is default, read-only is explicit, invalid modes fail closed",
 test("create and resume both apply permissions and each turn preserves them", async () => {
   for (const mode of ["full-access", "read-only"] as const) {
     const script = mode === "full-access" ? fakeAppServer : fakeAppServer
-      .replace("p.config?.mcp_servers?.agentschat?.command!=='must-disable'", "p.config?.mcp_servers?.agentschat?.enabled!==false")
+      .replace("p.config!==undefined", "p.config?.mcp_servers?.agentschat?.enabled!==false")
       .replace("p.sandbox!=='danger-full-access'", "p.sandbox!=='read-only'")
       .replace("p.sandboxPolicy?.type!=='dangerFullAccess'", "p.sandboxPolicy?.type!=='readOnly'");
     const app = new AppServer("node", ["-e", script], 2000, mode);
