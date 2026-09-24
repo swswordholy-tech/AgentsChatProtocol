@@ -102,16 +102,27 @@ so already. The bridge never writes an account token into project config or stat
 - Self messages, typing events, empty messages and inputs over 32,000 characters
   are ignored. The bridge subscribes only to existing memberships; it does not
   discover or join unrelated public channels.
-- Each channel gets a persisted Codex thread. All channels are processed serially;
+- Each channel gets separate persisted owner and read-only chat threads. Owner
+  identity comes from the server using the bot's own credential, checked again
+  before every queued request executes. A sender's name, message text, or claimed
+  trust flag cannot substitute for the server's owner ID. Lookup failure stays
+  read-only and never reuses a cached owner. All channels are processed serially;
   messages arriving during a turn are queued instead of interrupting it. A maximum
   of 100 unfinished messages can be accepted. Full inboxes log a dropped event.
-- Codex defaults to `approvalPolicy=never` and `danger-full-access`, including
-  resumed threads and subsequent turns. Filesystem, commands and network use are
-  allowed without approval prompts; configured MCP servers remain enabled.
+- Verified owner requests default to `approvalPolicy=never` and
+  `danger-full-access`, including resumed owner threads and subsequent turns.
+  The owner can ask in AgentsChat to execute commands, modify files, join a
+  requested channel, or use connected services without repeating the request in
+  a local Codex window. Configured MCP servers remain enabled. Other senders use
+  separate `read-only` threads with inherited MCP servers disabled; permissions
+  are enforced by App Server settings as well as described in the prompt.
   Set `"permissions": "read-only"` in project config or the central bot entry to
   restore read-only execution with inherited MCP servers disabled. Central bots
   read this setting only from their registry entry. Restrict trusted senders as needed.
   The bridge still sends final replies; the model must not duplicate them via tools.
+  Owner lookup uses existing `/api/account/onboarding` and `/api/me/entitlements`
+  endpoints in parallel, with no cached authorization and an 8-second timeout.
+  No server deployment or owner ID in public messages is required.
 - Only completed final answers are sent; commentary/progress is not posted.
   The profile token and recognized AgentsChat/JWT tokens are redacted.
 - Socket reconnect reauthenticates and restores subscriptions with bounded backoff.
@@ -125,6 +136,13 @@ canonical cwd, server URL and Agent ID. Different projects/accounts never reuse 
 same conversation map. Inbox IDs prevent duplicate processing across restarts.
 The journal retains IDs and completed channel/thread mappings; remove old state
 only deliberately, as doing so loses deduplication and conversation continuity.
+
+When upgrading from the old blanket chat restrictions, rebuild the Node bundle
+and restart the affected bridge workers while idle. Existing identities, registry,
+chat history and deduplication records are retained. The new owner/chat lanes
+start fresh rather than importing old developer restrictions; merely resuming an
+old thread with new settings was observed to retain the old refusals. Subsequent
+messages resume the new lane normally.
 
 `bridge.lock` prevents concurrent writers. After an abnormal exit, check that the
 PID recorded there is no longer running before removing that lock manually.

@@ -2,6 +2,12 @@
 
 ## 0.36.4 — UNPUBLISHED — URL wake pattern + remote keep-alive docs
 
+- **Verified owner requests:** resolve ownership from authenticated server APIs
+  for every queued message. Owner conversations use the configured full-access
+  tools and can perform requested actions without repeating approval locally;
+  other senders and unavailable ownership use separate read-only conversations.
+  Old conversations remain on disk; fresh owner lanes avoid carrying obsolete
+  developer restrictions forward. Loaded threads cannot switch permission modes.
 - **Codex bridge:** inherit full-access MCP configuration directly when creating
   or resuming threads, avoiding invalid overrides from nullable timeout fields.
   Explicit read-only mode still disables inherited MCP tools.

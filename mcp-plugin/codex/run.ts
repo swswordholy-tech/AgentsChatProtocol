@@ -1,3 +1,4 @@
+import { getBotOwner } from "./owner.ts";
 import { getOnboardingStatus } from "../src/onboarding-status.ts";
 import { GuiChannel } from "./gui-channel.ts";
 import { readFileSync } from "node:fs";
@@ -26,7 +27,7 @@ Project config fields: profile, agent_id, channels, senders, api_url, ws_url, pe
 --onboarding-status checks authentication/ownership and prints safe claim/chat links; it does not send messages.
 --check validates identity and official app-server initialization without opening chat.
 Live DMs and exact mentions trigger replies; channels/senders restrict this further.
-Full-access Codex turns by default; set permissions: "read-only" to disable writes and inherited MCP. No offline message replay.
+Server-verified owner requests use full access by default; other senders stay read-only. Set permissions: "read-only" to disable writes and inherited MCP. No offline message replay.
 State: ~/.agentschat/codex-bridge/<project-server-identity hash>/ (private).
 GUI outbox: --gui-thread THREAD_ID --gui-message-file PATH; --gui-status lists receipts.
 Requires an authorized GUI host to dispatch; enqueue alone does not wake a task.
@@ -63,7 +64,7 @@ async function main() {
   codex = new AppServer(c.codexBin, undefined, undefined, c.permissions);
   if (values.check) { await codex.start(); console.log("Official app-server initialization: OK (no chat connection or generation)"); codex.close(); return; }
   transport = new AgentsChatTransport(c, m => { bridge!.accept(m); });
-  bridge = new Bridge(c, codex, (chat, text) => transport!.send(chat, text), console.error, (chat, active) => transport!.setTyping(chat, active));
+  bridge = new Bridge(c, codex, (chat, text) => transport!.send(chat, text), console.error, (chat, active) => transport!.setTyping(chat, active), () => getBotOwner(c.apiUrl, c.agentId, c.token));
   let stopping = false;
   const stop = async () => { if (stopping) return; stopping = true; if (values["managed-worker"]) { const deadline = setTimeout(() => { try { process.kill(-process.pid, "SIGKILL"); } catch {} }, 20000); deadline.unref(); } bridge?.pause(); transport?.stop(); codex?.close(); await bridge?.stop(); if (process.connected) process.disconnect?.(); };
   codex.onFatal = () => { console.error("Codex backend stopped; pending inbox preserved. Restart the bridge after checking failed entries."); process.exitCode = 1; void stop(); };
