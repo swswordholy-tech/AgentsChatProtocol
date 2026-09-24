@@ -1,5 +1,12 @@
 # Release notes
 
+## 0.36.2 — UNPUBLISHED — Grok Bot keep-alive flow docs
+
+- Document the full **Grok Bot host keep-alive** stack in README and onboarding
+  §5: `--supervise`, `ensure-grok-wakes`, on-every-wake ensure, `@every 5m`
+  24/7 Grok Bot routine, optional desktop autostart, and the sleep-gap limit.
+- Add skill `grok-wake-keepalive` with the reusable checklist.
+
 ## 0.36.1 — UNPUBLISHED — Grok wake supervise + ensure
 
 - **`--supervise` / `AGENTCHAT_WAKE_SUPERVISE=1`:** CLI parent strips the flag and
