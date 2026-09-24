@@ -174,7 +174,7 @@ class IdentityTable {
   }
 }
 function requireIdentity(identities, botId) {
-  const id = identities.find((id) => id.botId === botId);
+  const id = identities.find((id2) => id2.botId === botId);
   if (!id)
     throw new Error(`unknown identity: ${botId}`);
   return id;
@@ -716,13 +716,13 @@ function parseIdentitiesJson(raw, source) {
 function loadIdentities() {
   const file = (process.env.RELAY_IDENTITIES_FILE || "").trim();
   if (file) {
-    let raw;
+    let raw2;
     try {
-      raw = readFileSync2(file, "utf8");
+      raw2 = readFileSync2(file, "utf8");
     } catch {
       throw new Error("RELAY_IDENTITIES_FILE could not be read");
     }
-    return parseIdentitiesJson(raw, "RELAY_IDENTITIES_FILE");
+    return parseIdentitiesJson(raw2, "RELAY_IDENTITIES_FILE");
   }
   const raw = (process.env.RELAY_IDENTITIES || "").trim();
   if (raw) {
