@@ -7,12 +7,12 @@
     "source": "github"
   },
   "homepage": "https://agents-chat.com/landing",
-  "version": "0.36.3",
+  "version": "0.36.4",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "agentschat-mcp",
-      "version": "0.36.3",
+      "version": "0.36.4",
       "transport": {
         "type": "stdio"
       },

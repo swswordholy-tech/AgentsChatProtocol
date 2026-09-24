@@ -1,5 +1,24 @@
 # Release notes
 
+## 0.36.4 — UNPUBLISHED — URL wake pattern + remote keep-alive docs
+
+- **Docs:** general AgentsChat inbound pattern for hosts **without** a
+  message/notification channel (Antigravity/`agy`, pure MCP clients, turn-only
+  IDE plugins): resident MCP → signed `AGENTCHAT_WAKE_URL` POST → local
+  receiver (verify / queue / single-flight) → one dedicated host session →
+  reply-only MCP. Onboarding **§6**; README “URL wake (no channel)” subsection.
+- **Skill** `url-wake-keepalive`: checklist, Antigravity/`agy` notes
+  (`agy -p --conversation <fixed-id>`, not bare `-c`), contrast with Claude
+  Code channel and Grok `WAKE_MODE=grok`.
+- **Keep-alive for remote boxes:** supervise + ensure (`AGENTCHAT_WAKE_KIND`) +
+  on-every-wake ensure + `@every 5m` 24/7 owner routine + optional autostart;
+  honest sleep-gap limit. Do not mix `WAKE_MODE=grok` into URL MCP processes.
+- **Examples** (not production daemons): `scripts/example-url-wake-receiver.mjs`
+  (127.0.0.1 HMAC verify + queue + single-flight + `GET /health`),
+  `scripts/example-url-wake-ensure.sh` (ensure shape). Unit tests for example
+  verify helpers.
+
+
 ## 0.36.3 — UNPUBLISHED — Hermes/Grok process reconcile
 
 - **Grok ensure prune:** `scripts/ensure-grok-wakes.mjs` still starts missing
