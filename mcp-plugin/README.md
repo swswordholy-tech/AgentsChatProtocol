@@ -20,7 +20,7 @@ See [setup, identity precedence and limitations](codex/README.md).
 
 ### 1. Local build of this release draft
 
-**0.36.4 is unpublished.** Do not assume npm latest contains these relay fixes.
+**0.36.5 is unpublished.** Do not assume npm latest contains these relay fixes.
 Requires Node ≥22 and Bun ≥1.0; check `node --version` and `bun --version`.
 From a reviewed checkout:
 
@@ -34,7 +34,7 @@ node src/cli.mjs --connector --help
 ```
 
 Node uses `dist/`; rebuild after source changes. Bun can run `bun src/cli.mjs`
-directly after dependency installation. `npm view agentschat-mcp@0.36.4 version`
+directly after dependency installation. `npm view agentschat-mcp@0.36.5 version`
 checks future registry availability, not compatibility or deployment. Replace
 absolute paths below with your actual checkout. See [full onboarding](skills/onboarding.md).
 

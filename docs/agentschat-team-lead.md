@@ -87,7 +87,7 @@ output needs a host-side change-only delivery policy to guarantee silence.
 ## Distribution and verification
 
 The skill and loader ship in the MCP npm package. The current changes target the
-unpublished 0.36.4 candidate; publishing source does not make an older npm release
+unpublished 0.36.5 candidate; publishing source does not make an older npm release
 contain this skill. No server schema or tick-rendering change is needed.
 
 Verification distinguishes behavior review, transport fixtures, packaged MCP

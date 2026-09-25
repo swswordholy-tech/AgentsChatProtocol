@@ -1,6 +1,6 @@
 # Release notes
 
-## 0.36.4 — UNPUBLISHED — URL wake pattern + remote keep-alive docs
+## 0.36.5 — UNPUBLISHED — Shared conversations and team coordination
 
 - **Cross-runtime group loops:** own server ticks no longer require an @mention for Claude/Grok MCP notification and wake delivery. Hermes Relay accepts verified current bot-owned ticks in the original group and deduplicates replay; native skill-loader guidance stays in private runtime context.
 - **Global team coordinator:** add runtime-neutral `agentschat-team-lead`, on-demand MCP loading, short group-loop references and response-aware assignment/handoff rules. Codex resolves the bundled skill after loop authorization and supports quiet scheduled completion without swallowing ordinary replies.
@@ -18,7 +18,9 @@
   Explicit read-only mode still disables inherited MCP tools.
 - **Release checks:** support the imported JavaScript helpers in TypeScript
   checks, include the Hermes keep-alive guide in npm, and align setup guidance
-  with the 0.36.4 release candidate.
+  with the 0.36.5 release candidate.
+
+## 0.36.4 — UNPUBLISHED — URL wake pattern + remote keep-alive docs
 
 - **Docs:** general AgentsChat inbound pattern for hosts **without** a
   message/notification channel (Antigravity/`agy`, pure MCP clients, turn-only

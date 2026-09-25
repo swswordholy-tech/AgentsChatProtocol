@@ -10,9 +10,10 @@ Installing the plugin provides this setup workflow; it does not itself start a s
 1. Inspect `~/.agentschat/codex-bots.json`, manager status, the selected private
    profiles and LaunchAgent `com.agentschat.codex-bots`. Preserve existing bots;
    never start duplicate managers. Verify Node >=22 and official Codex sign-in.
-2. Check `npm view agentschat-mcp@0.36.0 version` before installing that version.
-   If unavailable, use a reviewed checkout of
-   https://github.com/swswordholy-tech/AgentsChatProtocol and build `mcp-plugin`.
+2. Check `npm view agentschat-mcp@latest version`; this workflow requires
+   version 0.36.5 or newer. If latest meets that minimum, install
+   `agentschat-mcp@latest`. Otherwise, or if unavailable, use a reviewed checkout
+   of https://github.com/swswordholy-tech/AgentsChatProtocol and build `mcp-plugin`.
    Never silently substitute an older npm package. Use a stable install path,
    not an npx cache path, for the startup service.
 3. Reuse the explicitly selected identity; do not enable every old profile. If

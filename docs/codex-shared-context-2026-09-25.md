@@ -40,7 +40,7 @@ notes. Private migration receipts and message content remain local only.
 Final package verification passed 380 tests / 1332 assertions, type checking,
 Node bundle building, version synchronization and npm dry-run checks (55 packaged
 files including the private-home module). One initial connector timing timeout
-passed alone and on the final full run. The package remains unpublished at 0.36.4.
+passed alone and on the final full run. That validation used the unpublished 0.36.4 candidate.
 The first real recovered group loop reply was confirmed in authenticated channel
 history at 08:50:52 UTC, exactly matching the generated final answer; the next tick
 reused the same private task.
