@@ -1,5 +1,14 @@
 # Release notes
 
+## 0.36.7 — UNPUBLISHED — Non-Grok stacks start without Cursor session env
+
+- **Docs:** onboarding, `url-wake-keepalive` and `grok-wake-keepalive` say
+  non-Grok stacks (URL wakes such as Antigravity/ZCode, Hermes) are started with
+  the Cursor session env removed (`env -u CURSOR_CONVERSATION_ID -u CURSOR_REQUEST_ID -u __CURSOR_SANDBOX_ENV_RESTORE -u CURSOR_AGENT` + dynamic
+  `CURSOR_AGENT_STORE_*`), and that Grok `WAKE_MODE=grok` wakes keep theirs.
+- **Example receiver:** `withoutCursorSessionEnv()` drops those keys from the host
+  turn's env; `example-url-wake-ensure.sh` shows the start-script pattern.
+
 ## 0.36.6 — UNPUBLISHED — Grok binds: register-yourself, non-Grok wakes exempt
 
 - **grok-bind no longer captures non-Grok wakes:** identity bind, heal and the
