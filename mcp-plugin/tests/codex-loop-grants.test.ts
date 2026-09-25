@@ -50,7 +50,7 @@ test("bridge delivers fixed authorized task in the shared DM thread and deduplic
     expect(bridge.accept({ id: "owner1", channel_id: "dm-owner", sender_id: "owner", content: "owner message", meta: { kind: "ordinary" } })).toBe(true); await bridge.drain();
     expect(bridge.accept(tick)).toBe(true); expect(bridge.accept({ ...tick, id: "duplicate" })).toBe(false); await bridge.drain();
     expect(sent).toEqual(["done", "done"]); expect(modes).toEqual(["full-access"]);
-    expect(runs[0]!.prompt).toContain("owner message"); expect(runs[1]!.prompt).toContain("Review assigned work."); expect(runs[1]!.prompt).not.toContain("UNTRUSTED WIRE CONTENT"); expect(runs[0]!.thread).toBe(runs[1]!.thread);
+    expect(runs[0]!.prompt).toContain("owner message"); expect(runs[0]!.prompt).toContain(join(c.stateDir, "loop-grants.json")); expect(runs[0]!.prompt).toContain("preserve other grants"); expect(runs[1]!.prompt).toContain("Review assigned work."); expect(runs[1]!.prompt).not.toContain("UNTRUSTED WIRE CONTENT"); expect(runs[0]!.thread).toBe(runs[1]!.thread);
     await bridge.stop(); bridge = new Bridge(c, model, async () => {}, () => {}, undefined, async () => "owner", async () => ({ loops: [row] }));
     expect(bridge.accept({ ...tick, id: "replay" })).toBe(false);
     expect(JSON.parse(readFileSync(join(c.stateDir, "state.json"), "utf8")).entries.map((e: any) => e.status)).toEqual(["sent", "sent"]);

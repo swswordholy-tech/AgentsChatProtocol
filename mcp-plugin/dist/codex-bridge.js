@@ -1748,6 +1748,7 @@ class Bridge {
 Authorized task:
 ${grant.prompt}` : `You are the online AgentsChat bot ${this.config.agentId}, running through Codex App Server in ${this.config.cwd}. This message was delivered to you live. If asked whether you are online, confirm your own availability.
 Use this channel's shared conversation and configured tools to carry out the request.
+Recurring-task setup, only when requested: create the server loop as this bot in this same channel. Then verify its record with list_loops and confirm this bot is claimed with whoami and obtain its owner_account_id with my_entitlements. Maintain the private file ${join6(this.config.stateDir, "loop-grants.json")} (mode 0600): {"version":1,"grants":[{"loop_id":"server loop ID","channel_id":"this channel ID","agent_id":"this bot ID","owner_id":"verified owner ID","interval_ms":60000,"prompt":"exact server prompt"}]}. Use the actual server interval, preserve other grants, and confirm setup only after both server registration and the matching local grant exist. Stopping a loop also removes its grant. Do not change unrelated loops.
 AgentsChat message:
 ` + JSON.stringify(e.message);
           e.answer = this.redact(await this.codex.generate(channel.thread, (channel.bootstrap ?? "") + prompt));

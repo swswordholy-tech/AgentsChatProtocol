@@ -334,3 +334,9 @@ For group follow-ups, create the server loop in that group and use that exact
 conversation and its final reply returns to the group. Do not schedule group work
 in an owner DM. Changing a loop's target requires updating its local grant too;
 a mismatched target is rejected.
+
+The bot can configure its own loop after a requested recurring task: the live
+message instructions include its exact private grant path and schema, require
+checking the server record and current owner, and require preserving other grants.
+A plain mention does not start a loop. A raw `/loop` runs as its authenticated
+sender; mentioning another bot inside the prompt does not change that identity.
