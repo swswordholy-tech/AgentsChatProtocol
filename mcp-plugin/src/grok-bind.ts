@@ -15,11 +15,20 @@
  * and no CURSOR_CONVERSATION_ID), `switch_profile` must not steal the live
  * identity (gateSwitchProfile). Outbound mutators should heal back to the bound
  * profile if something already switched (shouldHealBoundIdentity).
+ *
+ * Non-Grok processes (Antigravity / ZCode / other URL wakes, or an explicit
+ * `--profile` different from the bound one) can inherit a Grok agent's
+ * CURSOR_CONVERSATION_ID; grokBindApplies() makes the bind a no-op for them.
+ *
+ * Each Grok bot registers ITSELF (grok-bind-register.sh <profile>); nobody else
+ * writes grok-binds.json and there is no hard-coded bot list.
  */
 
 import { join } from "node:path";
 
 export const DEFAULT_GROK_BINDS_FILENAME = "grok-binds.json";
+/** Sidecar written by grok-bind-register.sh ({profile, registered_by, ts} per uuid). Not a profile. */
+export const GROK_BINDS_META_FILENAME = "grok-binds.meta.json";
 export const GROK_BINDS_ENV = "AGENTCHAT_GROK_BINDS";
 export const CURSOR_CONVERSATION_ENV = "CURSOR_CONVERSATION_ID";
 
@@ -190,4 +199,68 @@ export function shouldHealBoundIdentity(input: {
     return true;
   }
   return false;
+}
+
+/** Env keys that tag a non-Grok wake stack (Antigravity / ZCode / URL wakes). */
+export const ANTIGRAVITY_WAKE_ENV = "AGENTCHAT_ANTIGRAVITY_WAKE";
+export const WAKE_KIND_ENV = "AGENTCHAT_WAKE_KIND";
+export const WAKE_MODE_ENV = "AGENTCHAT_WAKE_MODE";
+
+/**
+ * Non-null reason when this process is tagged as some OTHER wake stack, i.e.
+ * not a Grok wake / Grok Cursor MCP. Such processes may still inherit a Grok
+ * agent's CURSOR_CONVERSATION_ID from whatever shell launched them, so the
+ * grok bind must not be applied to them (neither identity nor switch lock).
+ *
+ * - AGENTCHAT_ANTIGRAVITY_WAKE set (any non-empty value) → antigravity
+ * - AGENTCHAT_WAKE_KIND set to something other than "grok" → that kind
+ * - AGENTCHAT_WAKE_MODE set to something other than "grok" → that mode
+ */
+export function nonGrokWakeReason(env: Record<string, string | undefined>): string | null {
+  const anti = (env[ANTIGRAVITY_WAKE_ENV] ?? "").trim();
+  if (anti) return `${ANTIGRAVITY_WAKE_ENV}=${anti}`;
+  const kind = (env[WAKE_KIND_ENV] ?? "").trim();
+  if (kind && kind.toLowerCase() !== "grok") return `${WAKE_KIND_ENV}=${kind}`;
+  const mode = (env[WAKE_MODE_ENV] ?? "").trim();
+  if (mode && mode.toLowerCase() !== "grok") return `${WAKE_MODE_ENV}=${mode}`;
+  return null;
+}
+
+export type GrokBindApplicability = { applies: true } | { applies: false; reason: string };
+
+/**
+ * Whether the grok bind (identity lock + switch_profile gate + heal) applies to
+ * this process at all.
+ *
+ * Skipped when:
+ * - the process is tagged as a non-Grok wake (see nonGrokWakeReason), or
+ * - it was started with an explicit profile (`--profile` / `--name` /
+ *   AGENTSCHAT_PROFILE) that differs from the profile bound to its
+ *   CURSOR_CONVERSATION_ID — that operator declared a different bot; an
+ *   inherited conversation id must not lock it to somebody else.
+ *
+ * An explicit profile EQUAL to the bound one (Cursor outbound via
+ * select-profile-mcp.sh) still applies.
+ */
+export function grokBindApplies(input: {
+  env: Record<string, string | undefined>;
+  explicitProfileName?: string | null;
+  conversationId?: string | undefined;
+  binds: Record<string, string>;
+}): GrokBindApplicability {
+  const reason = nonGrokWakeReason(input.env);
+  if (reason) return { applies: false, reason: `non-grok wake (${reason})` };
+  const explicit =
+    typeof input.explicitProfileName === "string" ? profileNameFromPath(input.explicitProfileName.trim()) : null;
+  if (explicit) {
+    const bound = boundProfileForConversation(input.conversationId, input.binds);
+    const norm = (n: string) => n.replace(/[^a-zA-Z0-9_-]/g, "_");
+    if (bound && norm(bound) !== norm(explicit)) {
+      return {
+        applies: false,
+        reason: `explicit profile "${explicit}" differs from grok-bind profile "${bound}"`,
+      };
+    }
+  }
+  return { applies: true };
 }

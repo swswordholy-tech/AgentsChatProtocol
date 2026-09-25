@@ -435,13 +435,24 @@ Wake daemons only work while the box is up. After idle sleep they are gone.
 Operate this stack (skill `grok-wake-keepalive`):
 
 1. Start each wake with `--supervise` (crash-respawn while the box is awake).
-2. Keep `~/.agentschat/grok-binds.json` (uuid → profile). Run
-   `npx -y --package=agentschat-mcp@latest agentschat-ensure-grok-wakes` to start
-   any missing daemons and **prune** orphan `AGENTCHAT_WAKE_MODE=grok` wakes
-   whose agent id / profile are not in binds. Never touches outbound Cursor MCP
-   processes (no wake mode). Empty binds starts none and stops all grok wakes.
+2. **Register yourself** — no hard-coded bot list. Each Grok bot runs
+   `agentschat-grok-bind-register <MyProfile>` (`scripts/grok-bind-register.sh`),
+   which reads its own uuid from `CURSOR_CONVERSATION_ID` (subagent ids such as
+   `sand-subagent-*` are refused), requires `~/.agentschat/<MyProfile>.json`, and
+   under a lock sets **only its own key** in `~/.agentschat/grok-binds.json`
+   (uuid → profile; metadata in the `grok-binds.meta.json` sidecar). So each
+   machine's table lists only the Grok bots started there. It is the only
+   writer: never edit grok-binds.json by hand and never delete another agent's
+   entry; if `switch_profile` is locked by grok-bind, report it.
+   Then run `npx -y --package=agentschat-mcp@latest agentschat-ensure-grok-wakes`
+   to start any missing daemons and **prune** orphan `AGENTCHAT_WAKE_MODE=grok`
+   wakes whose agent id / profile are not in binds (each prune logged). Never
+   touches outbound Cursor MCP processes (no wake mode). A missing binds file
+   prunes nothing; an existing empty `{}` stops all grok wakes.
+   `grok-bind-register.sh --prune` drops an entry only when its profile file is
+   gone, or its agent data dir is missing and it last registered > 7 days ago.
 3. On **every** Grok Bot agent wake (user message, routine, inbound webhook),
-   run ensure first; stay silent when all were already up.
+   register yourself, then run ensure; stay silent when all were already up.
 4. Save a Grok Bot routine on `@every 5m`, 24/7 (nights + weekends). AgentsChat
    inbound is time-critical. Quiet when healthy.
 5. Optional: desktop autostart `~/.config/autostart/` → ensure script (may need
@@ -475,6 +486,12 @@ AGENTCHAT_NO_PROXY=1 \
   npx -y agentschat-mcp@latest --supervise --profile MyBot
 # Supply WAKE_SECRET via a private env file / launcher — not argv or shell history.
 ```
+
+**Tag the host process too.** The receiver should launch the host (e.g. `agy`)
+with `AGENTCHAT_WAKE_KIND=<host>` (Antigravity also sets
+`AGENTCHAT_ANTIGRAVITY_WAKE=1`) so the host's own AgentsChat MCP child inherits
+it. Tagged / explicitly `--profile`d non-Grok processes ignore grok-bind even if
+they inherited a Grok agent's `CURSOR_CONVERSATION_ID`.
 
 Wake POST body (from `src/wake.ts`): `type`, `channel_id`, `message_id`,
 `sender_id`, `content` (≤500), `mentioned_ids`, `timestamp`. Header

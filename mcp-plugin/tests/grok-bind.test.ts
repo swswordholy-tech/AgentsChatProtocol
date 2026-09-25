@@ -3,6 +3,8 @@ import {
   boundProfileForConversation,
   decideGrokBind,
   gateSwitchProfile,
+  grokBindApplies,
+  nonGrokWakeReason,
   parseGrokBinds,
   parseGrokBindsText,
   profileNameFromPath,
@@ -374,5 +376,66 @@ describe("shouldHealBoundIdentity", () => {
         boundAgentId: undefined,
       }),
     ).toBe(false);
+  });
+});
+
+describe("nonGrokWakeReason / grokBindApplies — non-Grok wakes are exempt", () => {
+  const binds = { "jack-uuid": "Jack", "builder-uuid": "Grok_Builder" };
+
+  test("untagged env → grok wake/Cursor MCP (null reason)", () => {
+    expect(nonGrokWakeReason({})).toBeNull();
+    expect(nonGrokWakeReason({ AGENTCHAT_WAKE_MODE: "grok" })).toBeNull();
+    expect(nonGrokWakeReason({ AGENTCHAT_WAKE_KIND: "grok" })).toBeNull();
+    expect(nonGrokWakeReason({ AGENTCHAT_WAKE_KIND: "", AGENTCHAT_ANTIGRAVITY_WAKE: "" })).toBeNull();
+  });
+
+  test("AGENTCHAT_ANTIGRAVITY_WAKE set → non-grok", () => {
+    expect(nonGrokWakeReason({ AGENTCHAT_ANTIGRAVITY_WAKE: "1" })).toMatch(/ANTIGRAVITY/);
+    expect(nonGrokWakeReason({ AGENTCHAT_ANTIGRAVITY_WAKE: "mcp", AGENTCHAT_WAKE_MODE: "grok" })).toMatch(/ANTIGRAVITY/);
+  });
+
+  test("AGENTCHAT_WAKE_KIND / WAKE_MODE other than grok → non-grok", () => {
+    expect(nonGrokWakeReason({ AGENTCHAT_WAKE_KIND: "antigravity" })).toMatch(/antigravity/);
+    expect(nonGrokWakeReason({ AGENTCHAT_WAKE_KIND: "zcode" })).toMatch(/zcode/);
+    expect(nonGrokWakeReason({ AGENTCHAT_WAKE_MODE: "url" })).toMatch(/url/);
+  });
+
+  test("Antigravity inheriting Jack's conversation id: bind does not apply", () => {
+    const r = grokBindApplies({
+      env: { AGENTCHAT_ANTIGRAVITY_WAKE: "1", CURSOR_CONVERSATION_ID: "jack-uuid" },
+      explicitProfileName: "Antigravity",
+      conversationId: "jack-uuid",
+      binds,
+    });
+    expect(r.applies).toBe(false);
+  });
+
+  test("ZCode tagged env: bind does not apply even without explicit profile", () => {
+    const r = grokBindApplies({ env: { AGENTCHAT_WAKE_KIND: "zcode" }, conversationId: "jack-uuid", binds });
+    expect(r.applies).toBe(false);
+  });
+
+  test("untagged but explicit --profile differs from bound profile → exempt", () => {
+    const r = grokBindApplies({ env: {}, explicitProfileName: "Antigravity-3", conversationId: "jack-uuid", binds });
+    expect(r.applies).toBe(false);
+    if (!r.applies) expect(r.reason).toMatch(/Antigravity-3/);
+  });
+
+  test("explicit --profile equal to bound profile (Cursor outbound) → applies", () => {
+    expect(grokBindApplies({ env: {}, explicitProfileName: "Jack", conversationId: "jack-uuid", binds }).applies).toBe(true);
+    // --name "Grok Builder" normalizes to the Grok_Builder profile file
+    expect(
+      grokBindApplies({ env: {}, explicitProfileName: "Grok Builder", conversationId: "builder-uuid", binds }).applies,
+    ).toBe(true);
+  });
+
+  test("Grok wake (WAKE_MODE=grok, --profile Jack) → applies", () => {
+    expect(
+      grokBindApplies({ env: { AGENTCHAT_WAKE_MODE: "grok" }, explicitProfileName: "Jack", conversationId: "jack-uuid", binds }).applies,
+    ).toBe(true);
+  });
+
+  test("no conversation id + explicit bound profile keeps current-profile lock path", () => {
+    expect(grokBindApplies({ env: {}, explicitProfileName: "Jack", conversationId: undefined, binds }).applies).toBe(true);
   });
 });

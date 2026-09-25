@@ -440,6 +440,61 @@ describe("identity policy, end-to-end against a mock hub", () => {
     expect(err).not.toMatch(/WAKE_MODE/);
   }, 15_000);
 
+  const writeLockFixture = (tag: string) => {
+    const home = freshHome(tag);
+    mkdirSync(join(home, ".agentschat"), { recursive: true });
+    for (const [name, id] of [["Jack", "jack-id"], ["Antigravity", "anti-id"], ["Antigravity-3", "anti3-id"]]) {
+      writeFileSync(
+        join(home, ".agentschat", `${name}.json`),
+        JSON.stringify({ agent_id: id, display_name: name, token: `ac_${id}`, capabilities: ["chat"] }),
+      );
+    }
+    writeFileSync(join(home, ".agentschat", "grok-binds.json"), JSON.stringify({ "jack-uuid": "Jack" }));
+    return home;
+  };
+
+  test("Antigravity wake inheriting a bound CURSOR_CONVERSATION_ID can switch_profile", async () => {
+    calls = [];
+    const home = writeLockFixture("anti-switch");
+    const { res } = await drive(
+      ["--profile", "Antigravity"],
+      home,
+      [INIT, INITED, callTool(3, "switch_profile", { profile_name: "Antigravity-3" }), callTool(4, "whoami")],
+      4000,
+      { CURSOR_CONVERSATION_ID: "jack-uuid", AGENTCHAT_ANTIGRAVITY_WAKE: "1", AGENTCHAT_WAKE_KIND: "antigravity" },
+    );
+    const t3 = res.get(3)?.result?.content?.[0]?.text ?? "";
+    expect(t3).not.toMatch(/locked to grok-bind/);
+    expect(t3).toMatch(/Switched to profile "Antigravity-3"/);
+    expect(res.get(4)?.result?.content?.[0]?.text ?? "").toMatch(/Agent ID: anti3-id/);
+  }, 15_000);
+
+  test("Grok-bound Cursor MCP (same conversation id, no wake tag) stays locked", async () => {
+    calls = [];
+    const home = writeLockFixture("grok-lock");
+    const { res } = await drive(
+      ["--profile", "Jack"],
+      home,
+      [INIT, INITED, callTool(3, "switch_profile", { profile_name: "Antigravity-3" }), callTool(4, "whoami")],
+      4000,
+      { CURSOR_CONVERSATION_ID: "jack-uuid" },
+    );
+    expect(res.get(3)?.result?.content?.[0]?.text ?? "").toMatch(/locked to grok-bind profile "Jack"/);
+    expect(res.get(4)?.result?.content?.[0]?.text ?? "").toMatch(/Agent ID: jack-id/);
+  }, 15_000);
+
+  test("ZCode-tagged process ignores inherited grok-bind identity", async () => {
+    calls = [];
+    const home = writeLockFixture("zcode-skip");
+    const { err } = await drive([], home, [INIT, INITED, LIST], 3000, {
+      CURSOR_CONVERSATION_ID: "jack-uuid",
+      AGENTCHAT_WAKE_KIND: "zcode",
+    });
+    expect(err).toMatch(/grok-bind skipped: non-grok wake/);
+    expect(err).not.toMatch(/Jack\.json/);
+    expect(registerCalls()).toBe(0);
+  }, 15_000);
+
   test("grok-bind miss: logs the uuid and stays anonymous (does not pick a sibling)", async () => {
     calls = [];
     const home = freshHome("grokmiss");

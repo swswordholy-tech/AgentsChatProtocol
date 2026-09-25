@@ -9,6 +9,9 @@ import {
   shouldPruneWake,
   agentIdFromEnviron,
   profileFromCmdline,
+  isRealAgentUuid,
+  shouldPruneBindEntry,
+  mayPruneWakes,
 } from "../scripts/ensure-grok-wakes.mjs";
 import { join } from "node:path";
 
@@ -103,5 +106,33 @@ describe("ensure-grok-wakes helpers", () => {
       "Grok_Builder",
     );
     expect(agentIdFromEnviron(["AGENTCHAT_GROK_AGENT_ID=abc", ""].join("\0"))).toBe("abc");
+  });
+});
+
+describe("register-yourself binds rules", () => {
+  test("isRealAgentUuid rejects subagent ids", () => {
+    expect(isRealAgentUuid("fcd8776f-c67a-490d-810d-1840eaca7e4b")).toBe(true);
+    expect(isRealAgentUuid("sand-subagent-4be60ac7-5859-120d-69c5-04b035f82f3b")).toBe(false);
+    expect(isRealAgentUuid("")).toBe(false);
+    expect(isRealAgentUuid(undefined)).toBe(false);
+  });
+
+  test("missing binds file prunes no wakes; existing file (even empty) is authoritative", () => {
+    expect(mayPruneWakes(false)).toBe(false);
+    expect(mayPruneWakes(true)).toBe(true);
+  });
+
+  test("shouldPruneBindEntry: profile gone → prune", () => {
+    expect(shouldPruneBindEntry({ profileExists: false, agentDirExists: true, nowEpoch: 0 })).toMatch(/profile/);
+  });
+
+  test("shouldPruneBindEntry: agent dir missing only prunes after 7 days", () => {
+    const now = 1_000_000_000;
+    const day = 86400;
+    expect(shouldPruneBindEntry({ profileExists: true, agentDirExists: false, lastRegisteredEpoch: now - 8 * day, nowEpoch: now })).toMatch(/too old/);
+    expect(shouldPruneBindEntry({ profileExists: true, agentDirExists: false, lastRegisteredEpoch: now - 6 * day, nowEpoch: now })).toBeNull();
+    expect(shouldPruneBindEntry({ profileExists: true, agentDirExists: true, lastRegisteredEpoch: now - 30 * day, nowEpoch: now })).toBeNull();
+    // never registered via the script (no meta) → never age-pruned
+    expect(shouldPruneBindEntry({ profileExists: true, agentDirExists: false, lastRegisteredEpoch: null, nowEpoch: now })).toBeNull();
   });
 });

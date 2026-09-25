@@ -51,6 +51,9 @@ import {
   DEFAULT_GROK_BINDS_FILENAME,
   boundProfileForConversation,
   gateSwitchProfile,
+  grokBindApplies,
+  nonGrokWakeReason,
+  GROK_BINDS_META_FILENAME,
   profileNameFromPath,
   shouldHealBoundIdentity,
 } from "./grok-bind.ts";
@@ -194,7 +197,7 @@ function listProfileFiles(): Array<{ name: string; path: string }> {
     let files: string[] = [];
     try { files = readdirSync(dir).filter((f: string) => f.endsWith(".json")); } catch {}
     for (const file of files) {
-      if (file === DEFAULT_GROK_BINDS_FILENAME) continue; // bind map, not a profile
+      if (file === DEFAULT_GROK_BINDS_FILENAME || file === GROK_BINDS_META_FILENAME) continue; // bind map, not a profile
       const name = file.replace(/\.json$/, "");
       if (seen.has(name)) continue;
       seen.add(name);
@@ -223,7 +226,13 @@ function resolveProfile(): { path: string; source: ProfileSource; declaredName?:
   // is a declared identity (source grok-bind) so decideIdentity hard-errors
   // rather than falling through to a sibling bot.
   const grokToken = !!(cliArgs.token || process.env.AGENTCHAT_TOKEN);
-  const conversationId = process.env.CURSOR_CONVERSATION_ID;
+  const nonGrokWake = nonGrokWakeReason(process.env);
+  // A non-Grok wake stack (Antigravity / ZCode / URL wake) may have inherited a
+  // Grok agent's CURSOR_CONVERSATION_ID — never adopt that Grok identity.
+  const conversationId = nonGrokWake ? undefined : process.env.CURSOR_CONVERSATION_ID;
+  if (nonGrokWake && process.env.CURSOR_CONVERSATION_ID) {
+    process.stderr.write(`[agentchat] grok-bind skipped: non-grok wake (${nonGrokWake})\n`);
+  }
   let binds: Record<string, string> = {};
   if (!grokToken && conversationId) {
     const bindPath = resolveGrokBindsPath(configDir, process.env.AGENTCHAT_GROK_BINDS);
@@ -2059,6 +2068,25 @@ function loadGrokBinds(): Record<string, string> {
   }
 }
 
+/** Explicit profile declared at startup (env / --profile / --name), else null. */
+const explicitStartupProfileName: string | null =
+  profileSource === "env" || profileSource === "legacy-env" || profileSource === "flag-profile" || profileSource === "flag-name"
+    ? (declaredName ?? null)
+    : null;
+
+/**
+ * Whether grok-bind (switch lock + heal) applies to this process right now.
+ * Non-Grok wakes and explicit --profile ≠ bound profile are exempt.
+ */
+function currentGrokBindApplicability(binds: Record<string, string>) {
+  return grokBindApplies({
+    env: process.env,
+    explicitProfileName: explicitStartupProfileName,
+    conversationId: process.env.CURSOR_CONVERSATION_ID,
+    binds,
+  });
+}
+
 /**
  * Apply a profile file as the live identity and reconnect WS.
  * Shared by `switch_profile` and grok-bind heal.
@@ -2093,7 +2121,9 @@ function applyIdentityFromProfile(newProfile: any, targetFile: string): void {
 function ensureGrokBoundIdentity(): void {
   // Runtime recovery must honor the same explicit identity precedence as startup.
   if (profileSource !== "grok-bind" || hasToken || cliArgs.id || process.env.AGENTCHAT_AGENT_ID) return;
-  const boundName = boundProfileForConversation(process.env.CURSOR_CONVERSATION_ID, loadGrokBinds());
+  const healBinds = loadGrokBinds();
+  if (!currentGrokBindApplicability(healBinds).applies) return;
+  const boundName = boundProfileForConversation(process.env.CURSOR_CONVERSATION_ID, healBinds);
   if (!boundName) return;
   const boundPath = nameToPath(boundName);
   if (!existsSync(boundPath)) return;
@@ -3227,9 +3257,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     // when set, or via current profile when Cursor stdio started with --profile
     // and no CURSOR_CONVERSATION_ID. Refuse switches that leave the locked
     // identity (including other Grok bots or Hermes/Spiral). No-op allowed.
-    const switchGate = gateSwitchProfile({
+    // Non-Grok wakes (Antigravity / ZCode) and explicit --profile ≠ bound
+    // profile are exempt: an inherited CURSOR_CONVERSATION_ID must not lock them.
+    const switchBinds = loadGrokBinds();
+    const bindApplies = currentGrokBindApplicability(switchBinds);
+    const switchGate = !bindApplies.applies ? ({ kind: "allow" } as const) : gateSwitchProfile({
       conversationId: process.env.CURSOR_CONVERSATION_ID,
-      binds: loadGrokBinds(),
+      binds: switchBinds,
       requestedProfileName: profile_name,
       currentProfileName: profileNameFromPath(activeProfileFile),
     });
