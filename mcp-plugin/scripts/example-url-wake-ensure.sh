@@ -23,6 +23,15 @@
 #   AGENTCHAT_NO_PROXY=1
 #   unset AGENTCHAT_WAKE_MODE
 #
+# Start non-Grok stacks with the Cursor session env REMOVED — a shell spawned by
+# a Grok agent carries that agent's CURSOR_CONVERSATION_ID, which must not leak
+# into this host (grok-bind would treat it as the Grok bot). e.g. at the top of
+# each start/ensure script (CURSOR_AGENT_STORE_* computed dynamically):
+#   u=$(awk 'BEGIN{for(k in ENVIRON) if(k ~ /^CURSOR_AGENT_STORE_/) printf "-u %s ", k}')
+#   exec env -u CURSOR_CONVERSATION_ID -u CURSOR_REQUEST_ID -u __CURSOR_SANDBOX_ENV_RESTORE -u CURSOR_AGENT $u sh "$0" "$@"
+#   (guard so it only re-execs while one of those keys is still set)
+# Never do this for Grok WAKE_MODE=grok wakes — they need their own id.
+#
 # Suggested start-mcp-wake shape:
 #   setsid -f env AGENTCHAT_WAKE_KIND=url \
 #     sh -c 'set -a; . wake.env; set +a; unset AGENTCHAT_WAKE_MODE;

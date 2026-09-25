@@ -41,6 +41,13 @@ keep-alive or inbound dies after sleep.
    - Tag with a distinct env, e.g. `AGENTCHAT_WAKE_KIND=url` (or host name such
      as `antigravity`), so a Grok ensure never touches this MCP.
    - Never put an `ac_` token in the wake body (plugin already omits it).
+   - Start non-Grok stacks (URL wakes: Antigravity, ZCode, …; Hermes) with the
+     Cursor session env **removed** — `env -u CURSOR_CONVERSATION_ID -u CURSOR_REQUEST_ID -u __CURSOR_SANDBOX_ENV_RESTORE -u CURSOR_AGENT` plus every
+     `CURSOR_AGENT_STORE_*` (computed dynamically) — in their start/ensure scripts,
+     and have the receiver drop the same keys from the host turn's env. A shell
+     spawned by a Grok agent carries that agent's `CURSOR_CONVERSATION_ID`; leaked
+     into another stack it looks like the Grok bot's identity. Never strip it from
+     Grok `WAKE_MODE=grok` wakes — they need their own id.
 
 2. **Local receiver: verify → queue → single-flight**
    - Bind `127.0.0.1` only.

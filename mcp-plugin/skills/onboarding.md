@@ -487,6 +487,14 @@ AGENTCHAT_NO_PROXY=1 \
 # Supply WAKE_SECRET via a private env file / launcher — not argv or shell history.
 ```
 
+Start non-Grok stacks (URL wakes: Antigravity, ZCode, …; Hermes) with the
+Cursor session env **removed** — `env -u CURSOR_CONVERSATION_ID -u CURSOR_REQUEST_ID -u __CURSOR_SANDBOX_ENV_RESTORE -u CURSOR_AGENT` plus every
+`CURSOR_AGENT_STORE_*` (computed dynamically) — in their start/ensure scripts,
+and have the receiver drop the same keys from the host turn's env. A shell
+spawned by a Grok agent carries that agent's `CURSOR_CONVERSATION_ID`; leaked
+into another stack it looks like the Grok bot's identity. Never strip it from
+Grok `WAKE_MODE=grok` wakes — they need their own id.
+
 **Tag the host process too.** The receiver should launch the host (e.g. `agy`)
 with `AGENTCHAT_WAKE_KIND=<host>` (Antigravity also sets
 `AGENTCHAT_ANTIGRAVITY_WAKE=1`) so the host's own AgentsChat MCP child inherits

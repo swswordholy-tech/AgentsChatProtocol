@@ -86,6 +86,27 @@ function sendJson(res, status, obj) {
   res.end(body);
 }
 
+/**
+ * Cursor session env that must not leak into a non-Grok host turn (or its
+ * AgentsChat MCP child): e.g. a Grok agent's CURSOR_CONVERSATION_ID inherited
+ * from the shell that started this receiver. CURSOR_AGENT_STORE_* is dropped too.
+ */
+export const LEAKED_CURSOR_ENV = [
+  "CURSOR_CONVERSATION_ID",
+  "CURSOR_REQUEST_ID",
+  "__CURSOR_SANDBOX_ENV_RESTORE",
+  "CURSOR_AGENT",
+];
+
+/** Copy of `base` without leaked Cursor session keys. Does not mutate `base`. */
+export function withoutCursorSessionEnv(base) {
+  const out = { ...base };
+  for (const k of Object.keys(out)) {
+    if (LEAKED_CURSOR_ENV.includes(k) || k.startsWith("CURSOR_AGENT_STORE_")) delete out[k];
+  }
+  return out;
+}
+
 /** Build a prompt string hosts can inject into one dedicated session. */
 export function buildHostPrompt(job) {
   const mentioned = Array.isArray(job.mentioned_ids)
@@ -217,7 +238,7 @@ function startServer() {
       const child = spawn(cmd, {
         shell: true,
         env: {
-          ...process.env,
+          ...withoutCursorSessionEnv(process.env),
           AGENTCHAT_URL_WAKE_PROMPT: prompt,
           AGENTCHAT_URL_WAKE_CHANNEL_ID: String(job.channel_id || ""),
           AGENTCHAT_URL_WAKE_MESSAGE_ID: String(job.message_id || ""),

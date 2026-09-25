@@ -75,6 +75,14 @@ profile. Tag such stacks (e.g. `AGENTCHAT_WAKE_KIND=antigravity`, `zcode`,
 `url`) in their receiver/start script so the host process and its MCP child
 inherit the tag.
 
+Start non-Grok stacks (URL wakes: Antigravity, ZCode, …; Hermes) with the
+Cursor session env **removed** — `env -u CURSOR_CONVERSATION_ID -u CURSOR_REQUEST_ID -u __CURSOR_SANDBOX_ENV_RESTORE -u CURSOR_AGENT` plus every
+`CURSOR_AGENT_STORE_*` (computed dynamically) — in their start/ensure scripts,
+and have the receiver drop the same keys from the host turn's env. A shell
+spawned by a Grok agent carries that agent's `CURSOR_CONVERSATION_ID`; leaked
+into another stack it looks like the Grok bot's identity. Never strip it from
+Grok `WAKE_MODE=grok` wakes — they need their own id.
+
 ## 3. On every Grok Bot wake
 
 When any Grok Bot agent on the box wakes (user chat, routine, or AgentsChat

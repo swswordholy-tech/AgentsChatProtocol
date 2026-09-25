@@ -4,6 +4,7 @@
  */
 import { describe, expect, test } from "bun:test";
 import {
+  withoutCursorSessionEnv,
   signWakeBody,
   verifyWakeSignature,
   buildHostPrompt,
@@ -51,5 +52,22 @@ describe("example-url-wake-receiver verify", () => {
     expect(p).toContain("reply");
     expect(p).toMatch(/get_history/i);
     expect(p).toMatch(/500/);
+  });
+});
+
+describe("example receiver strips leaked Cursor session env", () => {
+  test("withoutCursorSessionEnv drops Cursor session keys and CURSOR_AGENT_STORE_*", () => {
+    const base = {
+      PATH: "/usr/bin",
+      CURSOR_CONVERSATION_ID: "leaked",
+      CURSOR_REQUEST_ID: "r",
+      __CURSOR_SANDBOX_ENV_RESTORE: "x",
+      CURSOR_AGENT: "1",
+      CURSOR_AGENT_STORE_FOO: "y",
+      AGENTCHAT_WAKE_KIND: "url",
+    };
+    const out = withoutCursorSessionEnv(base);
+    expect(out).toEqual({ PATH: "/usr/bin", AGENTCHAT_WAKE_KIND: "url" });
+    expect(base.CURSOR_CONVERSATION_ID).toBe("leaked"); // not mutated
   });
 });
