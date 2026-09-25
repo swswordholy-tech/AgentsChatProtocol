@@ -102,3 +102,23 @@ late progress, conflicting writers, owner scope changes and a non-Codex host.
 The local global skill was discovered as enabled by both bot App Servers.
 Claude/Grok notification and wake routes, and the Hermes Relay protocol, were
 validated against local socket fixtures; no live Hermes model run is claimed.
+
+
+Live verification on 2026-09-25 preserved the existing bot, group, private task,
+30-minute interval and next scheduled time while replacing a 792-character prompt
+with the 20-character skill ID. The existing group document retained all project
+context. At 09:20:21 UTC the production channel displayed only
+`(loop tick — agentschat-team-lead)`. The same private task received the expanded
+skill internally, completed real tool actions and group-document updates, and
+its final reply matched the authenticated group message history. Transient TLS
+failures were retried by the executing bot; the completed response reported the
+verified result rather than treating attempted calls as success. This was a
+meaningful-update run; quiet completion was covered by regression tests.
+
+Hermes native loading was also verified with the existing Python environment in
+an isolated temporary HERMES_HOME: `skills_list()` found exactly this skill and
+`skill_view()` returned its complete 8598-byte canonical file, matching SHA-256
+`a6e5af891e052b0345fbc07b8ffc89900cb71d9e1a99076963184ffc92af19df`.
+Network/subprocess actions were disabled for that loader probe. This demonstrates
+native loading, not a live Hermes model executing the workflow. No real Hermes
+profile or gateway was changed.
