@@ -198,3 +198,12 @@ Every connector frame ends in `\n`, as required by the gateway's relay reader.
 Supported operations remain `send`, `typing`, and `get_chat_info`; media, edits,
 reactions, arbitrary multi-tenant hosting, and durable delivery acknowledgments
 are outside this connector's current scope.
+
+### Shared Hermes group context
+
+Set `group_sessions_per_user: false` in every connected Hermes profile's
+`config.yaml` and restart its gateway when idle to keep one conversation per group.
+Hermes otherwise defaults to a separate session per sender even though this
+connector preserves the group `chat_id` and replies to that group. This setting
+applies across that profile's group platforms; it does not merge existing histories.
+See [the relay guide](../../docs/hermes-relay.md#3-keep-one-conversation-per-group).

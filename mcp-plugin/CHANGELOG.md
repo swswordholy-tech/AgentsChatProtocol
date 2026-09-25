@@ -2,12 +2,14 @@
 
 ## 0.36.4 — UNPUBLISHED — URL wake pattern + remote keep-alive docs
 
-- **Verified owner requests:** resolve ownership from authenticated server APIs
-  for every queued message. Owner conversations use the configured full-access
-  tools and can perform requested actions without repeating approval locally;
-  other senders and unavailable ownership use separate read-only conversations.
-  Old conversations remain on disk; fresh owner lanes avoid carrying obsolete
-  developer restrictions forward. Loaded threads cannot switch permission modes.
+- **Shared Codex channel context:** one persisted conversation per channel for
+  all accepted senders, using the bot's configured permissions (full access by
+  default). Owner lookup no longer splits ordinary messages into different tasks.
+  Scheduled grants also reuse their DM conversation. Existing split threads are
+  exported privately and their past chat context is imported once; restart resumes
+  the same task. Original history remains available for recovery.
+- **Group follow-up loops:** schedule in the originating group, resume its shared Codex conversation and reply there. Local grants accept exact group channel IDs; server state and owner checks remain required.
+- **Hermes group context:** document `group_sessions_per_user: false`; Hermes otherwise separates group history per sender. Existing histories need explicit carryover.
 - **Codex bridge:** inherit full-access MCP configuration directly when creating
   or resuming threads, avoiding invalid overrides from nullable timeout fields.
   Explicit read-only mode still disables inherited MCP tools.

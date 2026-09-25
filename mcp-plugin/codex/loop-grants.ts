@@ -28,7 +28,7 @@ function grants(config: BridgeConfig): LoopGrant[] {
     if (doc?.version !== 1 || !Array.isArray(doc.grants)) return [];
     return doc.grants.filter((g: any) => g &&
       [g.loop_id, g.channel_id, g.agent_id, g.owner_id, g.prompt].every(v => typeof v === "string" && v.trim()) &&
-      g.agent_id === config.agentId && g.channel_id.startsWith("dm-") && g.prompt.length <= 4000 &&
+      g.agent_id === config.agentId && g.prompt.length <= 4000 &&
       Number.isSafeInteger(g.interval_ms) && g.interval_ms >= 60_000 && g.interval_ms <= 86_400_000);
   } catch { return []; }
 }

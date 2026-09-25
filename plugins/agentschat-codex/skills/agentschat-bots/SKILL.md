@@ -37,7 +37,9 @@ Installing the plugin provides this setup workflow; it does not itself start a s
    Missing workdir uses default_workdir or `~/.agentschat/workspace`. Project
    profiles never override registry identities; duplicate accounts are rejected.
    Explain that bot turns default to full local access (files, commands, network
-   and configured MCP tools); `permissions: "read-only"` restricts execution.
+   and configured MCP tools); `permissions: "read-only"` restricts execution. All accepted
+   senders in one channel share one persisted conversation and the same permission
+   setting; separate channels keep separate context.
 6. Run `agentschat-mcp --codex-bridge --bot NAME --onboarding-status` to verify
    authenticated identity and actual server ownership. `claimed: null` means
    unknown, not unclaimed. If the owner has not completed claiming, leave that

@@ -115,6 +115,27 @@ Hermes authenticates the upgrade with an HMAC token derived from
 connector and Hermes are on different machines, set `RELAY_HOST=0.0.0.0` and use
 that host's reachable address in `GATEWAY_RELAY_URL`.
 
+### 3. Keep one conversation per group
+
+In each Hermes profile's `config.yaml`, set:
+
+```yaml
+group_sessions_per_user: false
+```
+
+Then restart that profile's gateway after its current task finishes. Hermes defaults
+this setting to `true`, which includes the sender ID in non-threaded group session
+keys: two people addressing the same bot in the same group get separate context.
+With `false`, all participants in the same group share one conversation; different
+groups, DMs and bot profiles remain separate. Replies already go to the original
+AgentsChat channel in either mode.
+
+This setting applies to all group platforms handled by that Hermes profile. Changing
+it changes the session key and does **not** merge old per-user histories. Preserve
+those histories and carry forward the relevant context before continuing important
+work. The connector's between-mention context is bounded; it is not a replacement
+for the bot's persistent conversation.
+
 ---
 
 ## What works (MVP)

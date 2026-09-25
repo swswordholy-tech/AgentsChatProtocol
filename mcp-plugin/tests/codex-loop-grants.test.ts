@@ -12,13 +12,13 @@ import { verifyLoopTick } from "../codex/loop-grants.ts";
 import type { BridgeConfig } from "../codex/config.ts";
 const dirs: string[] = [];
 afterEach(() => dirs.splice(0).forEach(d => rmSync(d, { recursive: true, force: true })));
-function fixture() {
+function fixture(channel = "dm-owner") {
   const stateDir = mkdtempSync(join(tmpdir(), "loop-grant-")); dirs.push(stateDir);
   const c: BridgeConfig = { stateDir, agentId: "bot", cwd: stateDir, permissions: "full-access", token: "test-token", profileFile: "unused", source: "test", apiUrl: "https://example.com", wsUrl: "wss://example.com/ws", channels: [], senders: [], codexBin: "unused" };
-  const grant = { loop_id: "loop-one", channel_id: "dm-owner", agent_id: "bot", owner_id: "owner", interval_ms: 1800000, prompt: "Review assigned work." };
+  const grant = { loop_id: "loop-one", channel_id: channel, agent_id: "bot", owner_id: "owner", interval_ms: 1800000, prompt: "Review assigned work." };
   const file = join(stateDir, "loop-grants.json");
   const save = (grants = [grant]) => writeFileSync(file, JSON.stringify({ version: 1, grants }), { mode: 0o600 }); save();
-  const tick = { id: "tick1", channel_id: "dm-owner", sender_id: "bot", content: "UNTRUSTED WIRE CONTENT", meta: { kind: "loop_tick" as const, loop_id: "loop-one", interval_ms: 1800000, next_tick_ms: 2800000, prompt: "Review assigned work." } };
+  const tick = { id: "tick1", channel_id: channel, sender_id: "bot", content: "UNTRUSTED WIRE CONTENT", meta: { kind: "loop_tick" as const, loop_id: "loop-one", interval_ms: 1800000, next_tick_ms: 2800000, prompt: "Review assigned work." } };
   const row = { ...grant, status: "active", expires_at: null, last_tick_at: 1000000, next_tick_ms: 2800000 };
   return { c, grant, tick, row, file, save };
 }
@@ -42,15 +42,15 @@ test("live check rejects owner changes, inactive/mismatched loops, failed lookup
   c.permissions = "read-only"; expect(await verifyLoopTick(tick, c, "owner", async () => ({ loops: [row] }))).toBeNull(); c.permissions = "full-access";
   expect(await verifyLoopTick(tick, c, "owner", async () => { save([]); return { loops: [row] }; })).toBeNull();
 });
-test("bridge delivers fixed authorized task in isolated lane and deduplicates tick across restart", async () => {
+test("bridge delivers fixed authorized task in the shared DM thread and deduplicates tick across restart", async () => {
   const { c, tick, row } = fixture(); const runs: { thread: string; prompt: string }[] = [], modes: string[] = [], sent: string[] = [];
   const model: Generator = { thread: async (_c, existing, _e, mode) => { modes.push(mode!); return existing ?? `thread-${modes.length}`; }, generate: async (thread, prompt) => { runs.push({ thread, prompt }); return "done"; } };
   let bridge = new Bridge(c, model, async (_ch, text) => { sent.push(text); }, () => {}, undefined, async () => "owner", async () => ({ loops: [row] }));
   try {
     expect(bridge.accept({ id: "owner1", channel_id: "dm-owner", sender_id: "owner", content: "owner message", meta: { kind: "ordinary" } })).toBe(true); await bridge.drain();
     expect(bridge.accept(tick)).toBe(true); expect(bridge.accept({ ...tick, id: "duplicate" })).toBe(false); await bridge.drain();
-    expect(sent).toEqual(["done", "done"]); expect(modes).toEqual(["full-access", "full-access"]);
-    expect(runs[0]!.prompt).toContain("owner message"); expect(runs[1]!.prompt).toContain("Review assigned work."); expect(runs[1]!.prompt).not.toContain("UNTRUSTED WIRE CONTENT"); expect(runs[0]!.thread).not.toBe(runs[1]!.thread);
+    expect(sent).toEqual(["done", "done"]); expect(modes).toEqual(["full-access"]);
+    expect(runs[0]!.prompt).toContain("owner message"); expect(runs[1]!.prompt).toContain("Review assigned work."); expect(runs[1]!.prompt).not.toContain("UNTRUSTED WIRE CONTENT"); expect(runs[0]!.thread).toBe(runs[1]!.thread);
     await bridge.stop(); bridge = new Bridge(c, model, async () => {}, () => {}, undefined, async () => "owner", async () => ({ loops: [row] }));
     expect(bridge.accept({ ...tick, id: "replay" })).toBe(false);
     expect(JSON.parse(readFileSync(join(c.stateDir, "state.json"), "utf8")).entries.map((e: any) => e.status)).toEqual(["sent", "sent"]);
@@ -66,4 +66,17 @@ test("bridge rechecks owner on each tick and blocks revoked work before generati
     bridge.accept({ ...tick, id: "tick2", meta: { ...tick.meta, next_tick_ms: 4600000 } }); await bridge.drain(); expect(calls).toBe(1);
     expect(JSON.parse(readFileSync(join(c.stateDir, "state.json"), "utf8")).entries[1].status).toBe("blocked");
   } finally { await bridge.stop(); }
+});
+
+test("group loop and group mentions resume the same conversation and reply only to that group", async () => {
+  const {c,tick,row} = fixture("original-group"); const runs: string[] = [], deliveries: string[] = [];
+  const model: Generator = {thread:async(_cwd,existing)=>existing??"group-thread",generate:async(thread,prompt)=>{runs.push(thread); return "group update";}};
+  const bridge=new Bridge(c,model,async(channel)=>{deliveries.push(channel);},()=>{},undefined,async()=>"owner",async()=>({loops:[row]}));
+  try {
+    expect(bridge.accept({id:"group-request",channel_id:"original-group",sender_id:"member",content:"@bot follow this task",mentioned_ids:["bot"]})).toBe(true);
+    await bridge.drain(); expect(bridge.accept(tick)).toBe(true); await bridge.drain();
+    expect(runs).toEqual(["group-thread","group-thread"]);
+    expect(deliveries).toEqual(["original-group","original-group"]);
+    expect(addressed({...tick,id:"wrong-channel",channel_id:"dm-owner"},c)).toBe(false);
+  } finally {await bridge.stop();}
 });

@@ -27,7 +27,7 @@ Project config fields: profile, agent_id, channels, senders, api_url, ws_url, pe
 --onboarding-status checks authentication/ownership and prints safe claim/chat links; it does not send messages.
 --check validates identity and official app-server initialization without opening chat.
 Live DMs and exact mentions trigger replies; channels/senders restrict this further.
-Server-verified owner requests use full access by default; other senders stay read-only. Set permissions: "read-only" to disable writes and inherited MCP. No offline message replay.
+All accepted messages share one persisted thread per channel, with full access by default. Set permissions: "read-only" to disable writes and inherited MCP. No offline message replay.
 State: ~/.agentschat/codex-bridge/<project-server-identity hash>/ (private).
 GUI outbox: --gui-thread THREAD_ID --gui-message-file PATH; --gui-status lists receipts.
 Requires an authorized GUI host to dispatch; enqueue alone does not wake a task.

@@ -102,27 +102,24 @@ so already. The bridge never writes an account token into project config or stat
 - Self messages, typing events, empty messages and inputs over 32,000 characters
   are ignored. The bridge subscribes only to existing memberships; it does not
   discover or join unrelated public channels.
-- Each channel gets separate persisted owner and read-only chat threads. Owner
-  identity comes from the server using the bot's own credential, checked again
-  before every queued request executes. A sender's name, message text, or claimed
-  trust flag cannot substitute for the server's owner ID. Lookup failure stays
-  read-only and never reuses a cached owner. All channels are processed serially;
-  messages arriving during a turn are queued instead of interrupting it. A maximum
-  of 100 unfinished messages can be accepted. Full inboxes log a dropped event.
-- Verified owner requests default to `approvalPolicy=never` and
-  `danger-full-access`, including resumed owner threads and subsequent turns.
-  The owner can ask in AgentsChat to execute commands, modify files, join a
-  requested channel, or use connected services without repeating the request in
-  a local Codex window. Configured MCP servers remain enabled. Other senders use
-  separate `read-only` threads with inherited MCP servers disabled; permissions
-  are enforced by App Server settings as well as described in the prompt.
-  Set `"permissions": "read-only"` in project config or the central bot entry to
-  restore read-only execution with inherited MCP servers disabled. Central bots
-  read this setting only from their registry entry. Restrict trusted senders as needed.
-  The bridge still sends final replies; the model must not duplicate them via tools.
-  Owner lookup uses existing `/api/account/onboarding` and `/api/me/entitlements`
-  endpoints in parallel, with no cached authorization and an 8-second timeout.
-  No server deployment or owner ID in public messages is required.
+- Each channel has one persisted Codex conversation shared by all accepted senders.
+  DMs and different groups stay separate. Permissions and owner lookup no longer
+  split ordinary chat history. Requests run in arrival order; restart resumes the
+  same thread. Up to 100 unfinished messages can queue.
+- All accepted messages use the bot's configured permissions: full access by
+  default (`approvalPolicy=never`, `danger-full-access`, inherited MCP tools).
+  Use `channels`/`senders` to limit which messages the bot accepts, or explicit
+  `permissions: "read-only"` to restrict the whole bot. Replies return to their
+  original channel; a group mention never creates a DM.
+- Upgrading from split owner/chat threads creates one fresh conversation per
+  channel so obsolete developer restrictions are not resumed. Original turns and
+  tool results are exported privately under the bridge state directory's `history/`.
+  Recent user/assistant messages from those threads are merged in turn order and
+  supplied once to the new conversation; earlier records remain available in the
+  export when the 60,000-character prompt budget is exceeded. Original thread
+  records are retained. A failed history read stops migration instead of silently
+  starting with blank context. Existing duplicate desktop tasks can be archived
+  after migration; normal message delivery and restart create no extra tasks.
 - Scheduled self ticks are ignored unless the operator creates a private local
   `loop-grants.json` in this bot's resolved bridge state directory after explicit
   owner authorization. The file must be a regular file owned by the bridge user,
@@ -139,8 +136,8 @@ so already. The bridge never writes an account token into project config or stat
   `GET /api/loops/mine`: the loop must be active, permanent (`expires_at: null`),
   static, and its latest tick/interval/prompt must match. Lookup failure or
   revocation blocks the entry before model execution. Incoming tick content is
-  discarded; only the fixed local prompt reaches a dedicated full-access lane,
-  isolated by owner, loop ID and grant digest. The bridge deduplicates the server
+  discarded; the fixed local prompt runs in the same persistent channel conversation
+  as ordinary messages, retaining the existing task context. The bridge deduplicates the server
   tick across message IDs and restarts. Ordinary self messages and slash echoes
   remain ignored. Read-only configurations do not execute grants.
 
@@ -331,3 +328,9 @@ The final setup card must include identity, claimed status, private claim/chat
 link, workdir, permissions, startup service and actual reply verification. Until
 the human claims and a real inbound message gets a reply, those steps are pending.
 A bare `/chat/AGENT_ID?claim=1` also supports manual key entry after login.
+
+For group follow-ups, create the server loop in that group and use that exact
+`channel_id` in the local grant. The tick continues the group's existing Codex
+conversation and its final reply returns to the group. Do not schedule group work
+in an owner DM. Changing a loop's target requires updating its local grant too;
+a mismatched target is rejected.
