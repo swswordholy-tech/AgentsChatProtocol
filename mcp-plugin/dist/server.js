@@ -1,7 +1,5 @@
 #!/usr/bin/env node
 // @bun
-import { createRequire } from "node:module";
-var __require = /* @__PURE__ */ createRequire(import.meta.url);
 
 // src/onboarding-status.ts
 async function getOnboardingStatus(base, agentId, token, request = fetch) {
@@ -232,6 +230,7 @@ function shouldMigrateDevToken(i) {
 // src/grok-bind.ts
 import { join } from "node:path";
 var DEFAULT_GROK_BINDS_FILENAME = "grok-binds.json";
+var GROK_BINDS_META_FILENAME = "grok-binds.meta.json";
 function parseGrokBinds(raw) {
   if (raw === null || typeof raw !== "object" || Array.isArray(raw))
     return {};
@@ -328,6 +327,38 @@ function shouldHealBoundIdentity(input) {
     return true;
   }
   return false;
+}
+var ANTIGRAVITY_WAKE_ENV = "AGENTCHAT_ANTIGRAVITY_WAKE";
+var WAKE_KIND_ENV = "AGENTCHAT_WAKE_KIND";
+var WAKE_MODE_ENV = "AGENTCHAT_WAKE_MODE";
+function nonGrokWakeReason(env) {
+  const anti = (env[ANTIGRAVITY_WAKE_ENV] ?? "").trim();
+  if (anti)
+    return `${ANTIGRAVITY_WAKE_ENV}=${anti}`;
+  const kind = (env[WAKE_KIND_ENV] ?? "").trim();
+  if (kind && kind.toLowerCase() !== "grok")
+    return `${WAKE_KIND_ENV}=${kind}`;
+  const mode = (env[WAKE_MODE_ENV] ?? "").trim();
+  if (mode && mode.toLowerCase() !== "grok")
+    return `${WAKE_MODE_ENV}=${mode}`;
+  return null;
+}
+function grokBindApplies(input) {
+  const reason = nonGrokWakeReason(input.env);
+  if (reason)
+    return { applies: false, reason: `non-grok wake (${reason})` };
+  const explicit = typeof input.explicitProfileName === "string" ? profileNameFromPath(input.explicitProfileName.trim()) : null;
+  if (explicit) {
+    const bound = boundProfileForConversation(input.conversationId, input.binds);
+    const norm = (n) => n.replace(/[^a-zA-Z0-9_-]/g, "_");
+    if (bound && norm(bound) !== norm(explicit)) {
+      return {
+        applies: false,
+        reason: `explicit profile "${explicit}" differs from grok-bind profile "${bound}"`
+      };
+    }
+  }
+  return { applies: true };
 }
 
 // src/terms.ts
@@ -548,8 +579,8 @@ async function fireGrokWake(msg, cfg) {
   }
   let gwcfg;
   try {
-    const { readFileSync: readFileSync2 } = await import("node:fs");
-    gwcfg = JSON.parse(readFileSync2(cfg.gatewayConfigPath, "utf8"));
+    const { readFileSync } = await import("node:fs");
+    gwcfg = JSON.parse(readFileSync(cfg.gatewayConfigPath, "utf8"));
   } catch (e) {
     log(`[agentchat] grok wake: cannot read ${cfg.gatewayConfigPath}: ${e}`);
     return;
@@ -593,13 +624,14 @@ async function fireGrokWake(msg, cfg) {
 var package_default = {
   name: "agentschat-mcp",
   mcpName: "io.github.swswordholy-tech/agentschat-mcp",
-  version: "0.36.5",
+  version: "0.36.6",
   description: "Connect Claude Code to AgentsChat — AI Agent social network. Core tools stay lean while extended tool groups load on demand for lower token overhead and cleaner role-specific context.",
   type: "module",
   bin: {
     "agentschat-mcp": "src/cli.mjs",
     "agentchat-mcp": "src/cli.mjs",
-    "agentschat-ensure-grok-wakes": "scripts/ensure-grok-wakes.mjs"
+    "agentschat-ensure-grok-wakes": "scripts/ensure-grok-wakes.mjs",
+    "agentschat-grok-bind-register": "scripts/grok-bind-register.sh"
   },
   engines: {
     node: ">=22",
@@ -683,6 +715,7 @@ var package_default = {
     "dist/server.js",
     "dist/connector.js",
     "scripts/ensure-grok-wakes.mjs",
+    "scripts/grok-bind-register.sh",
     "README.md",
     "CHANGELOG.md",
     "codex/",
@@ -974,7 +1007,7 @@ function listProfileFiles() {
       files = readdirSync(dir).filter((f) => f.endsWith(".json"));
     } catch {}
     for (const file of files) {
-      if (file === DEFAULT_GROK_BINDS_FILENAME)
+      if (file === DEFAULT_GROK_BINDS_FILENAME || file === GROK_BINDS_META_FILENAME)
         continue;
       const name = file.replace(/\.json$/, "");
       if (seen.has(name))
@@ -995,7 +1028,12 @@ function resolveProfile() {
   if (cliArgs.name)
     return { path: nameToPath(cliArgs.name), source: "flag-name", declaredName: cliArgs.name };
   const grokToken = !!(cliArgs.token || process.env.AGENTCHAT_TOKEN);
-  const conversationId = process.env.CURSOR_CONVERSATION_ID;
+  const nonGrokWake = nonGrokWakeReason(process.env);
+  const conversationId = nonGrokWake ? undefined : process.env.CURSOR_CONVERSATION_ID;
+  if (nonGrokWake && process.env.CURSOR_CONVERSATION_ID) {
+    process.stderr.write(`[agentchat] grok-bind skipped: non-grok wake (${nonGrokWake})
+`);
+  }
   let binds = {};
   if (!grokToken && conversationId) {
     const bindPath = resolveGrokBindsPath(configDir, process.env.AGENTCHAT_GROK_BINDS);
@@ -2544,18 +2582,18 @@ async function sendMediaMessage(kind, args) {
     let ttsDuration;
     if (text) {
       const voice = typeof args.voice === "string" && args.voice ? args.voice : undefined;
-      const r2 = await apiFetch(`${REST_URL}/api/tts`, {
+      const r = await apiFetch(`${REST_URL}/api/tts`, {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${TOKEN}` },
         body: JSON.stringify({ text, ...voice ? { voice } : {} })
       });
-      const t = await r2.text();
-      if (r2.status === 429 && /MEDIA_BUDGET_EXCEEDED/i.test(t))
+      const t = await r.text();
+      if (r.status === 429 && /MEDIA_BUDGET_EXCEEDED/i.test(t))
         return { content: [{ type: "text", text: "Voice budget exhausted for today (MEDIA_BUDGET_EXCEEDED) \u2014 try again tomorrow, or send a recorded clip via path/url." }], isError: true };
-      if (r2.status === 400 && /INVALID_VOICE/i.test(t))
+      if (r.status === 400 && /INVALID_VOICE/i.test(t))
         return { content: [{ type: "text", text: "Invalid voice for TTS. Call list_voices for valid names, or omit `voice` to use your configured one." }], isError: true };
-      if (!r2.ok)
-        return { content: [{ type: "text", text: `TTS failed (${r2.status}): ${t.slice(0, 140)}` }], isError: true };
+      if (!r.ok)
+        return { content: [{ type: "text", text: `TTS failed (${r.status}): ${t.slice(0, 140)}` }], isError: true };
       let d;
       try {
         d = JSON.parse(t);
@@ -2702,6 +2740,15 @@ function loadGrokBinds() {
     return {};
   }
 }
+var explicitStartupProfileName = profileSource === "env" || profileSource === "legacy-env" || profileSource === "flag-profile" || profileSource === "flag-name" ? declaredName ?? null : null;
+function currentGrokBindApplicability(binds) {
+  return grokBindApplies({
+    env: process.env,
+    explicitProfileName: explicitStartupProfileName,
+    conversationId: process.env.CURSOR_CONVERSATION_ID,
+    binds
+  });
+}
 function applyIdentityFromProfile(newProfile, targetFile) {
   validateIdentityProfile(newProfile, targetFile);
   heartbeat.stop();
@@ -2734,7 +2781,10 @@ function applyIdentityFromProfile(newProfile, targetFile) {
 function ensureGrokBoundIdentity() {
   if (profileSource !== "grok-bind" || hasToken || cliArgs.id || process.env.AGENTCHAT_AGENT_ID)
     return;
-  const boundName = boundProfileForConversation(process.env.CURSOR_CONVERSATION_ID, loadGrokBinds());
+  const healBinds = loadGrokBinds();
+  if (!currentGrokBindApplicability(healBinds).applies)
+    return;
+  const boundName = boundProfileForConversation(process.env.CURSOR_CONVERSATION_ID, healBinds);
   if (!boundName)
     return;
   const boundPath = nameToPath(boundName);
@@ -3456,7 +3506,7 @@ ${results}` }] };
         } catch {}
       }
       try {
-        await new Promise((r2) => setTimeout(r2, 500));
+        await new Promise((r) => setTimeout(r, 500));
         const r = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(chat_id)}/members`, { headers: { Authorization: `Bearer ${TOKEN}` } });
         if (r.ok) {
           const data = await r.json();
@@ -3858,9 +3908,11 @@ ${list}` }] };
 Available profiles:
 ${list}` }] };
       }
-      const switchGate = gateSwitchProfile({
+      const switchBinds = loadGrokBinds();
+      const bindApplies = currentGrokBindApplicability(switchBinds);
+      const switchGate = !bindApplies.applies ? { kind: "allow" } : gateSwitchProfile({
         conversationId: process.env.CURSOR_CONVERSATION_ID,
-        binds: loadGrokBinds(),
+        binds: switchBinds,
         requestedProfileName: profile_name,
         currentProfileName: profileNameFromPath(activeProfileFile)
       });
@@ -4644,15 +4696,15 @@ ${context}
         if (process.env.AGENTCHAT_WAKE_MODE === "grok") {
           (async () => {
             try {
-              const { readFileSync: readFileSync4, existsSync: existsSync3 } = await import("fs");
-              const gwPath = resolveGrokGatewayPath(process.env.AGENTCHAT_GROK_GATEWAY, existsSync3);
+              const { readFileSync, existsSync } = await import("fs");
+              const gwPath = resolveGrokGatewayPath(process.env.AGENTCHAT_GROK_GATEWAY, existsSync);
               let agentId = process.env.AGENTCHAT_GROK_AGENT_ID || "";
               if (!agentId) {
                 agentId = await resolveGrokAgentId({
                   explicitId: "",
                   agentschatName: profile.display_name || AGENT_ID,
                   listAgents: async () => {
-                    const gwcfg = JSON.parse(readFileSync4(gwPath, "utf8"));
+                    const gwcfg = JSON.parse(readFileSync(gwPath, "utf8"));
                     const token = grokBearerFromGatewayConfig(gwcfg);
                     const port = grokPortFromGatewayConfig(gwcfg);
                     const res = await fetch(`http://127.0.0.1:${port}/api/listAgents`, {

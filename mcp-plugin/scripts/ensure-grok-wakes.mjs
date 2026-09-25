@@ -11,10 +11,15 @@
  *   AGENTCHAT_WAKE_MODE=grok AGENTCHAT_GROK_AGENT_ID=<uuid> AGENTCHAT_NO_PROXY=1 \
  *     <agentschat-mcp> --profile <profileName>
  *
- * After starts (or when binds are empty), prunes any AGENTCHAT_WAKE_MODE=grok
- * process whose AGENTCHAT_GROK_AGENT_ID is not a binds key AND whose --profile
- * is not a binds value. Never kills processes without WAKE_MODE=grok (outbound
- * Cursor MCP).
+ * After starts, prunes any AGENTCHAT_WAKE_MODE=grok process whose
+ * AGENTCHAT_GROK_AGENT_ID is not a binds key AND whose --profile is not a binds
+ * value. A MISSING binds file prunes nothing (only an existing file — even `{}` —
+ * is authoritative). Every prune is logged with its reason. Never kills processes
+ * without WAKE_MODE=grok (outbound Cursor MCP).
+ *
+ * This script NEVER writes the binds file. Each Grok bot registers itself with
+ * `grok-bind-register.sh <profile>` (the only writer; see shouldPruneBindEntry for
+ * its `--prune` rules). No hard-coded bot list.
  *
  * Prints already-up|started|stopped|failed lines. Exit 0 if no failures.
  * Never prints tokens.
@@ -43,6 +48,46 @@ export function parseBinds(raw) {
     out[key] = name;
   }
   return out;
+}
+
+/** Real Grok agent uuid (rejects `sand-subagent-*` and other non-UUID ids). */
+export const AGENT_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** @param {string | undefined | null} id */
+export function isRealAgentUuid(id) {
+  return typeof id === "string" && AGENT_UUID_RE.test(id.trim());
+}
+
+export const BIND_PRUNE_MAX_AGE_DAYS = 7;
+
+/**
+ * Bind-entry prune rule used by grok-bind-register.sh --prune (the only writer).
+ * Returns a reason string when the entry should be removed, else null:
+ *  - its profile file is gone, OR
+ *  - the agent's data dir is missing AND its last registration is older than
+ *    maxAgeDays. Entries with no recorded registration are never age-pruned.
+ * @param {{ profileExists: boolean, agentDirExists: boolean, lastRegisteredEpoch?: number | null, nowEpoch: number, maxAgeDays?: number }} i
+ * @returns {string | null}
+ */
+export function shouldPruneBindEntry(i) {
+  if (!i.profileExists) return "profile file missing";
+  const maxAge = (i.maxAgeDays ?? BIND_PRUNE_MAX_AGE_DAYS) * 86400;
+  if (
+    !i.agentDirExists &&
+    typeof i.lastRegisteredEpoch === "number" &&
+    i.nowEpoch - i.lastRegisteredEpoch > maxAge
+  ) {
+    return "agent dir missing and last registration too old";
+  }
+  return null;
+}
+
+/**
+ * Whether orphan-wake pruning may run at all: only when the binds file exists.
+ * @param {boolean} bindsFileExists
+ */
+export function mayPruneWakes(bindsFileExists) {
+  return bindsFileExists === true;
 }
 
 /** @param {string} text */
@@ -366,22 +411,26 @@ async function main() {
     }
   }
 
-  if (entries.length === 0) {
-    console.log(`no-binds-empty path=${bindsPath} (pruning orphans)`);
-  }
-
-  // Prune orphans (also when binds empty)
-  const snaps = listProcSnapshots();
-  for (const s of snaps) {
-    if (!shouldPruneWake(s.environ, s.cmdline, binds)) continue;
-    if (stopWakePid(s.pid)) {
-      console.log(`stopped orphan pid=${s.pid}`);
-      stopped++;
+  const bindsExist = existsSync(bindsPath);
+  if (!mayPruneWakes(bindsExist)) {
+    console.log(`no-binds path=${bindsPath} (missing file: pruning nothing)`);
+  } else {
+    if (entries.length === 0) {
+      console.log(`no-binds-empty path=${bindsPath} (pruning orphans)`);
     }
-  }
-
-  if (stopped === 0 && entries.length === 0 && !existsSync(bindsPath)) {
-    /* already logged no-binds */
+    // Prune orphans — logged one line per stopped process with its reason.
+    const snaps = listProcSnapshots();
+    for (const s of snaps) {
+      if (!shouldPruneWake(s.environ, s.cmdline, binds)) continue;
+      const profile = profileFromCmdline(s.cmdline) || "?";
+      const agentId = agentIdFromEnviron(s.environ) || "?";
+      if (stopWakePid(s.pid)) {
+        console.log(
+          `stopped orphan pid=${s.pid} profile=${profile} agent_id=${agentId} ts=${new Date().toISOString()} reason=not-in-binds path=${bindsPath}`,
+        );
+        stopped++;
+      }
+    }
   }
 
   process.exit(failed > 0 ? 1 : 0);

@@ -118,7 +118,7 @@ function matchesLiveLoop(msg, agentId, response) {
   const rows = response?.loops;
   if (!Array.isArray(rows))
     return false;
-  const matches = rows.filter((row2) => row2?.loop_id === tick.loop_id);
+  const matches = rows.filter((row) => row?.loop_id === tick.loop_id);
   if (matches.length !== 1)
     return false;
   const row = matches[0];
@@ -194,7 +194,7 @@ class IdentityTable {
   }
 }
 function requireIdentity(identities, botId) {
-  const id = identities.find((id2) => id2.botId === botId);
+  const id = identities.find((id) => id.botId === botId);
   if (!id)
     throw new Error(`unknown identity: ${botId}`);
   return id;
@@ -761,13 +761,13 @@ function parseIdentitiesJson(raw, source) {
 function loadIdentities() {
   const file = (process.env.RELAY_IDENTITIES_FILE || "").trim();
   if (file) {
-    let raw2;
+    let raw;
     try {
-      raw2 = readFileSync2(file, "utf8");
+      raw = readFileSync2(file, "utf8");
     } catch {
       throw new Error("RELAY_IDENTITIES_FILE could not be read");
     }
-    return parseIdentitiesJson(raw2, "RELAY_IDENTITIES_FILE");
+    return parseIdentitiesJson(raw, "RELAY_IDENTITIES_FILE");
   }
   const raw = (process.env.RELAY_IDENTITIES || "").trim();
   if (raw) {

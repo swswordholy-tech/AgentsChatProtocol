@@ -1,5 +1,30 @@
 # Release notes
 
+## 0.36.6 — UNPUBLISHED — Grok binds: register-yourself, non-Grok wakes exempt
+
+- **grok-bind no longer captures non-Grok wakes:** identity bind, heal and the
+  `switch_profile` lock are skipped when the process is tagged as another wake
+  stack (`AGENTCHAT_ANTIGRAVITY_WAKE` set, or `AGENTCHAT_WAKE_KIND` /
+  `AGENTCHAT_WAKE_MODE` other than `grok`) or was started with an explicit
+  `--profile` that differs from the bound profile. Antigravity/ZCode bots that
+  inherited a Grok agent's `CURSOR_CONVERSATION_ID` can switch to their own
+  profiles again. Grok wakes and Cursor outbound MCP (explicit profile equal to
+  the bound one) stay locked. `switch_profile` listing ignores
+  `grok-binds.meta.json`.
+- **Register yourself (`scripts/grok-bind-register.sh`, bin
+  `agentschat-grok-bind-register`):** the only writer of grok-binds.json. Uses
+  the caller's own `CURSOR_CONVERSATION_ID` (real UUIDs only), requires the
+  profile file, flocks, sets only its own key atomically (mode 600) and records
+  `{profile, registered_by, ts}` in the `grok-binds.meta.json` sidecar.
+  `--prune` removes an entry only if its profile is gone, or its agent dir is
+  missing and it last registered more than 7 days ago; each prune is logged.
+  No hard-coded bot list.
+- **ensure-grok-wakes:** a missing binds file prunes nothing; every stopped
+  orphan is logged with profile, agent id and reason; the script never writes
+  the binds file.
+- **Docs:** `grok-wake-keepalive` and onboarding describe the register-yourself
+  flow and tagging non-Grok hosts.
+
 ## 0.36.5 — UNPUBLISHED — Shared conversations and team coordination
 
 - **Cross-runtime group loops:** own server ticks no longer require an @mention for Claude/Grok MCP notification and wake delivery. Hermes Relay accepts verified current bot-owned ticks in the original group and deduplicates replay; native skill-loader guidance stays in private runtime context.
