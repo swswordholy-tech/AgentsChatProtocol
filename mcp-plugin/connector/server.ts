@@ -15,7 +15,7 @@ import { createServer, type Server as HttpServer, type IncomingMessage } from "n
 import { WebSocketServer, WebSocket } from "ws";
 import { verifyUpgradeToken, CLOSE_UNAUTHORIZED } from "./auth.ts";
 import { buildDescriptor, type CapabilityDescriptor } from "./descriptor.ts";
-import { toWireEvent, type AgentsChatMessage } from "./normalize.ts";
+import { toWireEvent, serverLoopTick, matchesLiveLoop, type AgentsChatMessage } from "./normalize.ts";
 import { MessageDedup } from "../src/dedup.ts";
 import { IdentityTable, routeInboundTargets, hermesSourceProfile, type Identity } from "./identities.ts";
 
@@ -24,6 +24,8 @@ export interface AgentsChatHooks {
   sendMessage(botId: string, chatId: string, content: string, replyTo?: string): Promise<{ id?: string }>;
   getChatInfo(botId: string, chatId: string): Promise<{ name?: string; type?: string }>;
   sendTyping?(botId: string, chatId: string): Promise<void>;
+  /** Read /api/loops/mine using this bot's own credentials; missing hook rejects self ticks. */
+  getLoops?(botId: string): Promise<unknown>;
   /**
    * Recent channel messages to attach as `context` when an @-mention arrives —
    * the "what happened since the last time I was addressed" window. `sinceTs` is
@@ -293,15 +295,21 @@ export function startConnector(config: ConnectorConfig): ConnectorHandle {
       //
       // DM: always forward. __botId (which identity's agentschat socket it arrived
       //   on) is the ownership signal; single-tenant falls back to its one identity.
-      // Group: forward ONLY when the body @mentions a fronted identity (content-
+      // Group: ordinary messages forward only when they @mention a fronted identity (content-
       //   based — the agentschat WS pushes every message of a joined channel
       //   unannotated, and arrival on a socket is NOT an addressing signal). The
       //   MCP path's gate is isDM || isMentioned; this reproduces it. Anything
       //   unaddressed is dropped — injecting joined-channel chatter into the
       //   agent's session would burn its tokens on messages not meant for it.
+      // Own server loop ticks bypass those gates only after live-record verification.
       const isDm = typeof msg.channel_id === "string" && msg.channel_id.startsWith("dm-");
       const owner = (msg as any).__botId ?? (msg as any).dm_owner;
-      const targets = isDm
+      const isTick = (msg.meta as any)?.kind === "loop_tick";
+      const tick = serverLoopTick(msg);
+      const loopTargets = tick ? table.all().filter(id => id.agentId === msg.sender_id) : [];
+      // A server loop addresses only its own identity, even if the prompt @mentions others.
+      // Never interpret a malformed/foreign loop as an ordinary mention or DM.
+      const targets = isTick ? (loopTargets.length === 1 ? loopTargets : []) : isDm
         ? [owner !== undefined ? (typeof owner === "string" ? table.forBot(owner) : null)
           : table.isSingle() ? table.all()[0] : null].filter((id): id is Identity => !!id)
         : routeInboundTargets(table, {
@@ -317,7 +325,14 @@ export function startConnector(config: ConnectorConfig): ConnectorHandle {
         const key = JSON.stringify([target.botId, msg.channel_id]);
         const previous = inboundQueues.get(key) ?? Promise.resolve();
         const job = previous.catch(() => {}).then(async () => {
-          if (msg.sender_id === target.agentId) return;
+          if (tick) {
+            let verified = false;
+            try { verified = !!hooks.getLoops && matchesLiveLoop(msg, target.agentId, await hooks.getLoops(target.botId)); } catch { /* fail closed */ }
+            if (!verified || table.forBot(target.botId) !== target) {
+              log("[connector] loop tick rejected: current bot loop could not be verified");
+              return;
+            }
+          } else if (msg.sender_id === target.agentId) return;
           const baseEvent = toWireEvent(msg, "agentschat");
           if (!baseEvent) return;
           if (![...sockets].some(c => c.ws.readyState === WebSocket.OPEN && c.fronted.has(target.botId))) return;
@@ -325,6 +340,8 @@ export function startConnector(config: ConnectorConfig): ConnectorHandle {
             ? JSON.stringify([msg.channel_id, msg.id, target.botId]) : null;
           // Reserve synchronously, before async context fetch, across mirrored sockets.
           if (deliveryKey && delivered.recordOrSkip(deliveryKey)) return;
+          // A mirrored/replayed tick must not run twice even if its envelope ID changes.
+          if (tick && delivered.recordOrSkip(JSON.stringify(["loop_tick", target.botId, msg.channel_id, tick.loop_id, tick.next_tick_ms]))) return;
           if (!isDm) {
             // Attach "what happened since you were last addressed" so the agent gets
             // the conversation BETWEEN its @-mentions without being injected into
@@ -354,6 +371,12 @@ export function startConnector(config: ConnectorConfig): ConnectorHandle {
             }
             if (msg.timestamp && Number.isFinite(Date.parse(msg.timestamp)) &&
                 (!since || Date.parse(msg.timestamp) > Date.parse(since))) lastAddressed.set(key, msg.timestamp);
+          }
+          if (tick) {
+            baseEvent.context = [...(baseEvent.context ?? []), {
+              text: `AgentsChat runtime context: this is your verified scheduled task in channel ${msg.channel_id}, running as ${target.agentId}. Execute it once in this same conversation; replies stay here. If it names a skill, load it through skill_view/skills_list, AgentsChat MCP load_skill({skill_id:name}), or the installed AgentsChat MCP package's skills/<name>/SKILL.md in this runtime. Missing skill or tools is a failure to report, not successful execution. Do not repeat the skill text or create another loop.`,
+              source: {user_name: "AgentsChat runtime"},
+            }];
           }
           const deliverTo = [...sockets].filter((c) => c.ws.readyState === WebSocket.OPEN && c.fronted.has(target.botId)).slice(0, 1);
           if (deliverTo.length === 0) {

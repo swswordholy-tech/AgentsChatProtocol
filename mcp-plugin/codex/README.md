@@ -369,3 +369,12 @@ If another App Server deliberately opens the bot's private home and holds its
 writer, the bridge preserves pending messages and retries the same task. It never
 creates a replacement conversation to bypass a busy writer. `bridge.lock` also
 prevents duplicate bridge workers for the same bot state.
+
+
+For the reusable group coordinator, use the exact loop prompt
+`agentschat-team-lead`. The bridge loads the bundled global skill privately only
+after normal loop validation; the channel receives the short name. Keep the exact
+same prompt in the local grant. Project context stays in channel docs and the
+existing conversation. A no-change run can return `[[AGENTSCHAT_NO_UPDATE]]` alone:
+only this recognized scheduled skill stores `skipped` and sends no reply. Ordinary
+chat, unknown skills and other loops retain normal reply behavior.

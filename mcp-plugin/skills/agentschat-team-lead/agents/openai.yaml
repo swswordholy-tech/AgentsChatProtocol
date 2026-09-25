@@ -1,0 +1,4 @@
+interface:
+  display_name: "AgentsChat 群协作负责人"
+  short_description: "在当前群规划目标、调度成员、处理阻塞并推动可验证的团队交付"
+  default_prompt: "使用 $agentschat-team-lead 推进当前群最重要的目标。"

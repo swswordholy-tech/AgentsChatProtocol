@@ -74,6 +74,7 @@ function buildDescriptor(overrides = {}) {
     len_unit: "chars",
     emoji: "\uD83E\uDD16",
     pii_safe: false,
+    platform_hint: "AgentsChat named skills are reusable instructions. When explicitly asked to execute a skill by name, load it with the host's skill_view (use skills_list to discover it), AgentsChat MCP load_skill({skill_id:name}), or read skills/<name>/SKILL.md from the installed AgentsChat MCP package in this runtime. Report a missing loader or skill; do not pretend it ran. Keep skill text out of chat and keep replies in the originating chat.",
     supported_ops: [...SUPPORTED_OPS],
     ...overrides
   };
@@ -103,6 +104,25 @@ function toWireEvent(msg, platform = "agentschat") {
       thread_id: null
     }
   };
+}
+function serverLoopTick(msg) {
+  const meta = msg.meta;
+  if (!meta || meta.kind !== "loop_tick" || typeof msg.id !== "string" || !msg.id || typeof msg.channel_id !== "string" || !msg.channel_id || typeof msg.sender_id !== "string" || !msg.sender_id || msg.sender_type !== "agent" || msg.content_type !== "text" || typeof msg.timestamp !== "string" || !Number.isFinite(Date.parse(msg.timestamp)) || typeof meta.loop_id !== "string" || !/^loop_[a-zA-Z0-9_-]+$/.test(meta.loop_id) || typeof meta.prompt !== "string" || !meta.prompt.trim() || meta.prompt.length > 4000 || !Number.isSafeInteger(meta.interval_ms) || meta.interval_ms < 60000 || meta.interval_ms > 86400000 || !Number.isSafeInteger(meta.next_tick_ms) || meta.next_tick_ms <= meta.interval_ms || meta.expires_at !== null || msg.content !== `(loop tick — ${meta.prompt})`)
+    return null;
+  return meta;
+}
+function matchesLiveLoop(msg, agentId, response) {
+  const tick = serverLoopTick(msg);
+  if (!tick || msg.sender_id !== agentId)
+    return false;
+  const rows = response?.loops;
+  if (!Array.isArray(rows))
+    return false;
+  const matches = rows.filter((row2) => row2?.loop_id === tick.loop_id);
+  if (matches.length !== 1)
+    return false;
+  const row = matches[0];
+  return row.status === "active" && row.channel_id === msg.channel_id && row.prompt === tick.prompt && row.interval_ms === tick.interval_ms && row.next_tick_ms === tick.next_tick_ms && row.expires_at === null && (row.mode === undefined || row.mode === "static") && Number.isSafeInteger(row.last_tick_at) && row.last_tick_at > 0 && row.last_tick_at + row.interval_ms === row.next_tick_ms;
 }
 
 // src/dedup.ts
@@ -387,7 +407,10 @@ function startConnector(config) {
     async injectAgentsChatMessage(msg) {
       const isDm = typeof msg.channel_id === "string" && msg.channel_id.startsWith("dm-");
       const owner = msg.__botId ?? msg.dm_owner;
-      const targets = isDm ? [owner !== undefined ? typeof owner === "string" ? table.forBot(owner) : null : table.isSingle() ? table.all()[0] : null].filter((id) => !!id) : routeInboundTargets(table, {
+      const isTick = msg.meta?.kind === "loop_tick";
+      const tick = serverLoopTick(msg);
+      const loopTargets = tick ? table.all().filter((id) => id.agentId === msg.sender_id) : [];
+      const targets = isTick ? loopTargets.length === 1 ? loopTargets : [] : isDm ? [owner !== undefined ? typeof owner === "string" ? table.forBot(owner) : null : table.isSingle() ? table.all()[0] : null].filter((id) => !!id) : routeInboundTargets(table, {
         channel_id: msg.channel_id,
         mentioned_ids: msg.mentioned_ids,
         content: msg.content
@@ -400,7 +423,16 @@ function startConnector(config) {
         const key = JSON.stringify([target.botId, msg.channel_id]);
         const previous = inboundQueues.get(key) ?? Promise.resolve();
         const job = previous.catch(() => {}).then(async () => {
-          if (msg.sender_id === target.agentId)
+          if (tick) {
+            let verified = false;
+            try {
+              verified = !!hooks.getLoops && matchesLiveLoop(msg, target.agentId, await hooks.getLoops(target.botId));
+            } catch {}
+            if (!verified || table.forBot(target.botId) !== target) {
+              log("[connector] loop tick rejected: current bot loop could not be verified");
+              return;
+            }
+          } else if (msg.sender_id === target.agentId)
             return;
           const baseEvent = toWireEvent(msg, "agentschat");
           if (!baseEvent)
@@ -409,6 +441,8 @@ function startConnector(config) {
             return;
           const deliveryKey = typeof msg.id === "string" && msg.id ? JSON.stringify([msg.channel_id, msg.id, target.botId]) : null;
           if (deliveryKey && delivered.recordOrSkip(deliveryKey))
+            return;
+          if (tick && delivered.recordOrSkip(JSON.stringify(["loop_tick", target.botId, msg.channel_id, tick.loop_id, tick.next_tick_ms])))
             return;
           if (!isDm) {
             const since = lastAddressed.get(key);
@@ -440,6 +474,12 @@ function startConnector(config) {
             }
             if (msg.timestamp && Number.isFinite(Date.parse(msg.timestamp)) && (!since || Date.parse(msg.timestamp) > Date.parse(since)))
               lastAddressed.set(key, msg.timestamp);
+          }
+          if (tick) {
+            baseEvent.context = [...baseEvent.context ?? [], {
+              text: `AgentsChat runtime context: this is your verified scheduled task in channel ${msg.channel_id}, running as ${target.agentId}. Execute it once in this same conversation; replies stay here. If it names a skill, load it through skill_view/skills_list, AgentsChat MCP load_skill({skill_id:name}), or the installed AgentsChat MCP package's skills/<name>/SKILL.md in this runtime. Missing skill or tools is a failure to report, not successful execution. Do not repeat the skill text or create another loop.`,
+              source: { user_name: "AgentsChat runtime" }
+            }];
           }
           const deliverTo = [...sockets].filter((c) => c.ws.readyState === WebSocket.OPEN && c.fronted.has(target.botId)).slice(0, 1);
           if (deliverTo.length === 0) {
@@ -570,7 +610,9 @@ function planBackfill(after, msgs, agentId) {
   }
   const afterTs = normalizeTimestampForCursor(after, "after") || after;
   const replay = list.filter((m) => {
-    if (!m || m.sender_id === agentId || m.content === "__typing__")
+    if (!m || m.content === "__typing__")
+      return false;
+    if (m.sender_id === agentId && !serverLoopTick(m))
       return false;
     const msgTs = normalizeTimestampForCursor(m.timestamp, "after");
     return typeof msgTs === "string" && msgTs > afterTs;
@@ -589,7 +631,10 @@ function ingestAgentsChatFrame(id, frame, deps) {
   const scopedKey = key && (isDm ? JSON.stringify([id.botId, frame.channel_id, frame.id]) : key);
   if (scopedKey && deps.dedup.recordOrSkip(scopedKey))
     return false;
-  return (!frame.channel_id?.startsWith("dm-") || frame.sender_id !== id.agentId) && frame.content !== "__typing__";
+  if (frame.meta?.kind === "loop_tick") {
+    return !!serverLoopTick(frame) && (!isDm || frame.sender_id === id.agentId);
+  }
+  return (!isDm || frame.sender_id !== id.agentId) && frame.content !== "__typing__";
 }
 
 // src/heartbeat.ts
@@ -1022,6 +1067,16 @@ var connector = startConnector({
         throw new PlatformHttpError(res.status);
       const data = await res.json();
       return { id: data?.id };
+    },
+    async getLoops(botId) {
+      const id = requireIdentity(identities, botId);
+      const res = await fetch(`${API}/api/loops/mine`, {
+        headers: { Authorization: `Bearer ${id.token}` },
+        signal: AbortSignal.timeout(5000)
+      });
+      if (!res.ok)
+        throw new PlatformHttpError(res.status);
+      return await res.json();
     },
     async getChatInfo(botId, chatId) {
       const id = requireIdentity(identities, botId);

@@ -207,3 +207,24 @@ Hermes otherwise defaults to a separate session per sender even though this
 connector preserves the group `chat_id` and replies to that group. This setting
 applies across that profile's group platforms; it does not merge existing histories.
 See [the relay guide](../../docs/hermes-relay.md#3-keep-one-conversation-per-group).
+
+
+## Named skills and group loop ticks
+
+A current bot-owned server `loop_tick` can wake that bot without an @mention.
+The connector verifies the complete tick envelope against `/api/loops/mine`
+using that bot's credentials before delivery; malformed, expired, deleted,
+wrong-bot and unverifiable ticks are rejected. Ordinary self echoes remain
+ignored. Replays are deduplicated per loop/tick and keep the original channel.
+Use `group_sessions_per_user: false` in Hermes so group participants and the bot's
+self tick share the same group session.
+
+`agentschat-team-lead` is a runtime-neutral skill included under the installed MCP
+package's `skills/` directory. Load it with Hermes `skill_view` after adding that
+stable directory to the active profile's native skills or `skills.external_dirs`,
+or with an existing AgentsChat MCP connection. Relay advertises loader guidance
+in private runtime context; it does not invent extra gateway tools or broadcast
+the skill body. Workspace/OKR/docs actions still require actual authenticated tools.
+Hermes cron's `[SILENT]` is not assumed to work for ordinary Relay messages.
+These routes have real local socket tests; a live Hermes model run remains a
+separate deployment check.

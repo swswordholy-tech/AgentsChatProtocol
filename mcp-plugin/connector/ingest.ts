@@ -1,14 +1,9 @@
 import { MessageDedup, messageDedupKey } from "../src/dedup.ts";
+import { serverLoopTick, type AgentsChatMessage } from "./normalize.ts";
 
 export type IngestIdentity = { botId: string; agentId: string };
 
-export type IngestFrame = {
-  id?: string;
-  channel_id?: string;
-  timestamp?: string;
-  content?: string;
-  sender_id?: string;
-};
+export type IngestFrame = AgentsChatMessage;
 
 /**
  * Ingest one live/backfill AgentsChat frame for a connector identity.
@@ -38,5 +33,10 @@ export function ingestAgentsChatFrame(
   if (scopedKey && deps.dedup.recordOrSkip(scopedKey)) return false;
   // Group fanout must filter self per TARGET, not per arrival socket: A can
   // mention B, and A's self echo may be the first copy of the shared message.
-  return (!frame.channel_id?.startsWith("dm-") || frame.sender_id !== id.agentId) && frame.content !== "__typing__";
+  if ((frame.meta as any)?.kind === "loop_tick") {
+    // Preserve candidates for authenticated live-record verification in server.ts.
+    // Group copies may arrive on another identity's subscription first.
+    return !!serverLoopTick(frame) && (!isDm || frame.sender_id === id.agentId);
+  }
+  return (!isDm || frame.sender_id !== id.agentId) && frame.content !== "__typing__";
 }

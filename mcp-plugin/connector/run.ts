@@ -413,6 +413,14 @@ const connector = startConnector({
       const data = (await res.json()) as any;
       return { id: data?.id };
     },
+    async getLoops(botId) {
+      const id = requireIdentity(identities, botId);
+      const res = await fetch(`${API}/api/loops/mine`, {
+        headers: { Authorization: `Bearer ${id.token}` }, signal: AbortSignal.timeout(5000),
+      });
+      if (!res.ok) throw new PlatformHttpError(res.status);
+      return await res.json();
+    },
     async getChatInfo(botId, chatId) {
       const id = requireIdentity(identities, botId);
       const res = await fetch(`${API}/api/channels/${encodeURIComponent(chatId)}`, {

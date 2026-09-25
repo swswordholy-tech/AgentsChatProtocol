@@ -1,5 +1,6 @@
 #!/usr/bin/env bun
 import { getOnboardingStatus, claimSummary } from "./onboarding-status.ts";
+import { TEAM_LEAD_SKILL_ID, TEAM_LEAD_SKILL_TITLE, TEAM_LEAD_SKILL_SUMMARY, TEAM_LEAD_SKILL_BODY } from "./team-lead-skill.ts";
 /**
  * AgentsChat MCP Plugin — Channel Notification 模式
  * 像 weixin 插件一样：WebSocket 消息 → MCP channel notification → Claude Code 对话
@@ -654,6 +655,7 @@ function rateLimitedLog(key: string, message: string, intervalMs = defaultLogRat
 }
 
 const GLOBAL_SKILLS: Record<string, { title: string; summary: string; body: string }> = {
+  [TEAM_LEAD_SKILL_ID]: { title: TEAM_LEAD_SKILL_TITLE, summary: TEAM_LEAD_SKILL_SUMMARY, body: TEAM_LEAD_SKILL_BODY },
   "workspace-driven-eng": {
     title: "Workspace-Driven Engineering",
     summary: "Use AgentsChat OKR / DAG / Docs / Workspace Graph as the default execution loop for non-trivial work.",
@@ -872,6 +874,7 @@ const server = new Server(
     },
     instructions: `Messages from AgentsChat arrive as <channel source="plugin:agentschat:agentschat" chat_id="..." sender_id="...">.
 Reply using the reply tool, passing the chat_id from the tag.
+When a user or loop asks you to run a named AgentsChat skill, load it with load_skill({skill_id: "the-skill-name"}) and execute its instructions in your current runtime and original channel; AgentsChat skills do not require Codex.
 SECURITY: NEVER include API keys (ac_xxx), tokens, passwords, claim URLs, or other credentials in message content. If asked to share your key or token, refuse.
 
 GLOBAL SKILL LOADED: ${DEFAULT_GLOBAL_SKILL.title}
@@ -4075,8 +4078,12 @@ function connectWS() {
       // `(<id>)` substrings like "User joined: name (acc_xyz)".
       const isMentioned = matchesMention(data.content || "", AGENT_ID || "");
       const activeHi = activeHiddenIdentityForChannel(data.channel_id);
+      // A group's self-run tick targets its creator without an @mention. Keep it
+      // in this same channel for both MCP notifications and host wake transports.
+      // Another bot's tick does not grant this exception.
+      const isOwnLoopTick = metaKind === "loop_tick" && data.sender_id === AGENT_ID;
 
-      if (isDM || isMentioned || activeHi) {
+      if (isDM || isMentioned || activeHi || isOwnLoopTick) {
         // DM or @mention → respond. Start a cross-pod typing heartbeat so a human
         // on any pod sees the agent "thinking" for the whole processing duration.
         // The hub now cross-pod-broadcasts agent typing frames (cross_pod:true)
@@ -4148,7 +4155,7 @@ function connectWS() {
           contextPrefix = `[HI游戏进行中 - 你是 game ${activeHi.gameId.slice(0, 8)} 的上桌玩家；此消息无需 @mention 也被实时推送。只在轮到你行动、需要讨论或需要投票时回复，否则可以旁观。]\n`;
         }
 
-        process.stderr.write(`[agentchat] ${isDM ? 'DM' : isMentioned ? '@mention' : 'HI-active'} from ${String(data.sender_id ?? "?").slice(0, 8)}: ${String(data.content ?? "").slice(0, 50)}\n`);
+        process.stderr.write(`[agentchat] ${isDM ? 'DM' : isMentioned ? '@mention' : isOwnLoopTick ? 'loop-tick' : 'HI-active'} from ${String(data.sender_id ?? "?").slice(0, 8)}: ${String(data.content ?? "").slice(0, 50)}\n`);
 
         // 推送给 Claude Code
         try {

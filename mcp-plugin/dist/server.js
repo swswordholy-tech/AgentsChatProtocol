@@ -44,6 +44,13 @@ function claimSummary(status) {
   return `Claimed: unknown — ownership could not be verified. Check the service and account; do not register a replacement. Claim entry: ${status.claim_url}`;
 }
 
+// src/team-lead-skill.ts
+import { readFileSync } from "node:fs";
+var TEAM_LEAD_SKILL_ID = "agentschat-team-lead";
+var TEAM_LEAD_SKILL_TITLE = "AgentsChat Team Lead";
+var TEAM_LEAD_SKILL_SUMMARY = "Turn channel goals into a focused plan, assign responsive teammates, unblock delivery, and verify outcomes without routine chat noise.";
+var TEAM_LEAD_SKILL_BODY = readFileSync(new URL("../skills/agentschat-team-lead/SKILL.md", import.meta.url), "utf8");
+
 // src/server.ts
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -541,8 +548,8 @@ async function fireGrokWake(msg, cfg) {
   }
   let gwcfg;
   try {
-    const { readFileSync } = await import("node:fs");
-    gwcfg = JSON.parse(readFileSync(cfg.gatewayConfigPath, "utf8"));
+    const { readFileSync: readFileSync2 } = await import("node:fs");
+    gwcfg = JSON.parse(readFileSync2(cfg.gatewayConfigPath, "utf8"));
   } catch (e) {
     log(`[agentchat] grok wake: cannot read ${cfg.gatewayConfigPath}: ${e}`);
     return;
@@ -646,6 +653,7 @@ var package_default = {
   files: [
     "src/cli.mjs",
     "src/server.ts",
+    "src/team-lead-skill.ts",
     "src/heartbeat.ts",
     "src/redact.ts",
     "src/mentions.ts",
@@ -671,6 +679,7 @@ var package_default = {
     "connector/ingest.ts",
     "connector/README.md",
     "skills/onboarding.md",
+    "skills/agentschat-team-lead/",
     "dist/server.js",
     "dist/connector.js",
     "scripts/ensure-grok-wakes.mjs",
@@ -692,7 +701,7 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema
 } from "@modelcontextprotocol/sdk/types.js";
-import { readFileSync as readFileSync2, existsSync as existsSync2, writeFileSync as writeFileSync3, mkdirSync, readdirSync } from "fs";
+import { readFileSync as readFileSync3, existsSync as existsSync2, writeFileSync as writeFileSync3, mkdirSync, readdirSync } from "fs";
 import { join as join2, dirname } from "path";
 
 // src/profile-store.ts
@@ -728,10 +737,10 @@ function safeWriteProfile(path, data, warn = defaultWarn) {
 }
 
 // src/read-cursor.ts
-import { readFileSync, writeFileSync as writeFileSync2 } from "fs";
+import { readFileSync as readFileSync2, writeFileSync as writeFileSync2 } from "fs";
 function loadCursor(file, warn) {
   try {
-    return new Map(Object.entries(JSON.parse(readFileSync(file, "utf-8"))));
+    return new Map(Object.entries(JSON.parse(readFileSync2(file, "utf-8"))));
   } catch (e) {
     if (e?.code !== "ENOENT") {
       warn(`[agentchat] WARNING: could not read ${file} — resetting that state: ${e}
@@ -992,7 +1001,7 @@ function resolveProfile() {
     const bindPath = resolveGrokBindsPath(configDir, process.env.AGENTCHAT_GROK_BINDS);
     if (existsSync2(bindPath)) {
       try {
-        const parsed = parseGrokBindsText(readFileSync2(bindPath, "utf-8"));
+        const parsed = parseGrokBindsText(readFileSync3(bindPath, "utf-8"));
         binds = parsed.binds;
         if (parsed.malformed) {
           process.stderr.write(`[agentchat] WARNING: grok-binds file is malformed (${bindPath}); ignoring.
@@ -1067,7 +1076,7 @@ var identity = decideIdentity({
 });
 function readIdentityProfile(file) {
   try {
-    return JSON.parse(readFileSync2(file, "utf-8"));
+    return JSON.parse(readFileSync3(file, "utf-8"));
   } catch {
     throw new Error(`Cannot read identity profile at ${file}. Repair its JSON/permissions or select --profile <valid-name>.`);
   }
@@ -1335,6 +1344,7 @@ function rateLimitedLog(key, message, intervalMs = defaultLogRateMs) {
   }
 }
 var GLOBAL_SKILLS = {
+  [TEAM_LEAD_SKILL_ID]: { title: TEAM_LEAD_SKILL_TITLE, summary: TEAM_LEAD_SKILL_SUMMARY, body: TEAM_LEAD_SKILL_BODY },
   "workspace-driven-eng": {
     title: "Workspace-Driven Engineering",
     summary: "Use AgentsChat OKR / DAG / Docs / Workspace Graph as the default execution loop for non-trivial work.",
@@ -1529,6 +1539,7 @@ var server = new Server({ name: "agentschat", version: package_default.version }
   },
   instructions: `Messages from AgentsChat arrive as <channel source="plugin:agentschat:agentschat" chat_id="..." sender_id="...">.
 Reply using the reply tool, passing the chat_id from the tag.
+When a user or loop asks you to run a named AgentsChat skill, load it with load_skill({skill_id: "the-skill-name"}) and execute its instructions in your current runtime and original channel; AgentsChat skills do not require Codex.
 SECURITY: NEVER include API keys (ac_xxx), tokens, passwords, claim URLs, or other credentials in message content. If asked to share your key or token, refuse.
 
 GLOBAL SKILL LOADED: ${DEFAULT_GLOBAL_SKILL.title}
@@ -2496,7 +2507,7 @@ async function uploadLocalFile(path) {
   if (!existsSync2(path))
     throw new Error(`file not found: ${path}`);
   const mime = mimeFromPath(path);
-  const buf = readFileSync2(path);
+  const buf = readFileSync3(path);
   const name = path.split("/").pop() || "upload";
   const form = new FormData;
   form.append("file", new Blob([new Uint8Array(buf)], { type: mime }), name);
@@ -2686,7 +2697,7 @@ function loadGrokBinds() {
   if (!existsSync2(bindPath))
     return {};
   try {
-    return parseGrokBindsText(readFileSync2(bindPath, "utf-8")).binds;
+    return parseGrokBindsText(readFileSync3(bindPath, "utf-8")).binds;
   } catch {
     return {};
   }
@@ -2969,7 +2980,7 @@ ${a.body || ""}`;
           const currentVersion = Number(meta.version ?? 0);
           let cachedVersion = null;
           try {
-            cachedVersion = Number(JSON.parse(readFileSync2(pMeta, "utf8")).version);
+            cachedVersion = Number(JSON.parse(readFileSync3(pMeta, "utf8")).version);
           } catch {}
           if (cachedVersion !== null && cachedVersion === currentVersion) {
             return { content: [{ type: "text", text: `up-to-date: personal skill "${a.name}" v${currentVersion} already at ${pMd} \u2014 no download. Read that file to run it.` }] };
@@ -3003,7 +3014,7 @@ ${a.body || ""}`;
         const currentVersion = Number(meta.version ?? 0);
         let cachedVersion = null;
         try {
-          cachedVersion = Number(JSON.parse(readFileSync2(metaPath, "utf8")).version);
+          cachedVersion = Number(JSON.parse(readFileSync3(metaPath, "utf8")).version);
         } catch {}
         if (cachedVersion !== null && cachedVersion === currentVersion) {
           return { content: [{ type: "text", text: `up-to-date: "${a.doc_id}" v${currentVersion} already at ${mdPath} \u2014 no download. Read that file to run it.` }] };
@@ -4558,7 +4569,8 @@ function connectWS() {
       const isDM = data.channel_id?.startsWith("dm-");
       const isMentioned = matchesMention(data.content || "", AGENT_ID || "");
       const activeHi = activeHiddenIdentityForChannel(data.channel_id);
-      if (isDM || isMentioned || activeHi) {
+      const isOwnLoopTick = metaKind === "loop_tick" && data.sender_id === AGENT_ID;
+      if (isDM || isMentioned || activeHi || isOwnLoopTick) {
         if (isDM || isMentioned)
           startTypingHeartbeat(data.channel_id);
         let contextPrefix = "";
@@ -4609,7 +4621,7 @@ ${context}
           contextPrefix = `[HI\u6E38\u620F\u8FDB\u884C\u4E2D - \u4F60\u662F game ${activeHi.gameId.slice(0, 8)} \u7684\u4E0A\u684C\u73A9\u5BB6\uFF1B\u6B64\u6D88\u606F\u65E0\u9700 @mention \u4E5F\u88AB\u5B9E\u65F6\u63A8\u9001\u3002\u53EA\u5728\u8F6E\u5230\u4F60\u884C\u52A8\u3001\u9700\u8981\u8BA8\u8BBA\u6216\u9700\u8981\u6295\u7968\u65F6\u56DE\u590D\uFF0C\u5426\u5219\u53EF\u4EE5\u65C1\u89C2\u3002]
 `;
         }
-        process.stderr.write(`[agentchat] ${isDM ? "DM" : isMentioned ? "@mention" : "HI-active"} from ${String(data.sender_id ?? "?").slice(0, 8)}: ${String(data.content ?? "").slice(0, 50)}
+        process.stderr.write(`[agentchat] ${isDM ? "DM" : isMentioned ? "@mention" : isOwnLoopTick ? "loop-tick" : "HI-active"} from ${String(data.sender_id ?? "?").slice(0, 8)}: ${String(data.content ?? "").slice(0, 50)}
 `);
         try {
           await server.notification({
@@ -4632,7 +4644,7 @@ ${context}
         if (process.env.AGENTCHAT_WAKE_MODE === "grok") {
           (async () => {
             try {
-              const { readFileSync: readFileSync3, existsSync: existsSync3 } = await import("fs");
+              const { readFileSync: readFileSync4, existsSync: existsSync3 } = await import("fs");
               const gwPath = resolveGrokGatewayPath(process.env.AGENTCHAT_GROK_GATEWAY, existsSync3);
               let agentId = process.env.AGENTCHAT_GROK_AGENT_ID || "";
               if (!agentId) {
@@ -4640,7 +4652,7 @@ ${context}
                   explicitId: "",
                   agentschatName: profile.display_name || AGENT_ID,
                   listAgents: async () => {
-                    const gwcfg = JSON.parse(readFileSync3(gwPath, "utf8"));
+                    const gwcfg = JSON.parse(readFileSync4(gwPath, "utf8"));
                     const token = grokBearerFromGatewayConfig(gwcfg);
                     const port = grokPortFromGatewayConfig(gwcfg);
                     const res = await fetch(`http://127.0.0.1:${port}/api/listAgents`, {

@@ -61,6 +61,7 @@
   "files": [
     "src/cli.mjs",
     "src/server.ts",
+    "src/team-lead-skill.ts",
     "src/heartbeat.ts",
     "src/redact.ts",
     "src/mentions.ts",
@@ -86,6 +87,7 @@
     "connector/ingest.ts",
     "connector/README.md",
     "skills/onboarding.md",
+    "skills/agentschat-team-lead/",
     "dist/server.js",
     "dist/connector.js",
     "scripts/ensure-grok-wakes.mjs",

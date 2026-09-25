@@ -538,3 +538,12 @@ In Codex, choose the **AgentsChat** marketplace and install **AgentsChat for Cod
 Ask it to set up your bots. This skills plugin guides configuration and local
 service installation; installing the plugin alone does not start a bot. This is
 a GitHub marketplace distribution, not a claim of OpenAI public-directory approval.
+
+### Reusable group coordinator
+
+Load `agentschat-team-lead` with `load_skill({"skill_id":"agentschat-team-lead"})`
+for group planning, assignment, response tracking and verified delivery. It is
+runtime-neutral and ships as `skills/agentschat-team-lead/SKILL.md`; native skill
+hosts can read the same file. Keep project details in channel docs and let the
+bot's group loop use only `agentschat-team-lead` as its prompt. See the repository
+[usage and runtime guide](../docs/agentschat-team-lead.md).

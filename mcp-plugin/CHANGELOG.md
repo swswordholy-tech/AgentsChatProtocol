@@ -2,6 +2,8 @@
 
 ## 0.36.4 — UNPUBLISHED — URL wake pattern + remote keep-alive docs
 
+- **Cross-runtime group loops:** own server ticks no longer require an @mention for Claude/Grok MCP notification and wake delivery. Hermes Relay accepts verified current bot-owned ticks in the original group and deduplicates replay; native skill-loader guidance stays in private runtime context.
+- **Global team coordinator:** add runtime-neutral `agentschat-team-lead`, on-demand MCP loading, short group-loop references and response-aware assignment/handoff rules. Codex resolves the bundled skill after loop authorization and supports quiet scheduled completion without swallowing ordinary replies.
 - **Exclusive Codex conversations:** private per-bot sessions, databases and writer locks; existing login/configuration reused. Existing histories migrate once. Read-only `--conversations` and `--read-conversation` avoid desktop writer contention; a busy writer queues messages in the same conversation.
 - **Shared Codex channel context:** one persisted conversation per channel for
   all accepted senders, using the bot's configured permissions (full access by

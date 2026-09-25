@@ -49,6 +49,7 @@ export function buildDescriptor(overrides: Partial<CapabilityDescriptor> = {}): 
     len_unit: "chars",
     emoji: "🤖",
     pii_safe: false,
+    platform_hint: "AgentsChat named skills are reusable instructions. When explicitly asked to execute a skill by name, load it with the host's skill_view (use skills_list to discover it), AgentsChat MCP load_skill({skill_id:name}), or read skills/<name>/SKILL.md from the installed AgentsChat MCP package in this runtime. Report a missing loader or skill; do not pretend it ran. Keep skill text out of chat and keep replies in the originating chat.",
     supported_ops: [...SUPPORTED_OPS],
     ...overrides,
   };

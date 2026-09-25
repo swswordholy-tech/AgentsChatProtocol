@@ -7,14 +7,9 @@
  * lexical `>` matches chronology (whole-second vs fractional).
  */
 import { normalizeTimestampForCursor } from "../src/timestamps.ts";
+import { serverLoopTick, type AgentsChatMessage } from "./normalize.ts";
 
-export type BackfillMsg = {
-  id?: string;
-  timestamp?: string;
-  sender_id?: string;
-  content?: string;
-  channel_id?: string;
-};
+export type BackfillMsg = AgentsChatMessage;
 
 export function planBackfill(
   after: string | undefined,
@@ -32,7 +27,8 @@ export function planBackfill(
   }
   const afterTs = normalizeTimestampForCursor(after, "after") || after;
   const replay = list.filter((m) => {
-    if (!m || m.sender_id === agentId || m.content === "__typing__") return false;
+    if (!m || m.content === "__typing__") return false;
+    if (m.sender_id === agentId && !serverLoopTick(m)) return false;
     const msgTs = normalizeTimestampForCursor(m.timestamp, "after");
     return typeof msgTs === "string" && msgTs > afterTs;
   });
