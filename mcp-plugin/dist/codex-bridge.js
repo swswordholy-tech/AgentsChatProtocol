@@ -1,4 +1,39 @@
 #!/usr/bin/env node
+// codex/runtime-home.ts
+import { existsSync, mkdirSync, lstatSync, readlinkSync, realpathSync, symlinkSync } from "node:fs";
+import { homedir } from "node:os";
+import { join, resolve } from "node:path";
+function prepareRuntimeHome(stateDir, source = process.env.CODEX_HOME || join(homedir(), ".codex")) {
+  const legacyHome = existsSync(source) ? realpathSync(source) : resolve(source);
+  const home = join(stateDir, "codex-home");
+  mkdirSync(home, { recursive: true, mode: 448 });
+  if (realpathSync(home) === legacyHome)
+    throw new Error("Bot runtime home must differ from desktop Codex home");
+  for (const name of ["config.toml", "auth.json", "AGENTS.md", "skills", "rules", "plugins", "hooks.json", "models_cache.json"]) {
+    const origin = join(legacyHome, name), target = join(home, name);
+    if (!existsSync(origin))
+      continue;
+    let current;
+    try {
+      current = lstatSync(target);
+    } catch (e) {
+      if (e.code !== "ENOENT")
+        throw e;
+    }
+    if (current) {
+      if (!current.isSymbolicLink() || resolve(home, readlinkSync(target)) !== origin)
+        throw new Error(`Unexpected bot runtime configuration: ${name}`);
+    } else
+      symlinkSync(origin, target);
+  }
+  return { home, legacyHome };
+}
+
+// src/redact.ts
+function redactSecrets(text) {
+  return text.replace(/ac_[A-Za-z0-9_-]{16,}/g, "ac_***REDACTED***").replace(/eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "***JWT_REDACTED***");
+}
+
 // codex/owner.ts
 async function getBotOwner(base, agentId, token, request = fetch) {
   try {
@@ -67,8 +102,8 @@ async function getOnboardingStatus(base, agentId, token, request = fetch) {
 
 // codex/gui-channel.ts
 import { randomUUID } from "node:crypto";
-import { mkdirSync, writeFileSync, readFileSync, renameSync, readdirSync, rmSync } from "node:fs";
-import { join } from "node:path";
+import { mkdirSync as mkdirSync2, writeFileSync, readFileSync, renameSync, readdirSync, rmSync } from "node:fs";
+import { join as join2 } from "node:path";
 function payload(result) {
   if (result?.isError || result?.success === false || result?.error)
     throw new Error("GUI tool rejected request");
@@ -87,12 +122,12 @@ class GuiChannel {
   constructor(directory, allowedThreads) {
     this.directory = directory;
     this.allowedThreads = allowedThreads;
-    mkdirSync(directory, { recursive: true, mode: 448 });
+    mkdirSync2(directory, { recursive: true, mode: 448 });
   }
   path(id) {
     if (!/^[0-9a-f-]{36}$/.test(id))
       throw new Error("Invalid delivery ID");
-    return join(this.directory, `${id}.json`);
+    return join2(this.directory, `${id}.json`);
   }
   save(entry) {
     const path = this.path(entry.id), temp = `${path}.${randomUUID()}.tmp`;
@@ -125,7 +160,7 @@ ${text}`,
   }
   async dispatch(id, call) {
     const lock = `${this.path(id)}.lock`;
-    mkdirSync(lock, { mode: 448 });
+    mkdirSync2(lock, { mode: 448 });
     try {
       const entry = this.get(id);
       if (!this.allowedThreads.includes(entry.threadId))
@@ -182,18 +217,18 @@ ${text}`,
 
 // codex/run.ts
 import { readFileSync as readFileSync6 } from "node:fs";
-import { homedir as homedir3 } from "node:os";
-import { join as join7 } from "node:path";
+import { homedir as homedir4 } from "node:os";
+import { join as join8 } from "node:path";
 
 // codex/bots-config.ts
-import { readFileSync as readFileSync3, realpathSync as realpathSync2, mkdirSync as mkdirSync2 } from "node:fs";
-import { homedir as homedir2 } from "node:os";
-import { dirname, isAbsolute as isAbsolute2, join as join3, resolve as resolve2 } from "node:path";
+import { readFileSync as readFileSync3, realpathSync as realpathSync3, mkdirSync as mkdirSync3 } from "node:fs";
+import { homedir as homedir3 } from "node:os";
+import { dirname, isAbsolute as isAbsolute2, join as join4, resolve as resolve3 } from "node:path";
 
 // codex/config.ts
-import { existsSync, readFileSync as readFileSync2, realpathSync, statSync } from "node:fs";
-import { homedir } from "node:os";
-import { isAbsolute, join as join2, resolve } from "node:path";
+import { existsSync as existsSync2, readFileSync as readFileSync2, realpathSync as realpathSync2, statSync } from "node:fs";
+import { homedir as homedir2 } from "node:os";
+import { isAbsolute, join as join3, resolve as resolve2 } from "node:path";
 import { createHash } from "node:crypto";
 
 // src/identity.ts
@@ -1103,10 +1138,10 @@ function strings(value, name) {
     throw new Error(`${name} must be an array of nonempty strings`);
   return value;
 }
-function resolveConfig(opts, env = process.env, home = homedir()) {
-  const cwd = realpathSync(opts.cwd ?? process.cwd());
-  const configFile = join2(cwd, ".agentschat/config.json");
-  const project = opts.settings ?? (existsSync(configFile) ? readJson(configFile) : {});
+function resolveConfig(opts, env = process.env, home = homedir2()) {
+  const cwd = realpathSync2(opts.cwd ?? process.cwd());
+  const configFile = join3(cwd, ".agentschat/config.json");
+  const project = opts.settings ?? (existsSync2(configFile) ? readJson(configFile) : {});
   if (!project || typeof project !== "object" || Array.isArray(project))
     throw new Error("Invalid project config");
   const allowed = new Set(["profile", "agent_id", "channels", "senders", "api_url", "ws_url", "permissions"]);
@@ -1115,10 +1150,10 @@ function resolveConfig(opts, env = process.env, home = homedir()) {
   for (const k of ["profile", "agent_id", "api_url", "ws_url"])
     if (project[k] !== undefined && (typeof project[k] !== "string" || !project[k].trim()))
       throw new Error(`Invalid project ${k}`);
-  const localProfile = join2(cwd, ".agentschat/profile.json");
+  const localProfile = join3(cwd, ".agentschat/profile.json");
   let codexProfile;
-  const codexFile = join2(cwd, ".codex/config.toml");
-  if (opts.settings === undefined && existsSync(codexFile)) {
+  const codexFile = join3(cwd, ".codex/config.toml");
+  if (opts.settings === undefined && existsSync2(codexFile)) {
     let doc;
     try {
       doc = parse(readFileSync2(codexFile, "utf8"));
@@ -1137,7 +1172,7 @@ function resolveConfig(opts, env = process.env, home = homedir()) {
   const choices = [
     [opts.profile, "flag"],
     [project.profile, "project-config"],
-    [opts.settings === undefined && existsSync(localProfile) ? localProfile : undefined, "project-profile"],
+    [opts.settings === undefined && existsSync2(localProfile) ? localProfile : undefined, "project-profile"],
     [codexProfile, "project-codex"],
     [env.AGENTSCHAT_PROFILE, "env"],
     [env.AGENTCHAT_PROFILE, "legacy-env"],
@@ -1146,18 +1181,18 @@ function resolveConfig(opts, env = process.env, home = homedir()) {
   const [selector, source] = choices.find(([v]) => v !== undefined && v !== "");
   let profileFile;
   if (selector.startsWith("~/"))
-    profileFile = join2(home, selector.slice(2));
+    profileFile = join3(home, selector.slice(2));
   else if (isAbsolute(selector) || selector.includes("/"))
-    profileFile = resolve(cwd, selector);
+    profileFile = resolve2(cwd, selector);
   else {
     const name = selector.endsWith(".json") ? selector : `${selector}.json`;
-    profileFile = join2(home, ".agentschat/profiles", name);
-    if (!existsSync(profileFile))
-      profileFile = join2(home, ".agentschat", name);
-    if (!existsSync(profileFile))
-      profileFile = join2(home, ".agentchat", name);
+    profileFile = join3(home, ".agentschat/profiles", name);
+    if (!existsSync2(profileFile))
+      profileFile = join3(home, ".agentschat", name);
+    if (!existsSync2(profileFile))
+      profileFile = join3(home, ".agentchat", name);
   }
-  if (!existsSync(profileFile))
+  if (!existsSync2(profileFile))
     throw new Error(`Selected profile missing: ${profileFile}; no identity fallback or registration`);
   if (process.platform !== "win32" && statSync(profileFile).mode & 63)
     throw new Error(`Profile must be private (chmod 600): ${profileFile}`);
@@ -1186,15 +1221,15 @@ function resolveConfig(opts, env = process.env, home = homedir()) {
     channels: strings(project.channels, "channels"),
     senders: strings(project.senders, "senders"),
     codexBin: opts.codexBin ?? "codex",
-    stateDir: join2(home, ".agentschat/codex-bridge", key)
+    stateDir: join3(home, ".agentschat/codex-bridge", key)
   };
 }
 
 // codex/bots-config.ts
-function defaultRegistry(home = homedir2()) {
-  return join3(home, ".agentschat/codex-bots.json");
+function defaultRegistry(home = homedir3()) {
+  return join4(home, ".agentschat/codex-bots.json");
 }
-function loadBots(file = defaultRegistry(), home = homedir2()) {
+function loadBots(file = defaultRegistry(), home = homedir3()) {
   let doc;
   try {
     doc = JSON.parse(readFileSync3(file, "utf8"));
@@ -1213,8 +1248,8 @@ function loadBots(file = defaultRegistry(), home = homedir2()) {
   for (const k of ["default_workdir", "codex_bin"])
     if (doc[k] !== undefined && !text(doc[k]))
       throw new Error(`Invalid ${k}`);
-  const path = (value) => value.startsWith("~/") ? join3(home, value.slice(2)) : isAbsolute2(value) ? value : resolve2(dirname(file), value);
-  const defaultDir = doc.default_workdir ? path(doc.default_workdir) : join3(home, ".agentschat/workspace");
+  const path = (value) => value.startsWith("~/") ? join4(home, value.slice(2)) : isAbsolute2(value) ? value : resolve3(dirname(file), value);
+  const defaultDir = doc.default_workdir ? path(doc.default_workdir) : join4(home, ".agentschat/workspace");
   const names = new Set, identities = new Set;
   const bots = [];
   for (const bot of doc.bots) {
@@ -1231,8 +1266,8 @@ function loadBots(file = defaultRegistry(), home = homedir2()) {
     if (!/^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$/.test(bot.profile))
       throw new Error(`Bot ${bot.name}: profile must be a central profile name`);
     if (!doc.default_workdir && !bot.workdir)
-      mkdirSync2(defaultDir, { recursive: true, mode: 448 });
-    const cwd = realpathSync2(bot.workdir ? path(bot.workdir) : defaultDir);
+      mkdirSync3(defaultDir, { recursive: true, mode: 448 });
+    const cwd = realpathSync3(bot.workdir ? path(bot.workdir) : defaultDir);
     const settings = {};
     for (const k of ["agent_id", "channels", "senders", "api_url", "ws_url", "permissions"])
       if (bot[k] !== undefined)
@@ -1254,11 +1289,19 @@ import { parseArgs } from "node:util";
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
 
+class ThreadBusyError extends Error {
+  constructor() {
+    super("This conversation has another active writer; waiting to resume the same task");
+    this.name = "ThreadBusyError";
+  }
+}
+
 class AppServer {
   bin;
   args;
   timeoutMs;
   permissions;
+  runtime;
   onFatal;
   closed = false;
   child;
@@ -1267,15 +1310,24 @@ class AppServer {
   active;
   threadPermissions = new Map;
   disabledMcp = {};
-  constructor(bin = "codex", args = ["app-server", "--listen", "stdio://"], timeoutMs = 600000, permissions = "full-access") {
+  constructor(bin = "codex", args = ["app-server", "--listen", "stdio://"], timeoutMs = 600000, permissions = "full-access", runtime) {
     this.bin = bin;
     this.args = args;
     this.timeoutMs = timeoutMs;
     this.permissions = permissions;
+    this.runtime = runtime;
+  }
+  get namespace() {
+    return this.runtime?.home;
   }
   async start() {
     const env = Object.fromEntries(Object.entries(process.env).filter(([k]) => !/^AGENTS?CHAT_|^RELAY_/.test(k)));
-    this.child = spawn(this.bin, this.args, { env, stdio: "pipe" });
+    if (this.runtime) {
+      env.CODEX_HOME = this.runtime.home;
+      env.CODEX_SQLITE_HOME = this.runtime.home;
+    }
+    const args = this.runtime && this.args[0] === "app-server" ? [...this.args, "-c", `sqlite_home=${JSON.stringify(this.runtime.home)}`] : this.args;
+    this.child = spawn(this.bin, args, { env, stdio: "pipe" });
     this.child.stderr.resume();
     this.child.stdin.on("error", () => this.fatal(new Error("Codex input pipe closed")));
     this.child.on("error", () => this.fatal(new Error("Could not start Codex app-server")));
@@ -1297,10 +1349,10 @@ class AppServer {
 `);
   }
   request(method, params) {
-    return new Promise((resolve3, reject) => {
+    return new Promise((resolve4, reject) => {
       const id = ++this.nextId;
       const timer = setTimeout(() => this.fatal(new Error(`App-server ${method} timed out`)), 30000);
-      this.pending.set(id, { resolve: resolve3, reject, timer });
+      this.pending.set(id, { method, resolve: resolve4, reject, timer });
       try {
         this.write({ id, method, params });
       } catch (e) {
@@ -1320,7 +1372,7 @@ class AppServer {
       if (waiter) {
         clearTimeout(waiter.timer);
         this.pending.delete(message.id);
-        message.error ? waiter.reject(new Error(`App-server request rejected (${message.error.code})`)) : waiter.resolve(message.result);
+        message.error ? waiter.reject(waiter.method === "thread/resume" && /already has an active writer/i.test(message.error.message ?? "") ? new ThreadBusyError : new Error(`App-server request rejected (${message.error.code})`)) : waiter.resolve(message.result);
       }
       return;
     }
@@ -1380,6 +1432,17 @@ class AppServer {
       throw new Error("Original thread history is incomplete; refusing to discard context");
     return { id: thread, createdAt: result.thread.createdAt, turns: result.thread.turns };
   }
+  async readLegacyThread(thread) {
+    if (!this.runtime?.legacyHome)
+      return this.readThread(thread);
+    const reader = new AppServer(this.bin, undefined, this.timeoutMs, this.permissions, { home: this.runtime.legacyHome });
+    try {
+      await reader.start();
+      return await reader.readThread(thread);
+    } finally {
+      reader.close();
+    }
+  }
   async nameThread(thread, name) {
     await this.request("thread/name/set", { threadId: thread, name });
   }
@@ -1389,12 +1452,12 @@ class AppServer {
     const permissions = this.threadPermissions.get(thread);
     if (!permissions)
       throw new Error("Thread permissions have not been configured");
-    const completed = new Promise((resolve3, reject) => {
+    const completed = new Promise((resolve4, reject) => {
       this.active = {
         thread,
         items: new Map,
         early: [],
-        resolve: resolve3,
+        resolve: resolve4,
         reject,
         timer: setTimeout(() => this.fatal(new Error("Codex turn timed out")), this.timeoutMs)
       };
@@ -1445,13 +1508,13 @@ class AppServer {
 }
 
 // codex/bridge.ts
-import { existsSync as existsSync2, mkdirSync as mkdirSync4, readFileSync as readFileSync5, renameSync as renameSync3, writeFileSync as writeFileSync3, openSync, closeSync, unlinkSync } from "node:fs";
-import { join as join6 } from "node:path";
+import { existsSync as existsSync3, mkdirSync as mkdirSync5, readFileSync as readFileSync5, renameSync as renameSync3, writeFileSync as writeFileSync3, openSync, closeSync, unlinkSync } from "node:fs";
+import { join as join7 } from "node:path";
 
 // codex/thread-history.ts
 import { createHash as createHash2 } from "node:crypto";
-import { mkdirSync as mkdirSync3, renameSync as renameSync2, writeFileSync as writeFileSync2 } from "node:fs";
-import { join as join4 } from "node:path";
+import { mkdirSync as mkdirSync4, renameSync as renameSync2, writeFileSync as writeFileSync2 } from "node:fs";
+import { join as join5 } from "node:path";
 function priorChannelThreads(threads, channel) {
   return [...new Set(Object.entries(threads).filter(([key]) => {
     if (key === channel)
@@ -1465,9 +1528,9 @@ function priorChannelThreads(threads, channel) {
   }).map(([, id]) => id))];
 }
 function preserveChannelHistory(directory, channel, histories, redact) {
-  const root = join4(directory, "history");
-  mkdirSync3(root, { recursive: true, mode: 448 });
-  const file = join4(root, createHash2("sha256").update(channel).digest("hex").slice(0, 24) + ".json");
+  const root = join5(directory, "history");
+  mkdirSync4(root, { recursive: true, mode: 448 });
+  const file = join5(root, createHash2("sha256").update(channel).digest("hex").slice(0, 24) + ".json");
   writeFileSync2(file + ".tmp", redact(JSON.stringify({ channel_id: channel, threads: histories })), { mode: 384 });
   renameSync2(file + ".tmp", file);
   const records = [];
@@ -1477,7 +1540,7 @@ function preserveChannelHistory(directory, channel, histories, redact) {
       const order = String(turn.id ?? history.createdAt ?? history.id);
       for (const item of turn.items ?? []) {
         if (item.type === "userMessage") {
-          const text = (item.content ?? []).filter((part) => part.type === "text").map((part) => part.text).join(`
+          let text = (item.content ?? []).filter((part) => part.type === "text").map((part) => part.text).join(`
 `);
           const marker = `AgentsChat message:
 `;
@@ -1488,6 +1551,13 @@ function preserveChannelHistory(directory, channel, histories, redact) {
                 records.push({ order, sequence: sequence++, value: { ...message, role: "user" } });
               continue;
             } catch {}
+          }
+          if (text.startsWith("Previous conversations for this channel have been consolidated.")) {
+            const end = text.lastIndexOf(`End of historical context.
+`);
+            if (end >= 0)
+              text = text.slice(end + `End of historical context.
+`.length);
           }
           if (text.trim())
             records.push({ order, sequence: sequence++, value: { role: "user", content: text } });
@@ -1509,7 +1579,8 @@ function preserveChannelHistory(directory, channel, histories, redact) {
   const recent = [];
   let size = 0;
   for (let i = lines.length - 1;i >= 0; i--) {
-    const line = lines[i];
+    const original = lines[i];
+    const line = original.length > 12000 ? JSON.stringify({ role: "context", content: original.slice(0, 12000), truncated: true, full_record: file }) : original;
     if (size + line.length > 60000)
       break;
     recent.unshift(line);
@@ -1525,17 +1596,12 @@ End of historical context.
 `;
 }
 
-// src/redact.ts
-function redactSecrets(text) {
-  return text.replace(/ac_[A-Za-z0-9_-]{16,}/g, "ac_***REDACTED***").replace(/eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "***JWT_REDACTED***");
-}
-
 // codex/loop-grants.ts
-import { lstatSync, readFileSync as readFileSync4 } from "node:fs";
-import { join as join5 } from "node:path";
+import { lstatSync as lstatSync2, readFileSync as readFileSync4 } from "node:fs";
+import { join as join6 } from "node:path";
 function grants(config) {
   try {
-    const file = join5(config.stateDir, "loop-grants.json"), stat = lstatSync(file);
+    const file = join6(config.stateDir, "loop-grants.json"), stat = lstatSync2(file);
     if (!stat.isFile() || (stat.mode & 63) !== 0 || stat.uid !== process.getuid?.())
       return [];
     const doc = JSON.parse(readFileSync4(file, "utf8"));
@@ -1614,6 +1680,7 @@ class Bridge {
   lock;
   draining;
   stopped = false;
+  retry;
   loaded = new Set;
   constructor(config, codex, send, log = console.error, activity = () => {}, owner = async () => null, loops = async () => null) {
     this.config = config;
@@ -1623,9 +1690,9 @@ class Bridge {
     this.activity = activity;
     this.owner = owner;
     this.loops = loops;
-    mkdirSync4(config.stateDir, { recursive: true, mode: 448 });
-    this.file = join6(config.stateDir, "state.json");
-    this.lock = join6(config.stateDir, "bridge.lock");
+    mkdirSync5(config.stateDir, { recursive: true, mode: 448 });
+    this.file = join7(config.stateDir, "state.json");
+    this.lock = join7(config.stateDir, "bridge.lock");
     try {
       const fd = openSync(this.lock, "wx", 384);
       writeFileSync3(fd, String(process.pid));
@@ -1634,7 +1701,7 @@ class Bridge {
       throw new Error(`Bridge already locked: ${this.lock}. If its process has exited, remove that lock manually.`);
     }
     try {
-      this.state = existsSync2(this.file) ? JSON.parse(readFileSync5(this.file, "utf8")) : { version: 1, threads: {}, entries: [] };
+      this.state = existsSync3(this.file) ? JSON.parse(readFileSync5(this.file, "utf8")) : { version: 1, threads: {}, entries: [] };
       if (this.state.version !== 1 || !this.state.threads || !Array.isArray(this.state.entries))
         throw new Error("Invalid bridge state");
       for (const e of this.state.entries) {
@@ -1688,6 +1755,8 @@ class Bridge {
     return redactSecrets(text.split(this.config.token).join("[REDACTED]"));
   }
   drain() {
+    if (this.retry)
+      return Promise.resolve();
     if (this.draining)
       return this.draining;
     this.draining = this.run().finally(() => {
@@ -1699,17 +1768,22 @@ class Bridge {
     this.state.channels ??= {};
     let channel = this.state.channels[chat];
     if (!this.loaded.has(chat)) {
-      if (!channel) {
-        const ids = priorChannelThreads(this.state.threads, chat);
+      const namespace = this.codex.namespace;
+      if (channel?.namespace && channel.namespace !== namespace)
+        throw new Error("Conversation belongs to a different runtime home; refusing to lose context");
+      const movingHome = !!namespace && !!channel && !channel.namespace;
+      if (!channel || movingHome) {
+        const ids = [...new Set([...priorChannelThreads(this.state.threads, chat), ...movingHome ? [channel.thread] : []])];
         const histories = [];
         for (const id of ids) {
-          if (!this.codex.readThread)
+          const reader = namespace ? this.codex.readLegacyThread : this.codex.readThread;
+          if (!reader)
             throw new Error("Cannot migrate channel without original thread history");
-          histories.push(await this.codex.readThread(id));
+          histories.push(await reader.call(this.codex, id));
         }
         const bootstrap = histories.length ? preserveChannelHistory(this.config.stateDir, chat, histories, (s) => this.redact(s)) : undefined;
         const thread = await this.codex.thread(this.config.cwd, undefined, false, this.config.permissions);
-        channel = this.state.channels[chat] = { thread, ...bootstrap ? { bootstrap, importedThreads: ids } : {} };
+        channel = this.state.channels[chat] = { thread, ...namespace ? { namespace } : {}, ...bootstrap ? { bootstrap, importedThreads: ids } : {} };
         this.save();
         await this.codex.nameThread?.(thread, `AgentsChat · ${chat}`).catch(() => this.log("Could not name channel task"));
       } else {
@@ -1734,6 +1808,7 @@ class Bridge {
         this.activity(e.message.channel_id, true);
         if (e.status === "pending") {
           e.status = "running";
+          delete e.error;
           this.save();
           const chat = e.message.channel_id;
           const ownerId = e.message.meta ? await this.owner().catch(() => null) : null;
@@ -1748,7 +1823,7 @@ class Bridge {
 Authorized task:
 ${grant.prompt}` : `You are the online AgentsChat bot ${this.config.agentId}, running through Codex App Server in ${this.config.cwd}. This message was delivered to you live. If asked whether you are online, confirm your own availability.
 Use this channel's shared conversation and configured tools to carry out the request.
-Recurring-task setup, only when requested: create the server loop as this bot in this same channel. Then verify its record with list_loops and confirm this bot is claimed with whoami and obtain its owner_account_id with my_entitlements. Maintain the private file ${join6(this.config.stateDir, "loop-grants.json")} (mode 0600): {"version":1,"grants":[{"loop_id":"server loop ID","channel_id":"this channel ID","agent_id":"this bot ID","owner_id":"verified owner ID","interval_ms":60000,"prompt":"exact server prompt"}]}. Use the actual server interval, preserve other grants, and confirm setup only after both server registration and the matching local grant exist. Stopping a loop also removes its grant. Do not change unrelated loops.
+Recurring-task setup, only when requested: create the server loop as this bot in this same channel. Then verify its record with list_loops and confirm this bot is claimed with whoami and obtain its owner_account_id with my_entitlements. Maintain the private file ${join7(this.config.stateDir, "loop-grants.json")} (mode 0600): {"version":1,"grants":[{"loop_id":"server loop ID","channel_id":"this channel ID","agent_id":"this bot ID","owner_id":"verified owner ID","interval_ms":60000,"prompt":"exact server prompt"}]}. Use the actual server interval, preserve other grants, and confirm setup only after both server registration and the matching local grant exist. Stopping a loop also removes its grant. Do not change unrelated loops.
 AgentsChat message:
 ` + JSON.stringify(e.message);
           e.answer = this.redact(await this.codex.generate(channel.thread, (channel.bootstrap ?? "") + prompt));
@@ -1769,6 +1844,18 @@ AgentsChat message:
         this.save();
         this.log(`Replied in ${JSON.stringify(e.message.channel_id)}`);
       } catch (error) {
+        if (error instanceof ThreadBusyError) {
+          e.status = "pending";
+          e.error = error.message;
+          this.save();
+          this.log("Conversation in use; queued message will resume in the same task");
+          if (!this.stopped)
+            this.retry = setTimeout(() => {
+              this.retry = undefined;
+              this.drain();
+            }, 5000);
+          return;
+        }
         e.error = this.redact(error instanceof Error ? error.message : "Bridge operation failed").slice(0, 240);
         e.status = e.status === "sending" ? "uncertain" : "failed";
         this.save();
@@ -1780,11 +1867,13 @@ AgentsChat message:
   }
   pause() {
     this.stopped = true;
+    clearTimeout(this.retry);
+    this.retry = undefined;
   }
   async stop() {
     this.pause();
     await this.draining;
-    if (existsSync2(this.lock))
+    if (existsSync3(this.lock))
       unlinkSync(this.lock);
   }
 }
@@ -1926,12 +2015,12 @@ class AgentsChatTransport {
   async send(channel, text) {
     if (this.authenticated && this.socket?.readyState === WebSocket.OPEN) {
       const id = randomUUID2();
-      await new Promise((resolve3, reject) => {
+      await new Promise((resolve4, reject) => {
         const timer = setTimeout(() => {
           this.pending.delete(id);
           reject(new Error("AgentsChat acknowledgement timed out"));
         }, 15000);
-        this.pending.set(id, { resolve: resolve3, reject, timer });
+        this.pending.set(id, { resolve: resolve4, reject, timer });
         this.socket.send(JSON.stringify({
           type: "message",
           id,
@@ -1966,7 +2055,7 @@ class AgentsChatTransport {
       if (current() && socket.readyState === WebSocket.OPEN)
         socket.send(JSON.stringify(value));
     };
-    const join7 = (channel) => {
+    const join8 = (channel) => {
       if (!this.config.channels.length || this.config.channels.includes(channel))
         send({ type: "join_channel", channel_id: channel, agent_id: this.config.agentId });
     };
@@ -1999,7 +2088,7 @@ class AgentsChatTransport {
             throw new Error("Invalid membership response");
           for (const c of channels)
             if (typeof (c.id ?? c.channel_id) === "string")
-              join7(c.id ?? c.channel_id);
+              join8(c.id ?? c.channel_id);
         }).catch(() => {
           if (current()) {
             this.log("Membership sync failed; reconnecting");
@@ -2014,7 +2103,7 @@ class AgentsChatTransport {
           pending.resolve();
         }
       } else if (data.type === "channel_created" && typeof data.channel_id === "string")
-        join7(data.channel_id);
+        join8(data.channel_id);
       else if (["message", "thread_reply"].includes(data.type))
         this.receive(data);
       else if (data.type === "shard_moved")
@@ -2051,7 +2140,7 @@ class AgentsChatTransport {
 var HELP = `agentschat-mcp --codex-bridge [--cwd DIRECTORY] [--profile NAME_OR_PATH] [--codex-bin PATH] [--check]
 
 Official Codex app-server bridge. Node >=22; Codex installed and signed in.
-Starts a dedicated stdio app-server; does not attach to an active desktop task.
+Starts a dedicated stdio app-server with a private per-bot Codex home; does not attach to an active desktop task.
 No notifications/chat/channel, no fork, no account registration.
 
 Identity: --profile > CWD/.agentschat/config.json profile >
@@ -2065,6 +2154,7 @@ Project config fields: profile, agent_id, channels, senders, api_url, ws_url, pe
 Live DMs and exact mentions trigger replies; channels/senders restrict this further.
 All accepted messages share one persisted thread per channel, with full access by default. Set permissions: "read-only" to disable writes and inherited MCP. No offline message replay.
 State: ~/.agentschat/codex-bridge/<project-server-identity hash>/ (private).
+--conversations lists this bot's channel/task mappings; --read-conversation CHANNEL reads history without acquiring a writer.
 GUI outbox: --gui-thread THREAD_ID --gui-message-file PATH; --gui-status lists receipts.
 Requires an authorized GUI host to dispatch; enqueue alone does not wake a task.
 See codex/README.md for setup, verification, limitations and recovery.
@@ -2076,6 +2166,8 @@ async function main() {
   const { values } = parseArgs({ options: {
     "codex-bridge": { type: "boolean" },
     cwd: { type: "string" },
+    conversations: { type: "boolean" },
+    "read-conversation": { type: "string" },
     "gui-thread": { type: "string" },
     "gui-message-file": { type: "string" },
     "gui-status": { type: "boolean" },
@@ -2093,7 +2185,7 @@ async function main() {
     return;
   }
   if (values["gui-thread"] || values["gui-message-file"] || values["gui-status"]) {
-    const channel = new GuiChannel(join7(homedir3(), ".agentschat/codex-gui-outbox"), values["gui-thread"] ? [values["gui-thread"]] : []);
+    const channel = new GuiChannel(join8(homedir4(), ".agentschat/codex-gui-outbox"), values["gui-thread"] ? [values["gui-thread"]] : []);
     if (values["gui-status"]) {
       console.log(JSON.stringify(channel.list().map(({ prompt: prompt2, ...receipt2 }) => receipt2)));
       return;
@@ -2104,7 +2196,7 @@ async function main() {
     console.log(JSON.stringify(receipt));
     return;
   }
-  const snapshot = values["managed-worker"] ? await new Promise((resolve3, reject) => {
+  const snapshot = values["managed-worker"] ? await new Promise((resolve4, reject) => {
     if (!process.connected) {
       reject(new Error("Managed worker needs parent IPC"));
       return;
@@ -2112,7 +2204,7 @@ async function main() {
     const timer = setTimeout(() => reject(new Error("Parent configuration missing")), 1e4);
     process.once("message", (config) => {
       clearTimeout(timer);
-      resolve3(config);
+      resolve4(config);
     });
   }) : undefined;
   const c = snapshot ?? (values.bot ? loadBots(values.registry).find((b) => b.name === values.bot) : resolveConfig({ cwd: values.cwd, profile: values.profile, codexBin: values["codex-bin"] }));
@@ -2131,7 +2223,26 @@ async function main() {
     return;
   }
   console.log(JSON.stringify({ cwd: c.cwd, agent_id: c.agentId, profile: c.profileFile, source: c.source, stateDir: c.stateDir }));
-  codex = new AppServer(c.codexBin, undefined, undefined, c.permissions);
+  const runtime = prepareRuntimeHome(c.stateDir);
+  codex = new AppServer(c.codexBin, undefined, undefined, c.permissions, runtime);
+  if (values.conversations || values["read-conversation"]) {
+    const state = JSON.parse(readFileSync6(join8(c.stateDir, "state.json"), "utf8"));
+    const channels = state.channels ?? {};
+    if (values.conversations) {
+      console.log(JSON.stringify(Object.entries(channels).map(([channel2, data]) => ({ channel: channel2, thread: data.thread, isolated: data.namespace === runtime.home }))));
+      return;
+    }
+    const channel = channels[values["read-conversation"]];
+    if (!channel)
+      throw new Error("Unknown conversation channel");
+    if (channel.namespace && channel.namespace !== runtime.home)
+      throw new Error("Conversation belongs to a different runtime home");
+    await codex.start();
+    const history = channel.namespace ? await codex.readThread(channel.thread) : await codex.readLegacyThread(channel.thread);
+    console.log(redactSecrets(JSON.stringify(history).split(c.token).join("[REDACTED]")));
+    codex.close();
+    return;
+  }
   if (values.check) {
     await codex.start();
     console.log("Official app-server initialization: OK (no chat connection or generation)");

@@ -11,7 +11,7 @@ import { createServer } from "node:http";
 import { WebSocketServer } from "ws";
 import { resolveConfig, type BridgeConfig, type PermissionMode } from "../codex/config.ts";
 import { addressed, Bridge } from "../codex/bridge.ts";
-import { AppServer } from "../codex/app-server.ts";
+import { AppServer, ThreadBusyError } from "../codex/app-server.ts";
 import { AgentsChatTransport } from "../codex/transport.ts";
 
 const roots: string[] = [];
@@ -436,4 +436,45 @@ test("one App Server preserves each thread policy and rejects cross-permission r
     expect(turns.map((event: any) => event.params.sandboxPolicy.type)).toEqual(["dangerFullAccess","readOnly","dangerFullAccess","dangerFullAccess","readOnly","dangerFullAccess","readOnly"]);
     expect(turns.every((event: any) => event.params.approvalPolicy === "never")).toBe(true);
   } finally { app.close(); }
+});
+
+test("writer contention retains queued messages and resumes the same task after release", async () => {
+  const {c}=fixture(); mkdirSync(c.stateDir,{recursive:true});
+  writeFileSync(join(c.stateDir,"state.json"),JSON.stringify({version:1,threads:{},channels:{"dm-owner":{thread:"existing-task"}},entries:[]}));
+  let resumes=0; const used:string[]=[]; const sent:string[]=[];
+  const bridge=new Bridge(c,{thread:async(_cwd,existing)=>{expect(existing).toBe("existing-task");if(++resumes===1)throw new ThreadBusyError();return existing!;},generate:async(id)=>{used.push(id);return "done";}},async(_chat,text)=>{sent.push(text);},()=>{});
+  try{
+    bridge.accept(message("wait-1")); await bridge.drain();
+    expect(JSON.parse(readFileSync(join(c.stateDir,"state.json"),"utf8")).entries[0].status).toBe("pending");
+    bridge.accept(message("wait-2"));await bridge.drain();expect(resumes).toBe(1);
+    await new Promise(r=>setTimeout(r,5100));await bridge.drain();
+    expect(used).toEqual(["existing-task","existing-task"]);expect(sent).toEqual(["done","done"]);expect(resumes).toBe(2);
+  }finally{await bridge.stop();}
+},10000);
+
+test("App Server identifies writer contention without exposing raw backend error text", async()=>{
+  const app=server(fakeAppServer.replace("const m=JSON.parse(line), p=m.params;", "const m=JSON.parse(line), p=m.params; if(m.method==='thread/resume')return emit({id:m.id,error:{code:-32600,message:'thread x already has an active writer'}});"));
+  try{await app.start();await expect(app.thread("/tmp","existing-task")).rejects.toBeInstanceOf(ThreadBusyError);}finally{app.close();}
+});
+
+
+test("move desktop conversation into bot namespace once, retaining every source and restart mapping", async()=>{
+ const f=fixture();mkdirSync(f.c.stateDir,{recursive:true});
+ writeFileSync(join(f.c.stateDir,"state.json"),JSON.stringify({version:1,threads:{group:"legacy",other:"private"},channels:{group:{thread:"desktop-current"}},entries:[]}));
+ const reads:string[]=[],resumes:(string|undefined)[]=[];let starts=0;
+ const generator={namespace:join(f.c.stateDir,"codex-home"),
+  readLegacyThread:async(id:string)=>{reads.push(id);return{id,turns:[{id,items:[{type:"agentMessage",text:"from "+id}]}]};},
+  readThread:async()=>{throw Error("Must read original namespace");},
+  thread:async(_cwd:string,existing?:string)=>{resumes.push(existing);if(!existing)starts++;return existing??"bot-private";},generate:async()=>"reply"};
+ const b=new Bridge(f.c,generator,async()=>{});
+ try{const c=await b.prepareChannel("group");expect(c.namespace).toBe(generator.namespace);expect(c.importedThreads).toEqual(["legacy","desktop-current"]);expect(c.bootstrap).toContain("from desktop-current");expect(reads).toEqual(["legacy","desktop-current"]);}finally{await b.stop();}
+ const restarted=new Bridge(f.c,generator,async()=>{});
+ try{expect((await restarted.prepareChannel("group")).thread).toBe("bot-private");expect(starts).toBe(1);expect(resumes).toEqual([undefined,"bot-private"]);}finally{await restarted.stop();}
+ const wrong=new Bridge(f.c,{...generator,namespace:"another-home"},async()=>{});
+ try{await expect(wrong.prepareChannel("group")).rejects.toThrow("different runtime home");expect(starts).toBe(1);}finally{await wrong.stop();}
+});
+test("namespace migration failure retains original current thread without creating a blank replacement",async()=>{
+ const f=fixture();mkdirSync(f.c.stateDir,{recursive:true});writeFileSync(join(f.c.stateDir,"state.json"),JSON.stringify({version:1,threads:{},channels:{group:{thread:"original"}},entries:[]}));let starts=0;
+ const b=new Bridge(f.c,{namespace:"private",readLegacyThread:async()=>{throw Error("source unavailable");},thread:async()=>{starts++;return "bad";},generate:async()=>""},async()=>{});
+ try{await expect(b.prepareChannel("group")).rejects.toThrow("source unavailable");expect(starts).toBe(0);expect(JSON.parse(readFileSync(join(f.c.stateDir,"state.json"),"utf8")).channels.group.thread).toBe("original");}finally{await b.stop();}
 });

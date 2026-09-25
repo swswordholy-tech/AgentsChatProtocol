@@ -2,10 +2,11 @@
 
 ## 0.36.4 — UNPUBLISHED — URL wake pattern + remote keep-alive docs
 
+- **Exclusive Codex conversations:** private per-bot sessions, databases and writer locks; existing login/configuration reused. Existing histories migrate once. Read-only `--conversations` and `--read-conversation` avoid desktop writer contention; a busy writer queues messages in the same conversation.
 - **Shared Codex channel context:** one persisted conversation per channel for
   all accepted senders, using the bot's configured permissions (full access by
   default). Owner lookup no longer splits ordinary messages into different tasks.
-  Scheduled grants also reuse their DM conversation. Existing split threads are
+  Scheduled grants also reuse their original channel conversation. Existing split threads are
   exported privately and their past chat context is imported once; restart resumes
   the same task. Original history remains available for recovery.
 - **Group follow-up loops:** schedule in the originating group, resume its shared Codex conversation and reply there. Local grants accept exact group channel IDs; server state and owner checks remain required.

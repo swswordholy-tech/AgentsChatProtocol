@@ -65,3 +65,14 @@ recovery. Live messages only; no offline replay. Dedicated App Server threads ar
 independent of GUI tasks; the GUI outbox still requires an authorized desktop host
 and must not be advertised as unattended cross-session delivery. GitHub marketplace
 availability does not imply public OpenAI-directory approval.
+
+### Conversation ownership
+
+Bots exclusively write their conversations in the bridge state's private
+`codex-home/`; normal desktop tasks use a separate database. Keep one persistent
+conversation per original AgentsChat channel for all participants and loop ticks.
+Do not resume bot threads from the desktop or point desktop Codex at that home.
+For inspection use `--codex-bridge --bot NAME --conversations` and
+`--read-conversation CHANNEL_ID`; these query history without taking a writer.
+Existing desktop-home history migrates once; verify preservation before archiving
+old desktop tasks. File-backed Codex sign-in and configuration are reused.

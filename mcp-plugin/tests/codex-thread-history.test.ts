@@ -47,3 +47,12 @@ test("older plain-text envelopes and scheduled prompts remain in the imported co
   expect(prompt).toContain("continue the agreed work");
   expect(prompt).toContain("report project progress");
 });
+
+test("repeated migration does not let nested bootstrap or a huge message erase recent chat",()=>{
+ const root=directory();const old={id:"old",turns:[{id:"001",items:[user("actual","remember this agreement")]}]};
+ const bootstrap="Previous conversations for this channel have been consolidated.\n"+"old preview".repeat(10000)+"\nEnd of historical context.\nLocal operator maintenance: migration completed";
+ const current={id:"current",turns:[{id:"002",items:[{type:"userMessage",content:[{type:"text",text:bootstrap}]}]},{id:"003",items:[user("huge","x".repeat(70000))]}]};
+ const prompt=preserveChannelHistory(root,"group",[old,current],s=>s);
+ expect(prompt).toContain("remember this agreement");expect(prompt).toContain("migration completed");expect(prompt).not.toContain("old preview");expect(prompt).toContain('"truncated":true');expect(prompt.length).toBeLessThan(20000);
+ const file=join(root,"history",readdirSync(join(root,"history"))[0]!);expect(readFileSync(file,"utf8")).toContain("old preview");
+});

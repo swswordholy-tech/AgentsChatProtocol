@@ -24,7 +24,7 @@ export function preserveChannelHistory(directory: string, channel: string, histo
     const order = String(turn.id ?? history.createdAt ?? history.id);
     for (const item of turn.items ?? []) {
       if (item.type === "userMessage") {
-        const text = (item.content ?? []).filter((part: any) => part.type === "text").map((part: any) => part.text).join("\n");
+        let text = (item.content ?? []).filter((part: any) => part.type === "text").map((part: any) => part.text).join("\n");
         const marker = "AgentsChat message:\n";
         if (text.includes(marker)) {
           try {
@@ -32,6 +32,13 @@ export function preserveChannelHistory(directory: string, channel: string, histo
             if (message.channel_id === channel) records.push({order,sequence:sequence++,value:{...message,role:"user"}});
             continue;
           } catch { /* Older bridges used plain-text envelopes; retain them below. */ }
+        }
+        // Do not recursively import a previous migration's large preview.
+        // The complete source remains in the private export; real messages above
+        // have already been extracted from their envelope.
+        if (text.startsWith("Previous conversations for this channel have been consolidated.")) {
+          const end = text.lastIndexOf("End of historical context.\n");
+          if (end >= 0) text = text.slice(end + "End of historical context.\n".length);
         }
         if (text.trim()) records.push({order,sequence:sequence++,value:{role:"user",content:text}});
       } else if (item.type === "agentMessage" && (!item.phase || item.phase === "final_answer")) {
@@ -49,7 +56,9 @@ export function preserveChannelHistory(directory: string, channel: string, histo
   // Bound the one-time prompt while retaining the complete turns/tool results in the export.
   const recent: string[] = []; let size = 0;
   for (let i=lines.length-1;i>=0;i--) {
-    const line=lines[i]!;
+    const original=lines[i]!;
+    const line=original.length>12_000
+      ? JSON.stringify({role:"context",content:original.slice(0,12_000),truncated:true,full_record:file}) : original;
     if (size+line.length>60_000) break;
     recent.unshift(line); size+=line.length+1;
   }

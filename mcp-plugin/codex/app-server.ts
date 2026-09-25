@@ -3,21 +3,29 @@ import { createInterface } from "node:readline";
 import type { ThreadHistory } from "./thread-history.ts";
 import type { PermissionMode } from "./config.ts";
 
+export class ThreadBusyError extends Error {
+  constructor() { super("This conversation has another active writer; waiting to resume the same task"); this.name = "ThreadBusyError"; }
+}
+
 /** Official JSON-RPC stdio client. One active generation per bridge. */
 export class AppServer {
   onFatal?: () => void;
   private closed = false;
   private child?: ChildProcessWithoutNullStreams;
   private nextId = 0;
-  private pending = new Map<number, { resolve: (v: any) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> }>();
+  private pending = new Map<number, { method: string; resolve: (v: any) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> }>();
   private active?: { thread: string; turn?: string; items: Map<string, string>; early: any[];
     resolve: (s: string) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> };
   private threadPermissions = new Map<string, PermissionMode>();
   private disabledMcp: Record<string, { enabled: boolean }> = {};
-  constructor(private bin = "codex", private args = ["app-server", "--listen", "stdio://"], private timeoutMs = 600_000, private permissions: PermissionMode = "full-access") {}
+  constructor(private bin = "codex", private args = ["app-server", "--listen", "stdio://"], private timeoutMs = 600_000, private permissions: PermissionMode = "full-access", private runtime?: {home: string; legacyHome?: string}) {}
+  get namespace() { return this.runtime?.home; }
   async start() {
     const env = Object.fromEntries(Object.entries(process.env).filter(([k]) => !/^AGENTS?CHAT_|^RELAY_/.test(k)));
-    this.child = spawn(this.bin, this.args, { env, stdio: "pipe" });
+    if (this.runtime) { env.CODEX_HOME = this.runtime.home; env.CODEX_SQLITE_HOME = this.runtime.home; }
+    const args = this.runtime && this.args[0] === "app-server"
+      ? [...this.args, "-c", `sqlite_home=${JSON.stringify(this.runtime.home)}`] : this.args;
+    this.child = spawn(this.bin, args, { env, stdio: "pipe" });
     // Child diagnostics may contain account or MCP credentials; never relay raw stderr.
     this.child.stderr.resume();
     this.child.stdin.on("error", () => this.fatal(new Error("Codex input pipe closed")));
@@ -37,7 +45,7 @@ export class AppServer {
     return new Promise((resolve, reject) => {
       const id = ++this.nextId;
       const timer = setTimeout(() => this.fatal(new Error(`App-server ${method} timed out`)), 30_000);
-      this.pending.set(id, { resolve, reject, timer });
+      this.pending.set(id, { method, resolve, reject, timer });
       try { this.write({ id, method, params }); }
       catch (e) { clearTimeout(timer); this.pending.delete(id); reject(e); }
     });
@@ -51,7 +59,8 @@ export class AppServer {
     if (message.id !== undefined) {
       const waiter = this.pending.get(message.id);
       if (waiter) { clearTimeout(waiter.timer); this.pending.delete(message.id);
-        message.error ? waiter.reject(new Error(`App-server request rejected (${message.error.code})`)) : waiter.resolve(message.result); }
+        message.error ? waiter.reject(waiter.method === "thread/resume" && /already has an active writer/i.test(message.error.message ?? "")
+          ? new ThreadBusyError() : new Error(`App-server request rejected (${message.error.code})`)) : waiter.resolve(message.result); }
       return;
     }
     const a = this.active, p = message.params;
@@ -98,6 +107,11 @@ export class AppServer {
     if (result.thread.turns.some((turn: any) => !Array.isArray(turn.items) || (turn.itemsView && turn.itemsView !== "full")))
       throw new Error("Original thread history is incomplete; refusing to discard context");
     return {id:thread, createdAt:result.thread.createdAt, turns:result.thread.turns};
+  }
+  async readLegacyThread(thread: string): Promise<ThreadHistory> {
+    if (!this.runtime?.legacyHome) return this.readThread(thread);
+    const reader = new AppServer(this.bin, undefined, this.timeoutMs, this.permissions, {home:this.runtime.legacyHome});
+    try { await reader.start(); return await reader.readThread(thread); } finally { reader.close(); }
   }
   async nameThread(thread: string, name: string): Promise<void> {
     await this.request("thread/name/set", {threadId:thread, name});

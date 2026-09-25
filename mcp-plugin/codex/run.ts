@@ -1,3 +1,5 @@
+import { prepareRuntimeHome } from "./runtime-home.ts";
+import { redactSecrets } from "../src/redact.ts";
 import { getBotOwner } from "./owner.ts";
 import { getOnboardingStatus } from "../src/onboarding-status.ts";
 import { GuiChannel } from "./gui-channel.ts";
@@ -15,7 +17,7 @@ import { AgentsChatTransport } from "./transport.ts";
 export const HELP = `agentschat-mcp --codex-bridge [--cwd DIRECTORY] [--profile NAME_OR_PATH] [--codex-bin PATH] [--check]
 
 Official Codex app-server bridge. Node >=22; Codex installed and signed in.
-Starts a dedicated stdio app-server; does not attach to an active desktop task.
+Starts a dedicated stdio app-server with a private per-bot Codex home; does not attach to an active desktop task.
 No notifications/chat/channel, no fork, no account registration.
 
 Identity: --profile > CWD/.agentschat/config.json profile >
@@ -29,6 +31,7 @@ Project config fields: profile, agent_id, channels, senders, api_url, ws_url, pe
 Live DMs and exact mentions trigger replies; channels/senders restrict this further.
 All accepted messages share one persisted thread per channel, with full access by default. Set permissions: "read-only" to disable writes and inherited MCP. No offline message replay.
 State: ~/.agentschat/codex-bridge/<project-server-identity hash>/ (private).
+--conversations lists this bot's channel/task mappings; --read-conversation CHANNEL reads history without acquiring a writer.
 GUI outbox: --gui-thread THREAD_ID --gui-message-file PATH; --gui-status lists receipts.
 Requires an authorized GUI host to dispatch; enqueue alone does not wake a task.
 See codex/README.md for setup, verification, limitations and recovery.
@@ -37,7 +40,7 @@ See codex/README.md for setup, verification, limitations and recovery.
 let codex: AppServer | undefined, bridge: Bridge | undefined, transport: AgentsChatTransport | undefined;
 async function main() {
   const { values } = parseArgs({ options: { "codex-bridge": { type: "boolean" }, cwd: { type: "string" },
-    "gui-thread": { type: "string" }, "gui-message-file": { type: "string" }, "gui-status": { type: "boolean" }, "managed-worker": { type: "boolean" }, registry: { type: "string" }, bot: { type: "string" }, profile: { type: "string" }, "codex-bin": { type: "string" }, check: { type: "boolean" }, "onboarding-status": { type: "boolean" },
+    "conversations": { type: "boolean" }, "read-conversation": { type: "string" }, "gui-thread": { type: "string" }, "gui-message-file": { type: "string" }, "gui-status": { type: "boolean" }, "managed-worker": { type: "boolean" }, registry: { type: "string" }, bot: { type: "string" }, profile: { type: "string" }, "codex-bin": { type: "string" }, check: { type: "boolean" }, "onboarding-status": { type: "boolean" },
     help: { type: "boolean", short: "h" } }, strict: true });
   if (values.help) { console.log(HELP); return; }
   if (values["gui-thread"] || values["gui-message-file"] || values["gui-status"]) {
@@ -61,7 +64,20 @@ async function main() {
     return;
   }
   console.log(JSON.stringify({ cwd: c.cwd, agent_id: c.agentId, profile: c.profileFile, source: c.source, stateDir: c.stateDir }));
-  codex = new AppServer(c.codexBin, undefined, undefined, c.permissions);
+  const runtime = prepareRuntimeHome(c.stateDir);
+  codex = new AppServer(c.codexBin, undefined, undefined, c.permissions, runtime);
+  if (values.conversations || values["read-conversation"]) {
+    const state = JSON.parse(readFileSync(join(c.stateDir, "state.json"), "utf8"));
+    const channels = state.channels ?? {};
+    if (values.conversations) { console.log(JSON.stringify(Object.entries(channels).map(([channel, data]: [string, any]) => ({channel, thread:data.thread, isolated:data.namespace===runtime.home})))); return; }
+    const channel = channels[values["read-conversation"]!];
+    if (!channel) throw new Error("Unknown conversation channel");
+    if (channel.namespace && channel.namespace !== runtime.home) throw new Error("Conversation belongs to a different runtime home");
+    await codex.start();
+    const history = channel.namespace ? await codex.readThread(channel.thread) : await codex.readLegacyThread(channel.thread);
+    console.log(redactSecrets(JSON.stringify(history).split(c.token).join("[REDACTED]")));
+    codex.close(); return;
+  }
   if (values.check) { await codex.start(); console.log("Official app-server initialization: OK (no chat connection or generation)"); codex.close(); return; }
   transport = new AgentsChatTransport(c, m => { bridge!.accept(m); });
   bridge = new Bridge(c, codex, (chat, text) => transport!.send(chat, text), console.error, (chat, active) => transport!.setTyping(chat, active), () => getBotOwner(c.apiUrl, c.agentId, c.token), () => transport!.api("/api/loops/mine"));

@@ -1,3 +1,4 @@
+import { ThreadBusyError } from "./app-server.ts";
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync, openSync, closeSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { priorChannelThreads, preserveChannelHistory, type ThreadHistory } from "./thread-history.ts";
@@ -7,9 +8,9 @@ import { authorizedLoopTick, verifyLoopTick, type LoopTick } from "./loop-grants
 
 export interface ChatMessage { id: string; channel_id: string; sender_id: string; content: string; mentions?: string[]; mentioned_ids?: string[]; meta?: LoopTick }
 interface Entry { message: ChatMessage; status: "pending" | "running" | "ready" | "sending" | "sent" | "failed" | "uncertain" | "blocked"; answer?: string; error?: string }
-interface ChannelThread { thread: string; bootstrap?: string; importedThreads?: string[] }
+interface ChannelThread { thread: string; namespace?: string; bootstrap?: string; importedThreads?: string[] }
 interface State { version: 1; threads: Record<string, string>; channels?: Record<string, ChannelThread>; entries: Entry[] }
-export interface Generator { thread(cwd: string, existing?: string, ephemeral?: boolean, permissions?: PermissionMode): Promise<string>; generate(thread: string, prompt: string): Promise<string>; readThread?(thread: string): Promise<ThreadHistory>; nameThread?(thread: string, name: string): Promise<void> }
+export interface Generator { readonly namespace?: string; readLegacyThread?(thread: string): Promise<ThreadHistory>; thread(cwd: string, existing?: string, ephemeral?: boolean, permissions?: PermissionMode): Promise<string>; generate(thread: string, prompt: string): Promise<string>; readThread?(thread: string): Promise<ThreadHistory>; nameThread?(thread: string, name: string): Promise<void> }
 function permitted(m: ChatMessage, c: BridgeConfig) {
   if (m.meta?.kind === "loop_tick") return authorizedLoopTick(m, c) !== null;
   return (!c.channels.length || c.channels.includes(m.channel_id)) && (!c.senders.length || c.senders.includes(m.sender_id));
@@ -31,6 +32,7 @@ export class Bridge {
   private lock: string;
   private draining?: Promise<void>;
   private stopped = false;
+  private retry?: ReturnType<typeof setTimeout>;
   private loaded = new Set<string>();
   constructor(private config: BridgeConfig, private codex: Generator,
     private send: (channel: string, text: string) => Promise<void>, private log: (s: string) => void = console.error,
@@ -74,6 +76,7 @@ export class Bridge {
   }
   redact(text: string) { return redactSecrets(text.split(this.config.token).join("[REDACTED]")); }
   drain(): Promise<void> {
+    if (this.retry) return Promise.resolve();
     if (this.draining) return this.draining;
     this.draining = this.run().finally(() => { this.draining = undefined; });
     return this.draining;
@@ -83,18 +86,23 @@ export class Bridge {
     this.state.channels ??= {};
     let channel = this.state.channels[chat];
     if (!this.loaded.has(chat)) {
-      if (!channel) {
-        const ids = priorChannelThreads(this.state.threads, chat);
+      const namespace = this.codex.namespace;
+      if (channel?.namespace && channel.namespace !== namespace)
+        throw new Error("Conversation belongs to a different runtime home; refusing to lose context");
+      const movingHome = !!namespace && !!channel && !channel.namespace;
+      if (!channel || movingHome) {
+        const ids = [...new Set([...priorChannelThreads(this.state.threads, chat), ...(movingHome ? [channel!.thread] : [])])];
         const histories: ThreadHistory[] = [];
         for (const id of ids) {
-          if (!this.codex.readThread) throw new Error("Cannot migrate channel without original thread history");
-          histories.push(await this.codex.readThread(id));
+          const reader = namespace ? this.codex.readLegacyThread : this.codex.readThread;
+          if (!reader) throw new Error("Cannot migrate channel without original thread history");
+          histories.push(await reader.call(this.codex, id));
         }
         const bootstrap = histories.length ? preserveChannelHistory(this.config.stateDir, chat, histories, s => this.redact(s)) : undefined;
         const thread = await this.codex.thread(this.config.cwd, undefined, false, this.config.permissions);
-        channel = this.state.channels[chat] = {thread, ...(bootstrap ? {bootstrap, importedThreads:ids} : {})};
+        channel = this.state.channels[chat] = {thread, ...(namespace ? {namespace} : {}), ...(bootstrap ? {bootstrap, importedThreads:ids} : {})};
         this.save();
-        // Stable, compact titles distinguish channels in the desktop sidebar.
+        // Stable titles make read-only conversation listings useful.
         await this.codex.nameThread?.(thread, `AgentsChat · ${chat}`).catch(() => this.log("Could not name channel task"));
       } else {
         channel.thread = await this.codex.thread(this.config.cwd, channel.thread, false, this.config.permissions);
@@ -112,7 +120,7 @@ export class Bridge {
       try {
         this.activity(e.message.channel_id, true);
         if (e.status === "pending") {
-          e.status = "running"; this.save();
+          e.status = "running"; delete e.error; this.save();
           const chat = e.message.channel_id;
           // Ordinary accepted messages share the configured permissions and channel history.
           // Scheduled self ticks retain their explicit grant and live-loop validation.
@@ -134,12 +142,18 @@ export class Bridge {
         e.status = "sent"; delete e.answer; e.message.content = ""; this.save();
         this.log(`Replied in ${JSON.stringify(e.message.channel_id)}`);
       } catch (error) {
+        if (error instanceof ThreadBusyError) {
+          e.status = "pending"; e.error = error.message; this.save();
+          this.log("Conversation in use; queued message will resume in the same task");
+          if (!this.stopped) this.retry = setTimeout(() => { this.retry = undefined; void this.drain(); }, 5000);
+          return;
+        }
         e.error = this.redact(error instanceof Error ? error.message : "Bridge operation failed").slice(0, 240);
         e.status = e.status === "sending" ? "uncertain" : "failed";
         this.save(); this.log(`Message ${JSON.stringify(e.message.id)} ${e.status}; inspect private state before retrying`);
       } finally { this.activity(e.message.channel_id, false); }
     }
   }
-  pause() { this.stopped = true; }
+  pause() { this.stopped = true; clearTimeout(this.retry); this.retry = undefined; }
   async stop() { this.pause(); await this.draining; if (existsSync(this.lock)) unlinkSync(this.lock); }
 }
