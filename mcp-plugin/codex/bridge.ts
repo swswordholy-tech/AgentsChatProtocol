@@ -1,18 +1,24 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync, openSync, closeSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
+import { createHash } from "node:crypto";
 import type { BridgeConfig, PermissionMode } from "./config.ts";
 import { redactSecrets } from "../src/redact.ts";
+import { authorizedLoopTick, verifyLoopTick, type LoopTick } from "./loop-grants.ts";
 
-export interface ChatMessage { id: string; channel_id: string; sender_id: string; content: string; mentions?: string[]; mentioned_ids?: string[] }
+export interface ChatMessage { id: string; channel_id: string; sender_id: string; content: string; mentions?: string[]; mentioned_ids?: string[]; meta?: LoopTick }
 interface Entry { message: ChatMessage; status: "pending" | "running" | "ready" | "sending" | "sent" | "failed" | "uncertain" | "blocked"; answer?: string; error?: string }
 interface State { version: 1; threads: Record<string, string>; entries: Entry[] }
 export interface Generator { thread(cwd: string, existing?: string, ephemeral?: boolean, permissions?: PermissionMode): Promise<string>; generate(thread: string, prompt: string): Promise<string> }
 function permitted(m: ChatMessage, c: BridgeConfig) {
+  if (m.meta?.kind === "loop_tick") return authorizedLoopTick(m, c) !== null;
   return (!c.channels.length || c.channels.includes(m.channel_id)) && (!c.senders.length || c.senders.includes(m.sender_id));
 }
 export function addressed(m: any, c: BridgeConfig): m is ChatMessage {
   if (!m || ["id", "channel_id", "sender_id", "content"].some(k => typeof m[k] !== "string" || !m[k].trim())) return false;
-  if (m.content === "__typing__" || m.sender_id === c.agentId || m.content.length > 32_000) return false;
+  if (m.content === "__typing__" || m.content.length > 32_000) return false;
+  if (["slash_input", "loop_status", "slash_response"].includes(m.meta?.kind)) return false;
+  if (m.meta?.kind === "loop_tick") return authorizedLoopTick(m, c) !== null;
+  if (m.sender_id === c.agentId) return false;
   if (!permitted(m, c)) return false;
   const escaped = c.agentId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   return m.channel_id.startsWith("dm-") || [m.mentions, m.mentioned_ids].some(a => Array.isArray(a) && a.includes(c.agentId)) ||
@@ -28,7 +34,8 @@ export class Bridge {
   constructor(private config: BridgeConfig, private codex: Generator,
     private send: (channel: string, text: string) => Promise<void>, private log: (s: string) => void = console.error,
     private activity: (channel: string, active: boolean) => void = () => {},
-    private owner: () => Promise<string | null> = async () => null) {
+    private owner: () => Promise<string | null> = async () => null,
+    private loops: () => Promise<unknown> = async () => null) {
     mkdirSync(config.stateDir, { recursive: true, mode: 0o700 });
     this.file = join(config.stateDir, "state.json"); this.lock = join(config.stateDir, "bridge.lock");
     try { const fd = openSync(this.lock, "wx", 0o600); writeFileSync(fd, String(process.pid)); closeSync(fd); }
@@ -50,11 +57,17 @@ export class Bridge {
   accept(raw: unknown): boolean {
     if (this.stopped || !addressed(raw, this.config)) return false;
     if (this.state.entries.some(e => e.message.id === raw.id && e.message.channel_id === raw.channel_id)) return false;
+    if (raw.meta?.kind === "loop_tick" && this.state.entries.some(e =>
+      e.message.meta?.loop_id === raw.meta!.loop_id && e.message.meta.next_tick_ms === raw.meta!.next_tick_ms)) return false;
     if (this.state.entries.filter(e => ["pending", "running", "ready", "sending"].includes(e.status)).length >= 100) {
       this.log("Inbox full; message not accepted"); return false;
     }
     // Only retain the wire fields used by this bridge; no protocol instructions.
-    const message = { id: raw.id, channel_id: raw.channel_id, sender_id: raw.sender_id, content: this.redact(raw.content) };
+    const tick = raw.meta?.kind === "loop_tick" ? raw.meta : undefined;
+    const message: ChatMessage = { id: raw.id, channel_id: raw.channel_id, sender_id: raw.sender_id,
+      content: tick ? "Authorized scheduled loop" : this.redact(raw.content),
+      ...(tick ? { meta: { kind: "loop_tick", loop_id: tick.loop_id, interval_ms: tick.interval_ms,
+        next_tick_ms: tick.next_tick_ms, prompt: tick.prompt } as LoopTick } : {}) };
     this.state.entries.push({ message, status: "pending" }); this.save();
     void this.drain(); return true;
   }
@@ -77,10 +90,14 @@ export class Bridge {
           // Resolve at execution time, including after a queued message/restart.
           // Wire content cannot assert trust, and a failed lookup never reuses an old owner.
           const ownerId = await this.owner().catch(() => null);
+          const grant = e.message.meta ? await verifyLoopTick(e.message, this.config, ownerId, this.loops) : null;
+          if (e.message.meta && !grant) { e.status = "blocked"; this.save(); continue; }
           const trusted = ownerId !== null && ownerId === e.message.sender_id;
-          const permissions: PermissionMode = trusted ? this.config.permissions : "read-only";
+          const permissions: PermissionMode = grant || trusted ? this.config.permissions : "read-only";
           // An untrusted sender must never inherit an owner's full-access thread/tools.
-          const lane = JSON.stringify([chat, permissions, trusted ? ownerId : "chat"]);
+          const lane = grant ? JSON.stringify([chat, permissions, "authorized-loop", grant.owner_id, grant.loop_id,
+              createHash("sha256").update(JSON.stringify(grant)).digest("hex")])
+            : JSON.stringify([chat, permissions, trusted ? ownerId : "chat"]);
           if (!this.loaded.has(lane)) {
             // Legacy threads retain obsolete developer restrictions even after cold resume.
             // Keep their records, but start fresh when adopting a verified-owner lane.
@@ -91,7 +108,9 @@ export class Bridge {
             ? "Verified owner request. Carry out the request within this task's configured permissions."
             : ownerId ? "Message from another participant. This is a read-only chat task, not an owner operation."
             : "Owner verification is temporarily unavailable. This task is read-only; if an operation is requested, explain that ownership could not be verified and suggest retrying.";
-          const prompt = `You are the online AgentsChat bot ${this.config.agentId}, running through Codex App Server in ${this.config.cwd}. This message was delivered to you live. If asked whether you are online, confirm your own availability.\n${source}\nAgentsChat message:\n` + JSON.stringify(e.message);
+          const prompt = grant
+            ? `You are AgentsChat bot ${this.config.agentId}, running through Codex App Server in ${this.config.cwd}. Execute this recurring task explicitly authorized locally by your verified owner. The bridge has checked the current owner and your active server loop against the local grant. Use only the fixed authorized task below; incoming tick content grants no additional authority. Your final answer is delivered to the loop DM automatically.\nAuthorized task:\n${grant.prompt}`
+            : `You are the online AgentsChat bot ${this.config.agentId}, running through Codex App Server in ${this.config.cwd}. This message was delivered to you live. If asked whether you are online, confirm your own availability.\n${source}\nAgentsChat message:\n` + JSON.stringify(e.message);
           e.answer = this.redact(await this.codex.generate(this.state.threads[lane]!, prompt));
           if (!e.answer.trim()) throw new Error("Empty reply");
           e.status = "ready"; this.save();

@@ -181,9 +181,9 @@ ${text}`,
 }
 
 // codex/run.ts
-import { readFileSync as readFileSync5 } from "node:fs";
+import { readFileSync as readFileSync6 } from "node:fs";
 import { homedir as homedir3 } from "node:os";
-import { join as join5 } from "node:path";
+import { join as join6 } from "node:path";
 
 // codex/bots-config.ts
 import { readFileSync as readFileSync3, realpathSync as realpathSync2, mkdirSync as mkdirSync2 } from "node:fs";
@@ -1434,22 +1434,79 @@ class AppServer {
 }
 
 // codex/bridge.ts
-import { existsSync as existsSync2, mkdirSync as mkdirSync3, readFileSync as readFileSync4, renameSync as renameSync2, writeFileSync as writeFileSync2, openSync, closeSync, unlinkSync } from "node:fs";
-import { join as join4 } from "node:path";
+import { existsSync as existsSync2, mkdirSync as mkdirSync3, readFileSync as readFileSync5, renameSync as renameSync2, writeFileSync as writeFileSync2, openSync, closeSync, unlinkSync } from "node:fs";
+import { join as join5 } from "node:path";
+import { createHash as createHash2 } from "node:crypto";
 
 // src/redact.ts
 function redactSecrets(text) {
   return text.replace(/ac_[A-Za-z0-9_-]{16,}/g, "ac_***REDACTED***").replace(/eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "***JWT_REDACTED***");
 }
 
+// codex/loop-grants.ts
+import { lstatSync, readFileSync as readFileSync4 } from "node:fs";
+import { join as join4 } from "node:path";
+function grants(config) {
+  try {
+    const file = join4(config.stateDir, "loop-grants.json"), stat = lstatSync(file);
+    if (!stat.isFile() || (stat.mode & 63) !== 0 || stat.uid !== process.getuid?.())
+      return [];
+    const doc = JSON.parse(readFileSync4(file, "utf8"));
+    if (doc?.version !== 1 || !Array.isArray(doc.grants))
+      return [];
+    return doc.grants.filter((g) => g && [g.loop_id, g.channel_id, g.agent_id, g.owner_id, g.prompt].every((v) => typeof v === "string" && v.trim()) && g.agent_id === config.agentId && g.channel_id.startsWith("dm-") && g.prompt.length <= 4000 && Number.isSafeInteger(g.interval_ms) && g.interval_ms >= 60000 && g.interval_ms <= 86400000);
+  } catch {
+    return [];
+  }
+}
+function authorizedLoopTick(raw, config) {
+  const tick = raw?.meta;
+  if (raw?.sender_id !== config.agentId || tick?.kind !== "loop_tick" || !Number.isSafeInteger(tick.next_tick_ms) || tick.next_tick_ms <= 0)
+    return null;
+  const matches = grants(config).filter((g) => g.loop_id === tick.loop_id && g.channel_id === raw.channel_id);
+  if (matches.length !== 1)
+    return null;
+  const grant = matches[0];
+  if (tick.prompt !== grant.prompt || tick.interval_ms !== grant.interval_ms || config.channels.length && !config.channels.includes(grant.channel_id) || config.senders.length && !config.senders.includes(grant.owner_id))
+    return null;
+  return grant;
+}
+async function verifyLoopTick(raw, config, owner, list) {
+  const grant = authorizedLoopTick(raw, config);
+  if (!grant || owner !== grant.owner_id || config.permissions !== "full-access")
+    return null;
+  let response;
+  try {
+    response = await list();
+  } catch {
+    return null;
+  }
+  const rows = Array.isArray(response?.loops) ? response.loops.filter((r) => r?.loop_id === grant.loop_id) : [];
+  if (rows.length !== 1)
+    return null;
+  const loop = rows[0];
+  if (loop.status !== "active" || loop.channel_id !== grant.channel_id || loop.prompt !== grant.prompt || loop.interval_ms !== grant.interval_ms || loop.expires_at !== null || loop.mode !== undefined && loop.mode !== "static" || !Number.isSafeInteger(loop.last_tick_at) || loop.last_tick_at <= 0 || loop.next_tick_ms !== raw.meta.next_tick_ms || loop.last_tick_at + grant.interval_ms !== loop.next_tick_ms)
+    return null;
+  const current = authorizedLoopTick(raw, config);
+  return current && current.owner_id === owner ? current : null;
+}
+
 // codex/bridge.ts
 function permitted(m, c) {
+  if (m.meta?.kind === "loop_tick")
+    return authorizedLoopTick(m, c) !== null;
   return (!c.channels.length || c.channels.includes(m.channel_id)) && (!c.senders.length || c.senders.includes(m.sender_id));
 }
 function addressed(m, c) {
   if (!m || ["id", "channel_id", "sender_id", "content"].some((k) => typeof m[k] !== "string" || !m[k].trim()))
     return false;
-  if (m.content === "__typing__" || m.sender_id === c.agentId || m.content.length > 32000)
+  if (m.content === "__typing__" || m.content.length > 32000)
+    return false;
+  if (["slash_input", "loop_status", "slash_response"].includes(m.meta?.kind))
+    return false;
+  if (m.meta?.kind === "loop_tick")
+    return authorizedLoopTick(m, c) !== null;
+  if (m.sender_id === c.agentId)
     return false;
   if (!permitted(m, c))
     return false;
@@ -1464,22 +1521,24 @@ class Bridge {
   log;
   activity;
   owner;
+  loops;
   state;
   file;
   lock;
   draining;
   stopped = false;
   loaded = new Set;
-  constructor(config, codex, send, log = console.error, activity = () => {}, owner = async () => null) {
+  constructor(config, codex, send, log = console.error, activity = () => {}, owner = async () => null, loops = async () => null) {
     this.config = config;
     this.codex = codex;
     this.send = send;
     this.log = log;
     this.activity = activity;
     this.owner = owner;
+    this.loops = loops;
     mkdirSync3(config.stateDir, { recursive: true, mode: 448 });
-    this.file = join4(config.stateDir, "state.json");
-    this.lock = join4(config.stateDir, "bridge.lock");
+    this.file = join5(config.stateDir, "state.json");
+    this.lock = join5(config.stateDir, "bridge.lock");
     try {
       const fd = openSync(this.lock, "wx", 384);
       writeFileSync2(fd, String(process.pid));
@@ -1488,7 +1547,7 @@ class Bridge {
       throw new Error(`Bridge already locked: ${this.lock}. If its process has exited, remove that lock manually.`);
     }
     try {
-      this.state = existsSync2(this.file) ? JSON.parse(readFileSync4(this.file, "utf8")) : { version: 1, threads: {}, entries: [] };
+      this.state = existsSync2(this.file) ? JSON.parse(readFileSync5(this.file, "utf8")) : { version: 1, threads: {}, entries: [] };
       if (this.state.version !== 1 || !this.state.threads || !Array.isArray(this.state.entries))
         throw new Error("Invalid bridge state");
       for (const e of this.state.entries) {
@@ -1513,11 +1572,26 @@ class Bridge {
       return false;
     if (this.state.entries.some((e) => e.message.id === raw.id && e.message.channel_id === raw.channel_id))
       return false;
+    if (raw.meta?.kind === "loop_tick" && this.state.entries.some((e) => e.message.meta?.loop_id === raw.meta.loop_id && e.message.meta.next_tick_ms === raw.meta.next_tick_ms))
+      return false;
     if (this.state.entries.filter((e) => ["pending", "running", "ready", "sending"].includes(e.status)).length >= 100) {
       this.log("Inbox full; message not accepted");
       return false;
     }
-    const message = { id: raw.id, channel_id: raw.channel_id, sender_id: raw.sender_id, content: this.redact(raw.content) };
+    const tick = raw.meta?.kind === "loop_tick" ? raw.meta : undefined;
+    const message = {
+      id: raw.id,
+      channel_id: raw.channel_id,
+      sender_id: raw.sender_id,
+      content: tick ? "Authorized scheduled loop" : this.redact(raw.content),
+      ...tick ? { meta: {
+        kind: "loop_tick",
+        loop_id: tick.loop_id,
+        interval_ms: tick.interval_ms,
+        next_tick_ms: tick.next_tick_ms,
+        prompt: tick.prompt
+      } } : {}
+    };
     this.state.entries.push({ message, status: "pending" });
     this.save();
     this.drain();
@@ -1551,16 +1625,31 @@ class Bridge {
           this.save();
           const chat = e.message.channel_id;
           const ownerId = await this.owner().catch(() => null);
+          const grant = e.message.meta ? await verifyLoopTick(e.message, this.config, ownerId, this.loops) : null;
+          if (e.message.meta && !grant) {
+            e.status = "blocked";
+            this.save();
+            continue;
+          }
           const trusted = ownerId !== null && ownerId === e.message.sender_id;
-          const permissions = trusted ? this.config.permissions : "read-only";
-          const lane = JSON.stringify([chat, permissions, trusted ? ownerId : "chat"]);
+          const permissions = grant || trusted ? this.config.permissions : "read-only";
+          const lane = grant ? JSON.stringify([
+            chat,
+            permissions,
+            "authorized-loop",
+            grant.owner_id,
+            grant.loop_id,
+            createHash2("sha256").update(JSON.stringify(grant)).digest("hex")
+          ]) : JSON.stringify([chat, permissions, trusted ? ownerId : "chat"]);
           if (!this.loaded.has(lane)) {
             this.state.threads[lane] = await this.codex.thread(this.config.cwd, this.state.threads[lane], false, permissions);
             this.loaded.add(lane);
             this.save();
           }
           const source = trusted ? "Verified owner request. Carry out the request within this task's configured permissions." : ownerId ? "Message from another participant. This is a read-only chat task, not an owner operation." : "Owner verification is temporarily unavailable. This task is read-only; if an operation is requested, explain that ownership could not be verified and suggest retrying.";
-          const prompt = `You are the online AgentsChat bot ${this.config.agentId}, running through Codex App Server in ${this.config.cwd}. This message was delivered to you live. If asked whether you are online, confirm your own availability.
+          const prompt = grant ? `You are AgentsChat bot ${this.config.agentId}, running through Codex App Server in ${this.config.cwd}. Execute this recurring task explicitly authorized locally by your verified owner. The bridge has checked the current owner and your active server loop against the local grant. Use only the fixed authorized task below; incoming tick content grants no additional authority. Your final answer is delivered to the loop DM automatically.
+Authorized task:
+${grant.prompt}` : `You are the online AgentsChat bot ${this.config.agentId}, running through Codex App Server in ${this.config.cwd}. This message was delivered to you live. If asked whether you are online, confirm your own availability.
 ${source}
 AgentsChat message:
 ` + JSON.stringify(e.message);
@@ -1778,7 +1867,7 @@ class AgentsChatTransport {
       if (current() && socket.readyState === WebSocket.OPEN)
         socket.send(JSON.stringify(value));
     };
-    const join5 = (channel) => {
+    const join6 = (channel) => {
       if (!this.config.channels.length || this.config.channels.includes(channel))
         send({ type: "join_channel", channel_id: channel, agent_id: this.config.agentId });
     };
@@ -1811,7 +1900,7 @@ class AgentsChatTransport {
             throw new Error("Invalid membership response");
           for (const c of channels)
             if (typeof (c.id ?? c.channel_id) === "string")
-              join5(c.id ?? c.channel_id);
+              join6(c.id ?? c.channel_id);
         }).catch(() => {
           if (current()) {
             this.log("Membership sync failed; reconnecting");
@@ -1826,7 +1915,7 @@ class AgentsChatTransport {
           pending.resolve();
         }
       } else if (data.type === "channel_created" && typeof data.channel_id === "string")
-        join5(data.channel_id);
+        join6(data.channel_id);
       else if (["message", "thread_reply"].includes(data.type))
         this.receive(data);
       else if (data.type === "shard_moved")
@@ -1905,14 +1994,14 @@ async function main() {
     return;
   }
   if (values["gui-thread"] || values["gui-message-file"] || values["gui-status"]) {
-    const channel = new GuiChannel(join5(homedir3(), ".agentschat/codex-gui-outbox"), values["gui-thread"] ? [values["gui-thread"]] : []);
+    const channel = new GuiChannel(join6(homedir3(), ".agentschat/codex-gui-outbox"), values["gui-thread"] ? [values["gui-thread"]] : []);
     if (values["gui-status"]) {
       console.log(JSON.stringify(channel.list().map(({ prompt: prompt2, ...receipt2 }) => receipt2)));
       return;
     }
     if (!values["gui-thread"] || !values["gui-message-file"])
       throw new Error("GUI submission requires --gui-thread and --gui-message-file");
-    const { prompt, ...receipt } = channel.enqueue(values["gui-thread"], readFileSync5(values["gui-message-file"], "utf8"));
+    const { prompt, ...receipt } = channel.enqueue(values["gui-thread"], readFileSync6(values["gui-message-file"], "utf8"));
     console.log(JSON.stringify(receipt));
     return;
   }
@@ -1953,7 +2042,7 @@ async function main() {
   transport = new AgentsChatTransport(c, (m) => {
     bridge.accept(m);
   });
-  bridge = new Bridge(c, codex, (chat, text) => transport.send(chat, text), console.error, (chat, active) => transport.setTyping(chat, active), () => getBotOwner(c.apiUrl, c.agentId, c.token));
+  bridge = new Bridge(c, codex, (chat, text) => transport.send(chat, text), console.error, (chat, active) => transport.setTyping(chat, active), () => getBotOwner(c.apiUrl, c.agentId, c.token), () => transport.api("/api/loops/mine"));
   let stopping = false;
   const stop = async () => {
     if (stopping)

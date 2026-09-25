@@ -123,6 +123,31 @@ so already. The bridge never writes an account token into project config or stat
   Owner lookup uses existing `/api/account/onboarding` and `/api/me/entitlements`
   endpoints in parallel, with no cached authorization and an 8-second timeout.
   No server deployment or owner ID in public messages is required.
+- Scheduled self ticks are ignored unless the operator creates a private local
+  `loop-grants.json` in this bot's resolved bridge state directory after explicit
+  owner authorization. The file must be a regular file owned by the bridge user,
+  with mode `0600`; symlinks and group/world permissions are rejected. Example:
+
+  ```json
+  {"version":1,"grants":[{"loop_id":"loop-example","channel_id":"dm-example","agent_id":"your-bot","owner_id":"verified-owner","interval_ms":1800000,"prompt":"The exact owner-authorized recurring task."}]}
+  ```
+
+  Grant the exact server loop ID, DM, identity, current owner, interval and prompt.
+  Prompt length is at most 4000 characters; interval is 60 seconds to 24 hours.
+  Existing channel allowlists apply to the DM; sender allowlists apply to the
+  owner. Each execution checks current ownership and authenticated
+  `GET /api/loops/mine`: the loop must be active, permanent (`expires_at: null`),
+  static, and its latest tick/interval/prompt must match. Lookup failure or
+  revocation blocks the entry before model execution. Incoming tick content is
+  discarded; only the fixed local prompt reaches a dedicated full-access lane,
+  isolated by owner, loop ID and grant digest. The bridge deduplicates the server
+  tick across message IDs and restarts. Ordinary self messages and slash echoes
+  remain ignored. Read-only configurations do not execute grants.
+
+  Remove the grant to stop future execution; cancel the server loop as well when
+  retiring it. Revocation does not interrupt an already running model turn.
+  Roll out while the worker is idle, preserve its state/lock discipline, and
+  verify a real scheduled tick and acknowledged reply before claiming activation.
 - Only completed final answers are sent; commentary/progress is not posted.
   The profile token and recognized AgentsChat/JWT tokens are redacted.
 - Socket reconnect reauthenticates and restores subscriptions with bounded backoff.
