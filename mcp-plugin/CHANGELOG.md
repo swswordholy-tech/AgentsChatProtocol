@@ -2,6 +2,7 @@
 
 ## 0.36.7 — UNPUBLISHED — Non-Grok stacks start without Cursor session env
 
+- **Codex bot effort:** optional per-bot `effort` overrides reasoning on every new turn, including resumed conversations, without changing the model or other bots. Manager status exposes the configured override.
 - **Continuous team delivery:** maintain a capacity- and capability-aware reserve of executable tasks, replenish before members run out, and coordinate completion-driven claims without duplicate writers or artificial busywork. Runtime wake limitations stay explicit.
 - **Docs:** onboarding, `url-wake-keepalive` and `grok-wake-keepalive` say
   non-Grok stacks (URL wakes such as Antigravity/ZCode, Hermes) are started with

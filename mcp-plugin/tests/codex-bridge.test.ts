@@ -327,6 +327,26 @@ test("create and resume both apply permissions and each turn preserves them", as
   }
 });
 
+test("per-bot effort applies to new and resumed turns without changing model or conversation", async () => {
+  for (const effort of [undefined, "medium"] as const) {
+    const app = new AppServer("node", ["-e", fakeAppServer], 2000, "full-access", undefined, effort);
+    try {
+      await app.start();
+      const id = await app.thread("/tmp");
+      await app.generate(id, "first");
+      expect(await app.thread("/tmp", id)).toBe(id);
+      await app.generate(id, "second");
+      const turns = (await app.request("test/trace", {})).filter((e: any) => e.method === "turn/start");
+      expect(turns).toHaveLength(2);
+      for (const { params } of turns) {
+        expect(params.threadId).toBe(id);
+        expect(params.effort).toBe(effort);
+        expect(params.model).toBeUndefined();
+      }
+    } finally { app.close(); }
+  }
+});
+
 test("all accepted senders share one group thread and configured tools; replies stay in the group", async () => {
   let ownerChecks = 0;
   const f = await routingFixture(async () => {ownerChecks++; throw Error("unavailable");});

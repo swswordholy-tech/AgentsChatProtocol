@@ -1,7 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createInterface } from "node:readline";
 import type { ThreadHistory } from "./thread-history.ts";
-import type { PermissionMode } from "./config.ts";
+import type { PermissionMode, ReasoningEffort } from "./config.ts";
 
 export class ThreadBusyError extends Error {
   constructor() { super("This conversation has another active writer; waiting to resume the same task"); this.name = "ThreadBusyError"; }
@@ -18,7 +18,7 @@ export class AppServer {
     resolve: (s: string) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> };
   private threadPermissions = new Map<string, PermissionMode>();
   private disabledMcp: Record<string, { enabled: boolean }> = {};
-  constructor(private bin = "codex", private args = ["app-server", "--listen", "stdio://"], private timeoutMs = 600_000, private permissions: PermissionMode = "full-access", private runtime?: {home: string; legacyHome?: string}) {}
+  constructor(private bin = "codex", private args = ["app-server", "--listen", "stdio://"], private timeoutMs = 600_000, private permissions: PermissionMode = "full-access", private runtime?: {home: string; legacyHome?: string}, private effort?: ReasoningEffort) {}
   get namespace() { return this.runtime?.home; }
   async start() {
     const env = Object.fromEntries(Object.entries(process.env).filter(([k]) => !/^AGENTS?CHAT_|^RELAY_/.test(k)));
@@ -116,7 +116,7 @@ export class AppServer {
   async nameThread(thread: string, name: string): Promise<void> {
     await this.request("thread/name/set", {threadId:thread, name});
   }
-  async generate(thread: string, text: string, effort?: "low"): Promise<string> {
+  async generate(thread: string, text: string, effort: ReasoningEffort | undefined = this.effort): Promise<string> {
     if (this.active) throw new Error("App-server is busy");
     const permissions = this.threadPermissions.get(thread);
     if (!permissions) throw new Error("Thread permissions have not been configured");

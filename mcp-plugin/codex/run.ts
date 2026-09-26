@@ -25,7 +25,7 @@ CWD/.agentschat/profile.json > CWD/.codex/config.toml MCP profile > AGENTSCHAT_P
 Only the exact CWD is searched. Named profiles live in ~/.agentschat (legacy ~/.agentchat).
 An optional project agent_id must match the selected profile; it cannot replace it.
 Credentials: private profile JSON {agent_id, token}, chmod 600; never put keys in argv.
-Project config fields: profile, agent_id, channels, senders, api_url, ws_url, permissions.
+Project config fields: profile, agent_id, channels, senders, api_url, ws_url, permissions, effort.
 --onboarding-status checks authentication/ownership and prints safe claim/chat links; it does not send messages.
 --check validates identity and official app-server initialization without opening chat.
 Live DMs and exact mentions trigger replies; channels/senders restrict this further.
@@ -65,7 +65,7 @@ async function main() {
   }
   console.log(JSON.stringify({ cwd: c.cwd, agent_id: c.agentId, profile: c.profileFile, source: c.source, stateDir: c.stateDir }));
   const runtime = prepareRuntimeHome(c.stateDir);
-  codex = new AppServer(c.codexBin, undefined, undefined, c.permissions, runtime);
+  codex = new AppServer(c.codexBin, undefined, undefined, c.permissions, runtime, c.effort);
   if (values.conversations || values["read-conversation"]) {
     const state = JSON.parse(readFileSync(join(c.stateDir, "state.json"), "utf8"));
     const channels = state.channels ?? {};

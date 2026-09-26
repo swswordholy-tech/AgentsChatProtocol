@@ -19,7 +19,7 @@ function removeDeadLock(file: string) {
   try { process.kill(pid, 0); } catch (e: any) { if (e.code === "ESRCH") unlinkSync(file); }
 }
 function save() {
-  writeFileSync(statusFile + ".tmp", JSON.stringify({ pid: process.pid, updated_at: new Date().toISOString(), bots: [...workers.values()].map(w => ({ name: w.config.name, agent_id: w.config.agentId, workdir: w.config.cwd, pid: w.child?.pid, status: w.status })) }, null, 2), { mode: 0o600 });
+  writeFileSync(statusFile + ".tmp", JSON.stringify({ pid: process.pid, updated_at: new Date().toISOString(), bots: [...workers.values()].map(w => ({ name: w.config.name, agent_id: w.config.agentId, workdir: w.config.cwd, effort: w.config.effort, pid: w.child?.pid, status: w.status })) }, null, 2), { mode: 0o600 });
   renameSync(statusFile + ".tmp", statusFile);
 }
 async function stop(w: Worker) {

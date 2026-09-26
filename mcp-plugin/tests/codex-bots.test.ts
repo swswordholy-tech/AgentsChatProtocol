@@ -7,6 +7,7 @@ import { realpathSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSy
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { loadBots } from "../codex/bots-config.ts";
+import { reasoningEffort, resolveConfig } from "../codex/config.ts";
 import { parseProcesses, externalCodexPresent } from "../codex/processes.ts";
 test("watcher excludes descendants and keeps multiple independent sessions active", () => {
  const own = parseProcesses("10 1 /opt/node\n11 10 /opt/node\n12 11 /app/codex");
@@ -36,6 +37,31 @@ test("central registry ignores project identity; workdir defaults and duplicate 
   write([{name:"one",profile:"one"}],{default_workdir:undefined});
   expect(loadBots(file,home)[0]!.cwd).toBe(realpathSync(join(home,".agentschat/workspace")));
   write([{name:"one",profile:"one",enabled:"false"}]); expect(()=>loadBots(file,home)).toThrow("enabled");
+ } finally {rmSync(home,{recursive:true,force:true});}
+});
+
+test("reasoning effort is optional and independently scoped to each bot", () => {
+ const home=mkdtempSync(join(tmpdir(),"bots-effort-"));
+ try {
+  const profiles=join(home,".agentschat/profiles"), cwd=join(home,"project");
+  mkdirSync(profiles,{recursive:true}); mkdirSync(join(cwd,".agentschat"),{recursive:true});
+  for (const name of ["one","two"])
+   writeFileSync(join(profiles,`${name}.json`),JSON.stringify({agent_id:`test-${name}`,token:`ac_test_${name}_token`}),{mode:0o600});
+  writeFileSync(join(cwd,".agentschat/config.json"),JSON.stringify({profile:"one",effort:"high"}));
+  const file=join(home,"bots.json");
+  const write=(effort:unknown)=>writeFileSync(file,JSON.stringify({version:1,default_workdir:cwd,bots:[{name:"one",profile:"one",effort},{name:"two",profile:"two"}]}));
+  write("medium");
+  expect(loadBots(file,home).map(bot=>bot.effort)).toEqual(["medium",undefined]);
+  expect(resolveConfig({cwd},{},home).effort).toBe("high");
+  write(undefined);
+  expect(loadBots(file,home).map(bot=>bot.effort)).toEqual([undefined,undefined]);
+  for (const invalid of [null,123,false,[],{},"","   "]) {
+   write(invalid);
+   expect(()=>loadBots(file,home)).toThrow("effort");
+  }
+  write(" medium ");
+  expect(loadBots(file,home)[0]!.effort).toBe("medium");
+  expect(reasoningEffort("model-specific-effort")).toBe("model-specific-effort");
  } finally {rmSync(home,{recursive:true,force:true});}
 });
 
