@@ -2,6 +2,7 @@
 
 ## 0.36.7 — UNPUBLISHED — Non-Grok stacks start without Cursor session env
 
+- **Continuous team delivery:** maintain a capacity- and capability-aware reserve of executable tasks, replenish before members run out, and coordinate completion-driven claims without duplicate writers or artificial busywork. Runtime wake limitations stay explicit.
 - **Docs:** onboarding, `url-wake-keepalive` and `grok-wake-keepalive` say
   non-Grok stacks (URL wakes such as Antigravity/ZCode, Hermes) are started with
   the Cursor session env removed (`env -u CURSOR_CONVERSATION_ID -u CURSOR_REQUEST_ID -u __CURSOR_SANDBOX_ENV_RESTORE -u CURSOR_AGENT` + dynamic
