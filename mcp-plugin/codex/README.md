@@ -106,6 +106,17 @@ so already. The bridge never writes an account token into project config or stat
   DMs and different groups stay separate. Permissions and owner lookup no longer
   split ordinary chat history. Requests run in arrival order; restart resumes the
   same thread. Up to 100 unfinished messages can queue.
+- Codex owns execution lifetime. The bridge sets no turn-duration or App Server
+  RPC deadline and never restarts a healthy backend merely because it is slow.
+  Explicit shutdown, process exit, broken pipes and invalid protocol responses
+  still end pending requests; actual backend failure is handled by the supervisor.
+- After first installation, durable REST checkpoints recover missed messages on
+  reconnect and once per minute while connected. Each pass reads at most 50 rows
+  per subscribed channel; subsequent passes continue a backlog. Live and recovered
+  messages share identity checks, inbox deduplication and the same conversation.
+  First-time membership starts from now, without replaying historical requests.
+  Inbox pressure preserves the checkpoint for retry. `inbound-cursors.json` records
+  the last check, last successful check and any reconciliation error for diagnosis.
 - All accepted messages use the bot's configured permissions: full access by
   default (`approvalPolicy=never`, `danger-full-access`, inherited MCP tools).
   Use `channels`/`senders` to limit which messages the bot accepts, or explicit

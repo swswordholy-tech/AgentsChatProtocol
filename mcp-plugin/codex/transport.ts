@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import WebSocket from "ws";
 import type { BridgeConfig } from "./config.ts";
 import { HeartbeatMonitor } from "../src/heartbeat.ts";
+import { InboxSync } from "./inbox-sync.ts";
 
 export class AgentsChatTransport {
   private socket?: WebSocket;
@@ -12,7 +13,13 @@ export class AgentsChatTransport {
   private retry?: ReturnType<typeof setTimeout>;
   private closed = false;
   private delay = 1000;
-  constructor(private config: BridgeConfig, private receive: (m: unknown) => void, private log: (s: string) => void = console.error) {}
+  private inboxSync?: InboxSync;
+  private syncTimer?: ReturnType<typeof setInterval>;
+  constructor(private config: BridgeConfig, private receive: (m: unknown) => void, private log: (s: string) => void = console.error,
+    recover?: (m: unknown) => boolean, private syncIntervalMs = 60_000) {
+    if (recover) this.inboxSync = new InboxSync(config.stateDir, path => this.api(path), recover,
+      () => !this.closed && this.authenticated, log);
+  }
   async api(path: string, body?: unknown) {
     let response: Response;
     try {
@@ -62,7 +69,10 @@ export class AgentsChatTransport {
     const current = () => !this.closed && this.socket === socket;
     const send = (value: unknown) => { if (current() && socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(value)); };
     const join = (channel: string) => {
-      if (!this.config.channels.length || this.config.channels.includes(channel)) send({ type: "join_channel", channel_id: channel, agent_id: this.config.agentId });
+      if (!this.config.channels.length || this.config.channels.includes(channel)) {
+        this.inboxSync?.watch(channel);
+        send({ type: "join_channel", channel_id: channel, agent_id: this.config.agentId });
+      }
     };
     this.heartbeat = new HeartbeatMonitor({ getReadyState: () => socket.readyState,
       sendPing: () => send({ type: "ping" }), reconnect: () => socket.terminate() }, 15_000, 45_000, 30_000);
@@ -74,26 +84,31 @@ export class AgentsChatTransport {
       this.heartbeat?.receivedPong();
       if (data.type === "auth_ok") {
         this.authenticated = true; this.delay = 1000; this.log(`AgentsChat connected as ${this.config.agentId}`);
+        if (this.inboxSync && !this.syncTimer) this.syncTimer = setInterval(() => { void this.inboxSync!.sync(); }, this.syncIntervalMs);
         void this.api("/api/channels/mine").then((body: any) => {
           if (!current()) return;
           const channels = Array.isArray(body) ? body : body.channels;
           if (!Array.isArray(channels)) throw new Error("Invalid membership response");
-          for (const c of channels) if (typeof (c.id ?? c.channel_id) === "string") join(c.id ?? c.channel_id);
+          const ids = channels.map((c: any) => c.id ?? c.channel_id).filter((id: any) => typeof id === "string" &&
+            (!this.config.channels.length || this.config.channels.includes(id)));
+          this.inboxSync?.memberships(ids);
+          for (const id of ids) join(id);
+          void this.inboxSync?.sync();
         }).catch(() => { if (current()) { this.log("Membership sync failed; reconnecting"); socket.terminate(); } });
       } else if (data.type === "message_ack") {
         const id = data.message_id ?? data.id, pending = this.pending.get(id);
         if (pending) { clearTimeout(pending.timer); this.pending.delete(id); pending.resolve(); }
       } else if (data.type === "channel_created" && typeof data.channel_id === "string") join(data.channel_id);
       else if (["message", "thread_reply"].includes(data.type)) this.receive(data);
-      else if (data.type === "shard_moved") socket.terminate();
+      else if (data.type === "shard_moved" || data.type === "please_reconnect") socket.terminate();
       else if (data.type === "auth_error" || data.type === "error") this.log("AgentsChat returned an error; check account and channel permissions");
     });
     socket.on("error", () => this.log("AgentsChat socket error"));
     socket.on("close", () => {
       if (!current()) return;
-      this.authenticated = false; this.rejectPending(); this.heartbeat?.stop(); this.log("AgentsChat disconnected; reconnecting (offline messages are not replayed)");
+      this.authenticated = false; this.rejectPending(); this.heartbeat?.stop(); this.log("AgentsChat disconnected; reconnecting with history reconciliation");
       this.retry = setTimeout(() => this.start(), this.delay); this.delay = Math.min(this.delay * 2, 30_000);
     });
   }
-  stop() { for (const timer of this.typing.values()) clearInterval(timer); this.typing.clear(); this.closed = true; this.authenticated = false; this.rejectPending(); clearTimeout(this.retry); this.heartbeat?.stop(); this.socket?.terminate(); }
+  stop() { for (const timer of this.typing.values()) clearInterval(timer); this.typing.clear(); this.closed = true; this.authenticated = false; this.rejectPending(); clearTimeout(this.retry); clearInterval(this.syncTimer); this.heartbeat?.stop(); this.socket?.terminate(); }
 }

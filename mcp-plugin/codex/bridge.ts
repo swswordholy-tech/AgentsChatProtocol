@@ -76,6 +76,15 @@ export class Bridge {
     void this.drain(); return true;
   }
   redact(text: string) { return redactSecrets(text.split(this.config.token).join("[REDACTED]")); }
+  /** History cursors may advance past ignored/known messages, never a full inbox. */
+  recover(raw: unknown): boolean {
+    if (this.stopped) return false;
+    if (!addressed(raw, this.config)) return true;
+    if (this.state.entries.some(e => e.message.id === raw.id && e.message.channel_id === raw.channel_id)) return true;
+    if (raw.meta?.kind === "loop_tick" && this.state.entries.some(e =>
+      e.message.meta?.loop_id === raw.meta!.loop_id && e.message.meta.next_tick_ms === raw.meta!.next_tick_ms)) return true;
+    return this.accept(raw);
+  }
   drain(): Promise<void> {
     if (this.retry) return Promise.resolve();
     if (this.draining) return this.draining;

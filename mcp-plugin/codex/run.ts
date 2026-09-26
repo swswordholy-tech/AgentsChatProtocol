@@ -29,7 +29,7 @@ Project config fields: profile, agent_id, channels, senders, api_url, ws_url, pe
 --onboarding-status checks authentication/ownership and prints safe claim/chat links; it does not send messages.
 --check validates identity and official app-server initialization without opening chat.
 Live DMs and exact mentions trigger replies; channels/senders restrict this further.
-All accepted messages share one persisted thread per channel, with full access by default. Set permissions: "read-only" to disable writes and inherited MCP. No offline message replay.
+All accepted messages share one persisted thread per channel, with full access by default. Set permissions: "read-only" to disable writes and inherited MCP. After initial installation, persisted history cursors recover missed messages on reconnect and every minute.
 State: ~/.agentschat/codex-bridge/<project-server-identity hash>/ (private).
 --conversations lists this bot's channel/task mappings; --read-conversation CHANNEL reads history without acquiring a writer.
 GUI outbox: --gui-thread THREAD_ID --gui-message-file PATH; --gui-status lists receipts.
@@ -79,7 +79,7 @@ async function main() {
     codex.close(); return;
   }
   if (values.check) { await codex.start(); console.log("Official app-server initialization: OK (no chat connection or generation)"); codex.close(); return; }
-  transport = new AgentsChatTransport(c, m => { bridge!.accept(m); });
+  transport = new AgentsChatTransport(c, m => { bridge!.accept(m); }, console.error, m => bridge!.recover(m));
   bridge = new Bridge(c, codex, (chat, text) => transport!.send(chat, text), console.error, (chat, active) => transport!.setTyping(chat, active), () => getBotOwner(c.apiUrl, c.agentId, c.token), () => transport!.api("/api/loops/mine"));
   let stopping = false;
   const stop = async () => { if (stopping) return; stopping = true; if (values["managed-worker"]) { const deadline = setTimeout(() => { try { process.kill(-process.pid, "SIGKILL"); } catch {} }, 20000); deadline.unref(); } bridge?.pause(); transport?.stop(); codex?.close(); await bridge?.stop(); if (process.connected) process.disconnect?.(); };

@@ -2,6 +2,8 @@
 
 ## 0.36.7 — UNPUBLISHED — Non-Grok stacks start without Cursor session env
 
+- **Codex execution ownership:** remove outer turn/RPC time limits and duration-based restarts; Codex owns long-running execution. Explicit shutdown and actual backend failures still preserve pending work and conversation mappings.
+- **Codex message recovery:** persist independent history checkpoints and reconcile missed messages on reconnect and every minute, with bounded pages, durable deduplication, and inbox backpressure. Cold installation does not replay old requests.
 - **Codex bot effort:** optional per-bot `effort` overrides reasoning on every new turn, including resumed conversations, without changing the model or other bots. Manager status exposes the configured override.
 - **Continuous team delivery:** maintain a capacity- and capability-aware reserve of executable tasks, replenish before members run out, and coordinate completion-driven claims without duplicate writers or artificial busywork. Runtime wake limitations stay explicit.
 - **Docs:** onboarding, `url-wake-keepalive` and `grok-wake-keepalive` say

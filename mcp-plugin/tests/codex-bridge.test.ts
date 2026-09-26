@@ -498,3 +498,55 @@ test("namespace migration failure retains original current thread without creati
  const b=new Bridge(f.c,{namespace:"private",readLegacyThread:async()=>{throw Error("source unavailable");},thread:async()=>{starts++;return "bad";},generate:async()=>""},async()=>{});
  try{await expect(b.prepareChannel("group")).rejects.toThrow("source unavailable");expect(starts).toBe(0);expect(JSON.parse(readFileSync(join(f.c.stateDir,"state.json"),"utf8")).channels.group.thread).toBe("original");}finally{await b.stop();}
 });
+
+test('WS and persisted REST catchup share dedup, reply delivery and the original conversation', async () => {
+  const {c}=fixture(); const sent:any[]=[], rows:any[]=[];
+  mkdirSync(c.stateDir,{recursive:true});
+  writeFileSync(join(c.stateDir,'inbound-cursors.json'),JSON.stringify({version:1,channels:{'dm-owner':'2026-09-27T00:00:00.000000000Z'}}),{mode:0o600});
+  const row=(id:string,n:number)=>({...message(id),timestamp:`2026-09-27T00:00:00.${String(n).padStart(9,'0')}Z`});
+  rows.push(row('missed',1),row('live-later',2));
+  const http=createServer((req,res)=>{
+    if(req.headers.authorization!==`Bearer ${c.token}`){res.writeHead(401).end();return;}
+    if(req.url==='/api/channels/mine'){res.end(JSON.stringify({channels:[{id:'dm-owner'}]}));return;}
+    const after=new URL(req.url!,'http://localhost').searchParams.get('after')!;
+    res.end(JSON.stringify({messages:rows.filter(m=>m.timestamp>after)}));
+  });
+  await new Promise<void>(r=>http.listen(0,'127.0.0.1',r));
+  c.apiUrl=`http://127.0.0.1:${(http.address() as any).port}`;c.wsUrl=c.apiUrl.replace('http','ws');
+  const ws=new WebSocketServer({server:http});let connections=0;
+  ws.on('connection',socket=>{connections++;socket.on('message',raw=>{
+    const m=JSON.parse(String(raw));
+    if(m.type==='auth')socket.send(JSON.stringify({type:'auth_ok'}));
+    if(m.type==='join_channel')socket.send(JSON.stringify({type:'message',...rows[1]}));
+    if(m.type==='message'){sent.push(m);socket.send(JSON.stringify({type:'message_ack',message_id:m.id}));}
+  });});
+  const app=server();await app.start();
+  const transport=new AgentsChatTransport(c,m=>bridge.accept(m),()=>{},m=>bridge.recover(m),25);
+  const bridge=ownedBridge(c,app,(ch,text)=>transport.send(ch,text),()=>{});
+  const wait=async(fn:()=>boolean)=>{const end=Date.now()+5000;while(!fn()){if(Date.now()>end)throw Error('catchup timeout');await Bun.sleep(10);}};
+  try {
+    transport.start();await wait(()=>sent.length===2);
+    rows.push(row('silent-ws-gap',3));await wait(()=>sent.length===3);
+    for(const client of ws.clients)client.terminate();
+    rows.push(row('offline',4));await wait(()=>connections>=2&&sent.length===4);
+    await bridge.drain();
+    const state=JSON.parse(readFileSync(join(c.stateDir,'state.json'),'utf8'));
+    expect(state.entries.map((e:any)=>e.message.id).sort()).toEqual(rows.map(r=>r.id).sort());
+    expect(state.entries.every((e:any)=>e.status==='sent')).toBe(true);
+    const turns=(await app.request('test/trace',{})).filter((e:any)=>e.method==='turn/start');
+    expect(new Set(turns.map((e:any)=>e.params.threadId)).size).toBe(1);
+    expect(sent.every(m=>m.channel_id==='dm-owner')).toBe(true);
+  } finally {transport.stop();await bridge.stop();app.close();for(const client of ws.clients)client.terminate();ws.close();http.closeAllConnections();await new Promise<void>(r=>http.close(()=>r()));}
+},10000);
+
+test('recovery acknowledges ignored and known messages but keeps new work behind a full inbox', async () => {
+  const {c}=fixture();mkdirSync(c.stateDir,{recursive:true});
+  writeFileSync(join(c.stateDir,'state.json'),JSON.stringify({version:1,threads:{},entries:Array.from({length:100},(_,i)=>({message:message(String(i)),status:'pending'}))}));
+  const app=server();const bridge=ownedBridge(c,app,async()=>{},()=>{});
+  try {
+    expect(bridge.recover(message('0'))).toBe(true);
+    expect(bridge.recover(message('irrelevant','group'))).toBe(true);
+    expect(bridge.recover(message('new'))).toBe(false);
+    expect(JSON.parse(readFileSync(join(c.stateDir,'state.json'),'utf8')).entries).toHaveLength(100);
+  } finally {await bridge.stop();app.close();}
+});

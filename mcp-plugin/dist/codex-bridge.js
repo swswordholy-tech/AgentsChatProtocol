@@ -216,9 +216,9 @@ ${text}`,
 }
 
 // codex/run.ts
-import { readFileSync as readFileSync7 } from "node:fs";
+import { readFileSync as readFileSync8 } from "node:fs";
 import { homedir as homedir4 } from "node:os";
-import { join as join8 } from "node:path";
+import { join as join9 } from "node:path";
 
 // codex/bots-config.ts
 import { readFileSync as readFileSync3, realpathSync as realpathSync3, mkdirSync as mkdirSync3 } from "node:fs";
@@ -1307,7 +1307,6 @@ class ThreadBusyError extends Error {
 class AppServer {
   bin;
   args;
-  timeoutMs;
   permissions;
   runtime;
   effort;
@@ -1319,10 +1318,9 @@ class AppServer {
   active;
   threadPermissions = new Map;
   disabledMcp = {};
-  constructor(bin = "codex", args = ["app-server", "--listen", "stdio://"], timeoutMs = 600000, permissions = "full-access", runtime, effort) {
+  constructor(bin = "codex", args = ["app-server", "--listen", "stdio://"], _legacyTurnTimeoutMs, permissions = "full-access", runtime, effort) {
     this.bin = bin;
     this.args = args;
-    this.timeoutMs = timeoutMs;
     this.permissions = permissions;
     this.runtime = runtime;
     this.effort = effort;
@@ -1361,12 +1359,10 @@ class AppServer {
   request(method, params) {
     return new Promise((resolve4, reject) => {
       const id = ++this.nextId;
-      const timer = setTimeout(() => this.fatal(new Error(`App-server ${method} timed out`)), 30000);
-      this.pending.set(id, { method, resolve: resolve4, reject, timer });
+      this.pending.set(id, { method, resolve: resolve4, reject });
       try {
         this.write({ id, method, params });
       } catch (e) {
-        clearTimeout(timer);
         this.pending.delete(id);
         reject(e);
       }
@@ -1380,7 +1376,6 @@ class AppServer {
     if (message.id !== undefined) {
       const waiter = this.pending.get(message.id);
       if (waiter) {
-        clearTimeout(waiter.timer);
         this.pending.delete(message.id);
         message.error ? waiter.reject(waiter.method === "thread/resume" && /already has an active writer/i.test(message.error.message ?? "") ? new ThreadBusyError : new Error(`App-server request rejected (${message.error.code})`)) : waiter.resolve(message.result);
       }
@@ -1398,7 +1393,6 @@ class AppServer {
     if (message.method === "item/completed" && p.item?.type === "agentMessage" && (!p.item.phase || p.item.phase === "final_answer"))
       a.items.set(p.item.id, p.item.text);
     if (message.method === "turn/completed") {
-      clearTimeout(a.timer);
       this.active = undefined;
       if (p.turn.status !== "completed") {
         a.reject(new Error(`Codex turn ${p.turn.status}`));
@@ -1445,7 +1439,7 @@ class AppServer {
   async readLegacyThread(thread) {
     if (!this.runtime?.legacyHome)
       return this.readThread(thread);
-    const reader = new AppServer(this.bin, undefined, this.timeoutMs, this.permissions, { home: this.runtime.legacyHome });
+    const reader = new AppServer(this.bin, undefined, undefined, this.permissions, { home: this.runtime.legacyHome });
     try {
       await reader.start();
       return await reader.readThread(thread);
@@ -1463,14 +1457,7 @@ class AppServer {
     if (!permissions)
       throw new Error("Thread permissions have not been configured");
     const completed = new Promise((resolve4, reject) => {
-      this.active = {
-        thread,
-        items: new Map,
-        early: [],
-        resolve: resolve4,
-        reject,
-        timer: setTimeout(() => this.fatal(new Error("Codex turn timed out")), this.timeoutMs)
-      };
+      this.active = { thread, items: new Map, early: [], resolve: resolve4, reject };
     });
     completed.catch(() => {});
     try {
@@ -1491,13 +1478,10 @@ class AppServer {
     }
   }
   fail(error) {
-    for (const p of this.pending.values()) {
-      clearTimeout(p.timer);
+    for (const p of this.pending.values())
       p.reject(error);
-    }
     this.pending.clear();
     if (this.active) {
-      clearTimeout(this.active.timer);
       this.active.reject(error);
       this.active = undefined;
     }
@@ -1773,6 +1757,17 @@ class Bridge {
   redact(text) {
     return redactSecrets(text.split(this.config.token).join("[REDACTED]"));
   }
+  recover(raw) {
+    if (this.stopped)
+      return false;
+    if (!addressed(raw, this.config))
+      return true;
+    if (this.state.entries.some((e) => e.message.id === raw.id && e.message.channel_id === raw.channel_id))
+      return true;
+    if (raw.meta?.kind === "loop_tick" && this.state.entries.some((e) => e.message.meta?.loop_id === raw.meta.loop_id && e.message.meta.next_tick_ms === raw.meta.next_tick_ms))
+      return true;
+    return this.accept(raw);
+  }
   drain() {
     if (this.retry)
       return Promise.resolve();
@@ -1985,11 +1980,142 @@ class HeartbeatMonitor {
   }
 }
 
+// codex/inbox-sync.ts
+import { existsSync as existsSync4, mkdirSync as mkdirSync6, readFileSync as readFileSync7, renameSync as renameSync4, writeFileSync as writeFileSync4 } from "node:fs";
+import { join as join8 } from "node:path";
+
+// src/timestamps.ts
+function normalizeTimestampForCursor(ts, mode) {
+  if (!ts || typeof ts !== "string")
+    return ts;
+  const padChar = mode === "before" ? "9" : "0";
+  const withFrac = ts.match(/^(.*\.)(\d+)(Z)$/);
+  if (withFrac) {
+    const frac = withFrac[2];
+    if (frac.length >= 9)
+      return ts;
+    return withFrac[1] + frac + padChar.repeat(9 - frac.length) + withFrac[3];
+  }
+  const noFrac = ts.match(/^(.*\d)(Z)$/);
+  if (noFrac) {
+    return noFrac[1] + "." + padChar.repeat(9) + noFrac[2];
+  }
+  return ts;
+}
+
+// codex/inbox-sync.ts
+function timestamp(value) {
+  if (typeof value !== "string" || !Number.isFinite(Date.parse(value)))
+    throw new Error("Invalid history timestamp");
+  return normalizeTimestampForCursor(value, "after");
+}
+
+class InboxSync {
+  api;
+  receive;
+  active;
+  log;
+  file;
+  state;
+  channels = new Set;
+  running;
+  constructor(stateDir, api, receive, active, log = console.error) {
+    this.api = api;
+    this.receive = receive;
+    this.active = active;
+    this.log = log;
+    mkdirSync6(stateDir, { recursive: true, mode: 448 });
+    this.file = join8(stateDir, "inbound-cursors.json");
+    this.state = existsSync4(this.file) ? JSON.parse(readFileSync7(this.file, "utf8")) : { version: 1, channels: {} };
+    if (this.state.version !== 1 || !this.state.channels || typeof this.state.channels !== "object" || Array.isArray(this.state.channels))
+      throw new Error("Invalid inbound cursors; refusing to discard checkpoint");
+    for (const value of Object.values(this.state.channels))
+      timestamp(value);
+    this.state.channels = Object.assign(Object.create(null), this.state.channels);
+  }
+  save() {
+    writeFileSync4(this.file + ".tmp", JSON.stringify(this.state), { mode: 384 });
+    renameSync4(this.file + ".tmp", this.file);
+  }
+  watch(channel) {
+    this.channels.add(channel);
+    if (!Object.hasOwn(this.state.channels, channel)) {
+      this.state.channels[channel] = timestamp(new Date().toISOString());
+      this.save();
+    }
+  }
+  memberships(channels) {
+    this.channels.clear();
+    for (const channel of channels)
+      this.watch(channel);
+  }
+  sync() {
+    if (!this.running)
+      this.running = this.run().finally(() => {
+        this.running = undefined;
+      });
+    return this.running;
+  }
+  async run() {
+    if (!this.active())
+      return;
+    let failed = false;
+    for (const channel of [...this.channels]) {
+      if (!this.active())
+        return;
+      try {
+        const after = this.state.channels[channel];
+        const body = await this.api(`/api/channels/${encodeURIComponent(channel)}/messages?after=${encodeURIComponent(after)}&limit=50`);
+        if (!this.active())
+          return;
+        if (!this.channels.has(channel))
+          continue;
+        const messages = Array.isArray(body) ? body : body?.messages;
+        if (!Array.isArray(messages))
+          throw new Error("Invalid history response");
+        const rows = messages.map((m) => {
+          if (!m || m.channel_id !== channel || typeof m.id !== "string")
+            throw new Error("Invalid history message");
+          return { message: m, time: timestamp(m.timestamp) };
+        }).sort((a, b) => a.time.localeCompare(b.time));
+        let newest = after, complete = true;
+        for (const { message, time } of rows) {
+          if (time <= after)
+            continue;
+          if (!this.receive(message)) {
+            complete = false;
+            break;
+          }
+          newest = time;
+        }
+        if (complete) {
+          this.state.channels[channel] = newest;
+          this.save();
+        }
+      } catch {
+        failed = true;
+        this.log("Inbound history reconciliation failed; checkpoint retained for retry");
+      }
+    }
+    if (!this.active())
+      return;
+    this.state.last_check_at = new Date().toISOString();
+    if (failed)
+      this.state.last_error = "History reconciliation failed; retry pending";
+    else {
+      this.state.last_success_at = this.state.last_check_at;
+      delete this.state.last_error;
+    }
+    this.save();
+  }
+}
+
 // codex/transport.ts
 class AgentsChatTransport {
   config;
   receive;
   log;
+  syncIntervalMs;
   socket;
   authenticated = false;
   typing = new Map;
@@ -1998,10 +2124,15 @@ class AgentsChatTransport {
   retry;
   closed = false;
   delay = 1000;
-  constructor(config, receive, log = console.error) {
+  inboxSync;
+  syncTimer;
+  constructor(config, receive, log = console.error, recover, syncIntervalMs = 60000) {
     this.config = config;
     this.receive = receive;
     this.log = log;
+    this.syncIntervalMs = syncIntervalMs;
+    if (recover)
+      this.inboxSync = new InboxSync(config.stateDir, (path) => this.api(path), recover, () => !this.closed && this.authenticated, log);
   }
   async api(path, body) {
     let response;
@@ -2086,9 +2217,11 @@ class AgentsChatTransport {
       if (current() && socket.readyState === WebSocket.OPEN)
         socket.send(JSON.stringify(value));
     };
-    const join8 = (channel) => {
-      if (!this.config.channels.length || this.config.channels.includes(channel))
+    const join9 = (channel) => {
+      if (!this.config.channels.length || this.config.channels.includes(channel)) {
+        this.inboxSync?.watch(channel);
         send({ type: "join_channel", channel_id: channel, agent_id: this.config.agentId });
+      }
     };
     this.heartbeat = new HeartbeatMonitor({
       getReadyState: () => socket.readyState,
@@ -2111,15 +2244,21 @@ class AgentsChatTransport {
         this.authenticated = true;
         this.delay = 1000;
         this.log(`AgentsChat connected as ${this.config.agentId}`);
+        if (this.inboxSync && !this.syncTimer)
+          this.syncTimer = setInterval(() => {
+            this.inboxSync.sync();
+          }, this.syncIntervalMs);
         this.api("/api/channels/mine").then((body) => {
           if (!current())
             return;
           const channels = Array.isArray(body) ? body : body.channels;
           if (!Array.isArray(channels))
             throw new Error("Invalid membership response");
-          for (const c of channels)
-            if (typeof (c.id ?? c.channel_id) === "string")
-              join8(c.id ?? c.channel_id);
+          const ids = channels.map((c) => c.id ?? c.channel_id).filter((id) => typeof id === "string" && (!this.config.channels.length || this.config.channels.includes(id)));
+          this.inboxSync?.memberships(ids);
+          for (const id of ids)
+            join9(id);
+          this.inboxSync?.sync();
         }).catch(() => {
           if (current()) {
             this.log("Membership sync failed; reconnecting");
@@ -2134,10 +2273,10 @@ class AgentsChatTransport {
           pending.resolve();
         }
       } else if (data.type === "channel_created" && typeof data.channel_id === "string")
-        join8(data.channel_id);
+        join9(data.channel_id);
       else if (["message", "thread_reply"].includes(data.type))
         this.receive(data);
-      else if (data.type === "shard_moved")
+      else if (data.type === "shard_moved" || data.type === "please_reconnect")
         socket.terminate();
       else if (data.type === "auth_error" || data.type === "error")
         this.log("AgentsChat returned an error; check account and channel permissions");
@@ -2149,7 +2288,7 @@ class AgentsChatTransport {
       this.authenticated = false;
       this.rejectPending();
       this.heartbeat?.stop();
-      this.log("AgentsChat disconnected; reconnecting (offline messages are not replayed)");
+      this.log("AgentsChat disconnected; reconnecting with history reconciliation");
       this.retry = setTimeout(() => this.start(), this.delay);
       this.delay = Math.min(this.delay * 2, 30000);
     });
@@ -2162,6 +2301,7 @@ class AgentsChatTransport {
     this.authenticated = false;
     this.rejectPending();
     clearTimeout(this.retry);
+    clearInterval(this.syncTimer);
     this.heartbeat?.stop();
     this.socket?.terminate();
   }
@@ -2183,7 +2323,7 @@ Project config fields: profile, agent_id, channels, senders, api_url, ws_url, pe
 --onboarding-status checks authentication/ownership and prints safe claim/chat links; it does not send messages.
 --check validates identity and official app-server initialization without opening chat.
 Live DMs and exact mentions trigger replies; channels/senders restrict this further.
-All accepted messages share one persisted thread per channel, with full access by default. Set permissions: "read-only" to disable writes and inherited MCP. No offline message replay.
+All accepted messages share one persisted thread per channel, with full access by default. Set permissions: "read-only" to disable writes and inherited MCP. After initial installation, persisted history cursors recover missed messages on reconnect and every minute.
 State: ~/.agentschat/codex-bridge/<project-server-identity hash>/ (private).
 --conversations lists this bot's channel/task mappings; --read-conversation CHANNEL reads history without acquiring a writer.
 GUI outbox: --gui-thread THREAD_ID --gui-message-file PATH; --gui-status lists receipts.
@@ -2216,14 +2356,14 @@ async function main() {
     return;
   }
   if (values["gui-thread"] || values["gui-message-file"] || values["gui-status"]) {
-    const channel = new GuiChannel(join8(homedir4(), ".agentschat/codex-gui-outbox"), values["gui-thread"] ? [values["gui-thread"]] : []);
+    const channel = new GuiChannel(join9(homedir4(), ".agentschat/codex-gui-outbox"), values["gui-thread"] ? [values["gui-thread"]] : []);
     if (values["gui-status"]) {
       console.log(JSON.stringify(channel.list().map(({ prompt: prompt2, ...receipt2 }) => receipt2)));
       return;
     }
     if (!values["gui-thread"] || !values["gui-message-file"])
       throw new Error("GUI submission requires --gui-thread and --gui-message-file");
-    const { prompt, ...receipt } = channel.enqueue(values["gui-thread"], readFileSync7(values["gui-message-file"], "utf8"));
+    const { prompt, ...receipt } = channel.enqueue(values["gui-thread"], readFileSync8(values["gui-message-file"], "utf8"));
     console.log(JSON.stringify(receipt));
     return;
   }
@@ -2257,7 +2397,7 @@ async function main() {
   const runtime = prepareRuntimeHome(c.stateDir);
   codex = new AppServer(c.codexBin, undefined, undefined, c.permissions, runtime, c.effort);
   if (values.conversations || values["read-conversation"]) {
-    const state = JSON.parse(readFileSync7(join8(c.stateDir, "state.json"), "utf8"));
+    const state = JSON.parse(readFileSync8(join9(c.stateDir, "state.json"), "utf8"));
     const channels = state.channels ?? {};
     if (values.conversations) {
       console.log(JSON.stringify(Object.entries(channels).map(([channel2, data]) => ({ channel: channel2, thread: data.thread, isolated: data.namespace === runtime.home }))));
@@ -2282,7 +2422,7 @@ async function main() {
   }
   transport = new AgentsChatTransport(c, (m) => {
     bridge.accept(m);
-  });
+  }, console.error, (m) => bridge.recover(m));
   bridge = new Bridge(c, codex, (chat, text) => transport.send(chat, text), console.error, (chat, active) => transport.setTyping(chat, active), () => getBotOwner(c.apiUrl, c.agentId, c.token), () => transport.api("/api/loops/mine"));
   let stopping = false;
   const stop = async () => {

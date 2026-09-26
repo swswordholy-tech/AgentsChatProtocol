@@ -13,12 +13,13 @@ export class AppServer {
   private closed = false;
   private child?: ChildProcessWithoutNullStreams;
   private nextId = 0;
-  private pending = new Map<number, { method: string; resolve: (v: any) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> }>();
+  private pending = new Map<number, { method: string; resolve: (v: any) => void; reject: (e: Error) => void }>();
   private active?: { thread: string; turn?: string; items: Map<string, string>; early: any[];
-    resolve: (s: string) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> };
+    resolve: (s: string) => void; reject: (e: Error) => void };
   private threadPermissions = new Map<string, PermissionMode>();
   private disabledMcp: Record<string, { enabled: boolean }> = {};
-  constructor(private bin = "codex", private args = ["app-server", "--listen", "stdio://"], private timeoutMs = 600_000, private permissions: PermissionMode = "full-access", private runtime?: {home: string; legacyHome?: string}, private effort?: ReasoningEffort) {}
+  // Keep the legacy positional argument for callers; turns have no time limit.
+  constructor(private bin = "codex", private args = ["app-server", "--listen", "stdio://"], _legacyTurnTimeoutMs?: number, private permissions: PermissionMode = "full-access", private runtime?: {home: string; legacyHome?: string}, private effort?: ReasoningEffort) {}
   get namespace() { return this.runtime?.home; }
   async start() {
     const env = Object.fromEntries(Object.entries(process.env).filter(([k]) => !/^AGENTS?CHAT_|^RELAY_/.test(k)));
@@ -44,10 +45,9 @@ export class AppServer {
   request(method: string, params: unknown): Promise<any> {
     return new Promise((resolve, reject) => {
       const id = ++this.nextId;
-      const timer = setTimeout(() => this.fatal(new Error(`App-server ${method} timed out`)), 30_000);
-      this.pending.set(id, { method, resolve, reject, timer });
+      this.pending.set(id, { method, resolve, reject });
       try { this.write({ id, method, params }); }
-      catch (e) { clearTimeout(timer); this.pending.delete(id); reject(e); }
+      catch (e) { this.pending.delete(id); reject(e); }
     });
   }
   private receive(message: any) {
@@ -58,7 +58,7 @@ export class AppServer {
     }
     if (message.id !== undefined) {
       const waiter = this.pending.get(message.id);
-      if (waiter) { clearTimeout(waiter.timer); this.pending.delete(message.id);
+      if (waiter) { this.pending.delete(message.id);
         message.error ? waiter.reject(waiter.method === "thread/resume" && /already has an active writer/i.test(message.error.message ?? "")
           ? new ThreadBusyError() : new Error(`App-server request rejected (${message.error.code})`)) : waiter.resolve(message.result); }
       return;
@@ -70,7 +70,7 @@ export class AppServer {
     if (message.method === "item/completed" && p.item?.type === "agentMessage" &&
       (!p.item.phase || p.item.phase === "final_answer")) a.items.set(p.item.id, p.item.text);
     if (message.method === "turn/completed") {
-      clearTimeout(a.timer); this.active = undefined;
+      this.active = undefined;
       if (p.turn.status !== "completed") { a.reject(new Error(`Codex turn ${p.turn.status}`)); return; }
       for (const item of p.turn.items ?? []) if (item.type === "agentMessage" && (!item.phase || item.phase === "final_answer")) a.items.set(item.id, item.text);
       const text = [...a.items.values()].join("\n").trim();
@@ -110,7 +110,7 @@ export class AppServer {
   }
   async readLegacyThread(thread: string): Promise<ThreadHistory> {
     if (!this.runtime?.legacyHome) return this.readThread(thread);
-    const reader = new AppServer(this.bin, undefined, this.timeoutMs, this.permissions, {home:this.runtime.legacyHome});
+    const reader = new AppServer(this.bin, undefined, undefined, this.permissions, {home:this.runtime.legacyHome});
     try { await reader.start(); return await reader.readThread(thread); } finally { reader.close(); }
   }
   async nameThread(thread: string, name: string): Promise<void> {
@@ -121,8 +121,7 @@ export class AppServer {
     const permissions = this.threadPermissions.get(thread);
     if (!permissions) throw new Error("Thread permissions have not been configured");
     const completed = new Promise<string>((resolve, reject) => {
-      this.active = { thread, items: new Map(), early: [], resolve, reject,
-        timer: setTimeout(() => this.fatal(new Error("Codex turn timed out")), this.timeoutMs) };
+      this.active = { thread, items: new Map(), early: [], resolve, reject };
     });
     // Attach immediately, including while turn/start is waiting for its response.
     void completed.catch(() => {});
@@ -138,8 +137,8 @@ export class AppServer {
     } catch (e) { this.fail(e instanceof Error ? e : new Error("Generation failed")); throw e; }
   }
   private fail(error: Error) {
-    for (const p of this.pending.values()) { clearTimeout(p.timer); p.reject(error); } this.pending.clear();
-    if (this.active) { clearTimeout(this.active.timer); this.active.reject(error); this.active = undefined; }
+    for (const p of this.pending.values()) p.reject(error); this.pending.clear();
+    if (this.active) { this.active.reject(error); this.active = undefined; }
   }
   private fatal(error: Error) {
     if (this.closed) return;
