@@ -187,7 +187,8 @@ describe("identity policy, end-to-end against a mock hub", () => {
     expect(existsSync(join(home, ".agentschat", "Foo.json"))).toBe(true);
     // Control group for the `written(...) === []` assertions above: prove the helper
     // actually observes a persisted profile, so those empty expectations aren't vacuous.
-    expect(written(home, ".agentschat")).toEqual(["Foo.json"]);
+    // (identity-guard.json is the trust record written for every identified boot.)
+    expect(written(home, ".agentschat")).toEqual(["Foo.json", "identity-guard.json"]);
     // Control for the failure-path test below: on success we must NOT print that line.
     expect(err).not.toMatch(/Registration failed/);
     // The payload the hub actually validates.
@@ -338,6 +339,68 @@ describe("identity policy, end-to-end against a mock hub", () => {
     expect(written(home, ".agentschat")).toEqual([]);
     expect(written(home, ".agentchat")).toEqual([]);
   }, 15_000);
+
+  test("identity guard: a silent fallback to the default profile gates writes until whoami confirms (the 2026-09-27 incident)", async () => {
+    // Incident replay: boot 1 runs as chevron via an EXPLICIT selector (recorded
+    // trusted). Boot 2 (the respawn) loses the selector, resolves the DEFAULT
+    // profile (academic) — writes must refuse loudly until whoami confirms.
+    const home = freshHome("guard");
+    mkdirSync(join(home, ".agentschat"), { recursive: true });
+    writeFileSync(
+      join(home, ".agentschat", "Antigravity-2.json"),
+      JSON.stringify({ agent_id: "acc_chevron", display_name: "chevron", token: "ac_chevron", capabilities: ["chat"] }),
+    );
+    writeFileSync(
+      join(home, ".agentschat", "profile.json"),
+      JSON.stringify({ agent_id: "acc_academic", display_name: "academic", token: "ac_academic", capabilities: ["chat"] }),
+    );
+
+    // Boot 1: explicit selector, trusted — no alarm.
+    const boot1 = await drive(["--profile", "Antigravity-2"], home, [INIT, INITED, LIST]);
+    expect(boot1.err).not.toMatch(/IDENTITY CHANGED/);
+
+    // Boot 2: bare start → default profile = different identity → LOUD + gated.
+    const boot2 = await drive([], home, [INIT, INITED, callTool(3, "reply", { chat_id: "welcome", text: "evidence" }), callTool(4, "whoami"), callTool(5, "reply", { chat_id: "welcome", text: "evidence" })], 6000);
+    expect(boot2.err).toMatch(/IDENTITY CHANGED/);
+    expect(boot2.err).toMatch(/acc_chevron/);
+
+    const gatedReply = boot2.res.get(3);
+    expect(gatedReply?.result?.isError).toBe(true);
+    expect(gatedReply?.result?.content?.[0]?.text ?? "").toMatch(/whoami/);
+    expect(gatedReply?.result?.content?.[0]?.text ?? "").toMatch(/acc_chevron/);
+
+    // whoami surfaces the gate notice AND confirms — the next write is unblocked.
+    const confirm = boot2.res.get(4)?.result?.content?.[0]?.text ?? "";
+    expect(confirm).toMatch(/IDENTITY GUARD/);
+    expect(confirm).toMatch(/Agent ID: acc_academic/);
+    const after = boot2.res.get(5)?.result?.content?.[0]?.text ?? "";
+    expect(after).not.toMatch(/IDENTITY CHANGED|REFUSED until identity/);
+
+    // Boot 3: same (now confirmed) identity → no alarm again (guard learned the
+    // confirmation, not the unconfirmed fallback).
+    const boot3 = await drive([], home, [INIT, INITED, LIST], 2500);
+    expect(boot3.err).not.toMatch(/IDENTITY CHANGED/);
+  }, 30_000);
+
+  test("identity guard: repeat respawns into the WRONG identity keep alarming (record does not learn the fallback)", async () => {
+    const home = freshHome("guard2");
+    mkdirSync(join(home, ".agentschat"), { recursive: true });
+    writeFileSync(
+      join(home, ".agentschat", "Antigravity-2.json"),
+      JSON.stringify({ agent_id: "acc_chevron", display_name: "chevron", token: "ac_chevron", capabilities: ["chat"] }),
+    );
+    writeFileSync(
+      join(home, ".agentschat", "profile.json"),
+      JSON.stringify({ agent_id: "acc_academic", display_name: "academic", token: "ac_academic", capabilities: ["chat"] }),
+    );
+    await drive(["--profile", "Antigravity-2"], home, [INIT, INITED, LIST]);
+    // Two consecutive bare boots WITHOUT a whoami confirmation: both must alarm —
+    // a gated boot must not teach the guard that the wrong identity is fine.
+    const b1 = await drive([], home, [INIT, INITED, LIST], 2500);
+    const b2 = await drive([], home, [INIT, INITED, LIST], 2500);
+    expect(b1.err).toMatch(/IDENTITY CHANGED/);
+    expect(b2.err).toMatch(/IDENTITY CHANGED/);
+  }, 30_000);
 
   test("tools/list emits MCP annotations on every visible tool (OpenAI directory requirement)", async () => {
     const home = freshHome("annotations");

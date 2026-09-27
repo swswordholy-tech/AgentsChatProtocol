@@ -74,6 +74,7 @@
     "src/identity.ts",
     "src/grok-bind.ts",
     "src/tool-annotations.ts",
+    "src/identity-guard.ts",
     "src/terms.ts",
     "src/wake.ts",
     "src/profile-store.ts",

@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 // @bun
+import { createRequire } from "node:module";
+var __require = /* @__PURE__ */ createRequire(import.meta.url);
 
 // src/onboarding-status.ts
 async function getOnboardingStatus(base, agentId, token, request = fetch) {
@@ -579,8 +581,8 @@ async function fireGrokWake(msg, cfg) {
   }
   let gwcfg;
   try {
-    const { readFileSync } = await import("node:fs");
-    gwcfg = JSON.parse(readFileSync(cfg.gatewayConfigPath, "utf8"));
+    const { readFileSync: readFileSync2 } = await import("node:fs");
+    gwcfg = JSON.parse(readFileSync2(cfg.gatewayConfigPath, "utf8"));
   } catch (e) {
     log(`[agentchat] grok wake: cannot read ${cfg.gatewayConfigPath}: ${e}`);
     return;
@@ -697,6 +699,7 @@ var package_default = {
     "src/identity.ts",
     "src/grok-bind.ts",
     "src/tool-annotations.ts",
+    "src/identity-guard.ts",
     "src/terms.ts",
     "src/wake.ts",
     "src/profile-store.ts",
@@ -767,6 +770,70 @@ function safeWriteProfile(path, data, warn = defaultWarn) {
     warn(`[agentchat] WARNING: could not verify permissions of ${path}: ${e}
 `);
   }
+}
+
+// src/identity-guard.ts
+var IDENTITY_GUARD_FILENAME = "identity-guard.json";
+function emptyGuardRecord() {
+  return { bySelector: {}, lastEffective: null };
+}
+function parseGuardRecord(text) {
+  if (!text)
+    return emptyGuardRecord();
+  try {
+    const raw = JSON.parse(text);
+    if (!raw || typeof raw !== "object")
+      return emptyGuardRecord();
+    return {
+      bySelector: raw.bySelector && typeof raw.bySelector === "object" ? { ...raw.bySelector } : {},
+      lastEffective: raw.lastEffective && typeof raw.lastEffective.agentId === "string" ? {
+        agentId: raw.lastEffective.agentId,
+        source: String(raw.lastEffective.source ?? "unknown"),
+        ...raw.lastEffective.declaredName ? { declaredName: String(raw.lastEffective.declaredName) } : {},
+        ts: String(raw.lastEffective.ts ?? "")
+      } : null
+    };
+  } catch {
+    return emptyGuardRecord();
+  }
+}
+function decideIdentityGuard(prev, current) {
+  if (!current.agentId)
+    return { kind: "ok" };
+  const last = prev.lastEffective;
+  if (!last)
+    return { kind: "ok" };
+  if (last.agentId === current.agentId)
+    return { kind: "ok" };
+  if (current.source === "default") {
+    return {
+      kind: "gate",
+      message: `IDENTITY CHANGED after reconnect/restart: previously trusted as "${last.agentId}" ` + `(via ${last.source}${last.declaredName ? ` "${last.declaredName}"` : ""}), but this boot resolved the DEFAULT profile ` + `"${current.agentId}". Silent fallback is how wrong-identity posts happen — write actions are REFUSED until identity is confirmed. ` + `Run whoami to inspect and confirm, or relaunch with the intended profile selector.`
+    };
+  }
+  if (current.declaredName && prev.bySelector[current.declaredName] && prev.bySelector[current.declaredName] !== current.agentId) {
+    return {
+      kind: "warn",
+      message: `identity for selector "${current.declaredName}" changed: was "${prev.bySelector[current.declaredName]}", ` + `now "${current.agentId}". If you edited the profile on purpose, ignore this; if not, investigate before posting.`
+    };
+  }
+  return { kind: "ok" };
+}
+function advanceGuardRecord(prev, current, ts, trusted) {
+  const next = { bySelector: { ...prev.bySelector }, lastEffective: prev.lastEffective };
+  if (!current.agentId)
+    return next;
+  if (current.declaredName)
+    next.bySelector[current.declaredName] = current.agentId;
+  if (trusted) {
+    next.lastEffective = {
+      agentId: current.agentId,
+      source: current.source,
+      ...current.declaredName ? { declaredName: current.declaredName } : {},
+      ts
+    };
+  }
+  return next;
 }
 
 // src/read-cursor.ts
@@ -1283,6 +1350,54 @@ if (!anonymousMode || explicitAgentId !== undefined || hasToken) {
 `);
     process.exit(1);
   }
+}
+var identityGateMessage = "";
+var identityGuardFile = join2(configDir, IDENTITY_GUARD_FILENAME);
+function persistGuardRecord(rec) {
+  try {
+    mkdirSync(configDir, { recursive: true });
+    safeWriteProfile(identityGuardFile, rec);
+  } catch {}
+}
+function confirmLiveIdentityTrusted() {
+  identityGateMessage = "";
+  const live = {
+    agentId: AGENT_ID,
+    source: identity.mode === "env-creds" ? "env-creds" : profileSource,
+    ...declaredName ? { declaredName } : {}
+  };
+  guardRecord = advanceGuardRecord(guardRecord, live, new Date().toISOString(), true);
+  persistGuardRecord(guardRecord);
+}
+var guardRecord = (() => {
+  try {
+    return parseGuardRecord(readFileSync3(identityGuardFile, "utf-8"));
+  } catch {
+    return emptyGuardRecord();
+  }
+})();
+var guardBootIdentity = {
+  agentId: AGENT_ID,
+  source: identity.mode === "env-creds" ? "env-creds" : profileSource,
+  ...declaredName ? { declaredName } : {}
+};
+{
+  const verdict = AGENT_ID ? decideIdentityGuard(guardRecord, guardBootIdentity) : { kind: "ok" };
+  if (verdict.kind === "gate") {
+    identityGateMessage = verdict.message;
+    process.stderr.write(`
+[agentchat] \uD83D\uDEA8 ${verdict.message}
+
+`);
+    guardRecord = advanceGuardRecord(guardRecord, guardBootIdentity, new Date().toISOString(), false);
+  } else {
+    if (verdict.kind === "warn")
+      process.stderr.write(`[agentchat] WARNING: ${verdict.message}
+`);
+    guardRecord = advanceGuardRecord(guardRecord, guardBootIdentity, new Date().toISOString(), true);
+  }
+  if (AGENT_ID)
+    persistGuardRecord(guardRecord);
 }
 if (cliArgs.name && profile.display_name !== cliArgs.name) {
   profile.display_name = cliArgs.name;
@@ -2582,18 +2697,18 @@ async function sendMediaMessage(kind, args) {
     let ttsDuration;
     if (text) {
       const voice = typeof args.voice === "string" && args.voice ? args.voice : undefined;
-      const r = await apiFetch(`${REST_URL}/api/tts`, {
+      const r2 = await apiFetch(`${REST_URL}/api/tts`, {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${TOKEN}` },
         body: JSON.stringify({ text, ...voice ? { voice } : {} })
       });
-      const t = await r.text();
-      if (r.status === 429 && /MEDIA_BUDGET_EXCEEDED/i.test(t))
+      const t = await r2.text();
+      if (r2.status === 429 && /MEDIA_BUDGET_EXCEEDED/i.test(t))
         return { content: [{ type: "text", text: "Voice budget exhausted for today (MEDIA_BUDGET_EXCEEDED) \u2014 try again tomorrow, or send a recorded clip via path/url." }], isError: true };
-      if (r.status === 400 && /INVALID_VOICE/i.test(t))
+      if (r2.status === 400 && /INVALID_VOICE/i.test(t))
         return { content: [{ type: "text", text: "Invalid voice for TTS. Call list_voices for valid names, or omit `voice` to use your configured one." }], isError: true };
-      if (!r.ok)
-        return { content: [{ type: "text", text: `TTS failed (${r.status}): ${t.slice(0, 140)}` }], isError: true };
+      if (!r2.ok)
+        return { content: [{ type: "text", text: `TTS failed (${r2.status}): ${t.slice(0, 140)}` }], isError: true };
       let d;
       try {
         d = JSON.parse(t);
@@ -2774,6 +2889,8 @@ function applyIdentityFromProfile(newProfile, targetFile) {
   profile = newProfile;
   activeProfileFile = targetFile;
   anonymousMode = false;
+  guardRecord = advanceGuardRecord(guardRecord, { agentId: AGENT_ID, source: "switch_profile", ...profileNameFromPath(targetFile) ? { declaredName: profileNameFromPath(targetFile) } : {} }, new Date().toISOString(), true);
+  persistGuardRecord(guardRecord);
   wsReconnectAttempt = 0;
   heartbeat.start();
   connectWS();
@@ -2819,6 +2936,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return { content: [{ type: "text", text: `${name}: ${argErr}` }], isError: true };
     }
     ensureGrokBoundIdentity();
+    if (identityGateMessage && name !== "whoami" && TOOL_ANNOTATIONS[name]?.readOnlyHint !== true) {
+      return { content: [{ type: "text", text: `\uD83D\uDEA8 ${identityGateMessage}` }], isError: true };
+    }
     if (name === "list_skills") {
       const { chat_id } = args || {};
       const out = {
@@ -3506,7 +3626,7 @@ ${results}` }] };
         } catch {}
       }
       try {
-        await new Promise((r) => setTimeout(r, 500));
+        await new Promise((r2) => setTimeout(r2, 500));
         const r = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(chat_id)}/members`, { headers: { Authorization: `Bearer ${TOKEN}` } });
         if (r.ok) {
           const data = await r.json();
@@ -3725,7 +3845,12 @@ ${brief}` }] };
           authLine = "REST auth: unknown";
         }
       }
-      return { content: [{ type: "text", text: `Profile: ${profile.display_name || AGENT_ID}
+      const gateNotice = identityGateMessage ? `\uD83D\uDEA8 IDENTITY GUARD: ${identityGateMessage}
+(This whoami call confirms identity \u2014 writes are now unblocked. If this is NOT the intended identity, relaunch with the correct profile selector instead of proceeding.)
+
+` : "";
+      const wasGated = identityGateMessage !== "";
+      const text = `Profile: ${profile.display_name || AGENT_ID}
 Agent ID: ${AGENT_ID}
 Server: ${REST_URL}
 Web chat: ${REST_URL}/chat/${encodeURIComponent(AGENT_ID)}
@@ -3736,7 +3861,10 @@ ${authLine}
 ${claimedLine}${claimHint ? `
 ${claimHint}` : ""}
 Capabilities: ${CAPABILITIES.join(", ")}
-Profile file: ${activeProfileFile ?? (anonymousMode ? "(none \u2014 anonymous, no profile written)" : "(none \u2014 credentials from environment)")}` }] };
+Profile file: ${activeProfileFile ?? (anonymousMode ? "(none \u2014 anonymous, no profile written)" : "(none \u2014 credentials from environment)")}`;
+      if (wasGated)
+        confirmLiveIdentityTrusted();
+      return { content: [{ type: "text", text: gateNotice + text }] };
     }
     if (name === "list_channels") {
       const { limit = 50 } = args;
@@ -4696,15 +4824,15 @@ ${context}
         if (process.env.AGENTCHAT_WAKE_MODE === "grok") {
           (async () => {
             try {
-              const { readFileSync, existsSync } = await import("fs");
-              const gwPath = resolveGrokGatewayPath(process.env.AGENTCHAT_GROK_GATEWAY, existsSync);
+              const { readFileSync: readFileSync4, existsSync: existsSync3 } = await import("fs");
+              const gwPath = resolveGrokGatewayPath(process.env.AGENTCHAT_GROK_GATEWAY, existsSync3);
               let agentId = process.env.AGENTCHAT_GROK_AGENT_ID || "";
               if (!agentId) {
                 agentId = await resolveGrokAgentId({
                   explicitId: "",
                   agentschatName: profile.display_name || AGENT_ID,
                   listAgents: async () => {
-                    const gwcfg = JSON.parse(readFileSync(gwPath, "utf8"));
+                    const gwcfg = JSON.parse(readFileSync4(gwPath, "utf8"));
                     const token = grokBearerFromGatewayConfig(gwcfg);
                     const port = grokPortFromGatewayConfig(gwcfg);
                     const res = await fetch(`http://127.0.0.1:${port}/api/listAgents`, {

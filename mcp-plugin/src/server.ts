@@ -58,7 +58,7 @@ import {
   shouldHealBoundIdentity,
 } from "./grok-bind.ts";
 import { decideTermsConsent, TERMS_URL } from "./terms.ts";
-import { annotateTools } from "./tool-annotations.ts";
+import { annotateTools, TOOL_ANNOTATIONS } from "./tool-annotations.ts";
 import { fireWake, fireGrokWake, resolveGrokAgentId, resolveGrokGatewayPath, grokBearerFromGatewayConfig, grokPortFromGatewayConfig } from "./wake.ts";
 import pkg from "../package.json";
 import {
@@ -72,6 +72,15 @@ import { join, dirname } from "path";
 // Atomic + 0600-by-construction profile writer. Lives in its own module so the
 // "the key is never world-readable, even mid-write" property is directly testable.
 import { safeWriteProfile } from "./profile-store.ts";
+import {
+  decideIdentityGuard,
+  advanceGuardRecord,
+  parseGuardRecord,
+  emptyGuardRecord,
+  IDENTITY_GUARD_FILENAME,
+  type GuardIdentity,
+  type IdentityGuardRecord,
+} from "./identity-guard.ts";
 // Read-cursor persistence: a state change that merely *lives* in the teardown path.
 import { flushCursor, loadCursor, persistCursor } from "./read-cursor.ts";
 import { randomUUID } from "crypto";
@@ -548,6 +557,53 @@ if (!anonymousMode || explicitAgentId !== undefined || hasToken) {
     process.stderr.write(`[agentchat] ERROR: ${(e as Error).message}\n`);
     process.exit(1);
   }
+}
+
+// ── Identity guard (task_muk0154j_pstaosfn, incident 2026-09-27) ─────────────
+// A host respawn after a WS bounce can resolve a DIFFERENT identity than this
+// machine's MCP was trusted as (explicit selector lost → silent fall to the
+// default profile — wrong-identity posts followed). Compare this boot's identity
+// against the persisted trust record; on the default-fallback pattern, GATE
+// write tools until whoami confirms. Precedence and registration are untouched.
+let identityGateMessage = "";
+const identityGuardFile = join(configDir, IDENTITY_GUARD_FILENAME);
+function persistGuardRecord(rec: IdentityGuardRecord): void {
+  try {
+    mkdirSync(configDir, { recursive: true });
+    safeWriteProfile(identityGuardFile, rec);
+  } catch {}
+}
+function confirmLiveIdentityTrusted(): void {
+  identityGateMessage = "";
+  const live: GuardIdentity = {
+    agentId: AGENT_ID,
+    source: identity.mode === "env-creds" ? "env-creds" : profileSource,
+    ...(declaredName ? { declaredName } : {}),
+  };
+  guardRecord = advanceGuardRecord(guardRecord, live, new Date().toISOString(), true);
+  persistGuardRecord(guardRecord);
+}
+let guardRecord: IdentityGuardRecord = (() => {
+  try { return parseGuardRecord(readFileSync(identityGuardFile, "utf-8")); } catch { return emptyGuardRecord(); }
+})();
+const guardBootIdentity: GuardIdentity = {
+  agentId: AGENT_ID,
+  source: identity.mode === "env-creds" ? "env-creds" : profileSource,
+  ...(declaredName ? { declaredName } : {}),
+};
+{
+  const verdict = AGENT_ID
+    ? decideIdentityGuard(guardRecord, guardBootIdentity)
+    : ({ kind: "ok" } as const); // anonymous: no identity to protect, nothing to persist
+  if (verdict.kind === "gate") {
+    identityGateMessage = verdict.message;
+    process.stderr.write(`\n[agentchat] 🚨 ${verdict.message}\n\n`);
+    guardRecord = advanceGuardRecord(guardRecord, guardBootIdentity, new Date().toISOString(), false);
+  } else {
+    if (verdict.kind === "warn") process.stderr.write(`[agentchat] WARNING: ${verdict.message}\n`);
+    guardRecord = advanceGuardRecord(guardRecord, guardBootIdentity, new Date().toISOString(), true);
+  }
+  if (AGENT_ID) persistGuardRecord(guardRecord);
 }
 
 // Update display name if provided via CLI
@@ -2108,6 +2164,15 @@ function applyIdentityFromProfile(newProfile: any, targetFile: string): void {
   profile = newProfile;
   activeProfileFile = targetFile;
   anonymousMode = false;
+  // An explicit in-process switch is a TRUSTED identity change — advance the
+  // identity-guard record so the next boot doesn't alarm on it.
+  guardRecord = advanceGuardRecord(
+    guardRecord,
+    { agentId: AGENT_ID, source: "switch_profile", ...(profileNameFromPath(targetFile) ? { declaredName: profileNameFromPath(targetFile)! } : {}) },
+    new Date().toISOString(),
+    true,
+  );
+  persistGuardRecord(guardRecord);
   wsReconnectAttempt = 0;
   heartbeat.start();
   connectWS();
@@ -2168,6 +2233,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     // Shared Cursor MCP: heal back to grok-bind identity if another agent
     // stole the live profile via switch_profile. No-op when unbound.
     ensureGrokBoundIdentity();
+
+    // Identity guard (task_muk0154j_pstaosfn): after a suspect fallback (explicit
+    // identity lost on respawn → default profile), WRITE tools refuse until the
+    // agent looks at whoami and confirms. Read-only tools and whoami stay open.
+    if (identityGateMessage && name !== "whoami" && TOOL_ANNOTATIONS[name]?.readOnlyHint !== true) {
+      return { content: [{ type: "text", text: `🚨 ${identityGateMessage}` }], isError: true };
+    }
 
   if (name === "list_skills") {
     const { chat_id } = (args || {}) as { chat_id?: string };
@@ -3082,7 +3154,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         authLine = r.ok ? "REST auth: ok" : `REST auth: failed (${r.status})`;
       } catch { authLine = "REST auth: unknown"; }
     }
-    return { content: [{ type: "text", text: `Profile: ${profile.display_name || AGENT_ID}\nAgent ID: ${AGENT_ID}\nServer: ${REST_URL}\nWeb chat: ${REST_URL}/chat/${encodeURIComponent(AGENT_ID)}\nWebSocket: ${wsState}${sessionId ? `\nSession: ${sessionId.slice(0, 12)}...` : ""}\n${healthLine}\n${authLine}\n${claimedLine}${claimHint ? `\n${claimHint}` : ""}\nCapabilities: ${CAPABILITIES.join(", ")}\nProfile file: ${activeProfileFile ?? (anonymousMode ? "(none — anonymous, no profile written)" : "(none — credentials from environment)")}` }] };
+    // Identity guard: a whoami call IS the confirmation. Surface the gate state
+    // prominently on this response, then trust the live identity and unblock writes.
+    const gateNotice = identityGateMessage
+      ? `🚨 IDENTITY GUARD: ${identityGateMessage}\n(This whoami call confirms identity — writes are now unblocked. If this is NOT the intended identity, relaunch with the correct profile selector instead of proceeding.)\n\n`
+      : "";
+    const wasGated = identityGateMessage !== "";
+    const text = `Profile: ${profile.display_name || AGENT_ID}\nAgent ID: ${AGENT_ID}\nServer: ${REST_URL}\nWeb chat: ${REST_URL}/chat/${encodeURIComponent(AGENT_ID)}\nWebSocket: ${wsState}${sessionId ? `\nSession: ${sessionId.slice(0, 12)}...` : ""}\n${healthLine}\n${authLine}\n${claimedLine}${claimHint ? `\n${claimHint}` : ""}\nCapabilities: ${CAPABILITIES.join(", ")}\nProfile file: ${activeProfileFile ?? (anonymousMode ? "(none — anonymous, no profile written)" : "(none — credentials from environment)")}`;
+    if (wasGated) confirmLiveIdentityTrusted();
+    return { content: [{ type: "text", text: gateNotice + text }] };
   }
 
   if (name === "list_channels") {
