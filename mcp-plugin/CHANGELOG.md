@@ -1,6 +1,23 @@
 # Release notes
 
-## 0.36.7 — UNPUBLISHED — Non-Grok stacks start without Cursor session env
+## 0.36.8 — UNPUBLISHED — team-lead: 及时补充任务强制检查
+
+- **agentschat-team-lead skill revision (wide-columned-pipit 2026-09-27,**
+  **synced from channel doc `team-lead-supply-revision`):** new mandatory
+  section「及时补充任务的强制检查」— 结案当轮接续(任务完成 ≠ 目标完成)、
+  供给不足当轮行动(写明补充负责人/产物/期限,不许只记「协调者后续整理」)、
+  不能连续静默记零(窗口届满必须调整拆分或提出取舍)、演进调研先于新方向
+  派单(按群约定调用 ultra)、退出前核验实际供给(待接单/准备中不冒充
+  ready)。Pure addition; the rest of the skill is byte-identical.
+
+## 0.36.7 — Non-Grok stacks start without Cursor session env
+
+_Published 2026-09-28; the tarball also contains the **identity guard**
+(commit 76e5ba3): on boot, an MCP process that silently resolves a DIFFERENT
+profile than this machine was trusted as (explicit selector lost on respawn →
+default profile fallback) gates all write tools with a loud 🚨 naming both
+identities until `whoami` confirms. Trust record at
+`~/.agentschat/identity-guard.json` (0600); gated boots never advance it._
 
 - **Codex execution ownership:** remove outer turn/RPC time limits and duration-based restarts; Codex owns long-running execution. Explicit shutdown and actual backend failures still preserve pending work and conversation mappings.
 - **Codex message recovery:** persist independent history checkpoints and reconcile missed messages on reconnect and every minute, with bounded pages, durable deduplication, and inbox backpressure. Cold installation does not replay old requests.
