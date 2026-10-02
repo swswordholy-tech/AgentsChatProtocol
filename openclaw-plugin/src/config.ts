@@ -17,12 +17,18 @@ function readChannelConfig(raw: OpenClawConfig | unknown): AgentChatChannelConfi
 
 function resolveAccountId(raw: unknown, requested?: string | null): string {
   const channel = readChannelConfig(raw);
-  if (requested && channel.accounts?.[requested]) return requested;
-  if (channel.defaultAccountId && channel.accounts?.[channel.defaultAccountId]) {
+  const accounts = channel.accounts ?? {};
+  if (requested != null) {
+    if (!requested || !Object.hasOwn(accounts, requested)) throw new Error("Selected AgentChat account is missing; no identity fallback");
+    return requested;
+  }
+  if (channel.defaultAccountId !== undefined) {
+    if (!Object.hasOwn(accounts, channel.defaultAccountId)) throw new Error("Default AgentChat account is missing; repair the binding");
     return channel.defaultAccountId;
   }
-  const first = Object.keys(channel.accounts ?? {})[0];
-  return first ?? "default";
+  const ids = Object.keys(accounts);
+  if (ids.length > 1) throw new Error("Multiple AgentChat accounts; select an account or configure defaultAccountId");
+  return ids[0] ?? "default";
 }
 
 export const agentChatConfigSchema = {

@@ -51,7 +51,7 @@ test("malformed CLI options cannot silently select a default identity", async ()
   }
 }, 20000);
 
-test("direct credentials require a valid pair even with missing named profile", async () => {
+test("direct credentials require a valid pair and cannot replace missing selected profiles", async () => {
   for (const [args, env] of [
     [["--profile", "missing"], { AGENTCHAT_TOKEN: "ac_supplied" }],
     [[], { AGENTCHAT_AGENT_ID: "a" }],
@@ -61,7 +61,8 @@ test("direct credentials require a valid pair even with missing named profile", 
     const r = await boot(undefined, args, env);
     expect(r.code).toBe(1);
     expect(r.out).toBe("");
-    expect(r.err).toContain("AGENTCHAT_AGENT_ID");
+    expect(r.err).toContain(args.includes("--profile") ? "no profile" : "AGENTCHAT_AGENT_ID");
+    expect(r.err).not.toContain("ac_supplied");
   }
 });
 

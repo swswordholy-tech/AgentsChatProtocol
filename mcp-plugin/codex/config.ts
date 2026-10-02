@@ -57,8 +57,9 @@ export function resolveConfig(opts: { cwd?: string; profile?: string; codexBin?:
     const mcp = doc.mcp_servers?.agentschat;
     if (mcp && mcp.enabled !== false) {
       const args = Array.isArray(mcp.args) ? mcp.args : [];
-      const index = args.indexOf("--profile");
-      codexProfile = mcp.env?.AGENTSCHAT_PROFILE ?? mcp.env?.AGENTCHAT_PROFILE ?? (index >= 0 ? args[index + 1] : undefined);
+      const index = args.findIndex((arg: unknown) => typeof arg === "string" && (arg === "--profile" || arg.startsWith("--profile=")));
+      const flagProfile = index < 0 ? undefined : args[index] === "--profile" ? args[index + 1] : args[index].slice("--profile=".length);
+      codexProfile = index >= 0 ? flagProfile : mcp.env?.AGENTSCHAT_PROFILE ?? mcp.env?.AGENTCHAT_PROFILE;
       if ((index >= 0 || codexProfile !== undefined) && (typeof codexProfile !== "string" || !codexProfile.trim() || codexProfile.startsWith("--"))) throw new Error("Invalid project MCP profile selector");
     }
   }

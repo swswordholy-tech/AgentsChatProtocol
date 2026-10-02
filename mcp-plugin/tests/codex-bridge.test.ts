@@ -550,3 +550,12 @@ test('recovery acknowledges ignored and known messages but keeps new work behind
     expect(JSON.parse(readFileSync(join(c.stateDir,'state.json'),'utf8')).entries).toHaveLength(100);
   } finally {await bridge.stop();app.close();}
 });
+
+
+test("Codex project MCP CLI selector wins over env and supports equals syntax", () => {
+  const f = fixture(); f.config({}); mkdirSync(join(f.cwd, ".codex"));
+  for (const args of ['"--profile", "project"', '"--profile=project"']) {
+    writeFileSync(join(f.cwd, ".codex/config.toml"), `[mcp_servers.agentschat]\nargs = [${args}]\n[mcp_servers.agentschat.env]\nAGENTSCHAT_PROFILE = "global"\n`);
+    expect(resolveConfig({ cwd: f.cwd }, {}, f.root).agentId).toBe("project");
+  }
+});

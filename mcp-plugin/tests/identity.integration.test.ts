@@ -66,7 +66,7 @@ const callTool = (id: number, name: string, args: any = {}) =>
   ({ jsonrpc: "2.0", id, method: "tools/call", params: { name, arguments: args } });
 
 /** Spawn the real server against the mock hub; send frames one at a time, awaiting each. */
-function drive(args: string[], home: string, frames: any[], waitMs = 3000, extraEnv: Record<string, string> = {}) {
+function drive(args: string[], home: string, frames: any[], waitMs = 3000, extraEnv: Record<string, string> = {}, cwd?: string) {
   return new Promise<{ res: Map<number, any>; err: string; code: number | null }>((done) => {
     const child = spawn(process.execPath, [ENTRY, "--url", BASE, ...args], {
       env: {
@@ -77,6 +77,7 @@ function drive(args: string[], home: string, frames: any[], waitMs = 3000, extra
         AGENTCHAT_URL: "ws://127.0.0.1:1/ws", // dead WS; we only exercise stdio
         ...extraEnv,
       },
+      cwd,
       stdio: ["pipe", "pipe", "pipe"],
     });
     let out = "", err = "", code: number | null = null;
@@ -709,3 +710,34 @@ describe("identity policy, end-to-end against a mock hub", () => {
     expect(text).toMatch(/Agent ID: bot-a-id/);
   }, 15_000);
 });
+
+
+test("MCP CLI beats project/env; project and runtime bindings beat global default", async () => {
+  const home = freshHome("precedence");
+  const cwd = join(home, "work");
+  mkdirSync(join(cwd, ".agentschat"), { recursive: true });
+  mkdirSync(join(home, ".agentschat/profiles"), { recursive: true });
+  for (const name of ["flag", "project", "runtime", "global", "profile"])
+    writeFileSync(join(home, ".agentschat/profiles", `${name}.json`), JSON.stringify({ agent_id: name, token: `ac_test_${name}` }));
+  const config = join(cwd, ".agentschat/config.json");
+  writeFileSync(config, JSON.stringify({ profile: "project" }));
+  writeFileSync(join(home, ".agentschat/grok-binds.json"), JSON.stringify({ conversation: "runtime" }));
+  const env = { AGENTSCHAT_PROFILE: "global", CURSOR_CONVERSATION_ID: "conversation" };
+  for (const [args, expected] of [[["--profile", "flag"], "flag"], [[], "project"]] as const) {
+    const { res } = await drive([...args], home, [INIT, INITED, callTool(3, "whoami")], 3000, env, cwd);
+    expect(res.get(3)?.result?.content?.[0]?.text).toContain(`Agent ID: ${expected}`);
+  }
+  writeFileSync(config, JSON.stringify({ profile: "project", agent_id: "wrong" }));
+  calls = [];
+  const mismatch = await drive([], home, [INIT], 500, env, cwd);
+  expect(mismatch.code).toBe(1);
+  expect(mismatch.err).toContain("Project agent_id does not match");
+  expect(registerCalls()).toBe(0);
+  writeFileSync(config, "{}");
+  const { res } = await drive([], home, [INIT, INITED, callTool(3, "whoami")], 3000, env, cwd);
+  expect(res.get(3)?.result?.content?.[0]?.text).toContain("Agent ID: runtime");
+  calls = [];
+  const bad = await drive(["--profile", "missing", "--name", "New", "--register", "--accept-terms"], home, [INIT], 500, env, cwd);
+  expect(bad.code).toBe(1);
+  expect(registerCalls()).toBe(0);
+}, 20000);

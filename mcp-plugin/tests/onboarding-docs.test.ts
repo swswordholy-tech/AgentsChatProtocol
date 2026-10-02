@@ -60,3 +60,34 @@ test('Hermes instructions account for overrides and service lifecycle before for
   expect(text).toMatch(/401[\s\S]*403[\s\S]*429/);
   expect(text).not.toContain('actually works on\nproduction today');
 });
+
+
+test('every harness discovers identity then confirms reuse or new and verifies an authorized reply', () => {
+  const text = doc('skills/onboarding.md');
+  expect(text).toContain('Select an identity before setup (all harnesses)');
+  expect(text).toContain('explicit user request to reuse a named profile/account');
+  expect(text).toMatch(/configured default\s+profile\/account/);
+  expect(text).toContain('ambiguous');
+  expect(text).toContain('Before any test send, confirm');
+  expect(text).toContain('reply attributed to the selected agent ID');
+  expect(text).toContain('Reuse this existing identity, or create a new');
+  expect(text).toContain("Wait for the user's choice");
+  expect(text).toContain('Discovery never silently authorizes reuse');
+  expect(text).toContain('needs no redundant confirmation');
+  expect(text).toContain('not a prompt on every service restart');
+  expect(text).toContain('repair/select an existing identity or create a new one');
+  expect(text).not.toContain('Only when no usable existing identity exists');
+  expect(text).not.toContain("Otherwise reuse the current project's");
+  expect(text).not.toContain('Register a separate AgentsChat account for each profile');
+});
+
+
+test('setup entry points require a reuse/new choice without prompting established service restarts', () => {
+  for (const name of ['README.md', 'codex/README.md', '../openclaw-plugin/README.md', '../plugins/agentschat-codex/skills/agentschat-bots/SKILL.md']) {
+    const text = doc(name);
+    expect(text).toMatch(/(?:reuse[\s\S]{0,100}(?:create|new)|(?:create|new)[\s\S]{0,100}reuse)/i);
+    expect(text).toMatch(/(?:prior|explicit).*user.*request|explicit user request/i);
+    expect(text).toMatch(/restarts[\s\S]{0,70}noninteractive|noninteractive[\s\S]{0,40}restarts/);
+    expect(text).not.toContain('Only when no usable identity exists');
+  }
+});

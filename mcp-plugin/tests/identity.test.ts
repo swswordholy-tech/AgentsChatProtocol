@@ -50,7 +50,7 @@ describe("decideIdentity — never registers implicitly", () => {
 });
 
 describe("decideIdentity — declared-but-missing is a hard error, not an invented identity", () => {
-  for (const source of ["env", "legacy-env", "flag-profile", "grok-bind"] as const) {
+  for (const source of ["env", "legacy-env", "flag-profile", "grok-bind", "project-config", "project-profile"] as const) {
     test(`${source}: profile missing → error, not register`, () => {
       const d = decideIdentity({ ...base, source, declaredName: "mellow-blessed-obsidian" });
       expect(d.mode).toBe("error");
@@ -62,13 +62,13 @@ describe("decideIdentity — declared-but-missing is a hard error, not an invent
     });
   }
 
-  test("declared-but-missing still yields to an explicit --name", () => {
+  test("declared-but-missing refuses an explicit --name override", () => {
     const d = decideIdentity({ ...base, source: "flag-profile", declaredName: "typo", cliName: "Foo" });
-    expect(d).toEqual({ mode: "register", displayName: "Foo" });
+    expect(d.mode).toBe("error");
   });
 
-  test("declared-but-missing still yields to an out-of-band token", () => {
-    expect(decideIdentity({ ...base, source: "env", declaredName: "x", hasToken: true }).mode).toBe("env-creds");
+  test("declared-but-missing refuses an out-of-band token", () => {
+    expect(decideIdentity({ ...base, source: "env", declaredName: "x", hasToken: true }).mode).toBe("error");
   });
 });
 
@@ -78,7 +78,7 @@ describe("shouldMigrateDevToken — same opt-in gate as first-run registration",
   });
 
   test("declared identity → heal the key as before", () => {
-    for (const source of ["env", "legacy-env", "flag-profile", "flag-name", "grok-bind"] as const) {
+    for (const source of ["env", "legacy-env", "flag-profile", "flag-name", "grok-bind", "project-config", "project-profile"] as const) {
       expect(shouldMigrateDevToken({ source, hasToken: false })).toBe(true);
     }
   });

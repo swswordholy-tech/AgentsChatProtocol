@@ -26,7 +26,7 @@
  */
 
 /** Which resolution tier produced the profile path (see resolveProfile in server.ts). */
-export type ProfileSource = "env" | "legacy-env" | "flag-profile" | "flag-name" | "grok-bind" | "default";
+export type ProfileSource = "env" | "legacy-env" | "flag-profile" | "flag-name" | "grok-bind" | "project-config" | "project-profile" | "default";
 
 export type IdentityDecision =
   /** Profile file exists — load it. */
@@ -62,6 +62,12 @@ export interface IdentityInputs {
 export function decideIdentity(i: IdentityInputs): IdentityDecision {
   // An existing profile is authoritative — this is the overwhelmingly common path.
   if (i.profileExists) return { mode: "profile" };
+
+  // A selected existing identity cannot be replaced by credentials or registration
+  // flags when its backing file is missing. --name is the separate creation path.
+  if (i.source !== "default" && i.source !== "flag-name") {
+    return { mode: "error", message: `no profile for "${i.declaredName ?? "(unknown)"}" at ${i.profileFile}. Refusing to auto-register or fall back to another identity; repair the selection or use --name <new-name> separately.` };
+  }
 
   // Credentials handed to us directly: we can authenticate, so there is nothing to
   // register. (Previously this still registered, because the branch keyed only on

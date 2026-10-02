@@ -1,7 +1,5 @@
 #!/usr/bin/env node
 // @bun
-import { createRequire } from "node:module";
-var __require = /* @__PURE__ */ createRequire(import.meta.url);
 
 // src/onboarding-status.ts
 async function getOnboardingStatus(base, agentId, token, request = fetch) {
@@ -187,6 +185,9 @@ function matchesJsonType(val, expected) {
 function decideIdentity(i) {
   if (i.profileExists)
     return { mode: "profile" };
+  if (i.source !== "default" && i.source !== "flag-name") {
+    return { mode: "error", message: `no profile for "${i.declaredName ?? "(unknown)"}" at ${i.profileFile}. Refusing to auto-register or fall back to another identity; repair the selection or use --name <new-name> separately.` };
+  }
   if (i.hasToken)
     return { mode: "env-creds" };
   if (i.cliName)
@@ -229,8 +230,55 @@ function shouldMigrateDevToken(i) {
   return i.source !== "default";
 }
 
+// src/profile-selection.ts
+import { existsSync, readFileSync as readFileSync2 } from "node:fs";
+import { isAbsolute, join, resolve } from "node:path";
+function projectProfileSelector(cwd) {
+  const config = join(cwd, ".agentschat/config.json");
+  let doc = {};
+  if (existsSync(config)) {
+    try {
+      doc = JSON.parse(readFileSync2(config, "utf8"));
+    } catch {
+      throw new Error("Invalid project .agentschat/config.json; repair it before choosing an identity");
+    }
+    if (!doc || typeof doc !== "object" || Array.isArray(doc))
+      throw new Error("Invalid project identity configuration");
+    for (const field of ["profile", "agent_id", "api_url", "ws_url"]) {
+      if (doc[field] !== undefined && (typeof doc[field] !== "string" || !doc[field].trim()))
+        throw new Error(`Invalid project ${field}`);
+    }
+    for (const [field, protocols] of [["api_url", ["https:", "http:"]], ["ws_url", ["wss:", "ws:"]]]) {
+      if (doc[field] === undefined)
+        continue;
+      let url;
+      try {
+        url = new URL(doc[field]);
+      } catch {
+        throw new Error(`Invalid project ${field}`);
+      }
+      if (!protocols.includes(url.protocol) || url.username || url.password || url.search || url.hash || !url.protocol.endsWith("s:") && !["127.0.0.1", "localhost", "[::1]"].includes(url.hostname))
+        throw new Error(`Invalid project ${field}: require TLS (except loopback) and no credentials/query`);
+    }
+  }
+  const settings = {
+    ...doc.agent_id !== undefined ? { agentId: doc.agent_id } : {},
+    ...doc.api_url !== undefined ? { apiUrl: doc.api_url } : {},
+    ...doc.ws_url !== undefined ? { wsUrl: doc.ws_url } : {}
+  };
+  if (doc.profile !== undefined) {
+    const value = doc.profile;
+    return { selector: !isAbsolute(value) && !value.startsWith("~/") && value.includes("/") ? resolve(cwd, value) : value, source: "project-config", ...settings };
+  }
+  const profile = join(cwd, ".agentschat/profile.json");
+  if (existsSync(profile))
+    return { selector: profile, source: "project-profile", ...settings };
+  if (Object.keys(settings).length)
+    throw new Error("Project identity/server settings require a profile binding");
+}
+
 // src/grok-bind.ts
-import { join } from "node:path";
+import { join as join2 } from "node:path";
 var DEFAULT_GROK_BINDS_FILENAME = "grok-binds.json";
 var GROK_BINDS_META_FILENAME = "grok-binds.meta.json";
 function parseGrokBinds(raw) {
@@ -260,7 +308,7 @@ function parseGrokBindsText(text) {
 function resolveGrokBindsPath(configDir, envOverride) {
   if (envOverride && envOverride.length > 0)
     return envOverride;
-  return join(configDir, DEFAULT_GROK_BINDS_FILENAME);
+  return join2(configDir, DEFAULT_GROK_BINDS_FILENAME);
 }
 function decideGrokBind(input) {
   if (input.explicitIdentity || input.hasToken)
@@ -581,8 +629,8 @@ async function fireGrokWake(msg, cfg) {
   }
   let gwcfg;
   try {
-    const { readFileSync: readFileSync2 } = await import("node:fs");
-    gwcfg = JSON.parse(readFileSync2(cfg.gatewayConfigPath, "utf8"));
+    const { readFileSync } = await import("node:fs");
+    gwcfg = JSON.parse(readFileSync(cfg.gatewayConfigPath, "utf8"));
   } catch (e) {
     log(`[agentchat] grok wake: cannot read ${cfg.gatewayConfigPath}: ${e}`);
     return;
@@ -697,6 +745,7 @@ var package_default = {
     "src/argcheck.ts",
     "src/onboarding-status.ts",
     "src/identity.ts",
+    "src/profile-selection.ts",
     "src/grok-bind.ts",
     "src/tool-annotations.ts",
     "src/identity-guard.ts",
@@ -737,16 +786,16 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema
 } from "@modelcontextprotocol/sdk/types.js";
-import { readFileSync as readFileSync3, existsSync as existsSync2, writeFileSync as writeFileSync3, mkdirSync, readdirSync } from "fs";
-import { join as join2, dirname } from "path";
+import { readFileSync as readFileSync4, existsSync as existsSync3, writeFileSync as writeFileSync3, mkdirSync, readdirSync } from "fs";
+import { join as join3, dirname } from "path";
 
 // src/profile-store.ts
-import { existsSync, writeFileSync, renameSync, chmodSync, unlinkSync, statSync } from "fs";
+import { existsSync as existsSync2, writeFileSync, renameSync, chmodSync, unlinkSync, statSync } from "fs";
 var defaultWarn = (m) => process.stderr.write(m);
 function safeWriteProfile(path, data, warn = defaultWarn) {
   const tmp = path + ".tmp";
   try {
-    if (existsSync(tmp))
+    if (existsSync2(tmp))
       unlinkSync(tmp);
   } catch (e) {
     warn(`[agentchat] WARNING: stale ${tmp} could not be removed: ${e}
@@ -837,10 +886,10 @@ function advanceGuardRecord(prev, current, ts, trusted) {
 }
 
 // src/read-cursor.ts
-import { readFileSync as readFileSync2, writeFileSync as writeFileSync2 } from "fs";
+import { readFileSync as readFileSync3, writeFileSync as writeFileSync2 } from "fs";
 function loadCursor(file, warn) {
   try {
-    return new Map(Object.entries(JSON.parse(readFileSync2(file, "utf-8"))));
+    return new Map(Object.entries(JSON.parse(readFileSync3(file, "utf-8"))));
   } catch (e) {
     if (e?.code !== "ENOENT") {
       warn(`[agentchat] WARNING: could not read ${file} — resetting that state: ${e}
@@ -1044,7 +1093,7 @@ Grok multi-bot identity bind (Cursor / Grok Bot, no --profile):
 Hermes relay connector (no Hermes patch): run with --connector. See --connector --help.
 
 Identity is never created implicitly. Without explicit selectors, an existing
-default profile or Grok binding is loaded; only when neither exists and no
+project/runtime binding or default profile is loaded; only when none exists and no
 credentials are supplied does the server run ANONYMOUS (lists tools, no account).
 
 Profiles stored in: ~/.agentschat/ (legacy fallback: ~/.agentchat/)
@@ -1052,23 +1101,29 @@ Docs: https://github.com/swswordholy-tech/AgentsChatProtocol`);
   process.exit(0);
 }
 var homeDir = process.env.HOME || process.env.USERPROFILE || ".";
-var configDir = join2(homeDir, ".agentschat");
-var legacyConfigDir = join2(homeDir, ".agentchat");
+var configDir = join3(homeDir, ".agentschat");
+var legacyConfigDir = join3(homeDir, ".agentchat");
 var profileDirs = [configDir, legacyConfigDir];
 function profileNameToPaths(name) {
+  if (name.startsWith("~/"))
+    return [join3(homeDir, name.slice(2))];
   if (name.includes("/") || name.includes("\\"))
     return [name];
+  name = name.replace(/\.json$/, "");
   const safeName = name.replace(/[^a-zA-Z0-9_-]/g, "_");
-  return profileDirs.map((dir) => join2(dir, `${safeName}.json`));
+  return profileDirs.map((dir) => join3(dir, `${safeName}.json`));
 }
 function nameToPath(name) {
   const candidates = profileNameToPaths(name);
-  return candidates.find((path) => existsSync2(path)) || candidates[0];
+  const nested = join3(configDir, "profiles", name.replace(/\.json$/, "") + ".json");
+  if (!name.includes("/") && !name.includes("\\") && existsSync3(nested))
+    return nested;
+  return candidates.find((path) => existsSync3(path)) || candidates[0];
 }
 function listProfileFiles() {
   const seen = new Set;
   const profiles = [];
-  for (const dir of profileDirs) {
+  for (const dir of [join3(configDir, "profiles"), ...profileDirs]) {
     let files = [];
     try {
       files = readdirSync(dir).filter((f) => f.endsWith(".json"));
@@ -1080,20 +1135,21 @@ function listProfileFiles() {
       if (seen.has(name))
         continue;
       seen.add(name);
-      profiles.push({ name, path: join2(dir, file) });
+      profiles.push({ name, path: join3(dir, file) });
     }
   }
   return profiles;
 }
 function resolveProfile() {
-  if (process.env.AGENTSCHAT_PROFILE)
-    return { path: nameToPath(process.env.AGENTSCHAT_PROFILE), source: "env", declaredName: process.env.AGENTSCHAT_PROFILE };
-  if (process.env.AGENTCHAT_PROFILE)
-    return { path: nameToPath(process.env.AGENTCHAT_PROFILE), source: "legacy-env", declaredName: process.env.AGENTCHAT_PROFILE };
   if (cliArgs.profile)
     return { path: nameToPath(cliArgs.profile), source: "flag-profile", declaredName: cliArgs.profile };
   if (cliArgs.name)
     return { path: nameToPath(cliArgs.name), source: "flag-name", declaredName: cliArgs.name };
+  if (!cliArgs.token && !process.env.AGENTCHAT_TOKEN) {
+    const project = projectProfileSelector(process.cwd());
+    if (project)
+      return { ...project, path: nameToPath(project.selector), declaredName: project.selector };
+  }
   const grokToken = !!(cliArgs.token || process.env.AGENTCHAT_TOKEN);
   const nonGrokWake = nonGrokWakeReason(process.env);
   const conversationId = nonGrokWake ? undefined : process.env.CURSOR_CONVERSATION_ID;
@@ -1104,9 +1160,9 @@ function resolveProfile() {
   let binds = {};
   if (!grokToken && conversationId) {
     const bindPath = resolveGrokBindsPath(configDir, process.env.AGENTCHAT_GROK_BINDS);
-    if (existsSync2(bindPath)) {
+    if (existsSync3(bindPath)) {
       try {
-        const parsed = parseGrokBindsText(readFileSync3(bindPath, "utf-8"));
+        const parsed = parseGrokBindsText(readFileSync4(bindPath, "utf-8"));
         binds = parsed.binds;
         if (parsed.malformed) {
           process.stderr.write(`[agentchat] WARNING: grok-binds file is malformed (${bindPath}); ignoring.
@@ -1132,15 +1188,19 @@ function resolveProfile() {
     process.stderr.write(`[agentchat] no grok-bind matched CURSOR_CONVERSATION_ID=${grok.conversationId}
 `);
   }
+  if (process.env.AGENTSCHAT_PROFILE)
+    return { path: nameToPath(process.env.AGENTSCHAT_PROFILE), source: "env", declaredName: process.env.AGENTSCHAT_PROFILE };
+  if (process.env.AGENTCHAT_PROFILE)
+    return { path: nameToPath(process.env.AGENTCHAT_PROFILE), source: "legacy-env", declaredName: process.env.AGENTCHAT_PROFILE };
   return { path: nameToPath("profile"), source: "default" };
 }
-var { path: profileFile, source: profileSource, declaredName } = resolveProfile();
+var { path: profileFile, source: profileSource, declaredName, agentId: projectAgentId, apiUrl: projectApiUrl, wsUrl: projectWsUrl } = resolveProfile();
 var activeProfileFile = profileFile;
 var anonymousMode = false;
 var profile = {};
 var DEFAULT_SERVER = "https://agents-chat.com";
-var serverUrl = (cliArgs.url || process.env.AGENTCHAT_REST_URL || DEFAULT_SERVER).replace(/\/$/, "");
-var WS_URL = process.env.AGENTCHAT_URL || (() => {
+var serverUrl = (cliArgs.url || projectApiUrl || process.env.AGENTCHAT_REST_URL || DEFAULT_SERVER).replace(/\/$/, "");
+var WS_URL = !cliArgs.url && projectWsUrl || !projectApiUrl && process.env.AGENTCHAT_URL || (() => {
   const base = serverUrl.replace("https://", "wss://").replace("http://", "ws://");
   return base.endsWith("/ws") ? base : base + "/ws";
 })();
@@ -1170,7 +1230,7 @@ if (hasToken && !explicitAgentId && profileSource === "default") {
   process.exit(1);
 }
 var identity = decideIdentity({
-  profileExists: existsSync2(profileFile),
+  profileExists: existsSync3(profileFile),
   source: profileSource,
   profileFile,
   cliName: cliArgs.name,
@@ -1181,7 +1241,7 @@ var identity = decideIdentity({
 });
 function readIdentityProfile(file) {
   try {
-    return JSON.parse(readFileSync3(file, "utf-8"));
+    return JSON.parse(readFileSync4(file, "utf-8"));
   } catch {
     throw new Error(`Cannot read identity profile at ${file}. Repair its JSON/permissions or select --profile <valid-name>.`);
   }
@@ -1189,6 +1249,9 @@ function readIdentityProfile(file) {
 if (identity.mode === "profile") {
   try {
     profile = readIdentityProfile(profileFile);
+    if (projectAgentId !== undefined && projectAgentId !== (cliArgs.id ?? process.env.AGENTCHAT_AGENT_ID ?? profile?.agent_id)) {
+      throw new Error("Project agent_id does not match selected profile");
+    }
     validateIdentityProfile(profile && !Array.isArray(profile) ? {
       ...profile,
       agent_id: cliArgs.id ?? process.env.AGENTCHAT_AGENT_ID ?? profile.agent_id,
@@ -1352,7 +1415,7 @@ if (!anonymousMode || explicitAgentId !== undefined || hasToken) {
   }
 }
 var identityGateMessage = "";
-var identityGuardFile = join2(configDir, IDENTITY_GUARD_FILENAME);
+var identityGuardFile = join3(configDir, IDENTITY_GUARD_FILENAME);
 function persistGuardRecord(rec) {
   try {
     mkdirSync(configDir, { recursive: true });
@@ -1371,7 +1434,7 @@ function confirmLiveIdentityTrusted() {
 }
 var guardRecord = (() => {
   try {
-    return parseGuardRecord(readFileSync3(identityGuardFile, "utf-8"));
+    return parseGuardRecord(readFileSync4(identityGuardFile, "utf-8"));
   } catch {
     return emptyGuardRecord();
   }
@@ -2657,10 +2720,10 @@ function mimeFromPath(p) {
   return MEDIA_MIME_BY_EXT[ext] ?? "application/octet-stream";
 }
 async function uploadLocalFile(path) {
-  if (!existsSync2(path))
+  if (!existsSync3(path))
     throw new Error(`file not found: ${path}`);
   const mime = mimeFromPath(path);
-  const buf = readFileSync3(path);
+  const buf = readFileSync4(path);
   const name = path.split("/").pop() || "upload";
   const form = new FormData;
   form.append("file", new Blob([new Uint8Array(buf)], { type: mime }), name);
@@ -2697,18 +2760,18 @@ async function sendMediaMessage(kind, args) {
     let ttsDuration;
     if (text) {
       const voice = typeof args.voice === "string" && args.voice ? args.voice : undefined;
-      const r2 = await apiFetch(`${REST_URL}/api/tts`, {
+      const r = await apiFetch(`${REST_URL}/api/tts`, {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${TOKEN}` },
         body: JSON.stringify({ text, ...voice ? { voice } : {} })
       });
-      const t = await r2.text();
-      if (r2.status === 429 && /MEDIA_BUDGET_EXCEEDED/i.test(t))
+      const t = await r.text();
+      if (r.status === 429 && /MEDIA_BUDGET_EXCEEDED/i.test(t))
         return { content: [{ type: "text", text: "Voice budget exhausted for today (MEDIA_BUDGET_EXCEEDED) \u2014 try again tomorrow, or send a recorded clip via path/url." }], isError: true };
-      if (r2.status === 400 && /INVALID_VOICE/i.test(t))
+      if (r.status === 400 && /INVALID_VOICE/i.test(t))
         return { content: [{ type: "text", text: "Invalid voice for TTS. Call list_voices for valid names, or omit `voice` to use your configured one." }], isError: true };
-      if (!r2.ok)
-        return { content: [{ type: "text", text: `TTS failed (${r2.status}): ${t.slice(0, 140)}` }], isError: true };
+      if (!r.ok)
+        return { content: [{ type: "text", text: `TTS failed (${r.status}): ${t.slice(0, 140)}` }], isError: true };
       let d;
       try {
         d = JSON.parse(t);
@@ -2847,10 +2910,10 @@ HANDLERS.set("transcribe", async (args) => {
 });
 function loadGrokBinds() {
   const bindPath = resolveGrokBindsPath(configDir, process.env.AGENTCHAT_GROK_BINDS);
-  if (!existsSync2(bindPath))
+  if (!existsSync3(bindPath))
     return {};
   try {
-    return parseGrokBindsText(readFileSync3(bindPath, "utf-8")).binds;
+    return parseGrokBindsText(readFileSync4(bindPath, "utf-8")).binds;
   } catch {
     return {};
   }
@@ -2905,7 +2968,7 @@ function ensureGrokBoundIdentity() {
   if (!boundName)
     return;
   const boundPath = nameToPath(boundName);
-  if (!existsSync2(boundPath))
+  if (!existsSync3(boundPath))
     return;
   let boundProfile;
   try {
@@ -3150,7 +3213,7 @@ ${a.body || ""}`;
           const currentVersion = Number(meta.version ?? 0);
           let cachedVersion = null;
           try {
-            cachedVersion = Number(JSON.parse(readFileSync3(pMeta, "utf8")).version);
+            cachedVersion = Number(JSON.parse(readFileSync4(pMeta, "utf8")).version);
           } catch {}
           if (cachedVersion !== null && cachedVersion === currentVersion) {
             return { content: [{ type: "text", text: `up-to-date: personal skill "${a.name}" v${currentVersion} already at ${pMd} \u2014 no download. Read that file to run it.` }] };
@@ -3184,7 +3247,7 @@ ${a.body || ""}`;
         const currentVersion = Number(meta.version ?? 0);
         let cachedVersion = null;
         try {
-          cachedVersion = Number(JSON.parse(readFileSync3(metaPath, "utf8")).version);
+          cachedVersion = Number(JSON.parse(readFileSync4(metaPath, "utf8")).version);
         } catch {}
         if (cachedVersion !== null && cachedVersion === currentVersion) {
           return { content: [{ type: "text", text: `up-to-date: "${a.doc_id}" v${currentVersion} already at ${mdPath} \u2014 no download. Read that file to run it.` }] };
@@ -3626,7 +3689,7 @@ ${results}` }] };
         } catch {}
       }
       try {
-        await new Promise((r2) => setTimeout(r2, 500));
+        await new Promise((r) => setTimeout(r, 500));
         const r = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(chat_id)}/members`, { headers: { Authorization: `Bearer ${TOKEN}` } });
         if (r.ok) {
           const data = await r.json();
@@ -4048,7 +4111,7 @@ ${list}` }] };
         return { content: [{ type: "text", text: switchGate.message }], isError: true };
       }
       const targetFile = nameToPath(profile_name);
-      if (!existsSync2(targetFile)) {
+      if (!existsSync3(targetFile)) {
         return { content: [{ type: "text", text: `Profile "${profile_name}" not found. Available: ${available.join(", ")}` }], isError: true };
       }
       const newProfile = readIdentityProfile(targetFile);
@@ -4402,7 +4465,7 @@ ${list}` }] };
     return { content: [{ type: "text", text: `${name} failed: ${String(e?.message || e).slice(0, 300)}` }], isError: true };
   }
 });
-var mentionTsFile = join2(configDir, `mention-ts-${AGENT_ID}.json`);
+var mentionTsFile = join3(configDir, `mention-ts-${AGENT_ID}.json`);
 function loadMentionTimestamps() {
   return loadCursor(mentionTsFile, safeStderrWrite);
 }
@@ -4410,7 +4473,7 @@ function saveMentionTimestamps(m) {
   persistCursor(mentionTsFile, m, safeStderrWrite);
 }
 var lastMentionTimestamp = loadMentionTimestamps();
-var lastSeenMessageTsFile = join2(configDir, `last-seen-msg-ts-${AGENT_ID}.json`);
+var lastSeenMessageTsFile = join3(configDir, `last-seen-msg-ts-${AGENT_ID}.json`);
 function loadLastSeenMessageTs() {
   return loadCursor(lastSeenMessageTsFile, safeStderrWrite);
 }
@@ -4824,15 +4887,15 @@ ${context}
         if (process.env.AGENTCHAT_WAKE_MODE === "grok") {
           (async () => {
             try {
-              const { readFileSync: readFileSync4, existsSync: existsSync3 } = await import("fs");
-              const gwPath = resolveGrokGatewayPath(process.env.AGENTCHAT_GROK_GATEWAY, existsSync3);
+              const { readFileSync, existsSync } = await import("fs");
+              const gwPath = resolveGrokGatewayPath(process.env.AGENTCHAT_GROK_GATEWAY, existsSync);
               let agentId = process.env.AGENTCHAT_GROK_AGENT_ID || "";
               if (!agentId) {
                 agentId = await resolveGrokAgentId({
                   explicitId: "",
                   agentschatName: profile.display_name || AGENT_ID,
                   listAgents: async () => {
-                    const gwcfg = JSON.parse(readFileSync4(gwPath, "utf8"));
+                    const gwcfg = JSON.parse(readFileSync(gwPath, "utf8"));
                     const token = grokBearerFromGatewayConfig(gwcfg);
                     const port = grokPortFromGatewayConfig(gwcfg);
                     const res = await fetch(`http://127.0.0.1:${port}/api/listAgents`, {

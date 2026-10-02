@@ -1170,8 +1170,9 @@ function resolveConfig(opts, env = process.env, home = homedir2()) {
     const mcp = doc.mcp_servers?.agentschat;
     if (mcp && mcp.enabled !== false) {
       const args = Array.isArray(mcp.args) ? mcp.args : [];
-      const index = args.indexOf("--profile");
-      codexProfile = mcp.env?.AGENTSCHAT_PROFILE ?? mcp.env?.AGENTCHAT_PROFILE ?? (index >= 0 ? args[index + 1] : undefined);
+      const index = args.findIndex((arg) => typeof arg === "string" && (arg === "--profile" || arg.startsWith("--profile=")));
+      const flagProfile = index < 0 ? undefined : args[index] === "--profile" ? args[index + 1] : args[index].slice("--profile=".length);
+      codexProfile = index >= 0 ? flagProfile : mcp.env?.AGENTSCHAT_PROFILE ?? mcp.env?.AGENTCHAT_PROFILE;
       if ((index >= 0 || codexProfile !== undefined) && (typeof codexProfile !== "string" || !codexProfile.trim() || codexProfile.startsWith("--")))
         throw new Error("Invalid project MCP profile selector");
     }
@@ -1357,9 +1358,9 @@ class AppServer {
 `);
   }
   request(method, params) {
-    return new Promise((resolve4, reject) => {
+    return new Promise((resolve, reject) => {
       const id = ++this.nextId;
-      this.pending.set(id, { method, resolve: resolve4, reject });
+      this.pending.set(id, { method, resolve, reject });
       try {
         this.write({ id, method, params });
       } catch (e) {
@@ -1456,8 +1457,8 @@ class AppServer {
     const permissions = this.threadPermissions.get(thread);
     if (!permissions)
       throw new Error("Thread permissions have not been configured");
-    const completed = new Promise((resolve4, reject) => {
-      this.active = { thread, items: new Map, early: [], resolve: resolve4, reject };
+    const completed = new Promise((resolve, reject) => {
+      this.active = { thread, items: new Map, early: [], resolve, reject };
     });
     completed.catch(() => {});
     try {
@@ -1810,7 +1811,7 @@ class Bridge {
   }
   async run() {
     while (!this.stopped) {
-      const e = this.state.entries.find((e2) => e2.status === "pending" || e2.status === "ready");
+      const e = this.state.entries.find((e) => e.status === "pending" || e.status === "ready");
       if (!e)
         return;
       if (!permitted(e.message, this.config)) {
@@ -2177,12 +2178,12 @@ class AgentsChatTransport {
   async send(channel, text) {
     if (this.authenticated && this.socket?.readyState === WebSocket.OPEN) {
       const id = randomUUID2();
-      await new Promise((resolve4, reject) => {
+      await new Promise((resolve, reject) => {
         const timer = setTimeout(() => {
           this.pending.delete(id);
           reject(new Error("AgentsChat acknowledgement timed out"));
         }, 15000);
-        this.pending.set(id, { resolve: resolve4, reject, timer });
+        this.pending.set(id, { resolve, reject, timer });
         this.socket.send(JSON.stringify({
           type: "message",
           id,
@@ -2217,7 +2218,7 @@ class AgentsChatTransport {
       if (current() && socket.readyState === WebSocket.OPEN)
         socket.send(JSON.stringify(value));
     };
-    const join9 = (channel) => {
+    const join = (channel) => {
       if (!this.config.channels.length || this.config.channels.includes(channel)) {
         this.inboxSync?.watch(channel);
         send({ type: "join_channel", channel_id: channel, agent_id: this.config.agentId });
@@ -2257,7 +2258,7 @@ class AgentsChatTransport {
           const ids = channels.map((c) => c.id ?? c.channel_id).filter((id) => typeof id === "string" && (!this.config.channels.length || this.config.channels.includes(id)));
           this.inboxSync?.memberships(ids);
           for (const id of ids)
-            join9(id);
+            join(id);
           this.inboxSync?.sync();
         }).catch(() => {
           if (current()) {
@@ -2273,7 +2274,7 @@ class AgentsChatTransport {
           pending.resolve();
         }
       } else if (data.type === "channel_created" && typeof data.channel_id === "string")
-        join9(data.channel_id);
+        join(data.channel_id);
       else if (["message", "thread_reply"].includes(data.type))
         this.receive(data);
       else if (data.type === "shard_moved" || data.type === "please_reconnect")
@@ -2358,7 +2359,7 @@ async function main() {
   if (values["gui-thread"] || values["gui-message-file"] || values["gui-status"]) {
     const channel = new GuiChannel(join9(homedir4(), ".agentschat/codex-gui-outbox"), values["gui-thread"] ? [values["gui-thread"]] : []);
     if (values["gui-status"]) {
-      console.log(JSON.stringify(channel.list().map(({ prompt: prompt2, ...receipt2 }) => receipt2)));
+      console.log(JSON.stringify(channel.list().map(({ prompt, ...receipt }) => receipt)));
       return;
     }
     if (!values["gui-thread"] || !values["gui-message-file"])
@@ -2367,7 +2368,7 @@ async function main() {
     console.log(JSON.stringify(receipt));
     return;
   }
-  const snapshot = values["managed-worker"] ? await new Promise((resolve4, reject) => {
+  const snapshot = values["managed-worker"] ? await new Promise((resolve, reject) => {
     if (!process.connected) {
       reject(new Error("Managed worker needs parent IPC"));
       return;
@@ -2375,7 +2376,7 @@ async function main() {
     const timer = setTimeout(() => reject(new Error("Parent configuration missing")), 1e4);
     process.once("message", (config) => {
       clearTimeout(timer);
-      resolve4(config);
+      resolve(config);
     });
   }) : undefined;
   const c = snapshot ?? (values.bot ? loadBots(values.registry).find((b) => b.name === values.bot) : resolveConfig({ cwd: values.cwd, profile: values.profile, codexBin: values["codex-bin"] }));
@@ -2400,7 +2401,7 @@ async function main() {
     const state = JSON.parse(readFileSync8(join9(c.stateDir, "state.json"), "utf8"));
     const channels = state.channels ?? {};
     if (values.conversations) {
-      console.log(JSON.stringify(Object.entries(channels).map(([channel2, data]) => ({ channel: channel2, thread: data.thread, isolated: data.namespace === runtime.home }))));
+      console.log(JSON.stringify(Object.entries(channels).map(([channel, data]) => ({ channel, thread: data.thread, isolated: data.namespace === runtime.home }))));
       return;
     }
     const channel = channels[values["read-conversation"]];

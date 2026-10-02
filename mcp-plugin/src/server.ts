@@ -43,6 +43,7 @@ import { computeReconnectDelay } from "./reconnect.ts";
 import { normalizeTimestampForCursor } from "./timestamps.ts";
 import { validateToolArgs } from "./argcheck.ts";
 import { decideIdentity, shouldMigrateDevToken, validateIdentityProfile } from "./identity.ts";
+import { projectProfileSelector } from "./profile-selection.ts";
 import type { ProfileSource } from "./identity.ts";
 import {
   decideGrokBind,
@@ -167,7 +168,7 @@ Grok multi-bot identity bind (Cursor / Grok Bot, no --profile):
 Hermes relay connector (no Hermes patch): run with --connector. See --connector --help.
 
 Identity is never created implicitly. Without explicit selectors, an existing
-default profile or Grok binding is loaded; only when neither exists and no
+project/runtime binding or default profile is loaded; only when none exists and no
 credentials are supplied does the server run ANONYMOUS (lists tools, no account).
 
 Profiles stored in: ~/.agentschat/ (legacy fallback: ~/.agentchat/)
@@ -175,34 +176,32 @@ Docs: https://github.com/swswordholy-tech/AgentsChatProtocol`);
   process.exit(0);
 }
 
-// Profile resolution priority:
-//   1. AGENTSCHAT_PROFILE env var (name or path; canonical plural)
-//   2. AGENTCHAT_PROFILE env var (legacy singular)
-//   3. --profile <name> CLI arg
-//   4. --name <name> CLI arg (also used as profile name)
-//   5. Grok bind: CURSOR_CONVERSATION_ID → ~/.agentschat/grok-binds.json
-//      (skipped if an explicit token is set; does NOT imply AGENTCHAT_WAKE_MODE)
-//   6. default ~/.agentschat/profile.json, falling back to ~/.agentchat/profile.json
+// Explicit CLI selection > project binding > runtime binding > environment > default.
+// Onboarding resolves ambiguous unbound candidates with the user; never scan-and-pick.
 const homeDir = process.env.HOME || process.env.USERPROFILE || ".";
 const configDir = join(homeDir, ".agentschat");
 const legacyConfigDir = join(homeDir, ".agentchat");
 const profileDirs = [configDir, legacyConfigDir];
 
 function profileNameToPaths(name: string): string[] {
+  if (name.startsWith("~/")) return [join(homeDir, name.slice(2))];
   if (name.includes("/") || name.includes("\\")) return [name]; // explicit path
+  name = name.replace(/\.json$/, "");
   const safeName = name.replace(/[^a-zA-Z0-9_-]/g, "_");
   return profileDirs.map((dir) => join(dir, `${safeName}.json`));
 }
 
 function nameToPath(name: string): string {
   const candidates = profileNameToPaths(name);
+  const nested = join(configDir, "profiles", name.replace(/\.json$/, "") + ".json");
+  if (!name.includes("/") && !name.includes("\\") && existsSync(nested)) return nested;
   return candidates.find((path) => existsSync(path)) || candidates[0];
 }
 
 function listProfileFiles(): Array<{ name: string; path: string }> {
   const seen = new Set<string>();
   const profiles: Array<{ name: string; path: string }> = [];
-  for (const dir of profileDirs) {
+  for (const dir of [join(configDir, "profiles"), ...profileDirs]) {
     let files: string[] = [];
     try { files = readdirSync(dir).filter((f: string) => f.endsWith(".json")); } catch {}
     for (const file of files) {
@@ -216,19 +215,18 @@ function listProfileFiles(): Array<{ name: string; path: string }> {
   return profiles;
 }
 
-function resolveProfile(): { path: string; source: ProfileSource; declaredName?: string } {
-  // 1. AGENTSCHAT_PROFILE env var (supports both name and full path)
-  if (process.env.AGENTSCHAT_PROFILE)
-    return { path: nameToPath(process.env.AGENTSCHAT_PROFILE), source: "env", declaredName: process.env.AGENTSCHAT_PROFILE };
-  // 2. AGENTCHAT_PROFILE env var (legacy alias)
-  if (process.env.AGENTCHAT_PROFILE)
-    return { path: nameToPath(process.env.AGENTCHAT_PROFILE), source: "legacy-env", declaredName: process.env.AGENTCHAT_PROFILE };
-  // 3. --profile <name>
+function resolveProfile(): { path: string; source: ProfileSource; declaredName?: string; agentId?: string; apiUrl?: string; wsUrl?: string } {
   if (cliArgs.profile) return { path: nameToPath(cliArgs.profile), source: "flag-profile", declaredName: cliArgs.profile };
-  // 4. --name <name>
   if (cliArgs.name) return { path: nameToPath(cliArgs.name), source: "flag-name", declaredName: cliArgs.name };
 
-  // 5. Grok outbound bind. Explicit env/flags already returned above. An
+  // Paired direct credentials are a separate explicit authentication path.
+  // Do not borrow an unrelated project's identity when credentials are supplied.
+  if (!cliArgs.token && !process.env.AGENTCHAT_TOKEN) {
+    const project = projectProfileSelector(process.cwd());
+    if (project) return { ...project, path: nameToPath(project.selector), declaredName: project.selector };
+  }
+
+  // Grok outbound bind. Explicit CLI/project selections already returned above. An
   // explicit --token/AGENTCHAT_TOKEN also wins: do not steal identity from
   // operator-supplied creds. CURSOR_CONVERSATION_ID unset → skip entirely
   // (Claude Code / Hermes: zero change). A hit with a missing profile file
@@ -271,11 +269,16 @@ function resolveProfile(): { path: string; source: ProfileSource; declaredName?:
     process.stderr.write(`[agentchat] no grok-bind matched CURSOR_CONVERSATION_ID=${grok.conversationId}\n`);
   }
 
-  // 6. default — nothing was declared. NOT a licence to invent an identity.
+  if (process.env.AGENTSCHAT_PROFILE)
+    return { path: nameToPath(process.env.AGENTSCHAT_PROFILE), source: "env", declaredName: process.env.AGENTSCHAT_PROFILE };
+  if (process.env.AGENTCHAT_PROFILE)
+    return { path: nameToPath(process.env.AGENTCHAT_PROFILE), source: "legacy-env", declaredName: process.env.AGENTCHAT_PROFILE };
+
+  // Default — nothing was declared. NOT a licence to invent an identity.
   return { path: nameToPath("profile"), source: "default" };
 }
 
-const { path: profileFile, source: profileSource, declaredName } = resolveProfile();
+const { path: profileFile, source: profileSource, declaredName, agentId: projectAgentId, apiUrl: projectApiUrl, wsUrl: projectWsUrl } = resolveProfile();
 /**
  * The profile file currently in effect. Mutable because `switch_profile` swaps
  * identity at runtime — `whoami` must report the live one, not the boot-time one.
@@ -287,8 +290,8 @@ let anonymousMode = false;
 let profile: any = {};
 
 const DEFAULT_SERVER = "https://agents-chat.com";
-const serverUrl = (cliArgs.url || process.env.AGENTCHAT_REST_URL || DEFAULT_SERVER).replace(/\/$/, "");
-const WS_URL = process.env.AGENTCHAT_URL || (() => {
+const serverUrl = (cliArgs.url || projectApiUrl || process.env.AGENTCHAT_REST_URL || DEFAULT_SERVER).replace(/\/$/, "");
+const WS_URL = (!cliArgs.url && projectWsUrl) || (!projectApiUrl && process.env.AGENTCHAT_URL) || (() => {
   const base = serverUrl.replace("https://", "wss://").replace("http://", "ws://");
   return base.endsWith("/ws") ? base : base + "/ws";
 })();
@@ -363,6 +366,9 @@ function readIdentityProfile(file: string): any {
 if (identity.mode === "profile") {
   try {
     profile = readIdentityProfile(profileFile);
+    if (projectAgentId !== undefined && projectAgentId !== (cliArgs.id ?? process.env.AGENTCHAT_AGENT_ID ?? profile?.agent_id)) {
+      throw new Error("Project agent_id does not match selected profile");
+    }
     validateIdentityProfile(profile && !Array.isArray(profile) ? {
       ...profile,
       agent_id: cliArgs.id ?? process.env.AGENTCHAT_AGENT_ID ?? profile.agent_id,

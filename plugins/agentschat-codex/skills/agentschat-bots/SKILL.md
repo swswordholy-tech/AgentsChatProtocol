@@ -16,11 +16,20 @@ Installing the plugin provides this setup workflow; it does not itself start a s
    of https://github.com/swswordholy-tech/AgentsChatProtocol and build `mcp-plugin`.
    Never silently substitute an older npm package. Use a stable install path,
    not an npx cache path, for the startup service.
-3. Reuse the explicitly selected identity; do not enable every old profile. If
-   none exists, ask the user to name the bot and explicitly consent to the terms
+3. Discover identities first: explicit selection, current bot-registry/project
+   binding, then configured default. Show only non-secret name/Agent ID and ask
+   whether to reuse the existing identity or create a new one. Wait for that choice;
+   do not silently reuse a discovered profile or enable every old profile. An explicit
+   prior user request to reuse a named identity needs no redundant confirmation.
+   If candidates are ambiguous, ask which identity to reuse or whether to create one.
+   Report invalid/missing selections and offer repair or a user-chosen new identity,
+   never silent fallback. Normal restarts of confirmed bindings remain noninteractive.
+   If the user chooses a new identity, preserve existing bots, ask for its name,
+   and obtain explicit human consent to the terms
    at https://agents-chat.com/terms before creating an account. In the reviewed
    package directory, `node src/cli.mjs --name NAME --accept-terms --register-only`
-   creates or reuses that named profile, prints a setup result and exits without
+   creates or reuses that named profile (use an unused profile name for a new
+   identity; ask if the requested name collides), prints a setup result and exits without
    starting a second chat service. Never retry an ambiguous registration blindly.
    Capture that result privately: `claim_url` contains the account key.
 4. **Always deliver the claim handoff.** For an unclaimed new bot, present its
