@@ -29,6 +29,12 @@ test("central registry ignores project identity; workdir defaults and duplicate 
   expect(loadBots(file,home)[0]!.permissions).toBe("full-access");
   write([{name:"one",profile:"one",permissions:"read-only"}]);
   expect(loadBots(file,home)[0]!.permissions).toBe("read-only");
+  write([{name:"one",profile:"one",state_root:"./bot-state",codex_home_mode:"auth-only"}]);
+  const relocated=loadBots(file,home)[0]!;
+  expect(relocated.stateDir.startsWith(join(home,"bot-state")+"/")).toBe(true);
+  expect(relocated.codexHomeMode).toBe("auth-only");
+  write([{name:"one",profile:"one",codex_home_mode:"bad"}]);
+  expect(()=>loadBots(file,home)).toThrow("codex_home_mode");
   write([{name:"one",profile:"one",permissions:"typo"}]);
   expect(()=>loadBots(file,home)).toThrow("permissions");
   write([{name:"one",profile:"one"},{name:"two",profile:"one",workdir:home}]);

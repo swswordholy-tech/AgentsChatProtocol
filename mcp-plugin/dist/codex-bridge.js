@@ -1,9 +1,85 @@
 #!/usr/bin/env node
 // codex/runtime-home.ts
-import { existsSync, mkdirSync, lstatSync, readlinkSync, realpathSync, symlinkSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, accessSync, constants, lstatSync, readlinkSync, realpathSync, symlinkSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
-function prepareRuntimeHome(stateDir, source = process.env.CODEX_HOME || join(homedir(), ".codex")) {
+import { delimiter, isAbsolute, join, relative, resolve, sep } from "node:path";
+function executablePath(bin) {
+  const candidates = isAbsolute(bin) || bin.includes("/") ? [resolve(bin)] : (process.env.PATH ?? "").split(delimiter).filter(Boolean).map((dir) => join(dir, bin));
+  for (const candidate of candidates) {
+    try {
+      accessSync(candidate, constants.X_OK);
+      return realpathSync(candidate);
+    } catch {}
+  }
+}
+function assertIndependentTree(home, allowedAuthOrigin, codexExecutable) {
+  if (lstatSync(home).isSymbolicLink())
+    throw new Error("Independent Codex home must not be a symlink");
+  const inspect = (dir) => {
+    for (const name of readdirSync(dir)) {
+      const path = join(dir, name), info = lstatSync(path);
+      if (info.isSymbolicLink()) {
+        if (dir === home && name === "auth.json" && allowedAuthOrigin && resolve(home, readlinkSync(path)) === allowedAuthOrigin)
+          continue;
+        const local = relative(home, path).split(sep).join("/");
+        if (codexExecutable && /^tmp\/arg0\/codex-arg0[A-Za-z0-9_-]+\/(apply_patch|applypatch|codex-execve-wrapper|codex-linux-sandbox)$/.test(local)) {
+          try {
+            if (realpathSync(path) === codexExecutable)
+              continue;
+          } catch {}
+        }
+        throw new Error("Independent Codex home must not link configuration or runtime state");
+      }
+      if (info.isDirectory())
+        inspect(path);
+    }
+  };
+  inspect(home);
+}
+function prepareRuntimeHome(stateDir, source = process.env.CODEX_HOME || join(homedir(), ".codex"), mode = "linked", codexBin = "codex") {
+  if (mode !== "linked" && mode !== "isolated" && mode !== "auth-only")
+    throw new Error("Invalid Codex home mode");
+  if (mode === "isolated") {
+    const home = join(stateDir, "codex-home-isolated");
+    mkdirSync(home, { recursive: true, mode: 448 });
+    assertIndependentTree(home, undefined, executablePath(codexBin));
+    return { home: realpathSync(home) };
+  }
+  if (mode === "auth-only") {
+    const legacyHome = realpathSync(source);
+    const origin = join(legacyHome, "auth.json");
+    if (!lstatSync(origin).isFile())
+      throw new Error("auth-only requires an existing regular auth.json; authorize its use explicitly");
+    const home = join(stateDir, "codex-home-auth-only");
+    mkdirSync(home, { recursive: true, mode: 448 });
+    if (lstatSync(home).isSymbolicLink() || realpathSync(home) === legacyHome)
+      throw new Error("auth-only home must be independent");
+    for (const name of ["config.toml", "AGENTS.md", "rules", "plugins", "hooks.json"]) {
+      try {
+        lstatSync(join(home, name));
+      } catch (e) {
+        if (e.code === "ENOENT")
+          continue;
+        throw e;
+      }
+      throw new Error("auth-only home contains unexpected configuration; use a fresh state root");
+    }
+    const skills = join(home, "skills");
+    if (existsSync(skills) && (!lstatSync(skills).isDirectory() || readdirSync(skills).some((name) => name !== ".system")))
+      throw new Error("auth-only home contains unexpected custom skills");
+    assertIndependentTree(home, origin, executablePath(codexBin));
+    const target = join(home, "auth.json");
+    try {
+      if (!lstatSync(target).isSymbolicLink() || resolve(home, readlinkSync(target)) !== origin)
+        throw new Error("Unexpected auth-only login binding");
+    } catch (e) {
+      if (e.code !== "ENOENT")
+        throw e;
+      symlinkSync(origin, target);
+    }
+    assertIndependentTree(home, origin, executablePath(codexBin));
+    return { home: realpathSync(home) };
+  }
   const legacyHome = existsSync(source) ? realpathSync(source) : resolve(source);
   const home = join(stateDir, "codex-home");
   mkdirSync(home, { recursive: true, mode: 448 });
@@ -102,7 +178,7 @@ async function getOnboardingStatus(base, agentId, token, request = fetch) {
 
 // codex/gui-channel.ts
 import { randomUUID } from "node:crypto";
-import { mkdirSync as mkdirSync2, writeFileSync, readFileSync, renameSync, readdirSync, rmSync } from "node:fs";
+import { mkdirSync as mkdirSync2, writeFileSync, readFileSync, renameSync, readdirSync as readdirSync2, rmSync } from "node:fs";
 import { join as join2 } from "node:path";
 function payload(result) {
   if (result?.isError || result?.success === false || result?.error)
@@ -138,7 +214,7 @@ class GuiChannel {
     return JSON.parse(readFileSync(this.path(id), "utf8"));
   }
   list() {
-    return readdirSync(this.directory).filter((f) => /^[0-9a-f-]{36}\.json$/.test(f)).map((f) => this.get(f.slice(0, -5)));
+    return readdirSync2(this.directory).filter((f) => /^[0-9a-f-]{36}\.json$/.test(f)).map((f) => this.get(f.slice(0, -5)));
   }
   enqueue(threadId, text, hostId) {
     if (!this.allowedThreads.includes(threadId))
@@ -223,12 +299,12 @@ import { join as join9 } from "node:path";
 // codex/bots-config.ts
 import { readFileSync as readFileSync3, realpathSync as realpathSync3, mkdirSync as mkdirSync3 } from "node:fs";
 import { homedir as homedir3 } from "node:os";
-import { dirname, isAbsolute as isAbsolute2, join as join4, resolve as resolve3 } from "node:path";
+import { dirname, isAbsolute as isAbsolute3, join as join4, resolve as resolve3 } from "node:path";
 
 // codex/config.ts
 import { existsSync as existsSync2, readFileSync as readFileSync2, realpathSync as realpathSync2, statSync } from "node:fs";
 import { homedir as homedir2 } from "node:os";
-import { isAbsolute, join as join3, resolve as resolve2 } from "node:path";
+import { isAbsolute as isAbsolute2, join as join3, resolve as resolve2 } from "node:path";
 import { createHash } from "node:crypto";
 
 // src/identity.ts
@@ -1131,6 +1207,13 @@ function permissionMode(value) {
     throw new Error("permissions must be full-access or read-only");
   return value;
 }
+function codexHomeMode(value) {
+  if (value === undefined)
+    return "linked";
+  if (value !== "linked" && value !== "isolated" && value !== "auth-only")
+    throw new Error("codex_home_mode must be linked, isolated or auth-only");
+  return value;
+}
 function readJson(file) {
   try {
     return JSON.parse(readFileSync2(file, "utf8"));
@@ -1151,10 +1234,10 @@ function resolveConfig(opts, env = process.env, home = homedir2()) {
   const project = opts.settings ?? (existsSync2(configFile) ? readJson(configFile) : {});
   if (!project || typeof project !== "object" || Array.isArray(project))
     throw new Error("Invalid project config");
-  const allowed = new Set(["profile", "agent_id", "channels", "senders", "api_url", "ws_url", "permissions", "effort"]);
+  const allowed = new Set(["profile", "agent_id", "channels", "senders", "api_url", "ws_url", "permissions", "effort", "state_root", "codex_home_mode"]);
   if (Object.keys(project).some((k) => !allowed.has(k)))
     throw new Error("Unknown project config field (credentials belong in a private profile)");
-  for (const k of ["profile", "agent_id", "api_url", "ws_url"])
+  for (const k of ["profile", "agent_id", "api_url", "ws_url", "state_root"])
     if (project[k] !== undefined && (typeof project[k] !== "string" || !project[k].trim()))
       throw new Error(`Invalid project ${k}`);
   const localProfile = join3(cwd, ".agentschat/profile.json");
@@ -1190,7 +1273,7 @@ function resolveConfig(opts, env = process.env, home = homedir2()) {
   let profileFile;
   if (selector.startsWith("~/"))
     profileFile = join3(home, selector.slice(2));
-  else if (isAbsolute(selector) || selector.includes("/"))
+  else if (isAbsolute2(selector) || selector.includes("/"))
     profileFile = resolve2(cwd, selector);
   else {
     const name = selector.endsWith(".json") ? selector : `${selector}.json`;
@@ -1217,10 +1300,15 @@ function resolveConfig(opts, env = process.env, home = homedir2()) {
   }
   const canonicalApi = new URL(apiUrl).href.replace(/\/$/, "");
   const key = createHash("sha256").update(JSON.stringify([cwd, canonicalApi, profile.agent_id])).digest("hex").slice(0, 24);
+  const root = opts.stateRoot ?? project.state_root;
+  if (root !== undefined && (typeof root !== "string" || !root.trim()))
+    throw new Error("Invalid state_root");
+  const stateRoot = root === undefined ? join3(home, ".agentschat/codex-bridge") : root.startsWith("~/") ? join3(home, root.slice(2)) : resolve2(cwd, root);
   return {
     cwd,
     profileFile,
     source,
+    codexHomeMode: codexHomeMode(opts.codexHomeMode ?? project.codex_home_mode),
     permissions: permissionMode(project.permissions),
     effort: reasoningEffort(project.effort),
     agentId: profile.agent_id,
@@ -1230,7 +1318,7 @@ function resolveConfig(opts, env = process.env, home = homedir2()) {
     channels: strings(project.channels, "channels"),
     senders: strings(project.senders, "senders"),
     codexBin: opts.codexBin ?? "codex",
-    stateDir: join3(home, ".agentschat/codex-bridge", key)
+    stateDir: join3(stateRoot, key)
   };
 }
 
@@ -1257,12 +1345,12 @@ function loadBots(file = defaultRegistry(), home = homedir3()) {
   for (const k of ["default_workdir", "codex_bin"])
     if (doc[k] !== undefined && !text(doc[k]))
       throw new Error(`Invalid ${k}`);
-  const path = (value) => value.startsWith("~/") ? join4(home, value.slice(2)) : isAbsolute2(value) ? value : resolve3(dirname(file), value);
+  const path = (value) => value.startsWith("~/") ? join4(home, value.slice(2)) : isAbsolute3(value) ? value : resolve3(dirname(file), value);
   const defaultDir = doc.default_workdir ? path(doc.default_workdir) : join4(home, ".agentschat/workspace");
   const names = new Set, identities = new Set;
   const bots = [];
   for (const bot of doc.bots) {
-    fields(bot, ["name", "profile", "workdir", "enabled", "agent_id", "channels", "senders", "api_url", "ws_url", "permissions", "effort"]);
+    fields(bot, ["name", "profile", "workdir", "enabled", "agent_id", "channels", "senders", "api_url", "ws_url", "permissions", "effort", "state_root", "codex_home_mode"]);
     if (!text(bot.name) || !/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/.test(bot.name) || names.has(bot.name))
       throw new Error("Bot names must be unique simple labels");
     names.add(bot.name);
@@ -1278,9 +1366,14 @@ function loadBots(file = defaultRegistry(), home = homedir3()) {
       mkdirSync3(defaultDir, { recursive: true, mode: 448 });
     const cwd = realpathSync3(bot.workdir ? path(bot.workdir) : defaultDir);
     const settings = {};
-    for (const k of ["agent_id", "channels", "senders", "api_url", "ws_url", "permissions", "effort"])
+    for (const k of ["agent_id", "channels", "senders", "api_url", "ws_url", "permissions", "effort", "codex_home_mode"])
       if (bot[k] !== undefined)
         settings[k] = bot[k];
+    if (bot.state_root !== undefined) {
+      if (!text(bot.state_root))
+        throw new Error("Invalid state_root");
+      settings.state_root = path(bot.state_root);
+    }
     const config = resolveConfig({ cwd, profile: bot.profile, settings, codexBin: doc.codex_bin }, {}, home);
     const identity = JSON.stringify([config.apiUrl, config.agentId]);
     if (identities.has(identity))
@@ -1318,6 +1411,9 @@ class AppServer {
   pending = new Map;
   active;
   threadPermissions = new Map;
+  initialized = false;
+  readonlyFilesystemReported = false;
+  diagnosticTail = "";
   disabledMcp = {};
   constructor(bin = "codex", args = ["app-server", "--listen", "stdio://"], _legacyTurnTimeoutMs, permissions = "full-access", runtime, effort) {
     this.bin = bin;
@@ -1337,10 +1433,16 @@ class AppServer {
     }
     const args = this.runtime && this.args[0] === "app-server" ? [...this.args, "-c", `sqlite_home=${JSON.stringify(this.runtime.home)}`] : this.args;
     this.child = spawn(this.bin, args, { env, stdio: "pipe" });
-    this.child.stderr.resume();
+    this.child.stderr.on("data", (chunk) => {
+      if (this.initialized)
+        return;
+      this.diagnosticTail = (this.diagnosticTail + chunk.toString()).slice(-4096);
+      if (/read-only file system|\bEROFS\b|os error 30/i.test(this.diagnosticTail))
+        this.readonlyFilesystemReported = true;
+    });
     this.child.stdin.on("error", () => this.fatal(new Error("Codex input pipe closed")));
     this.child.on("error", () => this.fatal(new Error("Could not start Codex app-server")));
-    this.child.on("exit", () => this.fatal(new Error("Codex app-server exited")));
+    this.child.on("exit", () => this.fatal(new Error(!this.initialized && this.readonlyFilesystemReported ? "Codex app-server exited before initialization after reporting a read-only filesystem. CODEX_HOME must be writable (including installation_id); sqlite_home/log_dir overrides alone are insufficient. Use an authorized writable state_root and dedicated home; authentication is a separate step." : "Codex app-server exited")));
     createInterface({ input: this.child.stdout }).on("line", (line) => {
       try {
         this.receive(JSON.parse(line));
@@ -1350,6 +1452,20 @@ class AppServer {
     });
     await this.request("initialize", { clientInfo: { name: "agentschat_bridge", version: "0.1.0" } });
     this.write({ method: "initialized" });
+    this.initialized = true;
+    this.diagnosticTail = "";
+  }
+  async authenticationStatus() {
+    try {
+      const result = await this.request("account/read", { refreshToken: false });
+      if (result?.account && typeof result.account === "object")
+        return "authenticated";
+      if (result?.requiresOpenaiAuth === false)
+        return "not-required";
+      if (result?.requiresOpenaiAuth === true && result?.account === null)
+        return "required";
+    } catch {}
+    return "unknown";
   }
   write(value) {
     if (this.closed || !this.child || this.child.exitCode !== null || this.child.stdin.destroyed)
@@ -1378,7 +1494,12 @@ class AppServer {
       const waiter = this.pending.get(message.id);
       if (waiter) {
         this.pending.delete(message.id);
-        message.error ? waiter.reject(waiter.method === "thread/resume" && /already has an active writer/i.test(message.error.message ?? "") ? new ThreadBusyError : new Error(`App-server request rejected (${message.error.code})`)) : waiter.resolve(message.result);
+        if (message.error) {
+          const detail = typeof message.error.message === "string" ? message.error.message : "";
+          const error = waiter.method === "thread/resume" && /already has an active writer/i.test(detail) ? new ThreadBusyError : /app-server socket directory must be a user-owned directory with mode 0700/i.test(detail) ? new Error("Host sandbox rejected the app-server socket directory ownership or mode 0700. This executor may protect the fixed daemon socket directory; use a supported executor or host configuration. Do not weaken the sandbox or change existing host directory permissions. Model execution is not verified.") : /fs sandbox helper failed/i.test(detail) ? new Error("Host filesystem sandbox helper failed. Initialization and authentication do not prove model execution; use a supported host without bypassing sandbox restrictions.") : new Error(`App-server request rejected (${message.error.code})`);
+          waiter.reject(error);
+        } else
+          waiter.resolve(message.result);
       }
       return;
     }
@@ -2320,7 +2441,11 @@ CWD/.agentschat/profile.json > CWD/.codex/config.toml MCP profile > AGENTSCHAT_P
 Only the exact CWD is searched. Named profiles live in ~/.agentschat (legacy ~/.agentchat).
 An optional project agent_id must match the selected profile; it cannot replace it.
 Credentials: private profile JSON {agent_id, token}, chmod 600; never put keys in argv.
-Project config fields: profile, agent_id, channels, senders, api_url, ws_url, permissions, effort.
+Project config fields: profile, agent_id, channels, senders, api_url, ws_url, permissions, effort, state_root, codex_home_mode.
+--state-root DIRECTORY relocates private state while retaining project/server/identity isolation.
+--codex-home-mode linked|isolated|auth-only: linked (default) reuses operator configuration/login; isolated imports nothing; auth-only explicitly links only auth.json.
+CODEX_HOME itself must be writable (including installation_id); sqlite_home/log_dir overrides alone do not suffice.
+Any credential reuse or independent login needs operator authorization; isolated initialization is not authenticated readiness.
 --onboarding-status checks authentication/ownership and prints safe claim/chat links; it does not send messages.
 --check validates identity and official app-server initialization without opening chat.
 Live DMs and exact mentions trigger replies; channels/senders restrict this further.
@@ -2338,6 +2463,8 @@ async function main() {
   const { values } = parseArgs({ options: {
     "codex-bridge": { type: "boolean" },
     cwd: { type: "string" },
+    "state-root": { type: "string" },
+    "codex-home-mode": { type: "string" },
     conversations: { type: "boolean" },
     "read-conversation": { type: "string" },
     "gui-thread": { type: "string" },
@@ -2368,6 +2495,8 @@ async function main() {
     console.log(JSON.stringify(receipt));
     return;
   }
+  if ((values.bot || values["managed-worker"]) && (values["state-root"] || values["codex-home-mode"]))
+    throw new Error("For managed bots, configure state_root/codex_home_mode in the bot registry");
   const snapshot = values["managed-worker"] ? await new Promise((resolve, reject) => {
     if (!process.connected) {
       reject(new Error("Managed worker needs parent IPC"));
@@ -2379,7 +2508,7 @@ async function main() {
       resolve(config);
     });
   }) : undefined;
-  const c = snapshot ?? (values.bot ? loadBots(values.registry).find((b) => b.name === values.bot) : resolveConfig({ cwd: values.cwd, profile: values.profile, codexBin: values["codex-bin"] }));
+  const c = snapshot ?? (values.bot ? loadBots(values.registry).find((b) => b.name === values.bot) : resolveConfig({ cwd: values.cwd, profile: values.profile, codexBin: values["codex-bin"], stateRoot: values["state-root"], codexHomeMode: values["codex-home-mode"] }));
   if (!c)
     throw new Error("Bot is absent or disabled");
   if (values["onboarding-status"]) {
@@ -2395,7 +2524,7 @@ async function main() {
     return;
   }
   console.log(JSON.stringify({ cwd: c.cwd, agent_id: c.agentId, profile: c.profileFile, source: c.source, stateDir: c.stateDir }));
-  const runtime = prepareRuntimeHome(c.stateDir);
+  const runtime = prepareRuntimeHome(c.stateDir, undefined, c.codexHomeMode, c.codexBin);
   codex = new AppServer(c.codexBin, undefined, undefined, c.permissions, runtime, c.effort);
   if (values.conversations || values["read-conversation"]) {
     const state = JSON.parse(readFileSync8(join9(c.stateDir, "state.json"), "utf8"));
@@ -2418,6 +2547,7 @@ async function main() {
   if (values.check) {
     await codex.start();
     console.log("Official app-server initialization: OK (no chat connection or generation)");
+    console.log(JSON.stringify({ authentication: await codex.authenticationStatus(), generation_verified: false, reply_verified: false, codex_home_mode: c.codexHomeMode ?? "linked" }));
     codex.close();
     return;
   }

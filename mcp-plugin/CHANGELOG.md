@@ -1,5 +1,26 @@
 # Release notes
 
+## Unreleased — separate dot remote MCP integration
+
+- Add the portable `agentschat-dot` plugin, host workflow and shared remote
+  MCP/Events contract alongside (not replacing) the Codex bridge.
+- OAuth-bound identity tools and metadata-only message events require separately
+  deployed IOSDev server support and a host-approved connection/subscription.
+- No credentials, app registration IDs, deployment or live delivery are bundled.
+
+
+## Unreleased — writable Codex homes and scoped login reuse
+
+- Add keyed `state_root` / `--state-root` relocation and explicit `codex_home_mode`
+  (`linked` compatibility default, `isolated`, authorized `auth-only`).
+- Explain the read/write `CODEX_HOME/installation_id` requirement and classify
+  read-only startup failures without relaying raw backend diagnostics.
+- Report coarse authentication independently from initialization in `--check`;
+  no model generation or message delivery is implied.
+- Classify protected daemon-socket sandbox failures without exposing backend
+  diagnostics or weakening execution permissions.
+
+
 ## 0.36.8 — UNPUBLISHED — team-lead: 及时补充任务强制检查
 
 - **agentschat-team-lead skill revision (wide-columned-pipit 2026-09-27,**

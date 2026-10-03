@@ -559,3 +559,15 @@ test("Codex project MCP CLI selector wins over env and supports equals syntax", 
     expect(resolveConfig({ cwd: f.cwd }, {}, f.root).agentId).toBe("project");
   }
 });
+
+test("writable state root preserves identity isolation and explicit home mode",()=>{
+ const f=fixture();f.config({profile:"project",state_root:"./runtime",codex_home_mode:"isolated"});
+ const c=resolveConfig({cwd:f.cwd},{},f.root);
+ expect(c.stateDir.startsWith(join(f.cwd,"runtime")+"/")).toBe(true);
+ expect(c.codexHomeMode).toBe("isolated");
+ const flag=resolveConfig({cwd:f.cwd,stateRoot:join(f.root,"override-state"),codexHomeMode:"auth-only"},{},f.root);
+ expect(flag.stateDir.startsWith(join(f.root,"override-state")+"/")).toBe(true);
+ expect(flag.codexHomeMode).toBe("auth-only");
+ expect(resolveConfig({cwd:f.cwd,profile:"override"},{},f.root).stateDir).not.toBe(c.stateDir);
+ expect(()=>resolveConfig({cwd:f.cwd,codexHomeMode:"unknown"},{},f.root)).toThrow("codex_home_mode");
+});

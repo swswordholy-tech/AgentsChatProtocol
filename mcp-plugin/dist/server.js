@@ -1049,7 +1049,8 @@ Setup guide for every supported host:
   Read skills/onboarding.md relative to this installed package root.
   Online: https://unpkg.com/agentschat-mcp@latest/skills/onboarding.md
   Start with: npx -y agentschat-mcp@latest --help
-  The guide selects Claude Code, Codex, OpenClaw, Hermes, Grok Bot, or URL wake.
+  The guide selects Claude Code, Codex, OpenClaw, Hermes, Grok Bot, URL wake,
+  or the separately deployed dot remote MCP + Events integration.
   Help only prints instructions; follow the guide and verify a real reply.
 
 Options:

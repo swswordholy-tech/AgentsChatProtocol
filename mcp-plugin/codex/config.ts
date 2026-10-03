@@ -19,12 +19,18 @@ export function permissionMode(value: unknown): PermissionMode {
   if (value !== "full-access" && value !== "read-only") throw new Error("permissions must be full-access or read-only");
   return value;
 }
+export type CodexHomeMode = "linked" | "isolated" | "auth-only";
+export function codexHomeMode(value: unknown): CodexHomeMode {
+  if (value === undefined) return "linked";
+  if (value !== "linked" && value !== "isolated" && value !== "auth-only") throw new Error("codex_home_mode must be linked, isolated or auth-only");
+  return value;
+}
 export interface BridgeConfig {
   cwd: string; profileFile: string; source: string; agentId: string; token: string;
   apiUrl: string; wsUrl: string; channels: string[]; senders: string[];
-  codexBin: string; stateDir: string; permissions: PermissionMode; effort?: ReasoningEffort;
+  codexBin: string; stateDir: string; codexHomeMode?: CodexHomeMode; permissions: PermissionMode; effort?: ReasoningEffort;
 }
-export interface IdentitySettings { permissions?: PermissionMode; effort?: ReasoningEffort; profile?: string; agent_id?: string; channels?: string[]; senders?: string[]; api_url?: string; ws_url?: string }
+export interface IdentitySettings { state_root?: string; codex_home_mode?: CodexHomeMode; permissions?: PermissionMode; effort?: ReasoningEffort; profile?: string; agent_id?: string; channels?: string[]; senders?: string[]; api_url?: string; ws_url?: string }
 function readJson(file: string): any {
   try { return JSON.parse(readFileSync(file, "utf8")); }
   catch { throw new Error(`Cannot read valid JSON: ${file}`); }
@@ -35,15 +41,15 @@ function strings(value: unknown, name: string): string[] {
     throw new Error(`${name} must be an array of nonempty strings`);
   return value;
 }
-export function resolveConfig(opts: { cwd?: string; profile?: string; codexBin?: string; settings?: IdentitySettings },
+export function resolveConfig(opts: { cwd?: string; profile?: string; codexBin?: string; stateRoot?: string; codexHomeMode?: string; settings?: IdentitySettings },
   env: NodeJS.ProcessEnv = process.env, home = homedir()): BridgeConfig {
   const cwd = realpathSync(opts.cwd ?? process.cwd());
   const configFile = join(cwd, ".agentschat/config.json");
   const project = opts.settings ?? (existsSync(configFile) ? readJson(configFile) : {});
   if (!project || typeof project !== "object" || Array.isArray(project)) throw new Error("Invalid project config");
-  const allowed = new Set(["profile", "agent_id", "channels", "senders", "api_url", "ws_url", "permissions", "effort"]);
+  const allowed = new Set(["profile", "agent_id", "channels", "senders", "api_url", "ws_url", "permissions", "effort", "state_root", "codex_home_mode"]);
   if (Object.keys(project).some(k => !allowed.has(k))) throw new Error("Unknown project config field (credentials belong in a private profile)");
-  for (const k of ["profile", "agent_id", "api_url", "ws_url"])
+  for (const k of ["profile", "agent_id", "api_url", "ws_url", "state_root"])
     if (project[k] !== undefined && (typeof project[k] !== "string" || !project[k].trim())) throw new Error(`Invalid project ${k}`);
   const localProfile = join(cwd, ".agentschat/profile.json");
   // Read only the project file, not Codex's merged global config. Identity lookup
@@ -93,8 +99,11 @@ export function resolveConfig(opts: { cwd?: string; profile?: string; codexBin?:
   }
   const canonicalApi = new URL(apiUrl).href.replace(/\/$/, "");
   const key = createHash("sha256").update(JSON.stringify([cwd, canonicalApi, profile.agent_id])).digest("hex").slice(0, 24);
-  return { cwd, profileFile, source, permissions: permissionMode(project.permissions), effort: reasoningEffort(project.effort), agentId: profile.agent_id, token: profile.token,
+  const root = opts.stateRoot ?? project.state_root;
+  if (root !== undefined && (typeof root !== "string" || !root.trim())) throw new Error("Invalid state_root");
+  const stateRoot = root === undefined ? join(home, ".agentschat/codex-bridge") : root.startsWith("~/") ? join(home, root.slice(2)) : resolve(cwd, root);
+  return { cwd, profileFile, source, codexHomeMode: codexHomeMode(opts.codexHomeMode ?? project.codex_home_mode), permissions: permissionMode(project.permissions), effort: reasoningEffort(project.effort), agentId: profile.agent_id, token: profile.token,
     apiUrl: canonicalApi, wsUrl, channels: strings(project.channels, "channels"),
     senders: strings(project.senders, "senders"), codexBin: opts.codexBin ?? "codex",
-    stateDir: join(home, ".agentschat/codex-bridge", key) };
+    stateDir: join(stateRoot, key) };
 }

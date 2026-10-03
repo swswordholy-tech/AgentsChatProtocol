@@ -918,6 +918,13 @@ function permissionMode(value) {
     throw new Error("permissions must be full-access or read-only");
   return value;
 }
+function codexHomeMode(value) {
+  if (value === undefined)
+    return "linked";
+  if (value !== "linked" && value !== "isolated" && value !== "auth-only")
+    throw new Error("codex_home_mode must be linked, isolated or auth-only");
+  return value;
+}
 function readJson(file) {
   try {
     return JSON.parse(readFileSync(file, "utf8"));
@@ -938,10 +945,10 @@ function resolveConfig(opts, env = process.env, home = homedir()) {
   const project = opts.settings ?? (existsSync(configFile) ? readJson(configFile) : {});
   if (!project || typeof project !== "object" || Array.isArray(project))
     throw new Error("Invalid project config");
-  const allowed = new Set(["profile", "agent_id", "channels", "senders", "api_url", "ws_url", "permissions", "effort"]);
+  const allowed = new Set(["profile", "agent_id", "channels", "senders", "api_url", "ws_url", "permissions", "effort", "state_root", "codex_home_mode"]);
   if (Object.keys(project).some((k) => !allowed.has(k)))
     throw new Error("Unknown project config field (credentials belong in a private profile)");
-  for (const k of ["profile", "agent_id", "api_url", "ws_url"])
+  for (const k of ["profile", "agent_id", "api_url", "ws_url", "state_root"])
     if (project[k] !== undefined && (typeof project[k] !== "string" || !project[k].trim()))
       throw new Error(`Invalid project ${k}`);
   const localProfile = join(cwd, ".agentschat/profile.json");
@@ -1004,10 +1011,15 @@ function resolveConfig(opts, env = process.env, home = homedir()) {
   }
   const canonicalApi = new URL(apiUrl).href.replace(/\/$/, "");
   const key = createHash("sha256").update(JSON.stringify([cwd, canonicalApi, profile.agent_id])).digest("hex").slice(0, 24);
+  const root = opts.stateRoot ?? project.state_root;
+  if (root !== undefined && (typeof root !== "string" || !root.trim()))
+    throw new Error("Invalid state_root");
+  const stateRoot = root === undefined ? join(home, ".agentschat/codex-bridge") : root.startsWith("~/") ? join(home, root.slice(2)) : resolve(cwd, root);
   return {
     cwd,
     profileFile,
     source,
+    codexHomeMode: codexHomeMode(opts.codexHomeMode ?? project.codex_home_mode),
     permissions: permissionMode(project.permissions),
     effort: reasoningEffort(project.effort),
     agentId: profile.agent_id,
@@ -1017,7 +1029,7 @@ function resolveConfig(opts, env = process.env, home = homedir()) {
     channels: strings(project.channels, "channels"),
     senders: strings(project.senders, "senders"),
     codexBin: opts.codexBin ?? "codex",
-    stateDir: join(home, ".agentschat/codex-bridge", key)
+    stateDir: join(stateRoot, key)
   };
 }
 
@@ -1049,7 +1061,7 @@ function loadBots(file = defaultRegistry(), home = homedir2()) {
   const names = new Set, identities = new Set;
   const bots = [];
   for (const bot of doc.bots) {
-    fields(bot, ["name", "profile", "workdir", "enabled", "agent_id", "channels", "senders", "api_url", "ws_url", "permissions", "effort"]);
+    fields(bot, ["name", "profile", "workdir", "enabled", "agent_id", "channels", "senders", "api_url", "ws_url", "permissions", "effort", "state_root", "codex_home_mode"]);
     if (!text(bot.name) || !/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/.test(bot.name) || names.has(bot.name))
       throw new Error("Bot names must be unique simple labels");
     names.add(bot.name);
@@ -1065,9 +1077,14 @@ function loadBots(file = defaultRegistry(), home = homedir2()) {
       mkdirSync(defaultDir, { recursive: true, mode: 448 });
     const cwd = realpathSync2(bot.workdir ? path(bot.workdir) : defaultDir);
     const settings = {};
-    for (const k of ["agent_id", "channels", "senders", "api_url", "ws_url", "permissions", "effort"])
+    for (const k of ["agent_id", "channels", "senders", "api_url", "ws_url", "permissions", "effort", "codex_home_mode"])
       if (bot[k] !== undefined)
         settings[k] = bot[k];
+    if (bot.state_root !== undefined) {
+      if (!text(bot.state_root))
+        throw new Error("Invalid state_root");
+      settings.state_root = path(bot.state_root);
+    }
     const config = resolveConfig({ cwd, profile: bot.profile, settings, codexBin: doc.codex_bin }, {}, home);
     const identity = JSON.stringify([config.apiUrl, config.agentId]);
     if (identities.has(identity))

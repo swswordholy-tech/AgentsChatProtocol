@@ -188,11 +188,89 @@ and every earlier lane for that channel. Source tasks remain intact for review o
 archival after verification. A failed source read leaves the old mapping intact.
 Later restarts resume the private task; they do not create a replacement.
 
-Login (`auth.json`), configuration, skills, rules and plugins reuse the operator's
-existing home through links; session storage is never linked. File-backed login
-works without signing in again. A keychain-only login may require signing in for
-the private home. Project configuration still follows the bot's workdir. Do not
-launch the normal desktop against the bot's private home.
+The compatible default `codex_home_mode: "linked"` reuses login (`auth.json`),
+configuration, skills, rules and plugins through links; session storage is never
+linked. This needs operator permission to reuse the configuration and login.
+Project configuration still follows the bot's workdir. Do not launch the normal
+desktop against the bot's private home.
+
+### Read-only host homes and explicit authentication scope
+
+Codex App Server needs a **writable CODEX_HOME**, not only a writable database.
+For example, Codex 0.159.2 opens `CODEX_HOME/installation_id` for read/write,
+creation and locking during initialization ([official implementation](https://github.com/openai/codex/blob/431ebeaef70ebb08bba9221d7e0803c1b80d3a04/codex-rs/core/src/installation_id.rs)). Redirecting `sqlite_home` and
+`log_dir` alone cannot make an entirely read-only home work. Do not change host
+permissions or copy credentials to work around a host restriction.
+
+Use `--state-root /authorized/writable/directory` (project `state_root`, or a bot's
+registry `state_root`) to relocate the bridge's private state. The existing
+project/server/identity hash is retained under that root, so different bots do not
+share sessions. Changing `codex_home_mode` also changes the home namespace: existing
+conversation mappings are deliberately refused rather than silently resumed in a
+different home. Use a fresh state root for a new setup or explicitly plan migration
+of the old state; do not delete mappings to hide the mismatch. Project-relative roots resolve against the workdir; registry-relative
+roots resolve against the registry directory. Stop the old instance before changing
+roots. A new root does not migrate the old inbox/history automatically; preserve
+existing state and plan migration rather than creating duplicate conversations.
+
+Select `--codex-home-mode MODE` or `codex_home_mode` in project/bot settings:
+
+- `linked`: compatible desktop behavior, with the existing configuration/login links
+- `isolated`: creates `codex-home-isolated` without inspecting or linking the source
+  home. It can initialize without login; that is **not** authenticated readiness
+- `auth-only`: after explicit operator authorization, links only the existing regular
+  `auth.json` from the launcher's `CODEX_HOME` (or `~/.codex` when unset) into
+  `codex-home-auth-only`. It never imports home configuration,
+  plugins, skills, rules or hooks, and refuses preexisting extras there. It does not
+  read legacy desktop conversation storage. Codex's own bundled `skills/.system`
+  directory is allowed on restart; custom skills remain refused. Source login must be file-backed;
+  keychain-only login requires an independently authorized login flow instead
+
+The CLI cannot obtain permission for you. Never choose `auth-only` just because a
+host has credentials. Confirm the exact source login, destination private home and
+ongoing use with the operator first. A link uses the source login directly; future
+refresh can require writes to that login, which a read-only source may reject.
+Independent modes reject symlinks in state/configuration, including nested session,
+installation-ID, database and lock paths. The narrow exception is Codex's four
+`tmp/arg0/codex-arg0*/` executable aliases, only when they resolve to the exact
+selected Codex executable; this permits restart after an interrupted backend.
+For npm/shell launchers, set `--codex-bin` to the installed **native Codex binary**:
+a wrapper path may differ from the alias target and then fails closed after a crash.
+A binary-path upgrade can similarly invalidate old aliases. Stop the old backend
+first and select the reviewed native binary; do not broaden the symlink allowlist
+or delete conversation state to suppress the error.
+No mode bypasses the host's filesystem, network or process-lifetime restrictions.
+A second independent boundary can remain after login succeeds: the official
+filesystem sandbox helper requires its daemon socket directory to be user-owned
+and mode `0700`. Codex uses a fixed `/tmp/codex-daemon-<uid>` location on Unix
+([official implementation](https://github.com/openai/codex/blob/main/codex-rs/uds/src/daemon_directory.rs));
+`HOME`, `TMPDIR` and `CODEX_HOME` do not relocate that protected host directory.
+If the executor hides/protects it (for example mode `000`), nested read-only
+`thread/start` can fail even after initialization and authentication pass. The bridge
+reports a sanitized host-sandbox error. This requires a supported executor/host
+configuration; do not chmod the protected directory, switch to full access, disable
+the sandbox or filter its controls to bypass the restriction. No model execution
+or AgentsChat reply has been verified in that case.
+
+Provider/authentication environment and project configuration are still host inputs;
+use a reviewed launcher and workdir rather than assuming a new home is a sandbox.
+
+A credential-free setup check, using an already approved AgentsChat profile:
+
+```sh
+node src/cli.mjs --codex-bridge --cwd /authorized/workdir --profile Existing-Agent \
+  --state-root /authorized/writable/agentschat --codex-home-mode isolated --check
+```
+
+`--check` now reports initialization separately from coarse authentication status
+(`authenticated`, `required`, `not-required`, or `unknown`), without account details.
+It uses `account/read` with `refreshToken: false`; initialization success and an
+`authenticated` account do not prove a model turn or inbound/reply delivery. An old
+backend that lacks this API reports `unknown`. It never registers a bot, starts chat,
+or generates a reply. Complete an authorized login/model check and then verify one
+real incoming message and correct-identity reply in the owner's agreed test chat
+before calling the connection ready. `--state-root`/`--codex-home-mode` with `--bot`
+are rejected: persist those settings in that bot's registry entry instead.
 
 Use these read-only commands instead of opening a bot task for desktop editing:
 

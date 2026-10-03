@@ -17,6 +17,9 @@ export class AppServer {
   private active?: { thread: string; turn?: string; items: Map<string, string>; early: any[];
     resolve: (s: string) => void; reject: (e: Error) => void };
   private threadPermissions = new Map<string, PermissionMode>();
+  private initialized = false;
+  private readonlyFilesystemReported = false;
+  private diagnosticTail = "";
   private disabledMcp: Record<string, { enabled: boolean }> = {};
   // Keep the legacy positional argument for callers; turns have no time limit.
   constructor(private bin = "codex", private args = ["app-server", "--listen", "stdio://"], _legacyTurnTimeoutMs?: number, private permissions: PermissionMode = "full-access", private runtime?: {home: string; legacyHome?: string}, private effort?: ReasoningEffort) {}
@@ -28,15 +31,33 @@ export class AppServer {
       ? [...this.args, "-c", `sqlite_home=${JSON.stringify(this.runtime.home)}`] : this.args;
     this.child = spawn(this.bin, args, { env, stdio: "pipe" });
     // Child diagnostics may contain account or MCP credentials; never relay raw stderr.
-    this.child.stderr.resume();
+    this.child.stderr.on("data", (chunk: Buffer) => {
+      if (this.initialized) return;
+      // Classify a bounded fragment; never relay paths, tokens or arbitrary stderr.
+      this.diagnosticTail = (this.diagnosticTail + chunk.toString()).slice(-4096);
+      if (/read-only file system|\bEROFS\b|os error 30/i.test(this.diagnosticTail)) this.readonlyFilesystemReported = true;
+    });
     this.child.stdin.on("error", () => this.fatal(new Error("Codex input pipe closed")));
     this.child.on("error", () => this.fatal(new Error("Could not start Codex app-server")));
-    this.child.on("exit", () => this.fatal(new Error("Codex app-server exited")));
+    this.child.on("exit", () => this.fatal(new Error(!this.initialized && this.readonlyFilesystemReported
+      ? "Codex app-server exited before initialization after reporting a read-only filesystem. CODEX_HOME must be writable (including installation_id); sqlite_home/log_dir overrides alone are insufficient. Use an authorized writable state_root and dedicated home; authentication is a separate step."
+      : "Codex app-server exited")));
     createInterface({ input: this.child.stdout }).on("line", line => {
       try { this.receive(JSON.parse(line)); } catch { this.fatal(new Error("Invalid app-server response")); }
     });
     await this.request("initialize", { clientInfo: { name: "agentschat_bridge", version: "0.1.0" } });
     this.write({ method: "initialized" });
+    this.initialized = true;
+    this.diagnosticTail = "";
+  }
+  async authenticationStatus(): Promise<"authenticated" | "required" | "not-required" | "unknown"> {
+    try {
+      const result = await this.request("account/read", { refreshToken: false });
+      if (result?.account && typeof result.account === "object") return "authenticated";
+      if (result?.requiresOpenaiAuth === false) return "not-required";
+      if (result?.requiresOpenaiAuth === true && result?.account === null) return "required";
+    } catch { /* Older app-server versions may not support account/read. */ }
+    return "unknown";
   }
   private write(value: unknown) {
     if (this.closed || !this.child || this.child.exitCode !== null || this.child.stdin.destroyed) throw new Error("App-server unavailable");
@@ -59,8 +80,17 @@ export class AppServer {
     if (message.id !== undefined) {
       const waiter = this.pending.get(message.id);
       if (waiter) { this.pending.delete(message.id);
-        message.error ? waiter.reject(waiter.method === "thread/resume" && /already has an active writer/i.test(message.error.message ?? "")
-          ? new ThreadBusyError() : new Error(`App-server request rejected (${message.error.code})`)) : waiter.resolve(message.result); }
+        if (message.error) {
+          const detail = typeof message.error.message === "string" ? message.error.message : "";
+          const error = waiter.method === "thread/resume" && /already has an active writer/i.test(detail)
+            ? new ThreadBusyError()
+            : /app-server socket directory must be a user-owned directory with mode 0700/i.test(detail)
+              ? new Error("Host sandbox rejected the app-server socket directory ownership or mode 0700. This executor may protect the fixed daemon socket directory; use a supported executor or host configuration. Do not weaken the sandbox or change existing host directory permissions. Model execution is not verified.")
+              : /fs sandbox helper failed/i.test(detail)
+                ? new Error("Host filesystem sandbox helper failed. Initialization and authentication do not prove model execution; use a supported host without bypassing sandbox restrictions.")
+                : new Error(`App-server request rejected (${message.error.code})`);
+          waiter.reject(error);
+        } else waiter.resolve(message.result); }
       return;
     }
     const a = this.active, p = message.params;

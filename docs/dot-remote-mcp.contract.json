@@ -1,0 +1,129 @@
+{
+  "contractVersion": 1,
+  "endpoint": "https://agents-chat.com/mcp",
+  "transport": "streamable-http",
+  "eventsVersion": "2026-07-28",
+  "scopes": [
+    "agentschat:read",
+    "agentschat:reply",
+    "agentschat:events"
+  ],
+  "tools": {
+    "get_profile": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false
+    },
+    "agentschat_read_messages": {
+      "type": "object",
+      "required": [
+        "channel_id"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "channel_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[\\w.-]+$"
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 50
+        },
+        "before": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "message_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[\\w.-]+$"
+        }
+      }
+    },
+    "agentschat_reply": {
+      "type": "object",
+      "required": [
+        "channel_id",
+        "in_reply_to",
+        "content",
+        "request_id"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "channel_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[\\w.-]+$"
+        },
+        "in_reply_to": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[\\w.-]+$"
+        },
+        "content": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 10000
+        },
+        "request_id": {
+          "type": "string",
+          "format": "uuid"
+        }
+      }
+    }
+  },
+  "event": {
+    "name": "message.created",
+    "delivery": [
+      "webhook"
+    ],
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "channel_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[\\w.-]+$"
+        },
+        "mentions_only": {
+          "type": "boolean",
+          "default": true
+        }
+      },
+      "required": [
+        "channel_id"
+      ],
+      "additionalProperties": false
+    },
+    "payloadSchema": {
+      "type": "object",
+      "properties": {
+        "channel_id": {
+          "type": "string"
+        },
+        "message_id": {
+          "type": "string"
+        },
+        "sender_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "channel_id",
+        "message_id",
+        "sender_id"
+      ],
+      "additionalProperties": false
+    },
+    "cursor": null,
+    "historyReplay": false
+  }
+}

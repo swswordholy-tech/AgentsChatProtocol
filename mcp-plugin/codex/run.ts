@@ -25,7 +25,11 @@ CWD/.agentschat/profile.json > CWD/.codex/config.toml MCP profile > AGENTSCHAT_P
 Only the exact CWD is searched. Named profiles live in ~/.agentschat (legacy ~/.agentchat).
 An optional project agent_id must match the selected profile; it cannot replace it.
 Credentials: private profile JSON {agent_id, token}, chmod 600; never put keys in argv.
-Project config fields: profile, agent_id, channels, senders, api_url, ws_url, permissions, effort.
+Project config fields: profile, agent_id, channels, senders, api_url, ws_url, permissions, effort, state_root, codex_home_mode.
+--state-root DIRECTORY relocates private state while retaining project/server/identity isolation.
+--codex-home-mode linked|isolated|auth-only: linked (default) reuses operator configuration/login; isolated imports nothing; auth-only explicitly links only auth.json.
+CODEX_HOME itself must be writable (including installation_id); sqlite_home/log_dir overrides alone do not suffice.
+Any credential reuse or independent login needs operator authorization; isolated initialization is not authenticated readiness.
 --onboarding-status checks authentication/ownership and prints safe claim/chat links; it does not send messages.
 --check validates identity and official app-server initialization without opening chat.
 Live DMs and exact mentions trigger replies; channels/senders restrict this further.
@@ -40,7 +44,7 @@ See codex/README.md for setup, verification, limitations and recovery.
 let codex: AppServer | undefined, bridge: Bridge | undefined, transport: AgentsChatTransport | undefined;
 async function main() {
   const { values } = parseArgs({ options: { "codex-bridge": { type: "boolean" }, cwd: { type: "string" },
-    "conversations": { type: "boolean" }, "read-conversation": { type: "string" }, "gui-thread": { type: "string" }, "gui-message-file": { type: "string" }, "gui-status": { type: "boolean" }, "managed-worker": { type: "boolean" }, registry: { type: "string" }, bot: { type: "string" }, profile: { type: "string" }, "codex-bin": { type: "string" }, check: { type: "boolean" }, "onboarding-status": { type: "boolean" },
+    "state-root": { type: "string" }, "codex-home-mode": { type: "string" }, "conversations": { type: "boolean" }, "read-conversation": { type: "string" }, "gui-thread": { type: "string" }, "gui-message-file": { type: "string" }, "gui-status": { type: "boolean" }, "managed-worker": { type: "boolean" }, registry: { type: "string" }, bot: { type: "string" }, profile: { type: "string" }, "codex-bin": { type: "string" }, check: { type: "boolean" }, "onboarding-status": { type: "boolean" },
     help: { type: "boolean", short: "h" } }, strict: true });
   if (values.help) { console.log(HELP); return; }
   if (values["gui-thread"] || values["gui-message-file"] || values["gui-status"]) {
@@ -50,12 +54,13 @@ async function main() {
     const {prompt, ...receipt} = channel.enqueue(values["gui-thread"], readFileSync(values["gui-message-file"], "utf8"));
     console.log(JSON.stringify(receipt)); return;
   }
+  if ((values.bot || values["managed-worker"]) && (values["state-root"] || values["codex-home-mode"])) throw new Error("For managed bots, configure state_root/codex_home_mode in the bot registry");
   const snapshot = values["managed-worker"] ? await new Promise<BridgeConfig>((resolve, reject) => {
     if (!process.connected) { reject(new Error("Managed worker needs parent IPC")); return; }
     const timer = setTimeout(() => reject(new Error("Parent configuration missing")), 10000);
     process.once("message", config => { clearTimeout(timer); resolve(config as BridgeConfig); });
   }) : undefined;
-  const c = snapshot ?? (values.bot ? loadBots(values.registry).find(b => b.name === values.bot) : resolveConfig({ cwd: values.cwd, profile: values.profile, codexBin: values["codex-bin"] }));
+  const c = snapshot ?? (values.bot ? loadBots(values.registry).find(b => b.name === values.bot) : resolveConfig({ cwd: values.cwd, profile: values.profile, codexBin: values["codex-bin"], stateRoot: values["state-root"], codexHomeMode: values["codex-home-mode"] }));
   if (!c) throw new Error("Bot is absent or disabled");
   if (values["onboarding-status"]) {
     const status = await getOnboardingStatus(c.apiUrl, c.agentId, c.token);
@@ -64,7 +69,7 @@ async function main() {
     return;
   }
   console.log(JSON.stringify({ cwd: c.cwd, agent_id: c.agentId, profile: c.profileFile, source: c.source, stateDir: c.stateDir }));
-  const runtime = prepareRuntimeHome(c.stateDir);
+  const runtime = prepareRuntimeHome(c.stateDir, undefined, c.codexHomeMode, c.codexBin);
   codex = new AppServer(c.codexBin, undefined, undefined, c.permissions, runtime, c.effort);
   if (values.conversations || values["read-conversation"]) {
     const state = JSON.parse(readFileSync(join(c.stateDir, "state.json"), "utf8"));
@@ -78,7 +83,12 @@ async function main() {
     console.log(redactSecrets(JSON.stringify(history).split(c.token).join("[REDACTED]")));
     codex.close(); return;
   }
-  if (values.check) { await codex.start(); console.log("Official app-server initialization: OK (no chat connection or generation)"); codex.close(); return; }
+  if (values.check) {
+    await codex.start();
+    console.log("Official app-server initialization: OK (no chat connection or generation)");
+    console.log(JSON.stringify({ authentication: await codex.authenticationStatus(), generation_verified: false, reply_verified: false, codex_home_mode: c.codexHomeMode ?? "linked" }));
+    codex.close(); return;
+  }
   transport = new AgentsChatTransport(c, m => { bridge!.accept(m); }, console.error, m => bridge!.recover(m));
   bridge = new Bridge(c, codex, (chat, text) => transport!.send(chat, text), console.error, (chat, active) => transport!.setTyping(chat, active), () => getBotOwner(c.apiUrl, c.agentId, c.token), () => transport!.api("/api/loops/mine"));
   let stopping = false;
