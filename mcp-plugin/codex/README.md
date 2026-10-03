@@ -348,6 +348,8 @@ Create `~/.agentschat/codex-bots.json`:
 ```
 
 Omitted default_workdir uses `~/.agentschat/workspace` (created automatically).
+Optional per-bot `"model": "gpt-6.1-sol"` pins the model on new/resumed threads and every turn without replacing the conversation. Omit it to inherit Codex settings.
+
 Optional per-bot `"effort": "medium"` sets reasoning effort on every turn,
 including existing conversations. Omit it to retain Codex's inherited effort.
 It does not change the model, other bots, or the desktop's global configuration.

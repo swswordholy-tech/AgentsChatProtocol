@@ -22,7 +22,7 @@ export class AppServer {
   private diagnosticTail = "";
   private disabledMcp: Record<string, { enabled: boolean }> = {};
   // Keep the legacy positional argument for callers; turns have no time limit.
-  constructor(private bin = "codex", private args = ["app-server", "--listen", "stdio://"], _legacyTurnTimeoutMs?: number, private permissions: PermissionMode = "full-access", private runtime?: {home: string; legacyHome?: string}, private effort?: ReasoningEffort) {}
+  constructor(private bin = "codex", private args = ["app-server", "--listen", "stdio://"], _legacyTurnTimeoutMs?: number, private permissions: PermissionMode = "full-access", private runtime?: {home: string; legacyHome?: string}, private effort?: ReasoningEffort, private model?: string) {}
   get namespace() { return this.runtime?.home; }
   async start() {
     const env = Object.fromEntries(Object.entries(process.env).filter(([k]) => !/^AGENTS?CHAT_|^RELAY_/.test(k)));
@@ -118,7 +118,7 @@ export class AppServer {
     this.disabledMcp = {};
     for (const name of Object.keys(result.config?.mcp_servers ?? {})) this.disabledMcp[name] = { enabled: false };
     const r = await this.request(existing ? "thread/resume" : "thread/start", {
-      ...(existing ? { threadId: existing } : { ephemeral }), cwd,
+      ...(existing ? { threadId: existing } : { ephemeral }), cwd, ...(this.model ? { model: this.model } : {}),
       approvalPolicy: "never", sandbox: permissions === "full-access" ? "danger-full-access" : "read-only",
       // Inherit full-access MCP settings directly. config/read contains nullable
       // fields that are not valid TOML overrides when round-tripped.
@@ -156,7 +156,7 @@ export class AppServer {
     // Attach immediately, including while turn/start is waiting for its response.
     void completed.catch(() => {});
     try {
-      const r = await this.request("turn/start", { threadId: thread, approvalPolicy: "never", sandboxPolicy: { type: permissions === "full-access" ? "dangerFullAccess" : "readOnly" }, input: [{ type: "text", text }], ...(effort ? { effort } : {}) });
+      const r = await this.request("turn/start", { threadId: thread, approvalPolicy: "never", sandboxPolicy: { type: permissions === "full-access" ? "dangerFullAccess" : "readOnly" }, input: [{ type: "text", text }], ...(effort ? { effort } : {}), ...(this.model ? { model: this.model } : {}) });
       const active = this.active as NonNullable<AppServer["active"]> | undefined;
       if (!active) return await completed;
       if (typeof r.turn?.id !== "string") throw new Error("App-server returned no turn ID");

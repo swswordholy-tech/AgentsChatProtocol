@@ -70,7 +70,7 @@ async function main() {
   }
   console.log(JSON.stringify({ cwd: c.cwd, agent_id: c.agentId, profile: c.profileFile, source: c.source, stateDir: c.stateDir }));
   const runtime = prepareRuntimeHome(c.stateDir, undefined, c.codexHomeMode, c.codexBin);
-  codex = new AppServer(c.codexBin, undefined, undefined, c.permissions, runtime, c.effort);
+  codex = new AppServer(c.codexBin, undefined, undefined, c.permissions, runtime, c.effort, c.model);
   if (values.conversations || values["read-conversation"]) {
     const state = JSON.parse(readFileSync(join(c.stateDir, "state.json"), "utf8"));
     const channels = state.channels ?? {};

@@ -40,23 +40,23 @@ function prepareRuntimeHome(stateDir, source = process.env.CODEX_HOME || join(ho
   if (mode !== "linked" && mode !== "isolated" && mode !== "auth-only")
     throw new Error("Invalid Codex home mode");
   if (mode === "isolated") {
-    const home = join(stateDir, "codex-home-isolated");
-    mkdirSync(home, { recursive: true, mode: 448 });
-    assertIndependentTree(home, undefined, executablePath(codexBin));
-    return { home: realpathSync(home) };
+    const home2 = join(stateDir, "codex-home-isolated");
+    mkdirSync(home2, { recursive: true, mode: 448 });
+    assertIndependentTree(home2, undefined, executablePath(codexBin));
+    return { home: realpathSync(home2) };
   }
   if (mode === "auth-only") {
-    const legacyHome = realpathSync(source);
-    const origin = join(legacyHome, "auth.json");
+    const legacyHome2 = realpathSync(source);
+    const origin = join(legacyHome2, "auth.json");
     if (!lstatSync(origin).isFile())
       throw new Error("auth-only requires an existing regular auth.json; authorize its use explicitly");
-    const home = join(stateDir, "codex-home-auth-only");
-    mkdirSync(home, { recursive: true, mode: 448 });
-    if (lstatSync(home).isSymbolicLink() || realpathSync(home) === legacyHome)
+    const home2 = join(stateDir, "codex-home-auth-only");
+    mkdirSync(home2, { recursive: true, mode: 448 });
+    if (lstatSync(home2).isSymbolicLink() || realpathSync(home2) === legacyHome2)
       throw new Error("auth-only home must be independent");
     for (const name of ["config.toml", "AGENTS.md", "rules", "plugins", "hooks.json"]) {
       try {
-        lstatSync(join(home, name));
+        lstatSync(join(home2, name));
       } catch (e) {
         if (e.code === "ENOENT")
           continue;
@@ -64,21 +64,21 @@ function prepareRuntimeHome(stateDir, source = process.env.CODEX_HOME || join(ho
       }
       throw new Error("auth-only home contains unexpected configuration; use a fresh state root");
     }
-    const skills = join(home, "skills");
+    const skills = join(home2, "skills");
     if (existsSync(skills) && (!lstatSync(skills).isDirectory() || readdirSync(skills).some((name) => name !== ".system")))
       throw new Error("auth-only home contains unexpected custom skills");
-    assertIndependentTree(home, origin, executablePath(codexBin));
-    const target = join(home, "auth.json");
+    assertIndependentTree(home2, origin, executablePath(codexBin));
+    const target = join(home2, "auth.json");
     try {
-      if (!lstatSync(target).isSymbolicLink() || resolve(home, readlinkSync(target)) !== origin)
+      if (!lstatSync(target).isSymbolicLink() || resolve(home2, readlinkSync(target)) !== origin)
         throw new Error("Unexpected auth-only login binding");
     } catch (e) {
       if (e.code !== "ENOENT")
         throw e;
       symlinkSync(origin, target);
     }
-    assertIndependentTree(home, origin, executablePath(codexBin));
-    return { home: realpathSync(home) };
+    assertIndependentTree(home2, origin, executablePath(codexBin));
+    return { home: realpathSync(home2) };
   }
   const legacyHome = existsSync(source) ? realpathSync(source) : resolve(source);
   const home = join(stateDir, "codex-home");
@@ -567,7 +567,7 @@ function skipVoid(ctx, banNewLines, banComments) {
     skipComment(ctx);
   }
 }
-function skipUntil(ctx, sep, end) {
+function skipUntil(ctx, sep2, end) {
   let ptr = ctx.p;
   if (!end) {
     ptr = indexOfNewline(ctx.s, ptr);
@@ -578,7 +578,7 @@ function skipUntil(ctx, sep, end) {
     let c = ctx.s.charCodeAt(ctx.p);
     if (c === 35) {
       skipComment(ctx);
-    } else if (c === end || c === sep) {
+    } else if (c === end || c === sep2) {
       return;
     }
   }
@@ -1200,6 +1200,13 @@ function reasoningEffort(value) {
     throw new Error("effort must be a nonempty model-supported reasoning effort name");
   return value.trim();
 }
+function modelName(value) {
+  if (value === undefined)
+    return;
+  if (typeof value !== "string" || !value.trim())
+    throw new Error("model must be a nonempty model ID");
+  return value.trim();
+}
 function permissionMode(value) {
   if (value === undefined)
     return "full-access";
@@ -1234,7 +1241,7 @@ function resolveConfig(opts, env = process.env, home = homedir2()) {
   const project = opts.settings ?? (existsSync2(configFile) ? readJson(configFile) : {});
   if (!project || typeof project !== "object" || Array.isArray(project))
     throw new Error("Invalid project config");
-  const allowed = new Set(["profile", "agent_id", "channels", "senders", "api_url", "ws_url", "permissions", "effort", "state_root", "codex_home_mode"]);
+  const allowed = new Set(["profile", "agent_id", "channels", "senders", "api_url", "ws_url", "permissions", "effort", "model", "state_root", "codex_home_mode"]);
   if (Object.keys(project).some((k) => !allowed.has(k)))
     throw new Error("Unknown project config field (credentials belong in a private profile)");
   for (const k of ["profile", "agent_id", "api_url", "ws_url", "state_root"])
@@ -1311,6 +1318,7 @@ function resolveConfig(opts, env = process.env, home = homedir2()) {
     codexHomeMode: codexHomeMode(opts.codexHomeMode ?? project.codex_home_mode),
     permissions: permissionMode(project.permissions),
     effort: reasoningEffort(project.effort),
+    model: modelName(project.model),
     agentId: profile.agent_id,
     token: profile.token,
     apiUrl: canonicalApi,
@@ -1350,7 +1358,7 @@ function loadBots(file = defaultRegistry(), home = homedir3()) {
   const names = new Set, identities = new Set;
   const bots = [];
   for (const bot of doc.bots) {
-    fields(bot, ["name", "profile", "workdir", "enabled", "agent_id", "channels", "senders", "api_url", "ws_url", "permissions", "effort", "state_root", "codex_home_mode"]);
+    fields(bot, ["name", "profile", "workdir", "enabled", "agent_id", "channels", "senders", "api_url", "ws_url", "permissions", "effort", "model", "state_root", "codex_home_mode"]);
     if (!text(bot.name) || !/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/.test(bot.name) || names.has(bot.name))
       throw new Error("Bot names must be unique simple labels");
     names.add(bot.name);
@@ -1366,7 +1374,7 @@ function loadBots(file = defaultRegistry(), home = homedir3()) {
       mkdirSync3(defaultDir, { recursive: true, mode: 448 });
     const cwd = realpathSync3(bot.workdir ? path(bot.workdir) : defaultDir);
     const settings = {};
-    for (const k of ["agent_id", "channels", "senders", "api_url", "ws_url", "permissions", "effort", "codex_home_mode"])
+    for (const k of ["agent_id", "channels", "senders", "api_url", "ws_url", "permissions", "effort", "model", "codex_home_mode"])
       if (bot[k] !== undefined)
         settings[k] = bot[k];
     if (bot.state_root !== undefined) {
@@ -1404,6 +1412,7 @@ class AppServer {
   permissions;
   runtime;
   effort;
+  model;
   onFatal;
   closed = false;
   child;
@@ -1415,12 +1424,13 @@ class AppServer {
   readonlyFilesystemReported = false;
   diagnosticTail = "";
   disabledMcp = {};
-  constructor(bin = "codex", args = ["app-server", "--listen", "stdio://"], _legacyTurnTimeoutMs, permissions = "full-access", runtime, effort) {
+  constructor(bin = "codex", args = ["app-server", "--listen", "stdio://"], _legacyTurnTimeoutMs, permissions = "full-access", runtime, effort, model) {
     this.bin = bin;
     this.args = args;
     this.permissions = permissions;
     this.runtime = runtime;
     this.effort = effort;
+    this.model = model;
   }
   get namespace() {
     return this.runtime?.home;
@@ -1474,9 +1484,9 @@ class AppServer {
 `);
   }
   request(method, params) {
-    return new Promise((resolve, reject) => {
+    return new Promise((resolve4, reject) => {
       const id = ++this.nextId;
-      this.pending.set(id, { method, resolve, reject });
+      this.pending.set(id, { method, resolve: resolve4, reject });
       try {
         this.write({ id, method, params });
       } catch (e) {
@@ -1540,6 +1550,7 @@ class AppServer {
     const r = await this.request(existing ? "thread/resume" : "thread/start", {
       ...existing ? { threadId: existing } : { ephemeral },
       cwd,
+      ...this.model ? { model: this.model } : {},
       approvalPolicy: "never",
       sandbox: permissions === "full-access" ? "danger-full-access" : "read-only",
       ...permissions === "read-only" ? { config: { mcp_servers: this.disabledMcp } } : {},
@@ -1578,12 +1589,12 @@ class AppServer {
     const permissions = this.threadPermissions.get(thread);
     if (!permissions)
       throw new Error("Thread permissions have not been configured");
-    const completed = new Promise((resolve, reject) => {
-      this.active = { thread, items: new Map, early: [], resolve, reject };
+    const completed = new Promise((resolve4, reject) => {
+      this.active = { thread, items: new Map, early: [], resolve: resolve4, reject };
     });
     completed.catch(() => {});
     try {
-      const r = await this.request("turn/start", { threadId: thread, approvalPolicy: "never", sandboxPolicy: { type: permissions === "full-access" ? "dangerFullAccess" : "readOnly" }, input: [{ type: "text", text }], ...effort ? { effort } : {} });
+      const r = await this.request("turn/start", { threadId: thread, approvalPolicy: "never", sandboxPolicy: { type: permissions === "full-access" ? "dangerFullAccess" : "readOnly" }, input: [{ type: "text", text }], ...effort ? { effort } : {}, ...this.model ? { model: this.model } : {} });
       const active = this.active;
       if (!active)
         return await completed;
@@ -1932,7 +1943,7 @@ class Bridge {
   }
   async run() {
     while (!this.stopped) {
-      const e = this.state.entries.find((e) => e.status === "pending" || e.status === "ready");
+      const e = this.state.entries.find((e2) => e2.status === "pending" || e2.status === "ready");
       if (!e)
         return;
       if (!permitted(e.message, this.config)) {
@@ -2299,12 +2310,12 @@ class AgentsChatTransport {
   async send(channel, text) {
     if (this.authenticated && this.socket?.readyState === WebSocket.OPEN) {
       const id = randomUUID2();
-      await new Promise((resolve, reject) => {
+      await new Promise((resolve4, reject) => {
         const timer = setTimeout(() => {
           this.pending.delete(id);
           reject(new Error("AgentsChat acknowledgement timed out"));
         }, 15000);
-        this.pending.set(id, { resolve, reject, timer });
+        this.pending.set(id, { resolve: resolve4, reject, timer });
         this.socket.send(JSON.stringify({
           type: "message",
           id,
@@ -2339,7 +2350,7 @@ class AgentsChatTransport {
       if (current() && socket.readyState === WebSocket.OPEN)
         socket.send(JSON.stringify(value));
     };
-    const join = (channel) => {
+    const join9 = (channel) => {
       if (!this.config.channels.length || this.config.channels.includes(channel)) {
         this.inboxSync?.watch(channel);
         send({ type: "join_channel", channel_id: channel, agent_id: this.config.agentId });
@@ -2379,7 +2390,7 @@ class AgentsChatTransport {
           const ids = channels.map((c) => c.id ?? c.channel_id).filter((id) => typeof id === "string" && (!this.config.channels.length || this.config.channels.includes(id)));
           this.inboxSync?.memberships(ids);
           for (const id of ids)
-            join(id);
+            join9(id);
           this.inboxSync?.sync();
         }).catch(() => {
           if (current()) {
@@ -2395,7 +2406,7 @@ class AgentsChatTransport {
           pending.resolve();
         }
       } else if (data.type === "channel_created" && typeof data.channel_id === "string")
-        join(data.channel_id);
+        join9(data.channel_id);
       else if (["message", "thread_reply"].includes(data.type))
         this.receive(data);
       else if (data.type === "shard_moved" || data.type === "please_reconnect")
@@ -2486,7 +2497,7 @@ async function main() {
   if (values["gui-thread"] || values["gui-message-file"] || values["gui-status"]) {
     const channel = new GuiChannel(join9(homedir4(), ".agentschat/codex-gui-outbox"), values["gui-thread"] ? [values["gui-thread"]] : []);
     if (values["gui-status"]) {
-      console.log(JSON.stringify(channel.list().map(({ prompt, ...receipt }) => receipt)));
+      console.log(JSON.stringify(channel.list().map(({ prompt: prompt2, ...receipt2 }) => receipt2)));
       return;
     }
     if (!values["gui-thread"] || !values["gui-message-file"])
@@ -2497,7 +2508,7 @@ async function main() {
   }
   if ((values.bot || values["managed-worker"]) && (values["state-root"] || values["codex-home-mode"]))
     throw new Error("For managed bots, configure state_root/codex_home_mode in the bot registry");
-  const snapshot = values["managed-worker"] ? await new Promise((resolve, reject) => {
+  const snapshot = values["managed-worker"] ? await new Promise((resolve4, reject) => {
     if (!process.connected) {
       reject(new Error("Managed worker needs parent IPC"));
       return;
@@ -2505,7 +2516,7 @@ async function main() {
     const timer = setTimeout(() => reject(new Error("Parent configuration missing")), 1e4);
     process.once("message", (config) => {
       clearTimeout(timer);
-      resolve(config);
+      resolve4(config);
     });
   }) : undefined;
   const c = snapshot ?? (values.bot ? loadBots(values.registry).find((b) => b.name === values.bot) : resolveConfig({ cwd: values.cwd, profile: values.profile, codexBin: values["codex-bin"], stateRoot: values["state-root"], codexHomeMode: values["codex-home-mode"] }));
@@ -2525,12 +2536,12 @@ async function main() {
   }
   console.log(JSON.stringify({ cwd: c.cwd, agent_id: c.agentId, profile: c.profileFile, source: c.source, stateDir: c.stateDir }));
   const runtime = prepareRuntimeHome(c.stateDir, undefined, c.codexHomeMode, c.codexBin);
-  codex = new AppServer(c.codexBin, undefined, undefined, c.permissions, runtime, c.effort);
+  codex = new AppServer(c.codexBin, undefined, undefined, c.permissions, runtime, c.effort, c.model);
   if (values.conversations || values["read-conversation"]) {
     const state = JSON.parse(readFileSync8(join9(c.stateDir, "state.json"), "utf8"));
     const channels = state.channels ?? {};
     if (values.conversations) {
-      console.log(JSON.stringify(Object.entries(channels).map(([channel, data]) => ({ channel, thread: data.thread, isolated: data.namespace === runtime.home }))));
+      console.log(JSON.stringify(Object.entries(channels).map(([channel2, data]) => ({ channel: channel2, thread: data.thread, isolated: data.namespace === runtime.home }))));
       return;
     }
     const channel = channels[values["read-conversation"]];

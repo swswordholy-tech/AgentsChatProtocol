@@ -911,6 +911,13 @@ function reasoningEffort(value) {
     throw new Error("effort must be a nonempty model-supported reasoning effort name");
   return value.trim();
 }
+function modelName(value) {
+  if (value === undefined)
+    return;
+  if (typeof value !== "string" || !value.trim())
+    throw new Error("model must be a nonempty model ID");
+  return value.trim();
+}
 function permissionMode(value) {
   if (value === undefined)
     return "full-access";
@@ -945,7 +952,7 @@ function resolveConfig(opts, env = process.env, home = homedir()) {
   const project = opts.settings ?? (existsSync(configFile) ? readJson(configFile) : {});
   if (!project || typeof project !== "object" || Array.isArray(project))
     throw new Error("Invalid project config");
-  const allowed = new Set(["profile", "agent_id", "channels", "senders", "api_url", "ws_url", "permissions", "effort", "state_root", "codex_home_mode"]);
+  const allowed = new Set(["profile", "agent_id", "channels", "senders", "api_url", "ws_url", "permissions", "effort", "model", "state_root", "codex_home_mode"]);
   if (Object.keys(project).some((k) => !allowed.has(k)))
     throw new Error("Unknown project config field (credentials belong in a private profile)");
   for (const k of ["profile", "agent_id", "api_url", "ws_url", "state_root"])
@@ -1022,6 +1029,7 @@ function resolveConfig(opts, env = process.env, home = homedir()) {
     codexHomeMode: codexHomeMode(opts.codexHomeMode ?? project.codex_home_mode),
     permissions: permissionMode(project.permissions),
     effort: reasoningEffort(project.effort),
+    model: modelName(project.model),
     agentId: profile.agent_id,
     token: profile.token,
     apiUrl: canonicalApi,
@@ -1061,7 +1069,7 @@ function loadBots(file = defaultRegistry(), home = homedir2()) {
   const names = new Set, identities = new Set;
   const bots = [];
   for (const bot of doc.bots) {
-    fields(bot, ["name", "profile", "workdir", "enabled", "agent_id", "channels", "senders", "api_url", "ws_url", "permissions", "effort", "state_root", "codex_home_mode"]);
+    fields(bot, ["name", "profile", "workdir", "enabled", "agent_id", "channels", "senders", "api_url", "ws_url", "permissions", "effort", "model", "state_root", "codex_home_mode"]);
     if (!text(bot.name) || !/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/.test(bot.name) || names.has(bot.name))
       throw new Error("Bot names must be unique simple labels");
     names.add(bot.name);
@@ -1077,7 +1085,7 @@ function loadBots(file = defaultRegistry(), home = homedir2()) {
       mkdirSync(defaultDir, { recursive: true, mode: 448 });
     const cwd = realpathSync2(bot.workdir ? path(bot.workdir) : defaultDir);
     const settings = {};
-    for (const k of ["agent_id", "channels", "senders", "api_url", "ws_url", "permissions", "effort", "codex_home_mode"])
+    for (const k of ["agent_id", "channels", "senders", "api_url", "ws_url", "permissions", "effort", "model", "codex_home_mode"])
       if (bot[k] !== undefined)
         settings[k] = bot[k];
     if (bot.state_root !== undefined) {
@@ -1148,7 +1156,7 @@ function removeDeadLock(file) {
   }
 }
 function save() {
-  writeFileSync(statusFile + ".tmp", JSON.stringify({ pid: process.pid, updated_at: new Date().toISOString(), bots: [...workers.values()].map((w) => ({ name: w.config.name, agent_id: w.config.agentId, workdir: w.config.cwd, effort: w.config.effort, pid: w.child?.pid, status: w.status })) }, null, 2), { mode: 384 });
+  writeFileSync(statusFile + ".tmp", JSON.stringify({ pid: process.pid, updated_at: new Date().toISOString(), bots: [...workers.values()].map((w) => ({ name: w.config.name, agent_id: w.config.agentId, workdir: w.config.cwd, effort: w.config.effort, model: w.config.model, pid: w.child?.pid, status: w.status })) }, null, 2), { mode: 384 });
   renameSync(statusFile + ".tmp", statusFile);
 }
 async function stop(w) {
@@ -1209,7 +1217,7 @@ async function tick() {
   try {
     const configs = loadBots(registry);
     for (const [name, worker] of workers) {
-      const c = configs.find((c) => c.name === name);
+      const c = configs.find((c2) => c2.name === name);
       if (!c || createHash2("sha256").update(JSON.stringify(c)).digest("hex") !== worker.fingerprint) {
         await stop(worker);
         workers.delete(name);

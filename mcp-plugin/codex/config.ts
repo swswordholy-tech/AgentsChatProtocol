@@ -14,6 +14,11 @@ export function reasoningEffort(value: unknown): ReasoningEffort | undefined {
     throw new Error("effort must be a nonempty model-supported reasoning effort name");
   return value.trim();
 }
+export function modelName(value: unknown): string | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "string" || !value.trim()) throw new Error("model must be a nonempty model ID");
+  return value.trim();
+}
 export function permissionMode(value: unknown): PermissionMode {
   if (value === undefined) return "full-access";
   if (value !== "full-access" && value !== "read-only") throw new Error("permissions must be full-access or read-only");
@@ -28,9 +33,9 @@ export function codexHomeMode(value: unknown): CodexHomeMode {
 export interface BridgeConfig {
   cwd: string; profileFile: string; source: string; agentId: string; token: string;
   apiUrl: string; wsUrl: string; channels: string[]; senders: string[];
-  codexBin: string; stateDir: string; codexHomeMode?: CodexHomeMode; permissions: PermissionMode; effort?: ReasoningEffort;
+  codexBin: string; stateDir: string; codexHomeMode?: CodexHomeMode; permissions: PermissionMode; effort?: ReasoningEffort; model?: string;
 }
-export interface IdentitySettings { state_root?: string; codex_home_mode?: CodexHomeMode; permissions?: PermissionMode; effort?: ReasoningEffort; profile?: string; agent_id?: string; channels?: string[]; senders?: string[]; api_url?: string; ws_url?: string }
+export interface IdentitySettings { state_root?: string; codex_home_mode?: CodexHomeMode; permissions?: PermissionMode; effort?: ReasoningEffort; model?: string; profile?: string; agent_id?: string; channels?: string[]; senders?: string[]; api_url?: string; ws_url?: string }
 function readJson(file: string): any {
   try { return JSON.parse(readFileSync(file, "utf8")); }
   catch { throw new Error(`Cannot read valid JSON: ${file}`); }
@@ -47,7 +52,7 @@ export function resolveConfig(opts: { cwd?: string; profile?: string; codexBin?:
   const configFile = join(cwd, ".agentschat/config.json");
   const project = opts.settings ?? (existsSync(configFile) ? readJson(configFile) : {});
   if (!project || typeof project !== "object" || Array.isArray(project)) throw new Error("Invalid project config");
-  const allowed = new Set(["profile", "agent_id", "channels", "senders", "api_url", "ws_url", "permissions", "effort", "state_root", "codex_home_mode"]);
+  const allowed = new Set(["profile", "agent_id", "channels", "senders", "api_url", "ws_url", "permissions", "effort", "model", "state_root", "codex_home_mode"]);
   if (Object.keys(project).some(k => !allowed.has(k))) throw new Error("Unknown project config field (credentials belong in a private profile)");
   for (const k of ["profile", "agent_id", "api_url", "ws_url", "state_root"])
     if (project[k] !== undefined && (typeof project[k] !== "string" || !project[k].trim())) throw new Error(`Invalid project ${k}`);
@@ -102,7 +107,7 @@ export function resolveConfig(opts: { cwd?: string; profile?: string; codexBin?:
   const root = opts.stateRoot ?? project.state_root;
   if (root !== undefined && (typeof root !== "string" || !root.trim())) throw new Error("Invalid state_root");
   const stateRoot = root === undefined ? join(home, ".agentschat/codex-bridge") : root.startsWith("~/") ? join(home, root.slice(2)) : resolve(cwd, root);
-  return { cwd, profileFile, source, codexHomeMode: codexHomeMode(opts.codexHomeMode ?? project.codex_home_mode), permissions: permissionMode(project.permissions), effort: reasoningEffort(project.effort), agentId: profile.agent_id, token: profile.token,
+  return { cwd, profileFile, source, codexHomeMode: codexHomeMode(opts.codexHomeMode ?? project.codex_home_mode), permissions: permissionMode(project.permissions), effort: reasoningEffort(project.effort), model: modelName(project.model), agentId: profile.agent_id, token: profile.token,
     apiUrl: canonicalApi, wsUrl, channels: strings(project.channels, "channels"),
     senders: strings(project.senders, "senders"), codexBin: opts.codexBin ?? "codex",
     stateDir: join(stateRoot, key) };

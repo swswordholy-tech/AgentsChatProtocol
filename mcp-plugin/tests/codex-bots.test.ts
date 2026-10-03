@@ -27,6 +27,14 @@ test("central registry ignores project identity; workdir defaults and duplicate 
   write([{name:"one",profile:"one"},{name:"disabled",enabled:false}]);
   expect(loadBots(file,home).map(c=>[c.agentId,c.cwd])).toEqual([["test-bot",realpathSync(cwd)]]);
   expect(loadBots(file,home)[0]!.permissions).toBe("full-access");
+  expect(loadBots(file,home)[0]!.model).toBeUndefined();
+  write([{name:"one",profile:"one",model:" gpt-6.1-sol ",effort:"medium"}]);
+  expect(loadBots(file,home)[0]!.model).toBe("gpt-6.1-sol");
+  expect(loadBots(file,home)[0]!.effort).toBe("medium");
+  for (const model of [null,123,false,[],{},"", "   "]) {
+   write([{name:"one",profile:"one",model}]);
+   expect(()=>loadBots(file,home)).toThrow("model");
+  }
   write([{name:"one",profile:"one",permissions:"read-only"}]);
   expect(loadBots(file,home)[0]!.permissions).toBe("read-only");
   write([{name:"one",profile:"one",state_root:"./bot-state",codex_home_mode:"auth-only"}]);
