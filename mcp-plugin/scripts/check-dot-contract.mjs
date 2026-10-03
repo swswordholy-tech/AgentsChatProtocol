@@ -11,7 +11,7 @@ if (!root || process.argv.length !== 3) {
 }
 const contract = JSON.parse(readFileSync(new URL('../../docs/dot-remote-mcp.contract.json', import.meta.url), 'utf8'));
 const { MCP_TOOLS } = await import(pathToFileURL(resolve(root, 'src/remote-mcp.ts')).href);
-const { eventDescription } = await import(pathToFileURL(resolve(root, 'src/mcp-events.ts')).href);
+const { eventDescription, inboxEventDescription } = await import(pathToFileURL(resolve(root, 'src/mcp-events.ts')).href);
 const actual = Object.fromEntries(MCP_TOOLS.map(tool => [tool.name, tool.inputSchema]));
 for (const [name, expected, observed] of [
   ['tool input schemas', contract.tools, actual],
@@ -19,6 +19,10 @@ for (const [name, expected, observed] of [
   ['event delivery', contract.event.delivery, eventDescription.delivery],
   ['event input schema', contract.event.inputSchema, eventDescription.inputSchema],
   ['event payload schema', contract.event.payloadSchema, eventDescription.payloadSchema],
+  ['identity event name', contract.identityEvent.name, inboxEventDescription.name],
+  ['identity event delivery', contract.identityEvent.delivery, inboxEventDescription.delivery],
+  ['identity event input schema', contract.identityEvent.inputSchema, inboxEventDescription.inputSchema],
+  ['identity event payload schema', contract.identityEvent.payloadSchema, inboxEventDescription.payloadSchema],
 ]) {
   if (!isDeepStrictEqual(expected, observed)) {
     console.error(`dot contract mismatch: ${name}`);

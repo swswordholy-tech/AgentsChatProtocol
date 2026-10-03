@@ -1,5 +1,5 @@
 {
-  "contractVersion": 1,
+  "contractVersion": 2,
   "endpoint": "https://agents-chat.com/mcp",
   "transport": "streamable-http",
   "eventsVersion": "2026-07-28",
@@ -118,6 +118,48 @@
       },
       "required": [
         "channel_id",
+        "message_id",
+        "sender_id"
+      ],
+      "additionalProperties": false
+    },
+    "cursor": null,
+    "historyReplay": false
+  },
+  "identityEvent": {
+    "name": "message.received",
+    "delivery": [
+      "webhook"
+    ],
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false
+    },
+    "payloadSchema": {
+      "type": "object",
+      "properties": {
+        "channel_id": {
+          "type": "string"
+        },
+        "channel_type": {
+          "type": "string",
+          "enum": [
+            "direct",
+            "group",
+            "project"
+          ]
+        },
+        "message_id": {
+          "type": "string"
+        },
+        "sender_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "channel_id",
+        "channel_type",
         "message_id",
         "sender_id"
       ],

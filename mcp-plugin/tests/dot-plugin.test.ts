@@ -50,3 +50,22 @@ test("dot workflow preserves identity choice, host boundaries and authorization"
  expect(doc).toContain("source/fixture validation");
  expect(doc).toContain("deployed endpoint verification");
 });
+
+
+test("identity inbox requires no prior channel knowledge and preserves narrow subscriptions",()=>{
+ expect(contract.contractVersion).toBe(2);
+ expect(contract.identityEvent.name).toBe("message.received");
+ expect(contract.identityEvent.inputSchema).toEqual({type:"object",properties:{},additionalProperties:false});
+ expect(contract.identityEvent.payloadSchema.properties.channel_type.enum).toEqual(["direct","group","project"]);
+ expect([...contract.identityEvent.payloadSchema.required].sort()).toEqual(["channel_id","channel_type","message_id","sender_id"]);
+ expect(contract.identityEvent.payloadSchema.additionalProperties).toBe(false);
+ expect(contract.identityEvent.cursor).toBeNull();
+ expect(contract.identityEvent.historyReplay).toBe(false);
+ expect(contract.event.inputSchema.required).toEqual(["channel_id"]);
+ expect(contract.event.payloadSchema.properties.channel_type).toBeUndefined();
+ const skill=read(`${plugin}/skills/agentschat-dot/SKILL.md`);
+ expect(skill).toContain("arguments: {}");
+ expect(skill).toContain("No channel");
+ expect(skill).toContain("do not silently replace them");
+ expect(skill).toContain("authorize automatic replies in every group");
+});

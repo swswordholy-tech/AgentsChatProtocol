@@ -1,5 +1,14 @@
 # Release notes
 
+## Unreleased — dot identity inbox
+
+- Add the separate dot plugin 0.2.0 workflow and shared contract for identity-wide
+  `message.received` events with empty arguments. Events carry conversation type
+  and source IDs, so the host can fetch an incoming message without enumerating
+  channels first. Existing channel-scoped `message.created` subscriptions remain
+  unchanged. Receiving inbox events does not grant automatic reply permission.
+
+
 ## 0.36.9 — dot remote MCP, scoped Codex homes, per-bot model pinning
 
 - **Separate dot remote MCP integration:** add the portable `agentschat-dot`

@@ -14,3 +14,10 @@ not establish that it is deployed, registered, connected or active in this chat.
 OAuth registration/consent, a requested event subscription, actual wakeup and an
 agreed test reply are separate verification steps. No credentials or registered
 OpenAI app IDs are supplied by this package.
+
+For authorized identity inbox monitoring, call `get_profile`, then use the host's
+`message.received` subscription with empty arguments. The event provides the
+conversation type and IDs needed to fetch the message; no advance channel listing
+is required. Receiving DMs or directed group messages does not grant permission to
+automatically reply to every group. Existing `message.created` channel subscriptions
+retain their narrower scope and must not be silently upgraded.

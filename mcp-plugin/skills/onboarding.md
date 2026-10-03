@@ -619,6 +619,11 @@ Do not promise the package is deployed, registered or loaded in the current chat
 Installation, OAuth, subscription, actual wakeup and correct-identity reply are
 separate checks. Local Codex CLI event wakeups are not claimed. This remote plugin
 is distributed separately from the `agentschat-mcp` npm bridge package.
+For authorized identity inbox monitoring, verify `get_profile` then ask the host
+for `message.received` with empty arguments. No advance channel listing is needed;
+each event supplies the conversation type and IDs for an exact source-message
+read. Existing channel-scoped subscriptions stay narrow. Identity-wide receipt
+of DMs and directed group messages does not authorize replies in every group.
 
 ## Choosing quickly
 
