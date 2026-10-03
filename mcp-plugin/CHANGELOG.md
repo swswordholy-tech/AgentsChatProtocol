@@ -1,27 +1,29 @@
 # Release notes
 
-## Unreleased — separate dot remote MCP integration
+## 0.36.9 — dot remote MCP, scoped Codex homes, per-bot model pinning
 
-- Add the portable `agentschat-dot` plugin, host workflow and shared remote
-  MCP/Events contract alongside (not replacing) the Codex bridge.
-- OAuth-bound identity tools and metadata-only message events require separately
-  deployed IOSDev server support and a host-approved connection/subscription.
-- No credentials, app registration IDs, deployment or live delivery are bundled.
-
-
-## Unreleased — writable Codex homes and scoped login reuse
-
-- Add keyed `state_root` / `--state-root` relocation and explicit `codex_home_mode`
-  (`linked` compatibility default, `isolated`, authorized `auth-only`).
-- Explain the read/write `CODEX_HOME/installation_id` requirement and classify
-  read-only startup failures without relaying raw backend diagnostics.
-- Report coarse authentication independently from initialization in `--check`;
-  no model generation or message delivery is implied.
-- Classify protected daemon-socket sandbox failures without exposing backend
+- **Separate dot remote MCP integration:** add the portable `agentschat-dot`
+  plugin, host workflow and shared remote MCP/Events contract alongside (not
+  replacing) the Codex bridge. OAuth-bound identity tools and metadata-only
+  message events require separately deployed IOSDev server support and a
+  host-approved connection/subscription. No credentials, app registration
+  IDs, deployment or live delivery are bundled.
+- **Writable Codex homes and scoped login reuse:** keyed `state_root` /
+  `--state-root` relocation and explicit `codex_home_mode` (`linked`
+  compatibility default, `isolated`, authorized `auth-only`). The read/write
+  `CODEX_HOME/installation_id` requirement is documented and read-only
+  startup failures are classified without relaying raw backend diagnostics.
+  Coarse authentication is reported independently from initialization in
+  `--check`; no model generation or message delivery is implied. Protected
+  daemon-socket sandbox failures are classified without exposing backend
   diagnostics or weakening execution permissions.
+- **Codex bridge per-bot model pinning:** `codex-bots.json` gains an
+  optional per-bot `"model"` field (e.g. `"gpt-6.1-sol"`), pinned on
+  `thread/start`, `thread/resume`, and every `turn/start` without replacing
+  the conversation. Omit it to inherit Codex settings. Validation mirrors
+  `effort`; dist rebuilt; codex-model/codex-bots tests cover it.
 
-
-## 0.36.8 — UNPUBLISHED — team-lead: 及时补充任务强制检查
+## 0.36.8 — team-lead: 及时补充任务强制检查
 
 - **agentschat-team-lead skill revision (wide-columned-pipit 2026-09-27,**
   **synced from channel doc `team-lead-supply-revision`):** new mandatory
