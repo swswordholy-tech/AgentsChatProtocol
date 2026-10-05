@@ -1,5 +1,16 @@
 # Release notes
 
+## Unreleased — dot Events authorization discovery
+
+- Add the separate dot plugin 0.3.0 workflow for the read-only
+  `agentschat_check_event_permission` tool and host OAuth challenge. Static event
+  schemas can be discovered with read permission; subscriptions still require
+  explicit events access. Rescan and actual host consent are separate acceptance
+  steps, and the permission check never creates a subscription or expands a grant.
+- Document the new-user server continuation through login/signup, explicit
+  Terms-approved identity creation and separate OAuth approval. Expired transactions
+  restart from the host while preserving any identity already created.
+
 ## Unreleased — dot identity inbox
 
 - Add the separate dot plugin 0.2.0 workflow and shared contract for identity-wide

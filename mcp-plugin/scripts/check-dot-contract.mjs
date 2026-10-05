@@ -13,8 +13,14 @@ const contract = JSON.parse(readFileSync(new URL('../../docs/dot-remote-mcp.cont
 const { MCP_TOOLS } = await import(pathToFileURL(resolve(root, 'src/remote-mcp.ts')).href);
 const { eventDescription, inboxEventDescription } = await import(pathToFileURL(resolve(root, 'src/mcp-events.ts')).href);
 const actual = Object.fromEntries(MCP_TOOLS.map(tool => [tool.name, tool.inputSchema]));
+const metadata = Object.fromEntries(MCP_TOOLS.map(tool => [tool.name, {
+  securitySchemes: tool.securitySchemes, annotations: tool.annotations,
+  ...(tool.outputSchema ? {outputSchema: tool.outputSchema} : {}),
+  ...(tool._meta ? {_meta: tool._meta} : {}),
+}]));
 for (const [name, expected, observed] of [
   ['tool input schemas', contract.tools, actual],
+  ['tool authorization and result metadata', contract.toolMetadata, metadata],
   ['event name', contract.event.name, eventDescription.name],
   ['event delivery', contract.event.delivery, eventDescription.delivery],
   ['event input schema', contract.event.inputSchema, eventDescription.inputSchema],

@@ -22,7 +22,7 @@ test("dot package has a portable remote transport without credentials or fabrica
 });
 
 test("remote contract pins identity-bound tools and metadata-only event inputs",()=>{
- expect(Object.keys(contract.tools)).toEqual(["get_profile","agentschat_read_messages","agentschat_reply"]);
+ expect(Object.keys(contract.tools)).toEqual(["agentschat_check_event_permission","get_profile","agentschat_read_messages","agentschat_reply"]);
  expect(contract.tools.agentschat_read_messages.properties.message_id.maxLength).toBe(128);
  expect(contract.tools.agentschat_read_messages.properties.channel_id.pattern).toBe("^[\\w.-]+$");
  expect(contract.tools.agentschat_read_messages.properties.before.maxLength).toBe(64);
@@ -53,7 +53,7 @@ test("dot workflow preserves identity choice, host boundaries and authorization"
 
 
 test("identity inbox requires no prior channel knowledge and preserves narrow subscriptions",()=>{
- expect(contract.contractVersion).toBe(2);
+ expect(contract.contractVersion).toBe(3);
  expect(contract.identityEvent.name).toBe("message.received");
  expect(contract.identityEvent.inputSchema).toEqual({type:"object",properties:{},additionalProperties:false});
  expect(contract.identityEvent.payloadSchema.properties.channel_type.enum).toEqual(["direct","group","project"]);
@@ -68,4 +68,35 @@ test("identity inbox requires no prior channel knowledge and preserves narrow su
  expect(skill).toContain("No channel");
  expect(skill).toContain("do not silently replace them");
  expect(skill).toContain("authorize automatic replies in every group");
+});
+
+
+test("events permission check advertises explicit OAuth access without subscribing",()=>{
+ expect(contract.tools.agentschat_check_event_permission).toEqual({type:"object",properties:{},additionalProperties:false});
+ const meta=contract.toolMetadata.agentschat_check_event_permission;
+ expect(meta.securitySchemes).toEqual([{type:"oauth2",scopes:["agentschat:events"]}]);
+ expect(meta.annotations).toEqual({readOnlyHint:true,destructiveHint:false,idempotentHint:true,openWorldHint:false});
+ expect(meta.outputSchema).toEqual({type:"object",properties:{authorized:{type:"boolean",const:true}},required:["authorized"],additionalProperties:false});
+ expect(contract.toolMetadata.get_profile.securitySchemes).toEqual([{type:"oauth2",scopes:["agentschat:read"]}]);
+ expect(contract.toolMetadata.agentschat_reply.securitySchemes).toEqual([{type:"oauth2",scopes:["agentschat:reply"]}]);
+ const skill=read(`${plugin}/skills/agentschat-dot/SKILL.md`),doc=read("docs/dot-remote-mcp.md");
+ expect(skill).toContain('mcp/www_authenticate');
+ expect(skill).toContain('The user must explicitly approve');
+ expect(skill).toContain('rescan');
+ expect(skill).toContain('Do not assume events authorization preserves read/reply scopes');
+ expect(doc).toContain('Declining');
+ expect(doc).toContain('subscription remains forbidden');
+});
+
+
+test("new-user workflow keeps identity creation separate from OAuth approval",()=>{
+ const skill=read(`${plugin}/skills/agentschat-dot/SKILL.md`),doc=read("docs/dot-remote-mcp.md");
+ expect(skill).toContain("login/signup");
+ expect(skill).toContain("Terms");
+ expect(skill).toContain("separately approves Allow");
+ expect(skill).toContain("expires after ten minutes");
+ expect(skill).toContain("reuse that owned identity");
+ expect(doc).toContain("does not return an agent key");
+ expect(doc).toContain("Creating an identity does not grant OAuth permission");
+ expect(doc).toContain("cookie and CSRF");
 });

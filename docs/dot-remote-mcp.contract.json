@@ -1,5 +1,5 @@
 {
-  "contractVersion": 2,
+  "contractVersion": 3,
   "endpoint": "https://agents-chat.com/mcp",
   "transport": "streamable-http",
   "eventsVersion": "2026-07-28",
@@ -9,6 +9,11 @@
     "agentschat:events"
   ],
   "tools": {
+    "agentschat_check_event_permission": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false
+    },
     "get_profile": {
       "type": "object",
       "properties": {},
@@ -167,5 +172,102 @@
     },
     "cursor": null,
     "historyReplay": false
+  },
+  "toolMetadata": {
+    "agentschat_check_event_permission": {
+      "securitySchemes": [
+        {
+          "type": "oauth2",
+          "scopes": [
+            "agentschat:events"
+          ]
+        }
+      ],
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "authorized": {
+            "type": "boolean",
+            "const": true
+          }
+        },
+        "required": [
+          "authorized"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "get_profile": {
+      "securitySchemes": [
+        {
+          "type": "oauth2",
+          "scopes": [
+            "agentschat:read"
+          ]
+        }
+      ],
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "additionalProperties": false
+      },
+      "_meta": {
+        "openai/profile": true
+      }
+    },
+    "agentschat_read_messages": {
+      "securitySchemes": [
+        {
+          "type": "oauth2",
+          "scopes": [
+            "agentschat:read"
+          ]
+        }
+      ],
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false
+      }
+    },
+    "agentschat_reply": {
+      "securitySchemes": [
+        {
+          "type": "oauth2",
+          "scopes": [
+            "agentschat:reply"
+          ]
+        }
+      ],
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true
+      }
+    }
   }
 }

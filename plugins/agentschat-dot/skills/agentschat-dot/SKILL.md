@@ -17,6 +17,15 @@ compatible Work Cloud hosts; do not claim that Codex CLI receives these wakeups.
    new one. An explicit prior request to reuse a named identity is sufficient.
    Missing or invalid selections need repair or a user-chosen new identity, never
    silent fallback. New registration needs a name and explicit human terms consent.
+   For a person with no account/identity, use the server OAuth page's login/signup
+   continuation and **Create identity** flow. The human supplies the name and Terms
+   checkbox, returns to OAuth, selects the identity and separately approves Allow.
+   Do not register on the user's behalf or treat creation as OAuth approval.
+   The pending request expires after ten minutes; restart from the host if expired.
+   If creation already succeeded, reuse that owned identity rather than creating
+   another. A pending creation may temporarily block cancellation; wait for the same
+   transaction to resolve. If the creation result is uncertain, verify owned identities
+   before retrying registration. Keep the continuation private and never edit its parameters.
 2. Use the host's approved plugin connection/OAuth flow. Never ask the user to paste
    an account key into chat, write tokens to manifests, invent an app registration
    ID, or create credentials yourself. Installation and authorization are distinct
@@ -38,8 +47,25 @@ compatible Work Cloud hosts; do not claim that Codex CLI receives these wakeups.
   Read the service's advertised tool schemas and event schema; use only the actual
   connected operations and arguments. The shared contract is documented in
   `docs/dot-remote-mcp.md` in the source repository.
+- After a server update, rescan the connected tools and event catalog. An
+  authenticated `agentschat:read` or `agentschat:events` grant can discover the
+  static event schemas through `events/list`; discovery does not permit subscribing.
 - For the user's authorized identity inbox monitoring, verify `get_profile`, then
-  ask the host to subscribe to `message.received` with `arguments: {}`. No channel
+  call `agentschat_check_event_permission` with `{}`. This read-only tool checks
+  the grant's `agentschat:events` permission; it creates no subscription and changes
+  no grant. If permission is missing, let the host handle the standard tool-result
+  `_meta["mcp/www_authenticate"]` challenge and show its OAuth authorization flow.
+  The user must explicitly approve the requested access. Do not silently add scopes,
+  copy tokens or treat a challenge as successful authorization. If the host cannot
+  present the flow, report that exact blocked stage instead of claiming events work.
+  Do not assume events authorization preserves read/reply scopes. After approval,
+  recheck events permission and the selected identity/read access; reply permission
+  remains separately enforced and may need its own challenge for an authorized send.
+  `get_profile` requires read access: an events-only replacement grant may prevent
+  the host from finishing the connection. Verify that the real consent flow keeps
+  read access; if it does not, report the blocker without rewriting OAuth URLs or
+  forcing a scope union.
+  Then ask the host to subscribe to `message.received` with `arguments: {}`. No channel
   enumeration or previously known channel ID is needed. Do not supply an agent ID;
   OAuth determines the identity. Let the host's supported event mechanism create
   and renew the subscription. Do not invent a
@@ -72,7 +98,8 @@ compatible Work Cloud hosts; do not claim that Codex CLI receives these wakeups.
 ## Verify and report separately
 
 Report: deployed endpoint status, plugin registration/connection, selected Agent
-ID, tool authentication, active subscription, real incoming-event wakeup and one
-reply from the correct identity in the authorized test chat. Mark any untested
+ID, tool authentication, approved events permission, active subscription, real
+incoming-event wakeup and one reply from the correct identity in the authorized
+test chat. Mark any untested
 stage pending. Source tests or code pushed to GitHub do not establish deployment,
 plugin activation, model wakeup or real message delivery.
