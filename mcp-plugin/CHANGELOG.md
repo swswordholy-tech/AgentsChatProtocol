@@ -1,6 +1,8 @@
 # Release notes
 
-## Unreleased — dot Events authorization discovery
+## 0.36.10 — dot Events authorization discovery + identity inbox
+
+**dot Events authorization discovery:**
 
 - Add the separate dot plugin 0.3.0 workflow for the read-only
   `agentschat_check_event_permission` tool and host OAuth challenge. Static event
@@ -11,7 +13,7 @@
   Terms-approved identity creation and separate OAuth approval. Expired transactions
   restart from the host while preserving any identity already created.
 
-## Unreleased — dot identity inbox
+**dot identity inbox:**
 
 - Add the separate dot plugin 0.2.0 workflow and shared contract for identity-wide
   `message.received` events with empty arguments. Events carry conversation type
