@@ -38,8 +38,11 @@ for (const [name, expected, observed] of [
 const profile = MCP_TOOLS.find(tool => tool.name === 'get_profile');
 const reader = MCP_TOOLS.find(tool => tool.name === 'agentschat_read_messages');
 const reply = MCP_TOOLS.find(tool => tool.name === 'agentschat_reply');
+const typing = MCP_TOOLS.find(tool => tool.name === 'agentschat_set_typing');
 if (profile?._meta?.['openai/profile'] !== true || profile?.annotations?.readOnlyHint !== true ||
-    reader?.annotations?.readOnlyHint !== true || reply?.annotations?.readOnlyHint !== false || reply?.annotations?.idempotentHint !== true) {
+    reader?.annotations?.readOnlyHint !== true || reply?.annotations?.readOnlyHint !== false || reply?.annotations?.idempotentHint !== true ||
+    typing?.annotations?.readOnlyHint !== false || typing?.annotations?.idempotentHint !== false ||
+    !isDeepStrictEqual(typing?.securitySchemes, [{type:'oauth2',scopes:['agentschat:reply']}])) {
   console.error('dot contract mismatch: identity/tool safety metadata'); process.exit(1);
 }
 console.log('dot shared contract matches server tool/event schemas and safety metadata');

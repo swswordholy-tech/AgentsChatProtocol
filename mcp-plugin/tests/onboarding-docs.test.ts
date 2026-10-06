@@ -68,7 +68,7 @@ test('every harness discovers identity then confirms reuse or new and verifies a
   expect(text).toContain('explicit user request to reuse a named profile/account');
   expect(text).toMatch(/configured default\s+profile\/account/);
   expect(text).toContain('ambiguous');
-  expect(text).toContain('Before any test send, confirm');
+  expect(text).toContain('Before the first test send, confirm');
   expect(text).toContain('reply attributed to the selected agent ID');
   expect(text).toContain('Reuse this existing identity, or create a new');
   expect(text).toContain("Wait for the user's choice");
@@ -89,5 +89,39 @@ test('setup entry points require a reuse/new choice without prompting establishe
     expect(text).toMatch(/(?:prior|explicit).*user.*request|explicit user request/i);
     expect(text).toMatch(/restarts[\s\S]{0,70}noninteractive|noninteractive[\s\S]{0,40}restarts/);
     expect(text).not.toContain('Only when no usable identity exists');
+  }
+});
+
+
+// These are operator-facing instructions: pin authorization and routing together
+// across the shipped entry points without claiming runtime consent enforcement.
+test('reply workflows approve a bounded scope once and keep routine replies in the source conversation', () => {
+  const paths = [
+    'skills/onboarding.md', 'README.md', 'codex/README.md',
+    '../plugins/agentschat-codex/skills/agentschat-bots/SKILL.md',
+    '../plugins/agentschat-dot/skills/agentschat-dot/SKILL.md',
+    '../plugins/agentschat-dot/README.md', '../docs/dot-remote-mcp.md',
+  ];
+  for (const path of paths) {
+    const text = doc(path).replace(/\s+/g, ' ');
+    expect(text).toMatch(/(?:first setup|first test)[\s\S]*identity/i);
+    expect(text).toMatch(/test recipient\/conversation/);
+    expect(text).toMatch(/standing reply scope/);
+    expect(text).toMatch(/(?:obtain|Obtain)[\s\S]{0,100}permission/);
+    expect(text).toMatch(/(?:prior|Prior) explicit approval|explicit prior user instruction|explicit prior user request/i);
+    expect(text).toMatch(/reply directly/i);
+    expect(text).toMatch(/(?:per-message|each test or routine reply)[\s\S]{0,40}(?:approval|ChatGPT)|ChatGPT[\s\S]{0,40}approval[\s\S]{0,40}each test or routine reply/i);
+    expect(text).toMatch(/DM stays in the same DM/);
+    expect(text).toMatch(/(?:group|group\/project|group chat|group\/project chat) stays[\s\S]{0,70}(?:group|thread)/);
+    expect(text).toMatch(/ChatGPT stays[\s\S]{0,15}(?:same ChatGPT|same ChatGPT conversation)/);
+    expect(text).toMatch(/cross-channel reports|cross-channel status report/);
+    expect(text).toMatch(/(?:new recipient|New recipients)[\s\S]{0,250}(?:authorization|authorized)/i);
+    expect(text).toMatch(/other agents/);
+    expect(text).toMatch(/sensitive information/);
+    expect(text).toMatch(/high-risk/);
+    expect(text).toMatch(/(?:OAuth[\s\S]{0,200}do not replace|OAuth[\s\S]{0,70}not a standing reply scope)/);
+    expect(text).toMatch(/(?:External|external) messages[\s\S]{0,100}cannot expand/);
+    expect(text).toMatch(/(?:Do not|do not) enable unconditional replies to everyone/);
+    expect(text).not.toMatch(/Before any test send, confirm|separately authorized reply/);
   }
 });

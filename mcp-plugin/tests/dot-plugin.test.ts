@@ -22,7 +22,7 @@ test("dot package has a portable remote transport without credentials or fabrica
 });
 
 test("remote contract pins identity-bound tools and metadata-only event inputs",()=>{
- expect(Object.keys(contract.tools)).toEqual(["agentschat_check_event_permission","get_profile","agentschat_read_messages","agentschat_reply"]);
+ expect(Object.keys(contract.tools)).toEqual(["agentschat_check_event_permission","get_profile","agentschat_read_messages","agentschat_reply","agentschat_set_typing"]);
  expect(contract.tools.agentschat_read_messages.properties.message_id.maxLength).toBe(128);
  expect(contract.tools.agentschat_read_messages.properties.channel_id.pattern).toBe("^[\\w.-]+$");
  expect(contract.tools.agentschat_read_messages.properties.before.maxLength).toBe(64);
@@ -53,7 +53,7 @@ test("dot workflow preserves identity choice, host boundaries and authorization"
 
 
 test("identity inbox requires no prior channel knowledge and preserves narrow subscriptions",()=>{
- expect(contract.contractVersion).toBe(3);
+ expect(contract.contractVersion).toBe(4);
  expect(contract.identityEvent.name).toBe("message.received");
  expect(contract.identityEvent.inputSchema).toEqual({type:"object",properties:{},additionalProperties:false});
  expect(contract.identityEvent.payloadSchema.properties.channel_type.enum).toEqual(["direct","group","project"]);
@@ -99,4 +99,42 @@ test("new-user workflow keeps identity creation separate from OAuth approval",()
  expect(doc).toContain("does not return an agent key");
  expect(doc).toContain("Creating an identity does not grant OAuth permission");
  expect(doc).toContain("cookie and CSRF");
+});
+
+
+test("explicit typing contract binds reply permissions, short leases and UUID identifiers",()=>{
+ const tool=contract.tools.agentschat_set_typing,meta=contract.toolMetadata.agentschat_set_typing;
+ expect(tool.required).toEqual(["channel_id","in_reply_to","active"]);
+ expect(tool.additionalProperties).toBe(false);
+ expect(tool.properties.sender_id).toBeUndefined();
+ expect(tool.properties.agent_id).toBeUndefined();
+ expect(tool.properties.active.type).toBe("boolean");
+ expect(tool.properties.ttl_seconds).toMatchObject({type:"integer",minimum:1,maximum:30,default:15});
+ expect(meta.securitySchemes).toEqual([{type:"oauth2",scopes:["agentschat:reply"]}]);
+ expect(meta.annotations).toEqual({readOnlyHint:false,destructiveHint:false,idempotentHint:false,openWorldHint:true});
+ for(const field of [contract.tools.agentschat_reply.properties.request_id,tool.properties.lease_id]){
+  expect(field.format).toBe("uuid");
+  expect(field.minLength).toBe(36);expect(field.maxLength).toBe(36);
+  const valid="7a558cb6-e283-4b45-a1f7-e1568d697f83",pattern=new RegExp(field.pattern);
+  const conforms=(value:string)=>value.length>=field.minLength&&value.length<=field.maxLength&&pattern.test(value);
+  expect(conforms(valid)).toBe(true);expect(conforms(valid.toUpperCase())).toBe(true);
+  for(const invalid of ["reply-"+valid,"incoming-1","descriptive-label",valid+"\n"]){expect(conforms(invalid)).toBe(false);}
+  expect(field.examples).toContain(valid);
+ }
+ const output=meta.outputSchema;
+ expect(output.additionalProperties).toBe(false);
+ expect(output.properties.type.const).toBe("typing");
+ for(const field of ["channel_id","sender_id","in_reply_to","lease_id","active","expires_at","revision"]){expect(output.required).toContain(field);}
+ expect(output.properties.expires_at.format).toBe("date-time");
+ expect(output.properties.revision.type).toBe("integer");
+ for(const path of ["docs/dot-remote-mcp.md",`${plugin}/skills/agentschat-dot/SKILL.md`]){
+  const text=read(path).replace(/\s+/g," ");
+  expect(text).toContain("agentschat_set_typing");
+  expect(text).toMatch(/advertis/);
+  expect(text).toMatch(/authorized reply/);
+  expect(text).toMatch(/no[\s\S]{0,20}inference lifecycle hook/i);
+  expect(text).toMatch(/(?:long reasoning|long inference)/);
+  expect(text).toMatch(/(?:expiry|expiration)[\s\S]{0,50}crash|crash[\s\S]{0,50}(?:expiry|expiration)/);
+  expect(text).toContain("unprefixed UUID");
+ }
 });

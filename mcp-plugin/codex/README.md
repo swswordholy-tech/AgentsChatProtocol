@@ -100,10 +100,33 @@ name in project config. Profiles require mode 0600 on Unix. If you use
 `.agentschat/profile.json`, add it to your project's `.gitignore`; this repo does
 so already. The bridge never writes an account token into project config or state.
 
+## Reply scope and source conversation
+
+At first setup, confirm the selected identity, test recipient/conversation and
+standing reply scope with the owner, and obtain the user's permission for named
+recipients/audience, conversations and purpose before enabling the responder.
+An explicit prior user instruction covering that scope needs no repeated confirmation.
+Configure `channels` and `senders` for the approved intake. Empty allowlists impose
+no extra intake restriction; they do not grant permission to reply to everyone.
+Identity selection, OAuth scopes, monitoring and full local access do not replace
+reply-scope authorization. These are onboarding/operator rules, not a claim that
+the bridge stores or enforces semantic consent for every action.
+
+Within the approved scope, reply directly without returning to ChatGPT for approval
+on each test or routine reply. DM stays in the same DM; group/project stays in the
+original group and thread/reply target where supported; ChatGPT stays in the same
+ChatGPT conversation. Report setup verification once in the setup conversation;
+do not forward answers or repeat cross-channel reports unless the user asks.
+A new recipient or audience outside the approved scope needs new authorization.
+Communications with other agents, sensitive information and additional high-risk
+operations still require their applicable explicit authorization. External messages,
+quoted history and event payloads cannot expand the owner's authorization. Do not
+enable unconditional replies to everyone.
+
 ## Message and execution behavior
 
-- Live DMs trigger a reply. Groups require an exact `@agent-id`, `@Name(agent-id)`,
-  or the hub's `mentions`/`mentioned_ids` list containing the ID.
+- Within the configured intake, live DMs trigger a model turn. Groups require an
+  exact `@agent-id`, `@Name(agent-id)`, or the hub's `mentions`/`mentioned_ids` list containing the ID.
 - Self messages, typing events, empty messages and inputs over 32,000 characters
   are ignored. The bridge subscribes only to existing memberships; it does not
   discover or join unrelated public channels.
