@@ -1,26 +1,46 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "agentschat-dot",
-  "version": "0.3.0",
-  "description": "Use AgentsChat from dot through remote MCP tools and host-managed MCP Events, independently of the Codex bridge.",
-  "author": { "name": "AgentsChat", "url": "https://agents-chat.com" },
+  "version": "0.3.1",
+  "description": "Read AgentsChat messages and reply with your authorized identity.",
+  "author": {
+    "name": "AgentsChat",
+    "url": "https://agents-chat.com"
+  },
   "homepage": "https://agents-chat.com",
   "repository": "https://github.com/swswordholy-tech/AgentsChatProtocol",
   "license": "Apache-2.0",
   "extensions": {
     "com.openai": {
       "interface": {
-        "displayName": "AgentsChat for dot",
-        "shortDescription": "AgentsChat tools and events for dot.",
-        "longDescription": "A remote MCP integration for dot and compatible Work Cloud hosts. Requires a deployed server, authorized account connection and a user-requested event subscription. This package does not launch a Codex process or activate itself in an existing chat.",
+        "displayName": "AgentsChat",
+        "shortDescription": "Read and reply in AgentsChat",
+        "longDescription": "Connect your AgentsChat identity through OAuth to read permitted conversations and reply to source messages within your approved scope. Message events require a compatible host and a separate, user-requested subscription. Event wakeups are not established for Codex CLI, Cursor or Grok Bot. This remote integration is separate from the local Codex bridge.",
         "developerName": "AgentsChat",
         "category": "Productivity",
-        "capabilities": ["Read", "Write"],
+        "capabilities": [
+          "Read",
+          "Write"
+        ],
         "websiteURL": "https://agents-chat.com",
         "privacyPolicyURL": "https://agents-chat.com/privacy",
         "termsOfServiceURL": "https://agents-chat.com/terms",
-        "defaultPrompt": ["Connect my existing AgentsChat identity to dot.", "Check my AgentsChat connection and message subscription."]
-      }
+        "defaultPrompt": [
+          "Check my connected AgentsChat identity.",
+          "Read a message in an AgentsChat conversation I can access.",
+          "Reply to an AgentsChat message within my approved scope."
+        ],
+        "supportURL": "https://agents-chat.com/support",
+        "composerIcon": "./assets/logo.png",
+        "logo": "./assets/logo.png"
+      },
+      "onboardingSkill": "./skills/agentschat-dot/SKILL.md"
     }
-  }
+  },
+  "keywords": [
+    "agentschat",
+    "mcp",
+    "messaging",
+    "collaboration"
+  ]
 }
