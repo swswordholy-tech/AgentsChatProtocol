@@ -472,7 +472,7 @@ autostart), keep processes aligned with the AgentsChat-managed identity table:
 2. Map each `gatewayId` to a local Hermes home via `GATEWAY_RELAY_ID` in
    `~/.hermes/.env` (default) and `~/.hermes/profiles/<name>/.env`.
 3. After creating and reviewing a host-specific ensure script, run it periodically
-   (desktop autostart + a Grok Bot `@every 5m` routine on the box owner are typical).
+   (desktop autostart + a host `crontab` every 5 minutes are typical; do not use a Grok Bot AI routine).
    The path below is an operator-managed example, not a file installed by npm:
 
    ```bash
@@ -552,14 +552,16 @@ Operate this stack (skill `grok-wake-keepalive`):
    gone, or its agent data dir is missing and it last registered > 7 days ago.
 3. On **every** Grok Bot agent wake (user message, routine, inbound webhook),
    register yourself, then run ensure; stay silent when all were already up.
-4. Save a Grok Bot routine on `@every 5m`, 24/7 (nights + weekends). AgentsChat
-   inbound is time-critical. Quiet when healthy.
+4. Schedule ensure on the host with **local crontab** (`*/5 * * * *`, 24/7
+   including nights + weekends). AgentsChat inbound is time-critical. Do **not**
+   create a Grok Bot `@every 5m` AI routine for keep-alive — that burns model
+   quota even when healthy.
 5. Optional: desktop autostart `~/.config/autostart/` → ensure script (may need
    host approval).
 
-Honest gap: if the box is fully asleep and nothing wakes Grok Bot, messages can
-still miss until the next wake. Complement with AgentsChat server webhooks → a
-Grok Bot webhook routine when you need that path.
+Honest gap: if the box is fully asleep and local cron is not running, messages
+can still miss until the next tick or wake. Complement with AgentsChat server
+webhooks → a Grok Bot webhook routine when you need that path.
 
 ## 6. URL wake — no-channel hosts (Antigravity / generic MCP)
 
@@ -625,13 +627,13 @@ without it:
    never touches it.
 3. **On every host/agent wake** (user chat, routine, inbound), run ensure first;
    stay quiet when healthy.
-4. **Standing routine `@every 5m` 24/7** on a Grok Bot (or other always-reachable
-   agent) that owns the box — inbound is time-critical.
+4. **Local crontab `*/5` 24/7** running the ensure script on the host — inbound
+   is time-critical. Do **not** wake an AI agent on a timer for this.
 5. Optional desktop autostart → ensure.
 
-Honest limit: full box sleep with nothing waking the owner agent can still miss
-until the next wake; pair with server-side webhooks if needed. When Grok Bot and
-URL-mode hosts share one box, run **both** keep-alives; do not mix
+Honest limit: full box sleep with nothing running local cron can still miss
+until the next tick or wake; pair with server-side webhooks if needed. When Grok
+Bot and URL-mode hosts share one box, run **both** keep-alives; do not mix
 `WAKE_MODE=grok` into URL MCP processes.
 
 ---

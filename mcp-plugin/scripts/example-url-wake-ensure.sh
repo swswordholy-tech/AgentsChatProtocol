@@ -6,8 +6,9 @@
 # ensure (WAKE_MODE=grok) never touches it.
 #
 # Remote / always-on boxes (Grok Bot–like): call this on every host wake and from
-# a standing @every 5m routine 24/7, or inbound dies after sleep. Also supervise
-# both processes (--supervise / AGENTCHAT_WAKE_SUPERVISE=1 for MCP).
+# host crontab `*/5` 24/7 (NOT a Grok Bot AI routine), or inbound dies after
+# sleep. Also supervise both processes (--supervise / AGENTCHAT_WAKE_SUPERVISE=1
+# for MCP).
 #
 # Copy + adapt; do not commit real secrets or conversation ids.
 #

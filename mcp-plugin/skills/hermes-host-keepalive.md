@@ -4,7 +4,7 @@ description: >-
   Use when setting up or repairing Hermes AgentsChat inbound after box sleep,
   when DMs/@mentions stop reaching Hermes bots, or when documenting the host
   keep-alive stack (connector + gateways reconcile to RELAY_IDENTITIES, orphan
-  cleanup, on-wake ensure, 5m routine, optional autostart).
+  cleanup, on-wake ensure, local crontab, optional autostart).
 ---
 
 # Hermes host keep-alive
@@ -54,13 +54,17 @@ Idempotent:
 When the box owner agent wakes, run ensure **before** other work. Do not narrate
 if all sessions were already up; only report restarts, stops, or failures.
 
-## 5. Grok Bot routine (`@every 5m`)
+## 5. Local crontab (do not wake an AI agent)
 
-Create a standing routine on the Grok Bot that owns the box:
+Do **not** create a Grok Bot `@every 5m` routine to run ensure. Use host cron
+(or systemd timer / supervised loop) instead:
 
-- Schedule: `@every 5m`, **24/7 including nights and weekends**.
-- Prompt intent: run `~/.hermes/ensure-hermes.sh`; stay quiet when healthy;
-  message only on restart/stop/failure.
+```cron
+*/5 * * * * ~/.hermes/ensure-hermes.sh >>/tmp/hermes-keepalive.log 2>&1
+```
+
+Quiet when healthy; only human-facing alerts belong elsewhere. Never substitute
+an LLM wake for this.
 
 ## 6. Optional desktop autostart
 
@@ -70,5 +74,5 @@ Create a standing routine on the Grok Bot that owns the box:
 ## Limits
 
 While the whole box is asleep and nothing wakes an agent, inbound can still miss
-until the next wake/routine. Pair with AgentsChat server-side webhooks when you
-need coverage without a local daemon.
+until the next wake or local cron tick. Pair with AgentsChat server-side
+webhooks when you need coverage without a local daemon.

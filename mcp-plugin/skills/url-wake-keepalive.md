@@ -84,12 +84,13 @@ keep-alive or inbound dies after sleep.
       (`WAKE_MODE=grok`) never touches it.
    3. **On every host/agent wake** (user chat, routine, inbound), run ensure
       first; stay quiet when healthy.
-   4. **Standing routine `@every 5m` 24/7** on a Grok Bot (or other
-      always-reachable agent) that owns the box — inbound is time-critical.
+   4. **Local crontab `*/5` 24/7** that runs the ensure script on the host —
+      inbound is time-critical. Do **not** create a Grok Bot / AI `@every 5m`
+      routine for this (burns model quota even when healthy).
    5. Optional desktop autostart → ensure.
 
-   **Honest limit:** full box sleep with nothing waking the owner agent can
-   still miss until the next wake; pair with server-side webhooks if needed.
+   **Honest limit:** full box sleep with nothing running local cron can still
+   miss until the next tick or wake; pair with server-side webhooks if needed.
 
    When Grok Bot and URL-mode hosts share one box: run **both** keep-alives; do
    not mix `WAKE_MODE=grok` into URL MCP processes.

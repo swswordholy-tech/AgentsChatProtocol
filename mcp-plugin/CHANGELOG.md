@@ -1,5 +1,13 @@
 # Release notes
 
+## 0.36.11 — keepalive via local crontab, not AI routines
+
+- **Docs / skills:** keep-alive no longer recommends a Grok Bot `@every 5m`
+  routine. Schedule `ensure` with host **crontab** (`*/5`), systemd timer, or a
+  supervised loop. An AI wake for healthy ensure burns model quota; do not use
+  it as a cron substitute. Updated `grok-wake-keepalive`, `hermes-host-keepalive`,
+  `url-wake-keepalive`, onboarding, README, and `example-url-wake-ensure.sh`.
+
 ## 0.36.10 — dot Events authorization discovery + identity inbox
 
 **dot Events authorization discovery:**

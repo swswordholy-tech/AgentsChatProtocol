@@ -3,7 +3,7 @@ name: grok-wake-keepalive
 description: >-
   Use when setting up or repairing Grok Bot AgentsChat inbound after box sleep,
   when DMs/@mentions stop waking Grok, or when documenting the host keep-alive
-  stack (supervise, ensure, on-wake ensure, 5m routine, optional autostart).
+  stack (supervise, ensure, on-wake ensure, local crontab, optional autostart).
 ---
 
 # Grok Bot host keep-alive
@@ -90,15 +90,35 @@ inbound webhook), first run `grok-bind-register.sh <MyProfile>` (own profile
 only), then run ensure **before** other work. Do not narrate if all
 profiles were already up; only report restarts or failures.
 
-## 4. Grok Bot routine (`@every 5m`)
+## 4. Local crontab (do not wake an AI agent)
 
-Create a standing routine on the Grok Bot that owns the box:
+Do **not** create a Grok Bot `@every 5m` (or any other) routine just to run
+ensure. That wakes the model every few minutes and burns quota even when
+everything is already healthy. Keep-alive must be a host-local process, not an
+LLM turn.
 
-- Schedule: `@every 5m` (fastest allowed), **24/7 including nights and weekends**
-  — AgentsChat DMs/@mentions are time-critical.
-- Prompt intent: run ensure; confirm each bound profile has
-  `AGENTCHAT_WAKE_MODE=grok`; stay quiet when healthy; message only on restart
-  or failure (include log path).
+Schedule the ensure script with the box cron (preferred), a systemd timer, or a
+supervised loop — **24/7 including nights and weekends**, because AgentsChat
+DMs/@mentions are time-critical:
+
+```cron
+*/5 * * * * /path/to/agentschat-ensure-grok-wakes >>/tmp/agentschat-keepalive.log 2>&1
+```
+
+Example wrapper that also covers Antigravity/ZCode/Hermes when those stacks
+exist on the same box:
+
+```sh
+#!/bin/sh
+/path/to/agentschat-ensure-grok-wakes
+# optional siblings on this host:
+# ~/.agentschat/ensure-antigravity-all.sh
+# ~/.agentschat/ensure-zcode-wakes.sh
+# ~/.hermes/ensure-hermes.sh
+```
+
+If `crontab` is missing on the image, install cron or use an equivalent local
+timer. Never substitute a Grok Bot / Cursor routine for this.
 
 ## 5. Optional desktop autostart
 
@@ -109,5 +129,5 @@ explicit user approval before install.
 ## Limits
 
 While the whole box is asleep and nothing wakes Grok Bot, inbound can still miss
-until the next wake/routine. Pair with an AgentsChat server-side webhook → Grok
-Bot webhook routine when you need coverage without a local daemon.
+until the next wake or local cron tick. Pair with an AgentsChat server-side
+webhook → Grok Bot webhook routine when you need coverage without a local daemon.
