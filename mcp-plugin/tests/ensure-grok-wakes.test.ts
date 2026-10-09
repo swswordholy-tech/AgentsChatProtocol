@@ -136,3 +136,92 @@ describe("register-yourself binds rules", () => {
     expect(shouldPruneBindEntry({ profileExists: true, agentDirExists: false, lastRegisteredEpoch: null, nowEpoch: now })).toBeNull();
   });
 });
+
+import {
+  acquireRunLock,
+  isLockOwnerAlive,
+  resolveRunTimeoutMs,
+  DEFAULT_RUN_TIMEOUT_MS,
+} from "../scripts/ensure-grok-wakes.mjs";
+import { mkdtempSync, writeFileSync as wfs, existsSync as exists, readFileSync as rfs } from "node:fs";
+import { tmpdir as tmp } from "node:os";
+import { spawn as spawnChild, spawnSync as spawnSyncChild } from "node:child_process";
+import { resolve as resolvePath } from "node:path";
+
+describe("ensure-grok-wakes single-flight run lock", () => {
+  const lockIn = () => join(mkdtempSync(join(tmp(), "egw-lock-")), "run.lock");
+
+  test("first acquire wins; a live holder makes the next acquire return null", () => {
+    const p = lockIn();
+    const release = acquireRunLock(p, { pid: 111, isAlive: () => true });
+    expect(release).not.toBeNull();
+    expect(rfs(p, "utf8")).toBe("111");
+    expect(acquireRunLock(p, { pid: 222, isAlive: () => true })).toBeNull();
+    release!();
+    expect(exists(p)).toBe(false);
+    expect(acquireRunLock(p, { pid: 222, isAlive: () => true })).not.toBeNull();
+  });
+
+  test("a stale lock (dead pid / garbage) is reclaimed", () => {
+    const p = lockIn();
+    wfs(p, "999999");
+    const r1 = acquireRunLock(p, { pid: 333, isAlive: () => false });
+    expect(r1).not.toBeNull();
+    r1!();
+    wfs(p, "not-a-pid");
+    expect(acquireRunLock(p, { pid: 444, isAlive: (x) => Number.isInteger(x) && x > 0 })).not.toBeNull();
+  });
+
+  test("release only removes our own lock", () => {
+    const p = lockIn();
+    const release = acquireRunLock(p, { pid: 555, isAlive: () => false })!;
+    wfs(p, "666"); // someone reclaimed it after we were considered stale
+    release();
+    expect(rfs(p, "utf8")).toBe("666");
+  });
+
+  test("isLockOwnerAlive: dead pid false; recycled pid (foreign cmdline) false; ensure cmdline true", () => {
+    const dead = () => {
+      const e: any = new Error("ESRCH");
+      e.code = "ESRCH";
+      throw e;
+    };
+    expect(isLockOwnerAlive(123, { kill: dead })).toBe(false);
+    expect(isLockOwnerAlive(123, { kill: () => {}, readCmdline: () => "bash\0-c\0sleep" })).toBe(false);
+    expect(isLockOwnerAlive(123, { kill: () => {}, readCmdline: () => "node\0/x/ensure-grok-wakes.mjs" })).toBe(true);
+    expect(isLockOwnerAlive(123, { kill: () => {}, readCmdline: () => null })).toBe(true);
+    expect(isLockOwnerAlive(0)).toBe(false);
+  });
+
+  test("resolveRunTimeoutMs defaults to 240s and accepts a positive override", () => {
+    expect(DEFAULT_RUN_TIMEOUT_MS).toBe(240_000);
+    expect(resolveRunTimeoutMs(undefined)).toBe(240_000);
+    expect(resolveRunTimeoutMs("0")).toBe(240_000);
+    expect(resolveRunTimeoutMs("abc")).toBe(240_000);
+    expect(resolveRunTimeoutMs("5000")).toBe(5000);
+  });
+
+  test("an overlapping CLI run prints 'skip: another run in progress' and exits 0", async () => {
+    const p = lockIn();
+    // A live process whose cmdline carries the ensure marker holds the lock.
+    const holder = spawnChild("sh", ["-c", "sleep 30", "ensure-grok-wakes"], { stdio: "ignore" });
+    try {
+      wfs(p, String(holder.pid));
+      const home = mkdtempSync(join(tmp(), "egw-home-"));
+      const r = spawnSyncChild(
+        process.execPath,
+        [resolvePath(import.meta.dir, "../scripts/ensure-grok-wakes.mjs")],
+        {
+          env: { PATH: process.env.PATH!, HOME: home, AGENTCHAT_ENSURE_LOCK: p },
+          encoding: "utf8",
+          timeout: 20_000,
+        },
+      );
+      expect(r.status).toBe(0);
+      expect(r.stdout).toMatch(/skip: another run in progress/);
+      expect(rfs(p, "utf8")).toBe(String(holder.pid)); // untouched
+    } finally {
+      holder.kill("SIGKILL");
+    }
+  });
+});

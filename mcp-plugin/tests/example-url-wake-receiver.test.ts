@@ -8,6 +8,8 @@ import {
   signWakeBody,
   verifyWakeSignature,
   buildHostPrompt,
+  buildHostChildEnv,
+  requireIdentityPin,
   WAKE_SIG_HEADER,
 } from "../scripts/example-url-wake-receiver.mjs";
 
@@ -69,5 +71,51 @@ describe("example receiver strips leaked Cursor session env", () => {
     const out = withoutCursorSessionEnv(base);
     expect(out).toEqual({ PATH: "/usr/bin", AGENTCHAT_WAKE_KIND: "url" });
     expect(base.CURSOR_CONVERSATION_ID).toBe("leaked"); // not mutated
+  });
+});
+
+describe("example receiver identity pin (incident 2026-09-27)", () => {
+  test("requireIdentityPin refuses to start without profile + agent id", () => {
+    expect(() => requireIdentityPin({})).toThrow(/required/);
+    expect(() => requireIdentityPin({ AGENTCHAT_URL_WAKE_PROFILE: "Bot-2" })).toThrow(/required/);
+    expect(() => requireIdentityPin({ AGENTCHAT_URL_WAKE_AGENT_ID: "bot-2-id" })).toThrow(/required/);
+    expect(() =>
+      requireIdentityPin({ AGENTCHAT_URL_WAKE_PROFILE: "../x", AGENTCHAT_URL_WAKE_AGENT_ID: "id" }),
+    ).toThrow(/plain profile name/);
+    expect(
+      requireIdentityPin({ AGENTCHAT_URL_WAKE_PROFILE: " Bot-2 ", AGENTCHAT_URL_WAKE_AGENT_ID: "bot-2-id" }),
+    ).toEqual({ profile: "Bot-2", agentId: "bot-2-id" });
+  });
+
+  test("buildHostChildEnv pins AGENTSCHAT_PROFILE + expected id and strips overrides", () => {
+    const base = {
+      PATH: "/usr/bin",
+      AGENTCHAT_PROFILE: "Other",
+      AGENTCHAT_TOKEN: "ac_x",
+      AGENTCHAT_AGENT_ID: "other-id",
+      AGENTSCHAT_PROFILE: "Other",
+      AGENTSCHAT_EXPECT_AGENT_ID: "other-id",
+      CURSOR_CONVERSATION_ID: "leak",
+      CURSOR_RIPGREP_PATH: "/x",
+    };
+    const out = buildHostChildEnv(base, { profile: "Bot-2", agentId: "bot-2-id" });
+    expect(out).toEqual({
+      PATH: "/usr/bin",
+      AGENTSCHAT_PROFILE: "Bot-2",
+      AGENTCHAT_EXPECT_AGENT_ID: "bot-2-id",
+    });
+    expect(base.AGENTCHAT_TOKEN).toBe("ac_x"); // not mutated
+  });
+
+  test("prompt opens with the whoami / switch_profile identity check when pinned", () => {
+    const p = buildHostPrompt({ channel_id: "c", content: "hi" }, { profile: "Bot-2", agentId: "bot-2-id" });
+    const lines = p.split("\n");
+    expect(lines[0]).toBe("[AgentsChat inbound]");
+    expect(lines[1]).toMatch(/Bot-2 AgentsChat bot \(agent id bot-2-id\)/);
+    expect(lines[2]).toMatch(/IDENTITY CHECK/);
+    expect(lines[2]).toMatch(/whoami/);
+    expect(lines[2]).toMatch(/switch_profile` with profile_name="Bot-2"/);
+    expect(lines[2]).toMatch(/Never post under another identity/);
+    expect(p.indexOf("IDENTITY CHECK")).toBeLessThan(p.indexOf("channel_id=c"));
   });
 });

@@ -117,3 +117,33 @@ describe("parseGuardRecord — never blocks boot", () => {
     expect(parsed.bySelector["Antigravity-2"]).toBe(CHEVRON);
   });
 });
+
+import {
+  expectedAgentIdFromEnv,
+  expectedAgentIdViolation,
+  EXPECT_PIN_EXEMPT_TOOLS,
+} from "../src/identity-guard.ts";
+
+describe("expected agent id pin (AGENTCHAT_EXPECT_AGENT_ID)", () => {
+  test("canonical plural wins; blank/unset → null", () => {
+    expect(expectedAgentIdFromEnv({})).toBeNull();
+    expect(expectedAgentIdFromEnv({ AGENTCHAT_EXPECT_AGENT_ID: "  " })).toBeNull();
+    expect(expectedAgentIdFromEnv({ AGENTCHAT_EXPECT_AGENT_ID: "a" })).toBe("a");
+    expect(expectedAgentIdFromEnv({ AGENTSCHAT_EXPECT_AGENT_ID: "b", AGENTCHAT_EXPECT_AGENT_ID: "a" })).toBe("b");
+  });
+
+  test("violation only on mismatch; message names both ids and the fix", () => {
+    expect(expectedAgentIdViolation(null, "x")).toBeNull();
+    expect(expectedAgentIdViolation("x", "x")).toBeNull();
+    const m = expectedAgentIdViolation("chevron", "academic")!;
+    expect(m).toMatch(/"academic".*"chevron"/);
+    expect(m).toMatch(/switch_profile/);
+    expect(m).not.toMatch(/ac_/);
+  });
+
+  test("whoami and switch_profile stay callable while violated", () => {
+    expect(EXPECT_PIN_EXEMPT_TOOLS.has("whoami")).toBe(true);
+    expect(EXPECT_PIN_EXEMPT_TOOLS.has("switch_profile")).toBe(true);
+    expect(EXPECT_PIN_EXEMPT_TOOLS.has("reply")).toBe(false);
+  });
+});
