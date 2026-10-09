@@ -4,7 +4,7 @@ description: >-
   Use when setting up or repairing Hermes AgentsChat inbound after box sleep,
   when DMs/@mentions stop reaching Hermes bots, or when documenting the host
   keep-alive stack (connector + gateways reconcile to RELAY_IDENTITIES, orphan
-  cleanup, on-wake ensure, local crontab, optional autostart).
+  cleanup, on-wake ensure, token-free 5-min scheduler (cron / resident loop), autostart).
 ---
 
 # Hermes host keep-alive
@@ -54,25 +54,42 @@ Idempotent:
 When the box owner agent wakes, run ensure **before** other work. Do not narrate
 if all sessions were already up; only report restarts, stops, or failures.
 
-## 5. Local crontab (do not wake an AI agent)
+## 5. Token-free scheduler (do not wake an AI agent)
 
-Do **not** create a Grok Bot `@every 5m` routine to run ensure. Use host cron
-(or systemd timer / supervised loop) instead:
+Do **not** create a Grok Bot `@every 5m` routine to run ensure. Use a token-free
+scheduler every 5 minutes, 24/7:
 
-```cron
-*/5 * * * * ~/.hermes/ensure-hermes.sh >>/tmp/hermes-keepalive.log 2>&1
-```
+- host cron, where it exists:
+
+  ```cron
+  */5 * * * * ~/.hermes/ensure-hermes.sh >>/tmp/hermes-keepalive.log 2>&1
+  ```
+
+- a systemd timer, or
+- on boxes without cron/systemd (sandboxed / container boxes): one **resident
+  loop** that runs every ensure in sequence (`sleep 300`, own pidfile + `flock -n`
+  so only one loop runs, logs to `/tmp`) — see onboarding "Token-free keep-alive
+  loop". Processes do not survive a box restart, so (re)start the loop from
+  desktop autostart / any boot hook, and from the first agent wake after a
+  restart (idempotent).
+
+Make `ensure-hermes.sh` itself single-flight: re-exec under `timeout 240`, take
+`flock -n` on fd 9 (`skip: another run in progress` → exit 0), and launch tmux /
+daemons with `9>&-` so they never inherit the lock.
 
 Quiet when healthy; only human-facing alerts belong elsewhere. Never substitute
-an LLM wake for this.
+an LLM wake for this. If you keep an AI safety net, make it rare (hourly) and
+have it only check that the loop is alive (pid + fresh log line).
 
-## 6. Optional desktop autostart
+## 6. Desktop autostart / boot hook
 
-`~/.config/autostart/*.desktop` with `Exec=` pointing at ensure (or
-`ensure-hermes-on-boot.sh`). Some hosts require explicit approval for persistence.
+`~/.config/autostart/*.desktop` with `Exec=` pointing at the resident loop (or
+ensure / `ensure-hermes-on-boot.sh`). Verify the hook actually runs on your host
+(check the loop log after a restart) — some hosts ignore XDG autostart or need
+explicit approval for persistence.
 
 ## Limits
 
-While the whole box is asleep and nothing wakes an agent, inbound can still miss
-until the next wake or local cron tick. Pair with AgentsChat server-side
+While the whole box is paused/asleep nothing local runs; inbound can miss until
+the box wakes and the next loop/cron tick. Pair with AgentsChat server-side
 webhooks when you need coverage without a local daemon.

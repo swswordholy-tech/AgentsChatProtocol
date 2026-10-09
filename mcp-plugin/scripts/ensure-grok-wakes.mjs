@@ -23,10 +23,25 @@
  *
  * Prints already-up|started|stopped|failed lines. Exit 0 if no failures.
  * Never prints tokens.
+ *
+ * Single-flight: a non-blocking run lock (O_EXCL lockfile holding our pid, with a
+ * stale-pid check) makes an overlapping run print `skip: another run in progress`
+ * and exit 0 — host cron / resident loops / on-wake hooks may all fire at once.
+ * The whole run is capped by AGENTCHAT_ENSURE_TIMEOUT_MS (default 240000) so a
+ * hung /proc read or spawn can never pile up runs. Lock path:
+ * AGENTCHAT_ENSURE_LOCK, else <tmpdir>/agentschat-ensure-grok-wakes-<uid>.lock.
  */
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, openSync, readFileSync, readdirSync, closeSync } from "node:fs";
-import { homedir } from "node:os";
+import {
+  existsSync,
+  openSync,
+  readFileSync,
+  readdirSync,
+  closeSync,
+  writeSync,
+  unlinkSync,
+} from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -34,6 +49,98 @@ export const DEFAULT_BINDS_FILENAME = "grok-binds.json";
 export const BINDS_ENV = "AGENTCHAT_GROK_BINDS";
 export const BIN_ENV = "AGENTSCHAT_MCP_BIN";
 export const LOG_DIR_ENV = "AGENTCHAT_WAKE_LOG_DIR";
+export const LOCK_ENV = "AGENTCHAT_ENSURE_LOCK";
+export const TIMEOUT_ENV = "AGENTCHAT_ENSURE_TIMEOUT_MS";
+export const DEFAULT_RUN_TIMEOUT_MS = 240_000;
+export const LOCK_OWNER_MARKER = "ensure-grok-wakes";
+
+/** Default run-lock path (per uid so users on one host never block each other). */
+export function defaultLockPath() {
+  const uid = typeof process.getuid === "function" ? process.getuid() : "u";
+  return join(tmpdir(), `agentschat-ensure-grok-wakes-${uid}.lock`);
+}
+
+/** @param {string | undefined} raw */
+export function resolveRunTimeoutMs(raw) {
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : DEFAULT_RUN_TIMEOUT_MS;
+}
+
+/**
+ * Whether the pid recorded in a run lock still belongs to a live ensure run.
+ * A dead pid (or a recycled pid whose cmdline is not an ensure run, when /proc is
+ * readable) is stale.
+ * @param {number} pid
+ * @param {{ kill?: (pid: number, sig: number) => void, readCmdline?: (pid: number) => string | null }} [deps]
+ */
+export function isLockOwnerAlive(pid, deps = {}) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  const kill = deps.kill ?? ((p, sig) => process.kill(p, sig));
+  try {
+    kill(pid, 0);
+  } catch (e) {
+    // EPERM: exists but not ours — treat as alive (never steal a lock we can't vet).
+    if (!(e && /** @type {any} */ (e).code === "EPERM")) return false;
+  }
+  const readCmdline =
+    deps.readCmdline ??
+    ((p) => {
+      try {
+        return readFileSync(`/proc/${p}/cmdline`, "utf8");
+      } catch {
+        return null;
+      }
+    });
+  const cmd = readCmdline(pid);
+  if (cmd === null) return true; // no /proc: trust kill(0)
+  return cmd.includes(LOCK_OWNER_MARKER) || cmd.includes("agentschat-ensure-grok-wakes");
+}
+
+/**
+ * Non-blocking run lock. Returns a release() on success, or null when another
+ * live run holds it. Stale locks (dead/recycled pid, unreadable content) are
+ * removed once and acquisition retried.
+ * @param {string} lockPath
+ * @param {{ pid?: number, isAlive?: (pid: number) => boolean }} [opts]
+ * @returns {(() => void) | null}
+ */
+export function acquireRunLock(lockPath, opts = {}) {
+  const pid = opts.pid ?? process.pid;
+  const isAlive = opts.isAlive ?? ((p) => isLockOwnerAlive(p));
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const fd = openSync(lockPath, "wx", 0o600);
+      writeSync(fd, String(pid));
+      closeSync(fd);
+      let released = false;
+      return () => {
+        if (released) return;
+        released = true;
+        try {
+          if (readFileSync(lockPath, "utf8").trim() === String(pid)) unlinkSync(lockPath);
+        } catch {
+          /* already gone */
+        }
+      };
+    } catch (e) {
+      if (!(e && /** @type {any} */ (e).code === "EEXIST")) throw e;
+      let holder = NaN;
+      try {
+        holder = Number(readFileSync(lockPath, "utf8").trim());
+      } catch {
+        /* unreadable → stale */
+      }
+      if (holder === pid) return null; // never re-enter our own lock
+      if (isAlive(holder)) return null;
+      try {
+        unlinkSync(lockPath);
+      } catch {
+        /* raced with another cleaner */
+      }
+    }
+  }
+  return null;
+}
 
 /** @param {unknown} raw */
 export function parseBinds(raw) {
@@ -151,10 +258,17 @@ export function isLiveWakeDaemon(environNullSep, cmdlineNullSep, uuid, profileNa
   return false;
 }
 
-/** @returns {Array<{ pid: number, environ: string, cmdline: string }>} */
-export function listProcSnapshots() {
+/**
+ * One pass over /proc. With `envNeedle` (e.g. "AGENTCHAT_WAKE_MODE=grok"), pids
+ * whose environ lacks it are skipped before cmdline is read — every caller here
+ * only cares about grok wakes, so this halves the reads on a busy box.
+ * @param {{ envNeedle?: string | null }} [opts]
+ * @returns {Array<{ pid: number, environ: string, cmdline: string }>}
+ */
+export function listProcSnapshots(opts = {}) {
   /** @type {Array<{ pid: number, environ: string, cmdline: string }>} */
   const out = [];
+  const envNeedle = opts.envNeedle ?? null;
   let entries;
   try {
     entries = readdirSync("/proc");
@@ -171,6 +285,7 @@ export function listProcSnapshots() {
     } catch {
       continue;
     }
+    if (envNeedle && !environ.includes(envNeedle)) continue;
     try {
       cmdline = readFileSync(`/proc/${pid}/cmdline`, "utf8");
     } catch {
@@ -354,7 +469,21 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+const GROK_ENV_NEEDLE = "AGENTCHAT_WAKE_MODE=grok";
+
 async function main() {
+  const release = acquireRunLock(process.env[LOCK_ENV] || defaultLockPath());
+  if (!release) {
+    console.log("skip: another run in progress");
+    process.exit(0);
+  }
+  process.on("exit", release);
+  const timeoutMs = resolveRunTimeoutMs(process.env[TIMEOUT_ENV]);
+  setTimeout(() => {
+    console.error(`failed timeout after ${timeoutMs}ms`);
+    process.exit(1);
+  }, timeoutMs).unref();
+
   const envOverride = process.env[BINDS_ENV];
   const bindsPath = resolveBindsPath({ envOverride });
   /** @type {Record<string, string>} */
@@ -389,8 +518,10 @@ async function main() {
   let failed = 0;
   let stopped = 0;
 
+  // One /proc pass for the "already up?" checks (was one full scan per entry).
+  const initialSnaps = listProcSnapshots({ envNeedle: GROK_ENV_NEEDLE });
   for (const [uuid, profileName] of entries) {
-    const existing = findLiveWake(uuid, profileName);
+    const existing = findLiveWake(uuid, profileName, initialSnaps);
     if (existing != null) {
       console.log(`already-up profile=${profileName} pid=${existing}`);
       continue;
@@ -402,7 +533,7 @@ async function main() {
       continue;
     }
     await sleep(800);
-    const pid = findLiveWake(uuid, profileName);
+    const pid = findLiveWake(uuid, profileName, listProcSnapshots({ envNeedle: GROK_ENV_NEEDLE }));
     if (pid != null) {
       console.log(`started profile=${profileName} pid=${pid}`);
     } else {
@@ -419,7 +550,7 @@ async function main() {
       console.log(`no-binds-empty path=${bindsPath} (pruning orphans)`);
     }
     // Prune orphans — logged one line per stopped process with its reason.
-    const snaps = listProcSnapshots();
+    const snaps = listProcSnapshots({ envNeedle: GROK_ENV_NEEDLE });
     for (const s of snaps) {
       if (!shouldPruneWake(s.environ, s.cmdline, binds)) continue;
       const profile = profileFromCmdline(s.cmdline) || "?";

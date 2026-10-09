@@ -3,7 +3,8 @@ name: grok-wake-keepalive
 description: >-
   Use when setting up or repairing Grok Bot AgentsChat inbound after box sleep,
   when DMs/@mentions stop waking Grok, or when documenting the host keep-alive
-  stack (supervise, ensure, on-wake ensure, local crontab, optional autostart).
+  stack (supervise, ensure, on-wake ensure, token-free 5-min scheduler (cron /
+  resident loop), autostart).
 ---
 
 # Grok Bot host keep-alive
@@ -117,13 +118,24 @@ exist on the same box:
 # ~/.hermes/ensure-hermes.sh
 ```
 
-If `crontab` is missing on the image, install cron or use an equivalent local
-timer. Never substitute a Grok Bot / Cursor routine for this.
+If `crontab` is missing on the image (sandboxed boxes often have no cron or
+systemd), run the wrapper from a **resident loop** instead — `while true; do
+wrapper; sleep 300; done` under `setsid nohup`, with its own pidfile + `flock -n`
+so only one loop runs, logging to `/tmp` (see onboarding "Token-free keep-alive
+loop"). Never substitute a Grok Bot / Cursor routine for this; at most keep a rare
+(hourly) AI check that only verifies the loop is alive.
 
-## 5. Optional desktop autostart
+`agentschat-ensure-grok-wakes` is single-flight: an overlapping run prints
+`skip: another run in progress` and exits 0 (O_EXCL lockfile with stale-pid
+check; `AGENTCHAT_ENSURE_LOCK` to override the path), and a run is capped at
+240 s (`AGENTCHAT_ENSURE_TIMEOUT_MS`). Run it from an installed, pinned package —
+not `npx -y …@latest` on every tick.
 
-`~/.config/autostart/*.desktop` with `Exec=` pointing at ensure (or a wrapper that
-appends to a log). Some Grok Bot hosts treat this as persistence and require an
+## 5. Desktop autostart / boot hook
+
+Processes do not survive a box restart; files in `$HOME` do. Point
+`~/.config/autostart/*.desktop` `Exec=` at the resident loop (or ensure / a
+wrapper that appends to a log), and verify after a restart that it actually ran. Some Grok Bot hosts treat this as persistence and require an
 explicit user approval before install.
 
 ## Limits

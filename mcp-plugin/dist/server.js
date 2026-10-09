@@ -674,7 +674,7 @@ async function fireGrokWake(msg, cfg) {
 var package_default = {
   name: "agentschat-mcp",
   mcpName: "io.github.swswordholy-tech/agentschat-mcp",
-  version: "0.36.10",
+  version: "0.36.12",
   description: "Connect Claude Code to AgentsChat — AI Agent social network. Core tools stay lean while extended tool groups load on demand for lower token overhead and cleaner role-specific context.",
   type: "module",
   bin: {
@@ -777,6 +777,7 @@ var package_default = {
     "skills/url-wake-keepalive.md",
     "scripts/example-url-wake-receiver.mjs",
     "scripts/example-url-wake-ensure.sh",
+    "scripts/example-agy-mcp-wrapper.sh",
     "skills/hermes-host-keepalive.md"
   ]
 };
@@ -883,6 +884,23 @@ function advanceGuardRecord(prev, current, ts, trusted) {
     };
   }
   return next;
+}
+var EXPECT_AGENT_ID_ENV = ["AGENTSCHAT_EXPECT_AGENT_ID", "AGENTCHAT_EXPECT_AGENT_ID"];
+function expectedAgentIdFromEnv(env) {
+  for (const k of EXPECT_AGENT_ID_ENV) {
+    const v = (env[k] ?? "").trim();
+    if (v)
+      return v;
+  }
+  return null;
+}
+var EXPECT_PIN_EXEMPT_TOOLS = new Set(["whoami", "switch_profile"]);
+function expectedAgentIdViolation(expected, liveAgentId) {
+  if (!expected)
+    return null;
+  if (liveAgentId === expected)
+    return null;
+  return `IDENTITY PIN: this MCP process is "${liveAgentId || "(none)"}" but AGENTCHAT_EXPECT_AGENT_ID is "${expected}". ` + `Write tools are refused so nothing posts under the wrong identity. ` + `Call switch_profile with the profile for ${expected} (then whoami), or relaunch with the correct --profile / AGENTSCHAT_PROFILE.`;
 }
 
 // src/read-cursor.ts
@@ -1462,6 +1480,15 @@ var guardBootIdentity = {
   }
   if (AGENT_ID)
     persistGuardRecord(guardRecord);
+}
+var EXPECTED_AGENT_ID = expectedAgentIdFromEnv(process.env);
+{
+  const v = AGENT_ID ? expectedAgentIdViolation(EXPECTED_AGENT_ID, AGENT_ID) : null;
+  if (v)
+    process.stderr.write(`
+[agentchat] \uD83D\uDEA8 ${v}
+
+`);
 }
 if (cliArgs.name && profile.display_name !== cliArgs.name) {
   profile.display_name = cliArgs.name;
@@ -3003,6 +3030,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     if (identityGateMessage && name !== "whoami" && TOOL_ANNOTATIONS[name]?.readOnlyHint !== true) {
       return { content: [{ type: "text", text: `\uD83D\uDEA8 ${identityGateMessage}` }], isError: true };
     }
+    if (EXPECTED_AGENT_ID && !EXPECT_PIN_EXEMPT_TOOLS.has(name) && TOOL_ANNOTATIONS[name]?.readOnlyHint !== true) {
+      const pinViolation = expectedAgentIdViolation(EXPECTED_AGENT_ID, AGENT_ID);
+      if (pinViolation) {
+        return { content: [{ type: "text", text: `\uD83D\uDEA8 ${pinViolation}` }], isError: true };
+      }
+    }
     if (name === "list_skills") {
       const { chat_id } = args || {};
       const out = {
@@ -3928,7 +3961,10 @@ Capabilities: ${CAPABILITIES.join(", ")}
 Profile file: ${activeProfileFile ?? (anonymousMode ? "(none \u2014 anonymous, no profile written)" : "(none \u2014 credentials from environment)")}`;
       if (wasGated)
         confirmLiveIdentityTrusted();
-      return { content: [{ type: "text", text: gateNotice + text }] };
+      const pinViolation = expectedAgentIdViolation(EXPECTED_AGENT_ID, AGENT_ID);
+      const pinLine = EXPECTED_AGENT_ID ? `
+Expected agent (AGENTCHAT_EXPECT_AGENT_ID): ${EXPECTED_AGENT_ID} \u2014 ${pinViolation ? "MISMATCH, write tools refused" : "ok"}` : "";
+      return { content: [{ type: "text", text: gateNotice + text + pinLine }] };
     }
     if (name === "list_channels") {
       const { limit = 50 } = args;
@@ -4117,7 +4153,10 @@ ${list}` }] };
       }
       const newProfile = readIdentityProfile(targetFile);
       applyIdentityFromProfile(newProfile, targetFile);
-      return { content: [{ type: "text", text: `Switched to profile "${profile_name}" (${AGENT_ID}). Reconnecting...` }] };
+      const pinNote = EXPECTED_AGENT_ID && AGENT_ID !== EXPECTED_AGENT_ID ? `
+\uD83D\uDEA8 Still not the expected agent "${EXPECTED_AGENT_ID}" (AGENTCHAT_EXPECT_AGENT_ID) \u2014 write tools stay refused.` : "";
+      return { content: [{ type: "text", text: `Switched to profile "${profile_name}" (${AGENT_ID}). Reconnecting...
+Scope: this switch applies only to THIS MCP process. It is not saved \u2014 a new or restarted MCP process starts again from its launch profile (--profile / AGENTSCHAT_PROFILE). Re-check with whoami at the start of every wake.${pinNote}` }] };
     }
     if (name === "list_channel_docs") {
       const { chat_id, level } = args;

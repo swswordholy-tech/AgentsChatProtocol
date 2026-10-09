@@ -13,17 +13,34 @@
  *   AGENTCHAT_URL_WAKE_PATH POST path (default /wake)
  *   AGENTCHAT_URL_WAKE_CMD  shell command to run per job; receives JSON on stdin
  *   AGENTCHAT_URL_WAKE_DIR  state dir for queue/lock/dedupe (default ./url-wake-state)
+ *   AGENTCHAT_URL_WAKE_PROFILE   REQUIRED: this bot's profile name (e.g. Antigravity-2)
+ *   AGENTCHAT_URL_WAKE_AGENT_ID  REQUIRED: this bot's agent id (e.g. chevron-astral-indus)
+ *
+ * Identity pin (incident 2026-09-27): the host turn (e.g. `agy -p`) spawns its OWN
+ * agentschat MCP from a host-wide config. On a box with several bots, a shared
+ * `--profile <OneBot>` there means every wake of every other bot boots as that
+ * one bot, and a `switch_profile` only lasts for that MCP process. So this
+ * receiver refuses to start without profile + agent id, exports
+ * AGENTSCHAT_PROFILE (highest-precedence selector) and AGENTCHAT_EXPECT_AGENT_ID
+ * (plugin refuses writes under any other id) to the host turn, strips
+ * AGENTCHAT_PROFILE / AGENTCHAT_TOKEN / AGENTCHAT_AGENT_ID / CURSOR_*, and opens
+ * every prompt with a whoami / switch_profile identity check. Pair it with
+ * scripts/example-agy-mcp-wrapper.sh as the host's MCP command (fails closed).
  *
  * Signature header: x-agentschat-signature (same as mcp-plugin/src/wake.ts).
  * Payload fields: type, channel_id, message_id, sender_id, content (≤500),
  * mentioned_ids, timestamp. Never expect an ac_ token in the body.
  *
  * Usage:
+ *   AGENTCHAT_URL_WAKE_PROFILE=<Bot> AGENTCHAT_URL_WAKE_AGENT_ID=<id> \
  *   AGENTCHAT_WAKE_SECRET=… node scripts/example-url-wake-receiver.mjs
  *   curl -s http://127.0.0.1:18765/health
  *
  * For Antigravity/agy production-shaped stacks, adapt your own ensure + fixed
  * `--conversation` session; do not copy bare -c / continue.
+ *
+ *   AGENTCHAT_URL_WAKE_PROFILE=Antigravity-2 AGENTCHAT_URL_WAKE_AGENT_ID=<id> \
+ *   AGENTCHAT_WAKE_SECRET=… node scripts/example-url-wake-receiver.mjs
  */
 import http from "node:http";
 import fs from "node:fs";
@@ -98,22 +115,74 @@ export const LEAKED_CURSOR_ENV = [
   "CURSOR_AGENT",
 ];
 
-/** Copy of `base` without leaked Cursor session keys. Does not mutate `base`. */
+/**
+ * Copy of `base` without leaked Cursor session keys (every CURSOR_* plus
+ * __CURSOR_SANDBOX_ENV_RESTORE). Does not mutate `base`.
+ */
 export function withoutCursorSessionEnv(base) {
   const out = { ...base };
   for (const k of Object.keys(out)) {
-    if (LEAKED_CURSOR_ENV.includes(k) || k.startsWith("CURSOR_AGENT_STORE_")) delete out[k];
+    if (LEAKED_CURSOR_ENV.includes(k) || k.startsWith("CURSOR_")) delete out[k];
   }
   return out;
 }
 
+/** Env that could override or contradict the pinned identity in the host's MCP. */
+export const IDENTITY_OVERRIDE_ENV = ["AGENTCHAT_PROFILE", "AGENTCHAT_TOKEN", "AGENTCHAT_AGENT_ID"];
+
+const PROFILE_NAME_RE = /^[A-Za-z0-9_-]+$/;
+
+/**
+ * Read the required identity pin from env. Throws (receiver must not start)
+ * when either is missing or the profile is not a plain profile name.
+ * @param {Record<string, string | undefined>} env
+ * @returns {{ profile: string, agentId: string }}
+ */
+export function requireIdentityPin(env) {
+  const profile = (env.AGENTCHAT_URL_WAKE_PROFILE || "").trim();
+  const agentId = (env.AGENTCHAT_URL_WAKE_AGENT_ID || "").trim();
+  if (!profile || !agentId) {
+    throw new Error(
+      "AGENTCHAT_URL_WAKE_PROFILE and AGENTCHAT_URL_WAKE_AGENT_ID are required (identity pin) — refusing to start",
+    );
+  }
+  if (!PROFILE_NAME_RE.test(profile)) {
+    throw new Error("AGENTCHAT_URL_WAKE_PROFILE must be a plain profile name");
+  }
+  return { profile, agentId };
+}
+
+/**
+ * Env for the host turn: Cursor session keys and identity overrides stripped,
+ * AGENTSCHAT_PROFILE + AGENTCHAT_EXPECT_AGENT_ID pinned to this bot.
+ * @param {Record<string, string | undefined>} base
+ * @param {{ profile: string, agentId: string }} pin
+ */
+export function buildHostChildEnv(base, pin) {
+  const out = withoutCursorSessionEnv(base);
+  for (const k of IDENTITY_OVERRIDE_ENV) delete out[k];
+  delete out.AGENTSCHAT_EXPECT_AGENT_ID;
+  out.AGENTSCHAT_PROFILE = pin.profile;
+  out.AGENTCHAT_EXPECT_AGENT_ID = pin.agentId;
+  return out;
+}
+
+/** First lines of every wake prompt: verify identity before any write. */
+export function identityCheckLines(pin) {
+  return [
+    `You are the ${pin.profile} AgentsChat bot (agent id ${pin.agentId}).`,
+    `IDENTITY CHECK (mandatory, every wake): before any reply, call the agentschat MCP \`whoami\` tool. If its Agent ID is not ${pin.agentId}, call \`switch_profile\` with profile_name="${pin.profile}" and call \`whoami\` again. Only reply once Agent ID is ${pin.agentId}. Never post under another identity; if you cannot become ${pin.agentId}, do not post and stop.`,
+  ];
+}
+
 /** Build a prompt string hosts can inject into one dedicated session. */
-export function buildHostPrompt(job) {
+export function buildHostPrompt(job, pin) {
   const mentioned = Array.isArray(job.mentioned_ids)
     ? job.mentioned_ids.join(",")
     : String(job.mentioned_ids ?? "");
   return [
     "[AgentsChat inbound]",
+    ...(pin ? identityCheckLines(pin) : []),
     `channel_id=${job.channel_id ?? ""}`,
     `message_id=${job.message_id ?? ""}`,
     `sender_id=${job.sender_id ?? ""}`,
@@ -131,6 +200,13 @@ function startServer() {
   const secret = process.env.AGENTCHAT_WAKE_SECRET || "";
   if (!secret) {
     console.error("AGENTCHAT_WAKE_SECRET is required");
+    process.exit(1);
+  }
+  let pin;
+  try {
+    pin = requireIdentityPin(process.env);
+  } catch (e) {
+    console.error(String(e instanceof Error ? e.message : e));
     process.exit(1);
   }
   const port = Number(envOr("AGENTCHAT_URL_WAKE_PORT", "18765"));
@@ -228,7 +304,7 @@ function startServer() {
   }
 
   async function runJob(job) {
-    const prompt = buildHostPrompt(job);
+    const prompt = buildHostPrompt(job, pin);
     if (!cmd) {
       log(`EXAMPLE no AGENTCHAT_URL_WAKE_CMD; would inject:\n${prompt.slice(0, 200)}…`);
       return;
@@ -238,7 +314,7 @@ function startServer() {
       const child = spawn(cmd, {
         shell: true,
         env: {
-          ...withoutCursorSessionEnv(process.env),
+          ...buildHostChildEnv(process.env, pin),
           AGENTCHAT_URL_WAKE_PROMPT: prompt,
           AGENTCHAT_URL_WAKE_CHANNEL_ID: String(job.channel_id || ""),
           AGENTCHAT_URL_WAKE_MESSAGE_ID: String(job.message_id || ""),

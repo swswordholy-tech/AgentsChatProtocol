@@ -741,3 +741,109 @@ test("MCP CLI beats project/env; project and runtime bindings beat global defaul
   expect(bad.code).toBe(1);
   expect(registerCalls()).toBe(0);
 }, 20000);
+
+describe("multi-bot host: per-bot identity pin (AGENTSCHAT_PROFILE + AGENTCHAT_EXPECT_AGENT_ID)", () => {
+  const fixture = (tag: string) => {
+    const home = freshHome(tag);
+    mkdirSync(join(home, ".agentschat"), { recursive: true });
+    for (const [name, id] of [["Antigravity", "anti-id"], ["Antigravity-2", "anti2-id"]]) {
+      writeFileSync(
+        join(home, ".agentschat", `${name}.json`),
+        JSON.stringify({ agent_id: id, display_name: name, token: `ac_${id}`, capabilities: ["chat"] }),
+      );
+    }
+    return home;
+  };
+
+  // An explicit --profile outranks AGENTSCHAT_PROFILE (flags > project > grok-bind
+  // > env), so a shared host config must NOT hard-code --profile: the per-bot pin
+  // only works through a wrapper that turns AGENTSCHAT_PROFILE into --profile
+  // (scripts/example-agy-mcp-wrapper.sh) or a config with no selector at all.
+  test("shared host config with a hard-coded --profile overrides the receiver's AGENTSCHAT_PROFILE", async () => {
+    calls = [];
+    const home = fixture("pin-flag-wins");
+    const { res } = await drive(
+      ["--profile", "Antigravity"],
+      home,
+      [INIT, INITED, callTool(3, "whoami")],
+      4000,
+      { AGENTSCHAT_PROFILE: "Antigravity-2" },
+    );
+    expect(res.get(3)?.result?.content?.[0]?.text ?? "").toMatch(/Agent ID: anti-id/);
+  }, 15_000);
+
+  test("AGENTSCHAT_PROFILE pins the identity when the host config carries no selector", async () => {
+    calls = [];
+    const home = fixture("pin-env");
+    const { res } = await drive(
+      [],
+      home,
+      [INIT, INITED, callTool(3, "whoami")],
+      4000,
+      { AGENTSCHAT_PROFILE: "Antigravity-2" },
+    );
+    const text = res.get(3)?.result?.content?.[0]?.text ?? "";
+    expect(text).toMatch(/Agent ID: anti2-id/);
+    expect(text).not.toMatch(/Agent ID: anti-id/);
+    expect(registerCalls()).toBe(0);
+  }, 15_000);
+
+  test("expected-id mismatch refuses writes, keeps whoami/switch_profile open, clears after switching", async () => {
+    calls = [];
+    const home = fixture("pin-expect");
+    const { res, err } = await drive(
+      ["--profile", "Antigravity"],
+      home,
+      [
+        INIT,
+        INITED,
+        callTool(3, "reply", { chat_id: "c1", text: "hi" }),
+        callTool(4, "whoami"),
+        callTool(5, "switch_profile", { profile_name: "Antigravity-2" }),
+        callTool(6, "whoami"),
+        callTool(7, "reply", { chat_id: "c1", text: "hi" }),
+      ],
+      5000,
+      { AGENTCHAT_EXPECT_AGENT_ID: "anti2-id" },
+    );
+    expect(err).toMatch(/IDENTITY PIN/);
+    const r3 = res.get(3)?.result;
+    expect(r3?.isError).toBe(true);
+    expect(r3?.content?.[0]?.text ?? "").toMatch(/IDENTITY PIN: this MCP process is "anti-id".*"anti2-id"/);
+    expect(res.get(4)?.result?.content?.[0]?.text ?? "").toMatch(/Expected agent .*anti2-id — MISMATCH/);
+    const t5 = res.get(5)?.result?.content?.[0]?.text ?? "";
+    expect(t5).toMatch(/Switched to profile "Antigravity-2"/);
+    expect(t5).toMatch(/only to THIS MCP process/);
+    expect(res.get(6)?.result?.content?.[0]?.text ?? "").toMatch(/Agent ID: anti2-id[\s\S]*anti2-id — ok/);
+    // Write no longer blocked by the pin (it may still fail against the mock hub).
+    expect(res.get(7)?.result?.content?.[0]?.text ?? "").not.toMatch(/IDENTITY PIN/);
+  }, 20_000);
+
+  test("AGENTSCHAT_EXPECT_AGENT_ID (canonical alias) is honoured too", async () => {
+    calls = [];
+    const home = fixture("pin-alias");
+    const { res } = await drive(
+      ["--profile", "Antigravity"],
+      home,
+      [INIT, INITED, callTool(3, "reply", { chat_id: "c1", text: "hi" })],
+      4000,
+      { AGENTSCHAT_EXPECT_AGENT_ID: "anti2-id" },
+    );
+    expect(res.get(3)?.result?.isError).toBe(true);
+    expect(res.get(3)?.result?.content?.[0]?.text ?? "").toMatch(/IDENTITY PIN/);
+  }, 15_000);
+
+  test("matching expected id changes nothing", async () => {
+    calls = [];
+    const home = fixture("pin-match");
+    const { res, err } = await drive(
+      ["--profile", "Antigravity-2"],
+      home,
+      [INIT, INITED, callTool(3, "reply", { chat_id: "c1", text: "hi" })],
+      4000,
+      { AGENTCHAT_EXPECT_AGENT_ID: "anti2-id" },
+    );
+    expect(err).not.toMatch(/IDENTITY PIN/);
+    expect(res.get(3)?.result?.content?.[0]?.text ?? "").not.toMatch(/IDENTITY PIN/);
+  }, 15_000);
+});

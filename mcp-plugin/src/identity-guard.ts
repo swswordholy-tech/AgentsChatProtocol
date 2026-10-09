@@ -145,3 +145,40 @@ export function advanceGuardRecord(
   }
   return next;
 }
+
+// ── Expected agent id pin (AGENTCHAT_EXPECT_AGENT_ID) ────────────────────────
+// Root cause found on a multi-bot box after the 2026-09-27 incident: the host
+// (agy) spawned its agentschat MCP from ONE host-wide config carrying an explicit
+// `--profile <OneBot>`, so every other bot's wake booted as that bot. That is an
+// explicit selector, so the trust-record guard above stays quiet. A per-bot
+// launcher can additionally pin the agent id it expects; when set and the live
+// identity differs, write tools refuse (reads, whoami and switch_profile stay
+// open so the agent can see and fix it). Optional: unset = no behaviour change.
+
+/** Env names, canonical plural first (wins when both are set). */
+export const EXPECT_AGENT_ID_ENV = ["AGENTSCHAT_EXPECT_AGENT_ID", "AGENTCHAT_EXPECT_AGENT_ID"] as const;
+
+export function expectedAgentIdFromEnv(env: Record<string, string | undefined>): string | null {
+  for (const k of EXPECT_AGENT_ID_ENV) {
+    const v = (env[k] ?? "").trim();
+    if (v) return v;
+  }
+  return null;
+}
+
+/** Tools that must stay callable while the expected-id pin is violated. */
+export const EXPECT_PIN_EXEMPT_TOOLS = new Set(["whoami", "switch_profile"]);
+
+/**
+ * Error text when the live identity violates the expected pin, else null.
+ * Never includes tokens.
+ */
+export function expectedAgentIdViolation(expected: string | null, liveAgentId: string): string | null {
+  if (!expected) return null;
+  if (liveAgentId === expected) return null;
+  return (
+    `IDENTITY PIN: this MCP process is "${liveAgentId || "(none)"}" but AGENTCHAT_EXPECT_AGENT_ID is "${expected}". ` +
+    `Write tools are refused so nothing posts under the wrong identity. ` +
+    `Call switch_profile with the profile for ${expected} (then whoami), or relaunch with the correct --profile / AGENTSCHAT_PROFILE.`
+  );
+}

@@ -79,6 +79,9 @@ import {
   parseGuardRecord,
   emptyGuardRecord,
   IDENTITY_GUARD_FILENAME,
+  expectedAgentIdFromEnv,
+  expectedAgentIdViolation,
+  EXPECT_PIN_EXEMPT_TOOLS,
   type GuardIdentity,
   type IdentityGuardRecord,
 } from "./identity-guard.ts";
@@ -611,6 +614,16 @@ const guardBootIdentity: GuardIdentity = {
     guardRecord = advanceGuardRecord(guardRecord, guardBootIdentity, new Date().toISOString(), true);
   }
   if (AGENT_ID) persistGuardRecord(guardRecord);
+}
+
+// Optional expected-id pin (AGENTSCHAT_EXPECT_AGENT_ID / AGENTCHAT_EXPECT_AGENT_ID):
+// a per-bot launcher declares which agent this process must be. Mismatch → loud
+// stderr now, and write tools refuse at call time (checked against the LIVE id,
+// so a switch_profile to the right profile clears it).
+const EXPECTED_AGENT_ID = expectedAgentIdFromEnv(process.env);
+{
+  const v = AGENT_ID ? expectedAgentIdViolation(EXPECTED_AGENT_ID, AGENT_ID) : null;
+  if (v) process.stderr.write(`\n[agentchat] 🚨 ${v}\n\n`);
 }
 
 // Update display name if provided via CLI
@@ -2248,6 +2261,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       return { content: [{ type: "text", text: `🚨 ${identityGateMessage}` }], isError: true };
     }
 
+    // Expected-id pin: refuse writes while the live identity is not the one the
+    // launcher pinned. whoami + switch_profile stay open so the agent can fix it.
+    if (EXPECTED_AGENT_ID && !EXPECT_PIN_EXEMPT_TOOLS.has(name) && TOOL_ANNOTATIONS[name]?.readOnlyHint !== true) {
+      const pinViolation = expectedAgentIdViolation(EXPECTED_AGENT_ID, AGENT_ID);
+      if (pinViolation) {
+        return { content: [{ type: "text", text: `🚨 ${pinViolation}` }], isError: true };
+      }
+    }
+
   if (name === "list_skills") {
     const { chat_id } = (args || {}) as { chat_id?: string };
     const out: any = {
@@ -3169,7 +3191,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const wasGated = identityGateMessage !== "";
     const text = `Profile: ${profile.display_name || AGENT_ID}\nAgent ID: ${AGENT_ID}\nServer: ${REST_URL}\nWeb chat: ${REST_URL}/chat/${encodeURIComponent(AGENT_ID)}\nWebSocket: ${wsState}${sessionId ? `\nSession: ${sessionId.slice(0, 12)}...` : ""}\n${healthLine}\n${authLine}\n${claimedLine}${claimHint ? `\n${claimHint}` : ""}\nCapabilities: ${CAPABILITIES.join(", ")}\nProfile file: ${activeProfileFile ?? (anonymousMode ? "(none — anonymous, no profile written)" : "(none — credentials from environment)")}`;
     if (wasGated) confirmLiveIdentityTrusted();
-    return { content: [{ type: "text", text: gateNotice + text }] };
+    const pinViolation = expectedAgentIdViolation(EXPECTED_AGENT_ID, AGENT_ID);
+    const pinLine = EXPECTED_AGENT_ID
+      ? `\nExpected agent (AGENTCHAT_EXPECT_AGENT_ID): ${EXPECTED_AGENT_ID} — ${pinViolation ? "MISMATCH, write tools refused" : "ok"}`
+      : "";
+    return { content: [{ type: "text", text: gateNotice + text + pinLine }] };
   }
 
   if (name === "list_channels") {
@@ -3367,7 +3393,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const newProfile = readIdentityProfile(targetFile);
     applyIdentityFromProfile(newProfile, targetFile);
 
-    return { content: [{ type: "text", text: `Switched to profile "${profile_name}" (${AGENT_ID}). Reconnecting...` }] };
+    const pinNote = EXPECTED_AGENT_ID && AGENT_ID !== EXPECTED_AGENT_ID
+      ? `\n🚨 Still not the expected agent "${EXPECTED_AGENT_ID}" (AGENTCHAT_EXPECT_AGENT_ID) — write tools stay refused.`
+      : "";
+    return { content: [{ type: "text", text: `Switched to profile "${profile_name}" (${AGENT_ID}). Reconnecting...\nScope: this switch applies only to THIS MCP process. It is not saved — a new or restarted MCP process starts again from its launch profile (--profile / AGENTSCHAT_PROFILE). Re-check with whoami at the start of every wake.${pinNote}` }] };
   }
 
   if (name === "list_channel_docs") {
