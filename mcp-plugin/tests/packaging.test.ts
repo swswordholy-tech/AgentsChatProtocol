@@ -18,8 +18,12 @@
  * whitelisted module that imports a non-whitelisted one is the same defect.
  */
 import { describe, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { resolve, dirname, join, relative } from "node:path";
+import { tmpdir } from "node:os";
+import { spawnSync } from "node:child_process";
+// @ts-ignore — the same read-only checker used by the publication gate
+import { findDrift } from "../scripts/sync-doc-versions.mjs";
 
 const ROOT = resolve(import.meta.dir, "..");
 const pkg = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf-8"));
@@ -89,3 +93,44 @@ describe("package `files` covers the whole import graph", () => {
     expect(pkg.bin).toBeTruthy();
   });
 });
+
+/** Perspective: operators installing the npm artifact. Invariant: its executable,
+ * onboarding guides and distinct pinned bot examples survive npm's real file
+ * selection. Goal: catch omissions that a declared whitelist cannot prove absent.
+ * Migration: keep with package regressions; no registry install or publish needed. */
+test("the actual npm tarball retains version-pinned multi-bot installation examples", () => {
+  const dir = mkdtempSync(join(tmpdir(), "agentschat-pack-"));
+  try {
+    const packed = spawnSync("npm", ["pack", "--offline", "--ignore-scripts", "--json", "--pack-destination", dir], {
+      cwd: ROOT, env: { PATH: process.env.PATH, HOME: dir }, encoding: "utf8", timeout: 20000,
+    });
+    expect(packed.status).toBe(0);
+    const [artifact] = JSON.parse(packed.stdout);
+    expect(artifact.name).toBe("agentschat-mcp");
+    expect(artifact.version).toBe(pkg.version);
+    const files = artifact.files.map((f: { path: string }) => f.path);
+    const required: string[] = ["README.md", "skills/onboarding.md", "skills/grok-wake-keepalive.md",
+      "skills/url-wake-keepalive.md", "skills/hermes-host-keepalive.md", "codex/README.md",
+      "connector/README.md", "scripts/example-agy-mcp-wrapper.sh", "dist/server.js",
+      "dist/connector.js", "dist/codex-bridge.js", "dist/codex-bots.js", ...Object.values(pkg.bin as Record<string, string>)];
+    for (const path of required) expect(files).toContain(path);
+    const unpackText = (path: string): string => {
+      const result = spawnSync("tar", ["-xOf", join(dir, artifact.filename), `package/${path}`], { encoding: "utf8" });
+      expect(result.status).toBe(0);
+      return result.stdout;
+    };
+    for (const path of required.filter((p) => /\.(md|sh)$/.test(p))) {
+      expect(findDrift(unpackText(path), pkg.version, path)).toEqual([]);
+    }
+    const readme = unpackText("README.md");
+    for (const bot of ["A", "B"]) {
+      expect(readme).toContain(`claude mcp add agentschat-bot-${bot.toLowerCase()} -- npx -y agentschat-mcp@${pkg.version} --profile Bot-${bot}`);
+    }
+    const onboarding = unpackText("skills/onboarding.md");
+    for (const profile of ["Jack", "Builder"]) {
+      expect(onboarding).toContain(`npx -y agentschat-mcp@${pkg.version} --profile ${profile}`);
+    }
+    expect(onboarding).toContain("one MCP connection per Grok bot");
+    expect(onboarding).toContain("npx -y agentschat-mcp@latest --help");
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+}, 30000);

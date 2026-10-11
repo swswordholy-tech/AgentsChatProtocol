@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 // @bun
+import { createRequire } from "node:module";
+var __require = /* @__PURE__ */ createRequire(import.meta.url);
 
 // src/onboarding-status.ts
 async function getOnboardingStatus(base, agentId, token, request = fetch) {
@@ -629,8 +631,8 @@ async function fireGrokWake(msg, cfg) {
   }
   let gwcfg;
   try {
-    const { readFileSync } = await import("node:fs");
-    gwcfg = JSON.parse(readFileSync(cfg.gatewayConfigPath, "utf8"));
+    const { readFileSync: readFileSync3 } = await import("node:fs");
+    gwcfg = JSON.parse(readFileSync3(cfg.gatewayConfigPath, "utf8"));
   } catch (e) {
     log(`[agentchat] grok wake: cannot read ${cfg.gatewayConfigPath}: ${e}`);
     return;
@@ -698,7 +700,7 @@ var package_default = {
     "sync:docs": "bun scripts/sync-doc-versions.mjs --write",
     version: "bun run build && bun scripts/sync-doc-versions.mjs --write --git-add",
     verify: "bun run build && bun scripts/check-version-sync.mjs && bun scripts/sync-doc-versions.mjs --check && tsc --noEmit && bun test",
-    prepublishOnly: "bun run build"
+    prepublishOnly: "bun run check:version && bun run check:docs && bun test tests/doc-versions.test.ts tests/packaging.test.ts"
   },
   keywords: [
     "agentchat",
@@ -2794,18 +2796,18 @@ async function sendMediaMessage(kind, args) {
     let ttsDuration;
     if (text) {
       const voice = typeof args.voice === "string" && args.voice ? args.voice : undefined;
-      const r = await apiFetch(`${REST_URL}/api/tts`, {
+      const r2 = await apiFetch(`${REST_URL}/api/tts`, {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${TOKEN}` },
         body: JSON.stringify({ text, ...voice ? { voice } : {} })
       });
-      const t = await r.text();
-      if (r.status === 429 && /MEDIA_BUDGET_EXCEEDED/i.test(t))
+      const t = await r2.text();
+      if (r2.status === 429 && /MEDIA_BUDGET_EXCEEDED/i.test(t))
         return { content: [{ type: "text", text: "Voice budget exhausted for today (MEDIA_BUDGET_EXCEEDED) \u2014 try again tomorrow, or send a recorded clip via path/url." }], isError: true };
-      if (r.status === 400 && /INVALID_VOICE/i.test(t))
+      if (r2.status === 400 && /INVALID_VOICE/i.test(t))
         return { content: [{ type: "text", text: "Invalid voice for TTS. Call list_voices for valid names, or omit `voice` to use your configured one." }], isError: true };
-      if (!r.ok)
-        return { content: [{ type: "text", text: `TTS failed (${r.status}): ${t.slice(0, 140)}` }], isError: true };
+      if (!r2.ok)
+        return { content: [{ type: "text", text: `TTS failed (${r2.status}): ${t.slice(0, 140)}` }], isError: true };
       let d;
       try {
         d = JSON.parse(t);
@@ -3729,7 +3731,7 @@ ${results}` }] };
         } catch {}
       }
       try {
-        await new Promise((r) => setTimeout(r, 500));
+        await new Promise((r2) => setTimeout(r2, 500));
         const r = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(chat_id)}/members`, { headers: { Authorization: `Bearer ${TOKEN}` } });
         if (r.ok) {
           const data = await r.json();
@@ -4933,15 +4935,15 @@ ${context}
         if (process.env.AGENTCHAT_WAKE_MODE === "grok") {
           (async () => {
             try {
-              const { readFileSync, existsSync } = await import("fs");
-              const gwPath = resolveGrokGatewayPath(process.env.AGENTCHAT_GROK_GATEWAY, existsSync);
+              const { readFileSync: readFileSync5, existsSync: existsSync4 } = await import("fs");
+              const gwPath = resolveGrokGatewayPath(process.env.AGENTCHAT_GROK_GATEWAY, existsSync4);
               let agentId = process.env.AGENTCHAT_GROK_AGENT_ID || "";
               if (!agentId) {
                 agentId = await resolveGrokAgentId({
                   explicitId: "",
                   agentschatName: profile.display_name || AGENT_ID,
                   listAgents: async () => {
-                    const gwcfg = JSON.parse(readFileSync(gwPath, "utf8"));
+                    const gwcfg = JSON.parse(readFileSync5(gwPath, "utf8"));
                     const token = grokBearerFromGatewayConfig(gwcfg);
                     const port = grokPortFromGatewayConfig(gwcfg);
                     const res = await fetch(`http://127.0.0.1:${port}/api/listAgents`, {

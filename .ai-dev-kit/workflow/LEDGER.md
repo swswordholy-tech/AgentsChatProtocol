@@ -505,3 +505,16 @@ Branch: codex/multi-bot-manager. Contract: docs/working/codex-multi-bot.md.
 Multi-bot validation: 319 full-suite tests passed; final manager lifecycle tests
 passed (3 tests, 11 assertions), build/typecheck passed. Independent review fixes
 include IPC config snapshots, disconnect shutdown and process-group cleanup.
+
+## 2026-10-12 npm publication consistency
+- Status: ready-for-review; Owner: Codex; Branch: fix/npm-publish-consistency
+- Worktree: /Users/jiang/dev/AgentsChatProtocol-publish-consistency
+- Design: docs/working/npm-publish-consistency.md
+- Scope: read-only prepublish gate, version/doc checks, actual tarball regressions.
+- Non-goals: npm publication, version bump, 0.36.12 post-release validation, unrelated dirty bundles.
+- [x] Inspect latest main and preserve original checkout.
+- [x] Block metadata/bundled entry/doc drift without silently repairing it.
+- [x] Verify packed per-bot examples and first-install latest exceptions.
+- [x] Run focused tests, real dry-run failure controls and independent review (24 pass; typecheck pass; 9 negative lifecycle controls).
+- [x] Record full verify's existing failure and confirm commit/push permission (SSH push dry-run accepted).
+- Full verification: 506 pass, 4 skip, 1 existing remote-plugin doc failure; canonical macOS TMPDIR. No npm release or version bump.
