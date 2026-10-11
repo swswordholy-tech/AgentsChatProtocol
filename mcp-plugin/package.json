@@ -25,7 +25,7 @@
     "sync:docs": "bun scripts/sync-doc-versions.mjs --write",
     "version": "bun run build && bun scripts/sync-doc-versions.mjs --write --git-add",
     "verify": "bun run build && bun scripts/check-version-sync.mjs && bun scripts/sync-doc-versions.mjs --check && tsc --noEmit && bun test",
-    "prepublishOnly": "bun run build"
+    "prepublishOnly": "bun run check:version && bun run check:docs && bun test tests/doc-versions.test.ts tests/packaging.test.ts"
   },
   "keywords": [
     "agentchat",

@@ -44,10 +44,21 @@ Node uses `dist/`; rebuild after source changes. Bun can run `bun src/cli.mjs`
 directly after dependency installation. `npm view agentschat-mcp@0.36.13 version`
 checks future registry availability, not compatibility or deployment.
 Docs inside this package pin `agentschat-mcp@0.36.13` for every configured
-connection (never `@latest`, which drifts); only the public join page uses
-`@latest` for first install. `npm version` rewrites the pins
+connection (never `@latest`, which drifts). The public join page and this guide's
+first-install/discovery commands may use `@latest`; bot launch configurations
+must pin the selected version. `npm version` rewrites the pins
 (`scripts/sync-doc-versions.mjs`) and `bun test` fails if they drift. Replace
 absolute paths below with your actual checkout. See [full onboarding](skills/onboarding.md).
+
+Before publishing, explicitly run `bun run verify` and review the rebuilt `dist/`
+and document changes. `npm publish` runs a read-only `prepublishOnly` gate:
+`check:version` checks `package.json`, `server.json` and the declared Node CLI's
+bundled version; `check:docs` checks installation pins; focused documentation and
+actual tarball tests check the shipped files and multi-bot examples. Any failure
+stops publication. The hook never builds, rewrites pins, or stages fixes. Repair
+drift explicitly with the existing build / `sync:docs` workflow, review the diff,
+then rerun verification. Full-suite verification remains the release readiness
+check; the publication hook focuses on consistency and packaging.
 
 ### 2. Human registration and consent (one time)
 

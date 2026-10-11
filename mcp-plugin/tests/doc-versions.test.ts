@@ -52,6 +52,40 @@ test('findDrift flags stale pins and stray @latest but allows discovery lines', 
   expect(problems[1]).toContain('x.md:6: @latest');
 });
 
+test('discovery exemptions apply to each @latest occurrence, with exact help tokens', () => {
+  for (const discovery of [
+    'npx -y agentschat-mcp@latest --help',
+    'npm view agentschat-mcp@latest version',
+    'npm pack agentschat-mcp@latest --ignore-scripts',
+    'https://unpkg.com/agentschat-mcp@latest/skills/onboarding.md',
+  ]) {
+    expect(findDrift(discovery, '1.2.3')).toEqual([]);
+    expect(findDrift(`${discovery} && npx -y agentschat-mcp@latest --profile Bot-A`, '1.2.3')).toHaveLength(1);
+    expect(findDrift(`npx -y agentschat-mcp@latest --profile Bot-A; ${discovery}`, '1.2.3')).toHaveLength(1);
+  }
+  for (const flag of ['--help-other', '--help=foo']) {
+    expect(findDrift(`npx -y agentschat-mcp@latest ${flag}`, '1.2.3')).toHaveLength(1);
+  }
+});
+
+test('configured connections reject moving tags, ranges and different build metadata', () => {
+  for (const spec of ['^1.2.3', '~1.2.3', '1.x', '*', 'next', '1.2.3+local']) {
+    expect(findDrift(`npx -y agentschat-mcp@${spec} --profile Bot-A`, '1.2.3')).toHaveLength(1);
+  }
+  expect(findDrift('npx -y agentschat-mcp@1.2.3 --profile Bot-A', '1.2.3')).toEqual([]);
+  expect(findDrift('npx -y agentschat-mcp@1.2.3+local --profile Bot-A', '1.2.3+local')).toEqual([]);
+  expect(findDrift('agentschat-mcp@<version>', '1.2.3')).toEqual([]);
+  expect(rewritePins('agentschat-mcp@1.2.3+local', '2.0.0')).toBe('agentschat-mcp@2.0.0');
+});
+
+test('npm runners require a pin while an already-installed executable is allowed', () => {
+  for (const runner of ['npx', 'npx -y', 'npx --yes', 'bunx']) {
+    expect(findDrift(`${runner} agentschat-mcp --profile Bot-A`, '1.2.3')).toHaveLength(1);
+    expect(findDrift(`${runner} agentschat-mcp@1.2.3 --profile Bot-A`, '1.2.3')).toEqual([]);
+  }
+  expect(findDrift('agentschat-mcp --profile Bot-A', '1.2.3')).toEqual([]);
+});
+
 test('rewritePins moves every semver pin (incl. prerelease) and leaves @latest alone', () => {
   const out = rewritePins('a agentschat-mcp@0.1.0 b agentschat-mcp@0.36.12-rc.1 c agentschat-mcp@latest d agentschat-mcp@<version>', '9.9.9');
   expect(out).toBe('a agentschat-mcp@9.9.9 b agentschat-mcp@9.9.9 c agentschat-mcp@latest d agentschat-mcp@<version>');

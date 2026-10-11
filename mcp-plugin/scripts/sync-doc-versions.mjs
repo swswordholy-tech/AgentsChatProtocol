@@ -23,17 +23,21 @@ import { spawnSync } from "node:child_process";
 export const PKG_DIR = join(dirname(fileURLToPath(import.meta.url)), "..");
 
 /** `agentschat-mcp@1.2.3` / `@1.2.3-rc.1` (also the legacy `agentchat-mcp` bin name). */
-export const PINNED_RE = /\b(agents?chat-mcp)@(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)\b/g;
-const LATEST_RE = /\bagents?chat-mcp@latest\b/g;
+export const PINNED_RE = /\b(agents?chat-mcp)@(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?)\b/g;
+// Check complete package specs too: tags/ranges must not evade the numeric-pin
+// matcher. Angle-bracket placeholders such as @<version> are not launch specs.
+const SPEC_RE = /\bagents?chat-mcp@([^\s`'"<>()\[\]{},;|&/]+)/g;
+const UNPINNED_RUNNER_RE = /\b(?:npx|bunx)\s+(?:(?:-y|--yes)\s+)?agents?chat-mcp(?=$|[\s`])/g;
 
 /**
  * `@latest` is intentional only where the guide bootstraps / discovers the newest
- * published release (the join page → unpkg@latest guide → `--help`). Matched per line.
+ * published release (the join page → unpkg@latest guide → `--help`). Each match
+ * exempts only its own @latest occurrence, never another command on the same line.
  */
 export const ALLOWED_LATEST = [
-  /npx -y agentschat-mcp@latest --help\b/,
-  /npm pack agentschat-mcp@latest\b/,
-  /npm view agentschat-mcp@latest version\b/,
+  /npx -y agentschat-mcp@latest --help(?=$|[\s`])/,
+  /npm pack agentschat-mcp@latest(?=$|[\s`])/,
+  /npm view agentschat-mcp@latest version(?=$|[\s`])/,
   /unpkg\.com\/agentschat-mcp@latest\/skills\/onboarding\.md/,
 ];
 
@@ -61,17 +65,22 @@ export function rewritePins(text, version) {
   return text.replace(PINNED_RE, (_m, name) => `${name}@${version}`);
 }
 
-/** Problems in one file's text: wrong pins and non-allowlisted @latest. */
+/** Problems in one file's text: non-exact pins and non-allowlisted @latest. */
 export function findDrift(text, version, file = "<text>") {
   const problems = [];
   text.split("\n").forEach((line, i) => {
-    for (const m of line.matchAll(PINNED_RE)) {
-      if (m[2] !== version) problems.push(`${file}:${i + 1}: ${m[0]} (package.json is ${version})`);
+    for (const command of line.matchAll(UNPINNED_RUNNER_RE)) {
+      problems.push(`${file}:${i + 1}: ${command[0]} resolves an unpinned npm version; use agentschat-mcp@${version}`);
     }
-    if (LATEST_RE.test(line) && !ALLOWED_LATEST.some((re) => re.test(line))) {
-      problems.push(`${file}:${i + 1}: @latest in an in-package doc — pin agentschat-mcp@${version} (only first-install/discovery lines may use @latest)`);
+    const allowed = ALLOWED_LATEST.flatMap((re) => [...line.matchAll(new RegExp(re.source, "g"))]);
+    for (const spec of line.matchAll(SPEC_RE)) {
+      if (spec[1] === "latest") {
+        if (allowed.some((m) => spec.index >= m.index && spec.index + spec[0].length <= m.index + m[0].length)) continue;
+        problems.push(`${file}:${i + 1}: @latest in an in-package doc — pin agentschat-mcp@${version} (only first-install/discovery commands may use @latest)`);
+      } else if (spec[1] !== version) {
+        problems.push(`${file}:${i + 1}: ${spec[0]} (package.json is ${version}; use its exact version)`);
+      }
     }
-    LATEST_RE.lastIndex = 0;
   });
   return problems;
 }
