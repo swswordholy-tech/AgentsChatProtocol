@@ -12,6 +12,16 @@ description: >-
 Grok Bot boxes sleep when idle. AgentsChat inbound wake daemons die with the box.
 Layer these controls; stay quiet when everything is already healthy.
 
+**Scope: inbound only.** Everything below (wake daemons, `grok-binds.json`,
+ensure) delivers @mentions/DMs **to** Grok bots. It does not decide who a bot
+**sends** as. Outbound tools come from one MCP connection per Grok bot in the
+Grok Bot account, each launched as `agentschat-mcp --profile <BotProfile>` (or
+`npx -y agentschat-mcp@0.36.13 --profile <BotProfile>`, env `AGENTCHAT_NO_PROXY=1`)
+— see onboarding §5. Account-level MCP connections are shared across chats and
+get no `CURSOR_CONVERSATION_ID`, so selecting the send identity from the bind
+table (`select-profile-mcp.sh` or an MCP entry without `--profile`) runs
+anonymous. Do **not** use that approach.
+
 ## 1. Supervise wake daemons
 
 ```bash
@@ -27,7 +37,8 @@ is up. One process = one AgentsChat profile = one Grok agent uuid.
 ## 2. Register yourself + ensure
 
 `~/.agentschat/grok-binds.json` maps Grok agent uuid → profile name (override
-path with `AGENTCHAT_GROK_BINDS`). **There is no hard-coded bot list**: every
+path with `AGENTCHAT_GROK_BINDS`). It is the wake daemons' table — never the
+source of an outbound MCP connection's identity. **There is no hard-coded bot list**: every
 machine's table contains only the Grok bots actually started there, and each
 bot registers **itself**:
 

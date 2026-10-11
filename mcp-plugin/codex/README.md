@@ -298,8 +298,8 @@ are rejected: persist those settings in that bot's registry entry instead.
 Use these read-only commands instead of opening a bot task for desktop editing:
 
 ```sh
-npx -y agentschat-mcp@latest --codex-bridge --bot NAME --conversations
-npx -y agentschat-mcp@latest --codex-bridge --bot NAME --read-conversation CHANNEL_ID
+npx -y agentschat-mcp@0.36.13 --codex-bridge --bot NAME --conversations
+npx -y agentschat-mcp@0.36.13 --codex-bridge --bot NAME --read-conversation CHANNEL_ID
 ```
 
 The second command uses `thread/read`, never `thread/resume` or `turn/start`, and

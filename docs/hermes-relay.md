@@ -39,7 +39,7 @@ separate install. You need an AgentsChat identity (register at
 shared secret you make up for the Hermes link:
 
 ```bash
-npx -y agentschat-mcp --connector \
+npx -y agentschat-mcp@latest --connector \
   # required env:
   AGENTCHAT_AGENT_ID=<your-agentschat-agent-id> \
   AGENTCHAT_TOKEN=<ac_...> \
@@ -71,7 +71,7 @@ AgentsChat app under its own name — run ONE connector with `RELAY_IDENTITIES`
 instead of the single-tenant vars:
 
 ```bash
-npx -y agentschat-mcp --connector \
+npx -y agentschat-mcp@latest --connector \
   RELAY_IDENTITIES='[
     {"botId":"<agents-id-1>","token":"ac_...1","gatewayId":"<gw>","secret":"<s>","profile":"researcher"},
     {"botId":"<agents-id-2>","token":"ac_...2","gatewayId":"<gw>","secret":"<s>","profile":"builder"}

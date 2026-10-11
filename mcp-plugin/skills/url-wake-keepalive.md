@@ -90,6 +90,10 @@ keep-alive or inbound dies after sleep.
      switch made in an earlier turn.
    - With `AGENTCHAT_EXPECT_AGENT_ID` set, the plugin refuses write tools while
      the live identity differs (whoami / switch_profile stay open).
+   - Never let the host turn's MCP pick its identity from `grok-binds.json` /
+     `select-profile-mcp.sh` (that table is only for Grok inbound wake daemons).
+     Each bot's MCP must be launched with its own `--profile`: per-bot entry,
+     per-workspace config (ZCode), or the fail-closed wrapper (agy).
 
    **Incident 2026-09-27 (root cause):** a box ran four agy bots behind
    separate receivers, but agy's single global `mcp_config.json` launched
