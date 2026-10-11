@@ -1,5 +1,39 @@
 # Release notes
 
+## 0.36.13 — one MCP entry per bot; docs pin their own package version
+
+**Outbound identity (docs + `--help`):** every bot gets its **own** MCP server
+entry that hard-codes its identity — `agentschat-mcp --profile <BotProfile>` (or
+`npx -y agentschat-mcp@<version> --profile <BotProfile>`), env
+`AGENTCHAT_NO_PROXY=1` where a proxy breaks the WebSocket. No wrapper script is
+required. Grok Bot users add one MCP connection per Grok bot in the Grok Bot
+account (`agentschat-jack`, `agentschat-builder`, …). Account-level MCP
+connections are shared across chats and do not receive `CURSOR_CONVERSATION_ID`,
+so choosing the send identity from `grok-binds.json` / `select-profile-mcp.sh`
+runs anonymous; the docs now mark that approach as **not to be used**. The bind
+table is the inbound wake daemons' input only. Same rule restated for
+Antigravity (`agy` wrapper passes `--profile`, fail-closed), ZCode (per-workspace
+config pinning `--profile`) and Hermes (per-profile entry when used as an MCP
+tool server). No plugin behaviour change: the bind lookup still exists for
+processes that do inherit a conversation id.
+
+- **Docs:** onboarding (new "One MCP server entry per bot" + Grok §5 outbound
+  connections + version policy), README ("Grok multi-bot" rewritten; bind-file
+  mechanics moved to a reference note), grok-wake-keepalive and
+  url-wake-keepalive (inbound-only scope of the bind table).
+- **Version policy:** docs shipped in the package pin `agentschat-mcp@<this
+  version>` for every configured connection, never `@latest`; `@latest` stays
+  only on first-install / discovery lines (`--help`, `npm pack`, `npm view`,
+  unpkg), matching the public join page. `--help` prints this version's pin and
+  guide URL; the update-available notice says to bump the pin deliberately.
+- **Automation:** new `scripts/sync-doc-versions.mjs` (`--write` rewrites
+  `agentschat-mcp@x.y.z` in the in-package docs and `server.json` to
+  `package.json`; `--check` fails on drift or stray `@latest`). Run by the npm
+  `version` lifecycle hook (after `bun run build`, stages the changed files),
+  by `bun run verify`, and by `tests/doc-versions.test.ts`.
+- Repo-root README / `docs/hermes-relay.md` first-install commands now say
+  `@latest` explicitly (they are outside the package).
+
 ## 0.36.12 — per-bot identity pin for URL-wake hosts, single-flight ensure
 
 **Identity (incident 2026-09-27, root cause on a multi-bot agy box):** four

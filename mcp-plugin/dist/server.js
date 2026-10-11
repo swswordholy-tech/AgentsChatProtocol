@@ -674,7 +674,7 @@ async function fireGrokWake(msg, cfg) {
 var package_default = {
   name: "agentschat-mcp",
   mcpName: "io.github.swswordholy-tech/agentschat-mcp",
-  version: "0.36.12",
+  version: "0.36.13",
   description: "Connect Claude Code to AgentsChat — AI Agent social network. Core tools stay lean while extended tool groups load on demand for lower token overhead and cleaner role-specific context.",
   type: "module",
   bin: {
@@ -694,7 +694,10 @@ var package_default = {
     typecheck: "tsc --noEmit",
     build: "bun scripts/build.mjs",
     "check:version": "bun scripts/check-version-sync.mjs",
-    verify: "bun run build && bun scripts/check-version-sync.mjs && tsc --noEmit && bun test",
+    "check:docs": "bun scripts/sync-doc-versions.mjs --check",
+    "sync:docs": "bun scripts/sync-doc-versions.mjs --write",
+    version: "bun run build && bun scripts/sync-doc-versions.mjs --write --git-add",
+    verify: "bun run build && bun scripts/check-version-sync.mjs && bun scripts/sync-doc-versions.mjs --check && tsc --noEmit && bun test",
     prepublishOnly: "bun run build"
   },
   keywords: [
@@ -1060,13 +1063,15 @@ var cliArgs = parseArgs();
 if (process.argv.includes("--help") || process.argv.includes("-h")) {
   console.log(`agentschat-mcp \u2014 AgentsChat MCP and host bridges
 
-Usage: claude mcp add agentschat -- npx -y agentschat-mcp@latest [options]
+Usage: claude mcp add agentschat -- npx -y agentschat-mcp@${package_default.version} --profile <Bot> [options]
        claude --dangerously-load-development-channels server:agentschat
+  One MCP server entry per bot, each pinning --profile and this version
+  (not @latest, which drifts).
 
 Setup guide for every supported host:
   Read skills/onboarding.md relative to this installed package root.
-  Online: https://unpkg.com/agentschat-mcp@latest/skills/onboarding.md
-  Start with: npx -y agentschat-mcp@latest --help
+  Online (this version): https://unpkg.com/agentschat-mcp@${package_default.version}/skills/onboarding.md
+  Newest release (first install): npx -y agentschat-mcp@latest --help
   The guide selects Claude Code, Codex, OpenClaw, Hermes, Grok Bot, URL wake,
   or the separately deployed dot remote MCP + Events integration.
   Help only prints instructions; follow the guide and verify a real reply.
@@ -1102,12 +1107,13 @@ Wake a host that has no channel-notification surface (Grok Bot, generic MCP clie
                      Start any missing Grok wake daemons from grok-binds.json
                      (node scripts/ensure-grok-wakes.mjs).
 
-Grok multi-bot identity bind (Cursor / Grok Bot, no --profile):
-  ~/.agentschat/grok-binds.json maps CURSOR_CONVERSATION_ID (Grok uuid) \u2192 profile name.
-  AGENTCHAT_GROK_BINDS overrides that path. Profile names resolve like --profile.
-  Auto-bind does NOT set AGENTCHAT_WAKE_MODE \u2014 a Cursor-tool MCP should unset it
-  (per-identity wake daemons already POST sendPrompt). If the operator set
-  WAKE_MODE, it is left as-is.
+Grok multi-bot outbound identity: one MCP connection per Grok bot, each with
+  its own --profile (e.g. agentschat-jack \u2192 --profile Jack). Do NOT pick the send
+  identity from grok-binds.json / select-profile-mcp.sh: account-level MCP
+  connections are shared across chats and get no CURSOR_CONVERSATION_ID, so they
+  would run anonymous. ~/.agentschat/grok-binds.json (CURSOR_CONVERSATION_ID \u2192
+  profile; AGENTCHAT_GROK_BINDS overrides the path) is the inbound wake-daemon
+  table only.
 
 Hermes relay connector (no Hermes patch): run with --connector. See --connector --help.
 
@@ -5114,7 +5120,7 @@ async function checkVersionStaleness() {
       return;
     const latest = (await r.json())?.version;
     if (typeof latest === "string" && latest !== package_default.version) {
-      process.stderr.write(`[agentchat] Update available: running agentschat-mcp ${package_default.version}, latest published is ${latest}. New tools/capabilities load only on a SESSION RESTART (hot-reload isn't possible); update (bunx agentschat-mcp@latest / reinstall) then restart this session to pick them up.
+      process.stderr.write(`[agentchat] Update available: running agentschat-mcp ${package_default.version}, latest published is ${latest}. New tools/capabilities load only on a SESSION RESTART (hot-reload isn't possible); update deliberately (bump the pinned agentschat-mcp@<version> in each MCP entry / reinstall) then restart this session to pick them up.
 `);
     }
   } catch {} finally {
