@@ -518,3 +518,16 @@ include IPC config snapshots, disconnect shutdown and process-group cleanup.
 - [x] Run focused tests, real dry-run failure controls and independent review (24 pass; typecheck pass; 9 negative lifecycle controls).
 - [x] Record full verify's existing failure and confirm commit/push permission (SSH push dry-run accepted).
 - Full verification: 506 pass, 4 skip, 1 existing remote-plugin doc failure; canonical macOS TMPDIR. No npm release or version bump.
+
+## 2026-10-14 Remote plugin reply authorization documentation
+- Status: ready-for-review; Owner: Codex; Branch: codex/fix-remote-reply-scope
+- Design and evidence: docs/working/remote-reply-scope.md
+- Scope: remote README's bounded reply permission and original-conversation routing.
+- [x] Inspect latest main `79733ce` and reproduce the onboarding failure (5 pass, 1 fail).
+- [x] Complete readable README guidance without weakening the test or safety contract.
+- [x] Run targeted onboarding/remote tests (13 pass) and full verify (507 pass, 4 skip, 0 fail).
+- [x] Independently review the authorization contract and final documentation (accepted).
+- [x] Prepare the reviewed fix for commit/push and record 0.36.13's current release status.
+- Final original-bundle prepublishOnly: 14 pass; version/docs checks pass; tracked files unchanged.
+- Release state: the existing verification gate passes on this fix; npm latest remains 0.36.12 and 0.36.13 is absent. The 4 Grok registration tests require unavailable flock.
+- Constraints: preserve `.release-prep/`; no publish-hook rewrite, version bump or npm publication.
