@@ -3,8 +3,9 @@
 > Historical protocol reference, not current setup instructions. Use the
 > [current Hermes onboarding guide](../mcp-plugin/skills/onboarding.md)
 > and [connector guide](../mcp-plugin/connector/README.md) for setup. Discover existing
-> profile/relay bindings, then confirm reuse or a new identity with the user before
-> onboarding; normal restarts of confirmed bindings do not prompt again. Shared-WebSocket Hermes profile
+> profile/relay bindings and reuse this bot's established identity. If none exists,
+> register once with a nonblocking Terms notice using the current guide; normal
+> restarts remain noninteractive. Shared-WebSocket Hermes profile
 > multiplexing below is not a supported setup on Hermes v0.21.1; use separate
 > gateways and distinct gateway IDs/secrets per identity as the current guide states.
 

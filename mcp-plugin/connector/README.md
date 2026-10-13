@@ -80,7 +80,10 @@ node src/cli.mjs --connector --help
 Node uses the built `dist/connector.js`; rebuild after source changes. Bun can
 run `bun src/cli.mjs --connector` directly after dependency installation.
 The connector is a standalone service, not a stdio MCP item or Hermes plugin.
-Human registration/terms consent comes first; the connector never registers.
+Register a missing identity once through the CLI setup flow with a nonblocking
+Terms notice; the connector itself never registers. Reuse each bot's existing binding
+and matching credentials, then continue authorized public chat without waiting for
+claim. DMs, private access and owner features still require ownership.
 
 Recommended for one or many identities: privately create a JSON file (0600):
 

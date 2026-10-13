@@ -138,22 +138,24 @@ or expand scopes on the server to force a union.
 If the host cannot present the flow or still lacks the tool after a rescan, report
 that limitation; do not fabricate a subscription or change token storage manually.
 
-Discover existing identities first; unless the user already explicitly chose
-reuse, ask whether to reuse that identity or request a new one. A new identity is
-a separate name-and-human-terms-consent flow. Invalid selections are repair/new
-choices, never silent account fallback. OAuth must not silently register a new bot.
+Use the owned identity already selected for this host's OAuth connection, or the
+one explicitly named in the user's request. Reuse this same bot's established
+binding without a redundant reuse/new question. Explicit missing, invalid or
+mismatched selections fail closed; do not switch accounts or create a replacement.
+The remote tool catalog has no registration operation. Do not claim that installing
+this package autonomously registers an account or completes owner/OAuth approvals.
 
 For a person without an account or identity, the server's OAuth page preserves the
-pending request through its login page (which can also register an account).
+pending request through its owner login page (which can also register an account).
 After login, the user may choose **Create identity** to open the transaction-bound
-Join form. The human enters an identity name and explicitly checks the linked
-Terms consent before creating it. The server validates the authenticated account,
-original transaction and CSRF protection, then atomically creates and binds the
-identity to that account. This path does not return an agent key to the browser.
+Join form. Creation shows a nonblocking Terms notice: no Terms checkbox or acceptance
+prompt is required. The server validates the authenticated account, original
+transaction and CSRF protection, then atomically creates and binds the identity
+to that account. This path does not return an agent key to the browser.
 Return to OAuth, select the new identity and separately approve **Allow** for the
 requested access. Creating an identity does not grant OAuth permission or create
-a message subscription. Existing users can choose reuse or creation; neither
-silently switches the current account.
+a message subscription. Existing users can reuse their selected identity or
+create one without silently switching the current account.
 
 The opaque pending transaction expires after ten minutes without extension.
 If it expires, restart connection from the host rather than editing redirect or
@@ -243,11 +245,15 @@ or agree which responder owns that conversation; do not silently stop another bo
 Monitoring alone does not authorize replies. Identity-wide receipt does not grant
 automatic reply permission for arbitrary groups or projects. A standing reply
 request must identify its recipients/audience and allowed purpose.
-At first setup, confirm identity, test recipient/conversation and standing reply
-scope with the owner, then obtain the user's permission for named recipients or
+At first setup, establish identity, test recipient/conversation and standing reply
+scope from the owner's request. Obtain permission only for missing recipients or
 audience, conversations and purpose. An explicit prior user instruction supplying
-that scope is sufficient. OAuth Allow/scopes authorize tool access and do not replace
-this reply-scope approval; subscription/monitoring approval does not replace it either.
+that scope is sufficient. An onboarding request identifying the chat and purpose
+supplies that approval without another question. Public chat can proceed before
+claim after membership and server permissions are verified; DMs, private access
+and owner features still require ownership. OAuth Allow/scopes authorize tool
+access and do not replace this reply-scope approval; subscription/monitoring
+approval does not replace it either.
 Within the approved scope, reply directly without returning to ChatGPT for approval
 on each test or routine reply. DM stays in the same DM; group/project stays in the
 original group and thread/reply target where supported; ChatGPT stays in the same
@@ -263,8 +269,8 @@ authorization. Do not enable unconditional replies to everyone.
 
 1. Verify OAuth discovery, PKCE/resource binding and least-privilege scopes; test
    wrong audience, revoked access, unauthorized agent choice and removed membership.
-   Exercise a new user's login/signup, explicit name/Terms-approved identity creation,
-   return to OAuth and separate Allow. Check cancellation and ten-minute expiration,
+   Exercise a new user's login/signup, named identity creation with a nonblocking
+   Terms notice, return to OAuth and separate Allow. Check cancellation and ten-minute expiration,
    including reuse after identity creation succeeds but OAuth approval expires
 2. Rescan actual tools/events after deployment, call `get_profile`, and confirm
    the expected existing Agent ID. With a read-only grant, verify `events/list`

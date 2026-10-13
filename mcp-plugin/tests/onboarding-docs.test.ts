@@ -1,7 +1,9 @@
-/** Perspective: operators copying onboarding commands. Invariant: documented launch
- * paths use existing private identities, without implicit registration. Goal: prevent
- * credential/consent regressions and obsolete fork-only Codex setup. Migration: keep
- * with onboarding docs; assertions pin user-visible entry points and exclusions. */
+/** Perspective: agents and operators following the shipped setup guides.
+ * Invariant: a connection request can complete named registration/public chat without
+ * a Terms acceptance prompt, while credentials, identity selection and reply scope
+ * remain bounded. Goal: prevent contradictory copy/paste workflows from blocking
+ * setup or silently selecting another bot. Migration: keep with shipped guides;
+ * these are documentation-contract checks, not proof of runtime or live delivery. */
 import { test, expect } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -16,7 +18,7 @@ test('release draft instructions offer local build and do not promise unpublishe
   }
 });
 
-test('onboarding separates human consent, persistent profile launches, and private credentials', () => {
+test('onboarding separates one-shot registration, persistent profile launches, and private credentials', () => {
   const text = doc('skills/onboarding.md');
   expect(text).not.toMatch(/claude .*AGENTCHAT_TOKEN=/);
   // Inline launch config may refer to a private profile, but it must not carry
@@ -43,7 +45,7 @@ test('onboarding separates human consent, persistent profile launches, and priva
   expect(codex).not.toContain('git clone https://github.com/swswordholy-tech/codex');
   expect(codex).not.toMatch(/node .*--(?:name|register|accept-terms)/);
   expect(text).toContain('~/.agentschat/');
-  expect(text).toMatch(/human.*consent/i);
+  expect(text).toMatch(/Terms are a nonblocking notice/);
   expect(text).toMatch(/matching.*agent ID/i);
   expect(doc('README.md')).not.toMatch(/claude mcp add .*--accept-terms/);
   expect(doc('README.md')).toContain('default profile');
@@ -62,33 +64,49 @@ test('Hermes instructions account for overrides and service lifecycle before for
 });
 
 
-test('every harness discovers identity then confirms reuse or new and verifies an authorized reply', () => {
-  const text = doc('skills/onboarding.md');
+test('agent setup resolves its binding or creates a fresh named identity without a Terms gate', () => {
+  const text = doc('skills/onboarding.md').replace(/\s+/g, ' ');
   expect(text).toContain('Select an identity before setup (all harnesses)');
-  expect(text).toContain('explicit user request to reuse a named profile/account');
-  expect(text).toMatch(/configured default\s+profile\/account/);
-  expect(text).toContain('ambiguous');
-  expect(text).toContain('Before the first test send, confirm');
+  expect(text).toMatch(/reuse the current project's or runtime's established binding/i);
+  expect(text).toMatch(/configured default profile\/account only when it belongs to this bot/i);
+  expect(text).toMatch(/unused local profile name/);
+  expect(text).toMatch(/explicit missing, invalid or mismatched selection fails closed/i);
+  expect(text).toMatch(/do not overwrite or repurpose an existing bot's profile/);
+  expect(text).toMatch(/Bare MCP introspection[\s\S]{0,100}creates no account/);
+  expect(text).toMatch(/retries reuse a profile already created/);
+  expect(text).toMatch(/deprecated compatibility no-ops/);
+  expect(text).not.toMatch(/Terms consent is a human step|Wait for the user's choice|Discovery never silently authorizes reuse/);
+  expect(text).toMatch(/Public chat can proceed before claim/);
+  expect(text).toMatch(/Claim still unlocks DMs, private access, owner features and full limits/);
+  expect(text).toMatch(/onboarding request itself can supply the identity, chat and purpose/);
+  expect(text).toMatch(/public `welcome` conversation/);
   expect(text).toContain('reply attributed to the selected agent ID');
-  expect(text).toContain('Reuse this existing identity, or create a new');
-  expect(text).toContain("Wait for the user's choice");
-  expect(text).toContain('Discovery never silently authorizes reuse');
-  expect(text).toContain('needs no redundant confirmation');
-  expect(text).toContain('not a prompt on every service restart');
-  expect(text).toContain('repair/select an existing identity or create a new one');
-  expect(text).not.toContain('Only when no usable existing identity exists');
-  expect(text).not.toContain("Otherwise reuse the current project's");
-  expect(text).not.toContain('Register a separate AgentsChat account for each profile');
+
+  // Inspect actual copyable registration lines, rather than accepting prose that
+  // says setup is automatic while the command still requires an acceptance flag.
+  const commands = doc('skills/onboarding.md').split('\n').filter(line =>
+    /^(?:npx|node) /.test(line) && /--name /.test(line));
+  expect(commands.length).toBeGreaterThan(0);
+  for (const command of commands) {
+    expect(command).toContain('--register-only');
+    expect(command).not.toContain('--accept-terms');
+  }
 });
 
-
-test('setup entry points require a reuse/new choice without prompting established service restarts', () => {
+test('local setup entry points preserve isolation and noninteractive restarts with a Terms notice', () => {
   for (const name of ['README.md', 'codex/README.md', '../openclaw-plugin/README.md', '../plugins/agentschat-codex/skills/agentschat-bots/SKILL.md']) {
-    const text = doc(name);
-    expect(text).toMatch(/(?:reuse[\s\S]{0,100}(?:create|new)|(?:create|new)[\s\S]{0,100}reuse)/i);
-    expect(text).toMatch(/(?:prior|explicit).*user.*request|explicit user request/i);
+    const text = doc(name).replace(/\s+/g, ' ');
+    expect(text).toMatch(/unused (?:local )?profile name|unused name/);
+    expect(text).toMatch(/nonblocking[\s\S]{0,100}Terms notice/);
+    expect(text).toContain('https://agents-chat.com/terms');
+    expect(text).toMatch(/(?:selection|selections) fail(?:s)? closed/i);
     expect(text).toMatch(/restarts[\s\S]{0,70}noninteractive|noninteractive[\s\S]{0,40}restarts/);
-    expect(text).not.toContain('Only when no usable identity exists');
+    expect(text).toMatch(/Public chat can proceed before claim/i);
+    expect(text).not.toMatch(/human terms consent|Without consent, registration is refused|Wait for that choice/i);
+    const registration = text.match(/(?:node src\/cli\.mjs|agentschat-mcp) --name [^`]+/);
+    expect(registration).not.toBeNull();
+    expect(registration![0]).toContain('--register-only');
+    expect(registration![0]).not.toContain('--accept-terms');
   }
 });
 
@@ -101,6 +119,8 @@ test('reply workflows approve a bounded scope once and keep routine replies in t
     '../plugins/agentschat-codex/skills/agentschat-bots/SKILL.md',
     '../plugins/agentschat-dot/skills/agentschat-dot/SKILL.md',
     '../plugins/agentschat-dot/README.md', '../docs/dot-remote-mcp.md',
+    '../plugins/agentschat-dot-cursor/skills/agentschat-dot/SKILL.md',
+    '../plugins/agentschat-dot-cursor/README.md',
   ];
   for (const path of paths) {
     const text = doc(path).replace(/\s+/g, ' ');
@@ -109,6 +129,7 @@ test('reply workflows approve a bounded scope once and keep routine replies in t
     expect(text).toMatch(/standing reply scope/);
     expect(text).toMatch(/(?:obtain|Obtain)[\s\S]{0,100}permission/);
     expect(text).toMatch(/(?:prior|Prior) explicit approval|explicit prior user instruction|explicit prior user request/i);
+    expect(text).toMatch(/onboarding request[\s\S]{0,100}(?:chat|purpose)/i);
     expect(text).toMatch(/reply directly/i);
     expect(text).toMatch(/(?:per-message|each test or routine reply)[\s\S]{0,40}(?:approval|ChatGPT)|ChatGPT[\s\S]{0,40}approval[\s\S]{0,40}each test or routine reply/i);
     expect(text).toMatch(/DM stays in the same DM/);

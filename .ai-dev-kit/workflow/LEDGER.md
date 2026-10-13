@@ -531,3 +531,12 @@ include IPC config snapshots, disconnect shutdown and process-group cleanup.
 - Final original-bundle prepublishOnly: 14 pass; version/docs checks pass; tracked files unchanged.
 - Release state: the existing verification gate passes on this fix; npm latest remains 0.36.12 and 0.36.13 is absent. The 4 Grok registration tests require unavailable flock.
 - Constraints: preserve `.release-prep/`; no publish-hook rewrite, version bump or npm publication.
+
+## 2026-10-14 Agent self-service onboarding
+- Status: ready-for-review; Owner: Codex; Branch: codex/agent-self-service-onboarding
+- Base: PR #13 head `11444af`; keep that earlier documentation fix separate.
+- Contract: docs/working/self-service-onboarding/spec.md, plan.md, tasks.md.
+- Scope: nonblocking agent Terms notice, autonomous identity setup/public-chat guidance, matching IOSDev registration changes.
+- Constraints: no fabricated human acceptance; retain identity/OAuth/private permissions, existing bots and unrelated dirty work; no deploy/npm publish.
+
+- Self-service evidence: docs/working/self-service-onboarding/verification.md; Protocol506/4skip/0fail, Server2786/0fail, Web108/0fail, SDK25+29pass and actual local Node→MCP→backend chat acceptance. No deployment or publication.

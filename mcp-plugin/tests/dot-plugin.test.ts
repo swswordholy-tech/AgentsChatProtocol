@@ -1,3 +1,9 @@
+/** Perspective: operators installing the remote MCP package on supported hosts.
+ * Invariant: packaged transport/identity/event contracts stay scoped, and identity
+ * creation shows a nonblocking Terms notice without inventing remote registration
+ * or bypassing owner/OAuth access approval. Goal: prevent misleading setup guidance,
+ * credential leaks and cross-identity replies. Migration: keep beside plugin and
+ * shared-contract checks; actual OAuth/event delivery needs server/host acceptance. */
 import {test,expect} from "bun:test";
 import {readFileSync,existsSync} from "node:fs";
 import {join} from "node:path";
@@ -37,10 +43,12 @@ test("remote contract pins identity-bound tools and metadata-only event inputs",
  expect(contract.scopes).toEqual(["agentschat:read","agentschat:reply","agentschat:events"]);
 });
 
-test("dot workflow preserves identity choice, host boundaries and authorization",()=>{
+test("dot workflow reuses the selected identity while preserving host boundaries and authorization",()=>{
  const skill=read(`${plugin}/skills/agentschat-dot/SKILL.md`),doc=read("docs/dot-remote-mcp.md");
- expect(skill).toContain("ask whether to reuse");
- expect(skill).toContain("explicit prior request to reuse");
+ expect(skill).toMatch(/reuse that same\s+bot's binding without a redundant reuse\/new question/);
+ expect(skill).toMatch(/selections fail closed/);
+ expect(skill).toMatch(/remote tool catalog has no registration operation/);
+ expect(skill).toMatch(/Creating an identity is separate from OAuth approval/);
  expect(skill).toContain("Monitoring alone does not authorize replies");
  expect(skill).toContain("Installing this plugin does not subscribe");
  expect(skill).toContain("does not hot-load");
@@ -89,10 +97,15 @@ test("events permission check advertises explicit OAuth access without subscribi
 });
 
 
-test("new-user workflow keeps identity creation separate from OAuth approval",()=>{
+test("new-user workflow shows a nonblocking Terms notice and keeps owner/OAuth approval separate",()=>{
  const skill=read(`${plugin}/skills/agentschat-dot/SKILL.md`),doc=read("docs/dot-remote-mcp.md");
  expect(skill).toContain("login/signup");
- expect(skill).toContain("Terms");
+ expect(skill).toContain("nonblocking");
+ expect(skill).toMatch(/Terms notice; no Terms checkbox or acceptance prompt is required/);
+ expect(skill).not.toMatch(/human terms consent|human supplies the name and Terms/);
+ expect(doc).toMatch(/nonblocking Terms notice/);
+ expect(doc).not.toContain("explicitly checks the linked");
+ expect(read("plugins/agentschat-dot-cursor/skills/agentschat-dot/SKILL.md")).toBe(skill);
  expect(skill).toContain("separately approves Allow");
  expect(skill).toContain("expires after ten minutes");
  expect(skill).toContain("reuse that owned identity");
