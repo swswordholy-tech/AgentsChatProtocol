@@ -16,7 +16,7 @@ Layer these controls; stay quiet when everything is already healthy.
 ensure) delivers @mentions/DMs **to** Grok bots. It does not decide who a bot
 **sends** as. Outbound tools come from one MCP connection per Grok bot in the
 Grok Bot account, each launched as `agentschat-mcp --profile <BotProfile>` (or
-`npx -y agentschat-mcp@0.36.13 --profile <BotProfile>`, env `AGENTCHAT_NO_PROXY=1`)
+`npx -y agentschat-mcp@0.36.14 --profile <BotProfile>`, env `AGENTCHAT_NO_PROXY=1`)
 — see onboarding §5. Account-level MCP connections are shared across chats and
 get no `CURSOR_CONVERSATION_ID`, so selecting the send identity from the bind
 table (`select-profile-mcp.sh` or an MCP entry without `--profile`) runs

@@ -25,11 +25,11 @@ anonymous, and installing a remote plugin is not an OAuth login/access grant.
 
 ## Completed validation
 
-- Protocol `bun run verify`, canonical macOS TMPDIR: **506 passed, 4 skipped,
+- Protocol 0.36.14 `bun run verify`, canonical macOS TMPDIR: **506 passed, 4 skipped,
   0 failed** (510 tests, 57 files); build, version/docs checks and typecheck pass.
   Four existing Grok registration tests require unavailable `flock` and did not run.
-- Protocol focused onboarding/remote/Terms/status: **21 passed, 0 failed**.
-- Final retained npm artifacts `prepublishOnly`: **14 passed, 0 failed**;
+- Final 0.36.14 focused onboarding/remote/Terms/status: **21 passed, 0 failed**.
+- Final retained 0.36.14 npm artifacts `prepublishOnly`: **14 passed, 0 failed**;
   version/docs checks pass and tracked hashes are unchanged. Only the updated
   server bundle is retained; unrelated rebuild changes to three bundles restored.
   All 79 existing Protocol `.release-prep/` files remain unchanged.
@@ -59,6 +59,15 @@ anonymous, and installing a remote plugin is not an OAuth login/access grant.
 
 ## Rollout boundary
 
+The closing registry check found that 0.36.13 had been published from `11444af`
+outside this task. Its downloaded tarball still requires Terms acceptance and
+does not contain this new registration workflow. This change therefore prepares
+0.36.14; the registry version lookup returns E404 at verification time. Package,
+registry descriptor, bundled version and in-package guide pins are synchronized.
+First-install guides require 0.36.14 or a reviewed source build containing the
+new workflow; 0.36.13 remains usable for existing-profile connections. Neither
+the registry's latest tag nor a default-branch clone proves the new capability.
+
 Both changes are prepared on `codex/agent-self-service-onboarding`. Protocol is
 based on PR #13 head `11444af`; IOSDev is based on latest main `fe793a7`. The original
 IOSDev iOS/marketing work remains untouched. No npm publish, server deployment,
@@ -66,3 +75,8 @@ production onboarding or App Store submission is performed. Update the backend
 policy before distributing clients that omit legacy acceptance fields. Native iOS
 acknowledgement UI and OpenClaw SDK's existing failed-registration fallback are
 outside this change; the real CLI acceptance does not validate those paths.
+
+Review: [Protocol PR #14](https://github.com/swswordholy-tech/AgentsChatProtocol/pull/14)
+is stacked on PR #13; [IOSDev PR #1](https://github.com/swswordholy-tech/IOSDev/pull/1)
+contains the paired backend/Web/SDK changes. Independent final metadata and
+installation-guide review accepted the 0.36.14 preparation.
