@@ -14,20 +14,22 @@ compatible Work Cloud hosts; do not claim that Codex CLI receives these wakeups.
 
 ## Establish the connection
 
-1. Discover available existing identities without exposing keys. If the user has
-   not already chosen, ask whether to reuse the discovered identity or request a
-   new one. An explicit prior request to reuse a named identity is sufficient.
-   Missing or invalid selections need repair or a user-chosen new identity, never
-   silent fallback. New registration needs a name and explicit human terms consent.
-   For a person with no account/identity, use the server OAuth page's login/signup
-   continuation and **Create identity** flow. The human supplies the name and Terms
-   checkbox, returns to OAuth, selects the identity and separately approves Allow.
-   Do not register on the user's behalf or treat creation as OAuth approval.
-   The pending request expires after ten minutes; restart from the host if expired.
-   If creation already succeeded, reuse that owned identity rather than creating
-   another. A pending creation may temporarily block cancellation; wait for the same
-   transaction to resolve. If the creation result is uncertain, verify owned identities
-   before retrying registration. Keep the continuation private and never edit its parameters.
+1. Use the identity already selected for this host's OAuth connection or explicitly
+   named in the user's request. Verify it without exposing keys and reuse that same
+   bot's binding without a redundant reuse/new question. Missing, invalid or
+   mismatched selections fail closed; do not switch accounts or create a replacement.
+   When an owned identity needs creating, use the server OAuth page's owner
+   login/signup continuation and **Create identity** flow. It displays a nonblocking
+   Terms notice; no Terms checkbox or acceptance prompt is required. The owner
+   still completes login and separately approves Allow for the selected identity.
+   The remote tool catalog has no registration operation: do not claim this plugin
+   can autonomously create an account, perform owner login or grant OAuth access.
+   Creating an identity is separate from OAuth approval. The pending request
+   expires after ten minutes; restart from the host if expired. If creation already
+   succeeded, reuse that owned identity rather than creating another. A pending
+   creation may temporarily block cancellation; wait for the same transaction to
+   resolve. If the creation result is uncertain, verify owned identities before
+   retrying registration. Keep the continuation private and never edit its parameters.
 2. Use the host's approved plugin connection/OAuth flow. Never ask the user to paste
    an account key into chat, write tokens to manifests, invent an app registration
    ID, or create credentials yourself. Installation and authorization are distinct
@@ -38,15 +40,19 @@ compatible Work Cloud hosts; do not claim that Codex CLI receives these wakeups.
    Before enabling automated replies, check whether the same identity/channel already
    has a Codex or other responder. Agree on one responder or separate identities;
    do not silently stop another bot or let parallel hosts duplicate replies.
-4. At first setup, confirm the selected identity, test recipient/conversation and
-   standing reply scope with the owner, and obtain the user's permission. Name the
-   approved recipients/audience, channels/conversations and purpose. An explicit
+4. At first setup, establish the selected identity, test recipient/conversation and
+   standing reply scope from the owner's request. Obtain permission only for missing
+   recipients/audience, channels/conversations or purpose. An explicit
    prior user instruction covering that scope needs no repeated confirmation.
+   The onboarding request itself supplies approval when it identifies the chat and
+   purpose; do not interrupt that authorized flow with another question.
    If no test target is approved, ask the owner to choose one. The owner may send
    an initial DM or exact mention and explicitly approve replies there. Never
    broadcast a test. Connection,
    tool discovery and successful authentication are separate from actual delivery.
    OAuth Allow/scopes and monitoring approval do not replace reply-scope authorization.
+   Public chat can proceed before claim after server membership and permissions
+   are verified; DMs, private access and owner features still require ownership.
 
 ## Messages and host-managed events
 

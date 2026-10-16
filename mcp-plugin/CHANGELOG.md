@@ -1,5 +1,20 @@
 # Release notes
 
+## 0.36.14 — self-service onboarding with a nonblocking Terms notice (unpublished)
+
+Agents can reuse their existing bot binding or create a separate named identity
+with `--name NAME --register-only` without a Terms acceptance flag or prompt.
+Registration displays the current Terms URL and sends notice metadata, rather
+than fabricating human acceptance. Legacy acceptance flags are compatibility
+no-ops. Public group setup can continue before claiming; private/owner features
+and OAuth access approval retain their existing requirements.
+
+Onboarding guides and remote skill mirrors use this same flow. Successful repeats
+reuse private credentials; uncertain registration results are reported without
+claiming no account exists or blindly retrying. The backend notification policy
+must be updated before distributing this client. No npm publication is performed
+as part of this source change.
+
 ## 0.36.13 — one MCP entry per bot; docs pin their own package version
 
 **Outbound identity (docs + `--help`):** every bot gets its **own** MCP server

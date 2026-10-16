@@ -32,15 +32,15 @@ async function getOnboardingStatus(base, agentId, token, request = fetch) {
       return result;
     result.authentication = "ok";
     result.claimed = data.claimed;
-    result.next_step = data.claimed ? "verify_reply" : "claim_agent";
+    result.next_step = data.claimed ? "verify_reply" : "join_public_chat";
   } catch {}
   return result;
 }
 function claimSummary(status) {
   if (status.claimed === true)
-    return "Claimed: yes — verify an actual DM/reply before marking setup complete.";
+    return "Claimed: yes — verify an actual message/reply in the authorized conversation before marking setup complete.";
   if (status.claimed === false)
-    return `Claimed: NO — open ${status.claim_url} and enter the token from your private profile. Claiming unlocks DMs and private channels.`;
+    return `Claimed: NO — public group chat can proceed within the authorized scope and service limits. Claiming unlocks DMs, private channels and owner features: open ${status.claim_url} and enter the token from your private profile.`;
   return `Claimed: unknown — ownership could not be verified. Check the service and account; do not register a replacement. Claim entry: ${status.claim_url}`;
 }
 
@@ -416,23 +416,12 @@ function grokBindApplies(input) {
 // src/terms.ts
 var TERMS_URL = "https://agents-chat.com/terms";
 var TERMS_VERSION = "2026-05-29";
-function isTruthy(v) {
-  return typeof v === "string" && /^(1|true|yes)$/i.test(v.trim());
-}
-function decideTermsConsent(i) {
-  if (i.acceptFlag || isTruthy(i.acceptEnv)) {
-    return { mode: "accepted", version: TERMS_VERSION };
-  }
-  return {
-    mode: "refused",
-    message: `registering an agent requires accepting the AgentsChat terms (version ${TERMS_VERSION}).
-` + `  Read them:  ${TERMS_URL}
-` + `  Then re-run with:  --accept-terms   (or AGENTSCHAT_ACCEPT_TERMS=1)
-` + `  Prefer a browser? Register at https://agents-chat.com/join and pass the
-` + `  resulting credentials via --profile <name> or AGENTCHAT_TOKEN=<token>.
-` + `  Refusing to send acceptance you did not give — no account was created.`
-  };
-}
+var TERMS_NOTICE = {
+  url: TERMS_URL,
+  version: TERMS_VERSION,
+  requires_acceptance: false
+};
+var TERMS_NOTICE_TEXT = `Terms notice: ${TERMS_URL} (version ${TERMS_VERSION}). ` + "Registration continues without an acceptance prompt.";
 
 // src/tool-annotations.ts
 var R = { readOnlyHint: true, openWorldHint: true };
@@ -676,7 +665,7 @@ async function fireGrokWake(msg, cfg) {
 var package_default = {
   name: "agentschat-mcp",
   mcpName: "io.github.swswordholy-tech/agentschat-mcp",
-  version: "0.36.13",
+  version: "0.36.14",
   description: "Connect Claude Code to AgentsChat — AI Agent social network. Core tools stay lean while extended tool groups load on demand for lower token overhead and cleaner role-specific context.",
   type: "module",
   bin: {
@@ -1040,10 +1029,8 @@ function parseArgs() {
       parsed.registerOnly = "1";
       continue;
     }
-    if (arg === "--accept-terms") {
-      parsed.acceptTerms = "1";
+    if (arg === "--accept-terms")
       continue;
-    }
     const equal = arg.indexOf("=");
     const key = (equal < 0 ? arg : arg.slice(0, equal)).slice(2);
     if (!arg.startsWith("--") || !values.has(key)) {
@@ -1084,8 +1071,8 @@ Options:
   --profile <name>   Use specific profile (~/.agentschat/<name>.json, falls back to ~/.agentchat)
   --register-only    Save/inspect the selected identity and print a private setup result (includes a credential-bearing claim link), then exit.
   --register         Explicitly opt in to registering a new agent (implied by --name)
-  --accept-terms     Accept the terms at https://agents-chat.com/terms. REQUIRED to
-                     register (or AGENTSCHAT_ACCEPT_TERMS=1); never assumed for you.
+  --accept-terms     Deprecated compatibility flag; Terms are a nonblocking notice.
+                     No acceptance flag or AGENTSCHAT_ACCEPT_TERMS is needed.
   --id <id>          Existing agent ID paired with the token (or AGENTCHAT_AGENT_ID)
   --url <url>        Server URL (default: production)
   --token <token>    Auth token (or AGENTCHAT_TOKEN); requires its paired ID or an
@@ -1308,15 +1295,8 @@ if (identity.mode === "profile") {
 } else {
   const displayName = identity.displayName;
   const caps = ["claude-code", "coding", "chat"];
-  const consent = decideTermsConsent({
-    acceptFlag: !!cliArgs.acceptTerms,
-    acceptEnv: process.env.AGENTSCHAT_ACCEPT_TERMS
-  });
-  if (consent.mode === "refused") {
-    process.stderr.write(`[agentchat] ERROR: ${consent.message}
+  process.stderr.write(`[agentchat] ${TERMS_NOTICE_TEXT}
 `);
-    process.exit(1);
-  }
   process.stderr.write(`[agentchat] Registering "${displayName}" with server...
 `);
   try {
@@ -1328,8 +1308,7 @@ if (identity.mode === "profile") {
         type: "agent",
         capabilities: caps,
         source: "mcp",
-        accepted_terms: true,
-        terms_version: consent.version
+        terms_notice_version: TERMS_VERSION
       })
     });
     if (regRes.ok) {
@@ -1340,23 +1319,24 @@ if (identity.mode === "profile") {
         token: data.key,
         capabilities: caps
       };
+      validateIdentityProfile(profile, profileFile);
       process.stderr.write(`[agentchat] Registered! ID: ${data.id}
 `);
       process.stderr.write(`[agentchat] Claim entry: ${REST_URL}/chat/${encodeURIComponent(data.id)}?claim=1 \u2014 enter the key from your private profile in the browser.
 `);
-      process.stderr.write(`[agentchat] Next steps: confirm ownership, configure your runtime, then verify one real reply. Registration alone is not setup completion.
+      process.stderr.write(`[agentchat] Next steps: configure your runtime, join the authorized public conversation and verify a real message/reply. Claiming is only needed for private access and owner features.
 `);
     } else {
       const body = await regRes.text().catch(() => "");
       process.stderr.write(`[agentchat] ERROR: registration refused by ${REST_URL} \u2014 HTTP ${regRes.status} ${body.slice(0, 300)}
-` + `  No profile was written and no account exists. Nothing is running.
-` + `  If this mentions terms, read ${TERMS_URL} and re-run with --accept-terms.
+` + `  No profile was written. Check the service response before retrying registration. Nothing is running.
+` + `  If the service requires accepted_terms, its agent onboarding must be updated; this client does not fabricate acceptance.
 `);
       process.exit(1);
     }
   } catch (e) {
     process.stderr.write(`[agentchat] ERROR: Registration failed: ${e}
-` + `  No profile was written and no account exists. Nothing is running.
+` + `  No profile was written. Registration may have completed on the service; check the result before retrying. Nothing is running.
 `);
     process.exit(1);
   }
@@ -1369,61 +1349,59 @@ if (!hasToken && profile.token === "dev-token" && !shouldMigrateDevToken({ sourc
   process.stderr.write(`[agentchat] Profile at ${profileFile} carries a dev-token but no identity was declared \u2014 ` + `refusing to auto-register. Pass --name <name> or --register to create a real agent.
 `);
 } else if (!hasToken && profile.token === "dev-token") {
-  const migrationConsent = decideTermsConsent({
-    acceptFlag: !!cliArgs.acceptTerms,
-    acceptEnv: process.env.AGENTSCHAT_ACCEPT_TERMS
-  });
-  if (migrationConsent.mode === "refused") {
-    process.stderr.write(`[agentchat] Profile at ${profileFile} carries a placeholder dev-token and cannot authenticate.
-` + `  Healing it registers a real account: ${migrationConsent.message}
+  process.stderr.write(`[agentchat] ${TERMS_NOTICE_TEXT}
 `);
-  } else {
-    const terms = { accepted_terms: true, terms_version: migrationConsent.version };
-    process.stderr.write(`[agentchat] Migrating dev-token profile \u2014 registering with server...
+  const terms = { terms_notice_version: TERMS_VERSION };
+  process.stderr.write(`[agentchat] Migrating dev-token profile \u2014 registering with server...
 `);
-    try {
-      const regRes = await apiFetch(`${REST_URL}/api/account/register`, {
+  try {
+    const regRes = await apiFetch(`${REST_URL}/api/account/register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id: profile.agent_id, name: profile.display_name, type: "agent", capabilities: profile.capabilities || [], ...terms })
+    });
+    if (regRes.ok) {
+      const data = await regRes.json();
+      const repaired = { ...profile, agent_id: data.id, token: data.key };
+      validateIdentityProfile(repaired, profileFile);
+      safeWriteProfile(profileFile, repaired);
+      profile = repaired;
+      process.stderr.write(`[agentchat] Migrated! New key saved. ID: ${data.id}
+`);
+    } else if (regRes.status === 409) {
+      const regRes2 = await apiFetch(`${REST_URL}/api/account/register`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ id: profile.agent_id, name: profile.display_name, type: "agent", capabilities: profile.capabilities || [], ...terms })
+        body: JSON.stringify({ name: profile.display_name, type: "agent", capabilities: profile.capabilities || [], ...terms })
       });
-      if (regRes.ok) {
-        const data = await regRes.json();
-        profile.agent_id = data.id;
-        profile.token = data.key;
-        safeWriteProfile(profileFile, profile);
-        process.stderr.write(`[agentchat] Migrated! New key saved. ID: ${data.id}
+      if (regRes2.ok) {
+        const data = await regRes2.json();
+        const repaired = { ...profile, agent_id: data.id, token: data.key };
+        validateIdentityProfile(repaired, profileFile);
+        safeWriteProfile(profileFile, repaired);
+        profile = repaired;
+        process.stderr.write(`[agentchat] Migrated with new ID: ${data.id}
 `);
       } else {
-        const regRes2 = await apiFetch(`${REST_URL}/api/account/register`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ name: profile.display_name, type: "agent", capabilities: profile.capabilities || [], ...terms })
-        });
-        if (regRes2.ok) {
-          const data = await regRes2.json();
-          profile.agent_id = data.id;
-          profile.token = data.key;
-          safeWriteProfile(profileFile, profile);
-          process.stderr.write(`[agentchat] Migrated with new ID: ${data.id}
-`);
-        } else {
-          const body = await regRes2.text().catch(() => "");
-          process.stderr.write(`[agentchat] WARNING: dev-token migration refused \u2014 HTTP ${regRes2.status} ${body.slice(0, 200)}
+        const body = await regRes2.text().catch(() => "");
+        process.stderr.write(`[agentchat] WARNING: dev-token migration refused \u2014 HTTP ${regRes2.status} ${body.slice(0, 200)}
 ` + `  This profile still holds a placeholder token; authenticated calls will fail.
 `);
-        }
       }
-    } catch (e) {
-      process.stderr.write(`[agentchat] dev-token migration failed: ${e}
+    } else {
+      const body = await regRes.text().catch(() => "");
+      process.stderr.write(`[agentchat] WARNING: dev-token migration refused \u2014 HTTP ${regRes.status} ${body.slice(0, 200)}; no alternate identity was registered.
 `);
     }
+  } catch (e) {
+    process.stderr.write(`[agentchat] dev-token migration failed: ${e}. Check the registration result before retrying; the saved placeholder profile is unchanged.
+`);
   }
 }
 if (!hasToken && profile.token === "dev-token") {
   process.stderr.write(`[agentchat] ERROR: profile ${profileFile} holds a placeholder dev-token, which cannot authenticate.
 ` + `  Not starting \u2014 a server that lists tools it cannot use is worse than one that fails.
-` + `  Heal it:      --accept-terms   (registers a real account for this profile)
+` + `  Repair it:    --profile <name>   (registers a real account for this declared placeholder)
 ` + `  Or replace:   register at https://agents-chat.com/join, then use --profile <name>
 ` + `                or AGENTCHAT_TOKEN=<token>
 `);
@@ -1502,7 +1480,7 @@ if (cliArgs.name && profile.display_name !== cliArgs.name) {
   profile.display_name = cliArgs.name;
 }
 if (cliArgs.registerOnly && !TOKEN) {
-  process.stderr.write(`[agentchat] Select an existing profile or use --name with explicit --accept-terms.
+  process.stderr.write(`[agentchat] Select an existing profile or use --name <name> / --register to self-register.
 `);
   process.exit(1);
 }
@@ -1511,7 +1489,7 @@ if (TOKEN && TOKEN !== "dev-token") {
   process.stderr.write(`[agentchat] ${claimSummary(status)}
 `);
   if (cliArgs.registerOnly) {
-    console.log(JSON.stringify({ ...status, claim_url: status.claimed === true ? null : `${status.chat_url}?key=${encodeURIComponent(TOKEN)}`, profile_file: activeProfileFile, reply_verified: false }));
+    console.log(JSON.stringify({ ...status, terms_notice: TERMS_NOTICE, claim_url: status.claimed === true ? null : `${status.chat_url}?key=${encodeURIComponent(TOKEN)}`, profile_file: activeProfileFile, reply_verified: false }));
     process.exit(0);
   }
 }

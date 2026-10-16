@@ -1,5 +1,9 @@
 /**
- * Integration guard for the identity/registration policy.
+ * Perspective: agents registering and operators preserving bot attribution.
+ * Invariant: explicit registration notifies without acceptance, existing/invalid
+ * bindings do not mint replacement identities, and unusable profiles never boot.
+ * Goal: catch registration side effects, credential writes and startup failures.
+ * Migration: retain with identity policy and real CLI protocol integration tests.
  *
  * Unit tests cover the decision function, but they cannot catch the failure that
  * actually shipped: the register call site was hoisted above apiFetch's `const`
@@ -35,16 +39,12 @@ beforeAll(() => {
       calls.push(`${req.method} ${u.pathname}`);
       authRequests.push({ path: u.pathname, authorization: req.headers.get("Authorization") });
       if (req.method === "POST" && u.pathname === "/api/account/register") {
-        // Mirror production: agent registration requires accepted_terms. The old mock
-        // accepted ANY payload, which is why the client could ship without the field
-        // and every real `npx agentschat-mcp --name X` 400'd with the suite green.
+        // Mirror self-service registration: Terms are informational, not a gate.
+        // Capture the actual client payload so tests reject fabricated acceptance.
         const body = await req.json().catch(() => ({})) as any;
         registerBodies.push(body);
-        if (body?.type === "agent" && body?.accepted_terms !== true) {
-          return Response.json({ error: "accepted_terms required for agent registration" }, { status: 400 });
-        }
         // Test-only lever: lets a test exercise hub-side rejection independently of
-        // the consent gate, without a production flag existing just for tests.
+        // Terms notification, without a production flag existing just for tests.
         if (body?.name === "RejectMe") {
           return Response.json({ error: "name unavailable" }, { status: 400 });
         }
@@ -192,35 +192,34 @@ describe("identity policy, end-to-end against a mock hub", () => {
     expect(written(home, ".agentschat")).toEqual(["Foo.json", "identity-guard.json"]);
     // Control for the failure-path test below: on success we must NOT print that line.
     expect(err).not.toMatch(/Registration failed/);
-    // The payload the hub actually validates.
-    expect(registerBodies[0]?.accepted_terms).toBe(true);
-    expect(registerBodies[0]?.terms_version).toBe(TERMS_VERSION);
+    expect(registerBodies[0]).not.toHaveProperty("accepted_terms");
+    expect(registerBodies[0]?.terms_notice_version).toBe(TERMS_VERSION);
   }, 15_000);
 
-  test("--name WITHOUT --accept-terms: registers nothing, writes nothing, exits 1", async () => {
+  test("--name without acceptance flags registers after a notice and persists a working identity", async () => {
     calls = [];
+    registerBodies = [];
     const home = freshHome("noterms");
-    const { err, code } = await drive(["--name", "Foo"], home, [INIT], 2500);
+    const { err, code, res } = await drive(["--name", "Foo"], home, [INIT], 2500);
 
-    // We must not accept a legal agreement on the operator's behalf.
-    expect(registerCalls()).toBe(0);
-    expect(code).toBe(1);
-    expect(err).toContain("https://agents-chat.com/terms"); // shows the document
-    expect(err).toMatch(/--accept-terms/); // and how to proceed
-    expect(written(home, ".agentschat")).toEqual([]);
+    expect(registerCalls()).toBe(1);
+    expect(code).not.toBe(1);
+    expect(err).toContain("Terms notice: https://agents-chat.com/terms");
+    expect(err).toContain("Registered!");
+    expect(res.get(1)?.result?.protocolVersion).toBe("2024-11-05");
+    expect(registerBodies[0]).not.toHaveProperty("accepted_terms");
+    expect(JSON.parse(readFileSync(join(home, ".agentschat", "Foo.json"), "utf8")).token).toBe("ac_mock_key");
     expect(written(home, ".agentchat")).toEqual([]);
   }, 15_000);
 
   test("a 400 from the hub leaves NO dev-token profile behind and exits 1", async () => {
-    // The shipped bug: server 400s (accepted_terms), client writes a `dev-token`
+    // A server rejection must not write a `dev-token`
     // profile and starts anyway → client shows a connected server with a full tool
     // list while every authenticated call 401s, and the placeholder then loads as
     // authoritative forever. A dead agent must not look like a live one.
     calls = [];
     const home = freshHome("dead");
-    // --accept-terms passes OUR gate; the hub rejects this name for its own reason,
-    // isolating the failure-handling path from the consent path.
-    const { err, code } = await drive(["--name", "RejectMe", "--accept-terms"], home, [INIT], 2500);
+    const { err, code } = await drive(["--name", "RejectMe"], home, [INIT], 2500);
 
     expect(code).toBe(1);
     expect(err).toMatch(/ERROR/);
@@ -293,11 +292,7 @@ describe("identity policy, end-to-end against a mock hub", () => {
     expect(err).not.toMatch(/MCP server started/);
   }, 15_000);
 
-  test("dev-token profile + refused terms: does not boot a dead agent", async () => {
-    // Reported by review against 7a0b2a6: the NEW-registration path exited 1, but the
-    // legacy dev-token heal path printed an equally good message and then started the
-    // server anyway (exit 0, full tool list). Same harm, second failure policy — and
-    // these are exactly the users the shipped 0.30.0 created.
+  test("a declared dev-token profile repairs itself after a nonblocking Terms notice", async () => {
     calls = [];
     const home = freshHome("devtokterms");
     mkdirSync(join(home, ".agentschat"), { recursive: true });
@@ -305,12 +300,14 @@ describe("identity policy, end-to-end against a mock hub", () => {
       join(home, ".agentschat", "victim.json"),
       JSON.stringify({ agent_id: "local", display_name: "Victim", token: "dev-token", capabilities: [] }),
     );
-    const { err, code } = await drive(["--profile", "victim"], home, [INIT, INITED, LIST], 2500);
+    const { err, code, res } = await drive(["--profile", "victim"], home, [INIT, INITED, LIST], 2500);
 
-    expect(registerCalls()).toBe(0); // no consent → no account
-    expect(code).toBe(1);
-    expect(err).not.toMatch(/MCP server started/);
-    expect(err).toContain("https://agents-chat.com/terms"); // still tells them how to fix it
+    expect(registerCalls()).toBe(1);
+    expect(code).not.toBe(1);
+    expect(err).toContain("Terms notice: https://agents-chat.com/terms");
+    expect(err).toContain("Migrated!");
+    expect(res.get(2)?.result?.tools.some((tool: any) => tool.name === "whoami")).toBe(true);
+    expect(JSON.parse(readFileSync(join(home, ".agentschat", "victim.json"), "utf8")).token).toBe("ac_mock_key");
   }, 15_000);
 
   test("a real key still boots normally (control for the dev-token guard)", async () => {
