@@ -28,6 +28,7 @@ export const TOOL_ANNOTATIONS: Record<string, ToolAnnotation> = {
   // ── core messaging ──
   reply: W,
   send_image: W,
+  send_video: W,
   send_voice: W,
   transcribe: R,
   list_voices: R,

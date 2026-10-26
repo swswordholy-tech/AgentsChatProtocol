@@ -70,6 +70,7 @@ import {
   fireGrokWake,
   fireAntigravityWake,
   fireZcodeWake,
+  formatWakeAttachments,
   resolveGrokAgentId,
   resolveGrokGatewayPath,
   grokBearerFromGatewayConfig,
@@ -1007,10 +1008,10 @@ const TOOL_GROUPS: ToolGroupMeta[] = [
   },
   {
     name: "media",
-    summary: "Send images and voice/audio clips into channels (upload a local file or attach an already-hosted url).",
+    summary: "Send images, videos, and voice/audio clips into channels (upload a local file or attach an already-hosted url).",
     tags: ["chat", "media"],
-    estimated_tokens: 700,
-    tools: ["send_image", "send_voice", "set_voice", "list_voices", "transcribe"],
+    estimated_tokens: 750,
+    tools: ["send_image", "send_video", "send_voice", "set_voice", "list_voices", "transcribe"],
   },
 ];
 
@@ -1082,6 +1083,24 @@ const ALL_TOOL_DEFS = [
           caption: { type: "string", description: "Optional text shown alongside the image" },
           width: { type: "number", description: "Image width in px (optional; prevents receiver list reflow)" },
           height: { type: "number", description: "Image height in px (optional)" },
+        },
+        required: ["chat_id"],
+      },
+    },
+    {
+      name: "send_video",
+      description: "Send a video clip into a channel. Give a local file `path` (mp4/mov/webm/m4v; the plugin uploads it for you) OR an already-hosted `url` (/api/file/uploads/*). `caption` becomes the message text.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          chat_id: { type: "string", description: "Channel id to post into" },
+          path: { type: "string", description: "Local video file to upload (mp4/mov/webm/m4v; ≤50MB). Provide this OR url." },
+          url: { type: "string", description: "Already-uploaded proxy url (/api/file/uploads/<name>). Provide this OR path." },
+          caption: { type: "string", description: "Optional text shown alongside the video" },
+          width: { type: "number", description: "Video width in px (optional)" },
+          height: { type: "number", description: "Video height in px (optional)" },
+          duration_ms: { type: "number", description: "Video duration in milliseconds (optional)" },
+          transcript: { type: "string", description: "Optional transcript or summary of the video" },
         },
         required: ["chat_id"],
       },
@@ -2074,19 +2093,22 @@ HANDLERS.set("list_my_channels", async (args) => {
 const MEDIA_MIME_BY_EXT: Record<string, string> = {
   jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png", gif: "image/gif",
   webp: "image/webp", heic: "image/heic", heif: "image/heif", avif: "image/avif",
-  m4a: "audio/mp4", mp4: "audio/mp4", aac: "audio/aac", mp3: "audio/mpeg",
-  wav: "audio/wav", weba: "audio/webm", webm: "audio/webm", ogg: "audio/ogg", oga: "audio/ogg",
+  mp4: "video/mp4", mov: "video/quicktime", m4v: "video/x-m4v", webm: "video/webm", "3gp": "video/3gpp",
+  m4a: "audio/mp4", aac: "audio/aac", mp3: "audio/mpeg",
+  wav: "audio/wav", weba: "audio/webm", ogg: "audio/ogg", oga: "audio/ogg",
 };
-function mimeFromPath(p: string): string {
+function mimeFromPath(p: string, kindHint?: "image" | "video" | "audio"): string {
   const ext = p.split(".").pop()?.toLowerCase() ?? "";
+  if (kindHint === "audio" && ext === "mp4") return "audio/mp4";
+  if (kindHint === "audio" && ext === "webm") return "audio/webm";
   return MEDIA_MIME_BY_EXT[ext] ?? "application/octet-stream";
 }
 // Upload a local file via multipart POST /api/upload → { url, mime, size }.
-async function uploadLocalFile(path: string): Promise<{ url: string; mime: string; size: number }> {
+async function uploadLocalFile(path: string, kindHint?: "image" | "video" | "audio"): Promise<{ url: string; mime: string; size: number }> {
   // node:fs (not Bun.file) so this runs on plain Node too — Bun supports node:fs
   // identically, and the Node path is what registry introspection (Glama) uses.
   if (!existsSync(path)) throw new Error(`file not found: ${path}`);
-  const mime = mimeFromPath(path);
+  const mime = mimeFromPath(path, kindHint);
   const buf = readFileSync(path);
   const name = path.split("/").pop() || "upload";
   const form = new FormData();
@@ -2100,8 +2122,8 @@ async function uploadLocalFile(path: string): Promise<{ url: string; mime: strin
   if (!data?.url) throw new Error(`upload response missing url: ${text.slice(0, 120)}`);
   return { url: data.url as string, mime: (data.type as string) || mime, size: (data.size as number) ?? buf.byteLength };
 }
-// Post a message carrying exactly one media attachment (image|audio).
-async function sendMediaMessage(kind: "image" | "audio", args: any): Promise<{ content: any[]; isError?: boolean }> {
+// Post a message carrying exactly one media attachment (image|video|audio).
+async function sendMediaMessage(kind: "image" | "video" | "audio", args: any): Promise<{ content: any[]; isError?: boolean }> {
   const { chat_id, path, url, caption } = (args || {}) as { chat_id?: string; path?: string; url?: string; caption?: string };
   if (!chat_id) return { content: [{ type: "text", text: "Error: chat_id required" }], isError: true };
   // `text` (speak-via-TTS) is an audio-only third source, alongside path/url.
@@ -2135,11 +2157,11 @@ async function sendMediaMessage(kind: "image" | "audio", args: any): Promise<{ c
       mime = (d.mime as string) || "audio/mpeg";
       ttsDuration = typeof d.duration_ms === "number" ? d.duration_ms : undefined;
     } else if (path) {
-      const up = await uploadLocalFile(path);
+      const up = await uploadLocalFile(path, kind);
       finalUrl = up.url; mime = up.mime; size = up.size;
     } else {
       finalUrl = url as string;
-      mime = mimeFromPath(finalUrl);
+      mime = mimeFromPath(finalUrl, kind);
     }
     const attachment: Record<string, any> = { type: kind, url: finalUrl };
     if (mime && mime !== "application/octet-stream") attachment.mime = mime;
@@ -2147,6 +2169,11 @@ async function sendMediaMessage(kind: "image" | "audio", args: any): Promise<{ c
     if (kind === "image") {
       if (typeof args.width === "number") attachment.width = args.width;
       if (typeof args.height === "number") attachment.height = args.height;
+    } else if (kind === "video") {
+      if (typeof args.width === "number") attachment.width = args.width;
+      if (typeof args.height === "number") attachment.height = args.height;
+      if (typeof args.duration_ms === "number") attachment.duration_ms = args.duration_ms;
+      if (typeof args.transcript === "string" && args.transcript) attachment.transcript = args.transcript;
     } else {
       const dur = typeof args.duration_ms === "number" ? args.duration_ms : ttsDuration;
       if (dur != null) attachment.duration_ms = dur;
@@ -2169,6 +2196,7 @@ async function sendMediaMessage(kind: "image" | "audio", args: any): Promise<{ c
   }
 }
 HANDLERS.set("send_image", (args) => sendMediaMessage("image", args));
+HANDLERS.set("send_video", (args) => sendMediaMessage("video", args));
 HANDLERS.set("send_voice", (args) => sendMediaMessage("audio", args));
 
 // list_voices — the server's curated TTS voice catalog (GET /api/voices), so an
@@ -3795,6 +3823,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         } else if (a.type === "image") {
           const dim = a.width && a.height ? ` ${a.width}×${a.height}` : "";
           line += `\n    🖼 image${dim}: ${a.url}`;
+        } else if (a.type === "video") {
+          const dim = a.width && a.height ? ` ${a.width}×${a.height}` : "";
+          const dur = typeof a.duration_ms === "number" ? ` ${(a.duration_ms / 1000).toFixed(1)}s` : "";
+          line += `\n    🎬 video${dim}${dur}: ${a.url}`;
+          if (a.transcript) {
+            line += `\n       transcript: "${String(a.transcript).slice(0, 400)}"`;
+          }
         } else {
           line += `\n    📎 ${a.type || "file"}: ${a.url}`;
         }
@@ -4745,7 +4780,7 @@ function connectWS() {
               const truncatedMsgs = trimmed.length < msgs.length;
               if (trimmed.length > 0) {
                 const context = trimmed
-                  .map((m: any) => `${m.sender_id}: ${m.content}`)
+                  .map((m: any) => `${m.sender_id}: ${m.content}${formatWakeAttachments(m.attachments)}`)
                   .join("\n");
                 const note = truncatedMsgs
                   ? `[频道上下文 - 最近 ${trimmed.length} 条消息（更早的已截断保护上下文窗口）]`
@@ -4768,10 +4803,11 @@ function connectWS() {
 
         // 推送给 Claude Code
         try {
+          const notifAtt = formatWakeAttachments(data.attachments);
           await server.notification({
             method: process.env.CLAUDE_CODE_ENTRYPOINT ? "notifications/claude/channel" : "notifications/chat/channel",
             params: {
-              content: contextPrefix + data.content,
+              content: contextPrefix + (data.content || "") + notifAtt,
               meta: {
                 chat_id: data.channel_id,
                 sender_id: data.sender_id,

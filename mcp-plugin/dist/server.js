@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 // @bun
+import { createRequire } from "node:module";
+var __require = /* @__PURE__ */ createRequire(import.meta.url);
 
 // src/onboarding-status.ts
 async function getOnboardingStatus(base, agentId, token, request = fetch) {
@@ -428,6 +430,7 @@ var D = { readOnlyHint: false, destructiveHint: true, openWorldHint: true };
 var TOOL_ANNOTATIONS = {
   reply: W,
   send_image: W,
+  send_video: W,
   send_voice: W,
   transcribe: R,
   list_voices: R,
@@ -512,14 +515,47 @@ function redactSecrets2(text) {
 var WAKE_SIG_HEADER = "x-agentschat-signature";
 var WAKE_CONTENT_MAX = 500;
 var NATIVE_WAKE_CONTENT_MAX = 4000;
+function formatWakeAttachments(attachments) {
+  if (!Array.isArray(attachments) || attachments.length === 0)
+    return "";
+  const lines = [];
+  for (const raw of attachments) {
+    if (!raw || typeof raw !== "object")
+      continue;
+    const a = raw;
+    if (typeof a.url !== "string" || !a.url)
+      continue;
+    const t = typeof a.type === "string" ? a.type : "file";
+    const dim = typeof a.width === "number" && typeof a.height === "number" ? ` ${a.width}×${a.height}` : "";
+    const dur = typeof a.duration_ms === "number" ? ` ${(a.duration_ms / 1000).toFixed(1)}s` : "";
+    const icon = t === "image" ? "\uD83D\uDDBC" : t === "video" ? "\uD83C\uDFAC" : t === "audio" ? "\uD83D\uDD0A" : "\uD83D\uDCCE";
+    let desc = `${icon} ${t}${dim}${dur}: ${a.url}`;
+    if (typeof a.transcript === "string" && a.transcript.trim()) {
+      desc += ` (transcript: "${redactSecrets2(a.transcript.trim().slice(0, 300))}")`;
+    }
+    lines.push(desc);
+  }
+  return lines.length > 0 ? ` [附件: ${lines.join("; ")}]` : "";
+}
 function buildWakePayload(msg) {
   const content = typeof msg.content === "string" ? redactSecrets2(msg.content.slice(0, WAKE_CONTENT_MAX)) : undefined;
+  const attachments = Array.isArray(msg.attachments) && msg.attachments.length > 0 ? msg.attachments.filter((a) => a && typeof a === "object" && typeof a.url === "string").map((a) => ({
+    type: typeof a.type === "string" ? a.type : undefined,
+    url: a.url,
+    mime: typeof a.mime === "string" ? a.mime : undefined,
+    size: typeof a.size === "number" ? a.size : undefined,
+    width: typeof a.width === "number" ? a.width : undefined,
+    height: typeof a.height === "number" ? a.height : undefined,
+    duration_ms: typeof a.duration_ms === "number" ? a.duration_ms : undefined,
+    transcript: typeof a.transcript === "string" ? redactSecrets2(a.transcript.slice(0, 300)) : undefined
+  })) : undefined;
   return {
     type: typeof msg.type === "string" ? msg.type : "message",
     channel_id: msg.channel_id,
     message_id: msg.id,
     sender_id: msg.sender_id,
     content,
+    ...attachments && attachments.length > 0 ? { attachments } : {},
     mentioned_ids: Array.isArray(msg.mentioned_ids) ? msg.mentioned_ids.filter((x) => typeof x === "string") : undefined,
     timestamp: typeof msg.timestamp === "string" ? msg.timestamp : undefined
   };
@@ -570,9 +606,10 @@ function buildGrokPrompt(msg, agentId, contextPrefix = "") {
   const isDm = channel.startsWith("dm-");
   const where = isDm ? "私聊 (DM)" : `频道 ${channel}`;
   const actionHint = isTruncated ? `——消息已截断，可调 get_history 查看全文，再用 reply 回复` : `——请直接用 reply 回复；仅需更早历史时调 get_history`;
+  const attSummary = formatWakeAttachments(msg.attachments);
   const prompt = (cleanPrefix ? `${cleanPrefix}
 
-` : "") + `[AgentsChat] ${sender} 在${where}提到了你` + (content ? `："${content}${isTruncated ? " …[truncated]" : ""}"` : "。") + (msgId ? ` (channel_id=${channel}, message_id=${msgId}${actionHint})` : "");
+` : "") + `[AgentsChat] ${sender} 在${where}提到了你` + (content ? `："${content}${isTruncated ? " …[truncated]" : ""}"` : "。") + attSummary + (msgId ? ` (channel_id=${channel}, message_id=${msgId}${actionHint})` : "");
   return { agentId, prompt };
 }
 function grokBearerFromGatewayConfig(cfg) {
@@ -628,8 +665,8 @@ async function fireGrokWake(msg, cfg) {
   }
   let gwcfg;
   try {
-    const { readFileSync } = await import("node:fs");
-    gwcfg = JSON.parse(readFileSync(cfg.gatewayConfigPath, "utf8"));
+    const { readFileSync: readFileSync3 } = await import("node:fs");
+    gwcfg = JSON.parse(readFileSync3(cfg.gatewayConfigPath, "utf8"));
   } catch (e) {
     log(`[agentchat] grok wake: cannot read ${cfg.gatewayConfigPath}: ${e}`);
     return;
@@ -680,9 +717,10 @@ function buildWakePrompt(msg, contextPrefix = "") {
   const isDm = channel.startsWith("dm-");
   const where = isDm ? `私聊 (${channel})` : `频道 ${channel}`;
   const actionHint = isTruncated ? ` —— 消息过长已截断，可调用 get_history(chat_id, message_id) 查看全文，再用 reply 回复并 mark_read 标记已读` : ` —— 请直接用 reply 回复并用 mark_read 标记已读；仅在需要更早上下文时调用 get_history`;
+  const attSummary = formatWakeAttachments(msg.attachments);
   return (cleanPrefix ? `${cleanPrefix}
 
-` : "") + `[AgentsChat] ${sender} 在${where}给你发了消息` + (content ? `："${content}${isTruncated ? " …[truncated]" : ""}"` : "。") + ` (channel_id=${channel}` + (msgId ? `, message_id=${msgId}` : "") + `${actionHint})`;
+` : "") + `[AgentsChat] ${sender} 在${where}给你发了消息` + (content ? `："${content}${isTruncated ? " …[truncated]" : ""}"` : "。") + attSummary + ` (channel_id=${channel}` + (msgId ? `, message_id=${msgId}` : "") + `${actionHint})`;
 }
 async function fireAntigravityWake(msg, cfg) {
   const log = cfg.logger ?? (() => {});
@@ -754,8 +792,8 @@ async function resolveZcodeCommand(explicitBin) {
   }
   const macAppBundleCjs = "/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs";
   try {
-    const { existsSync } = await import("node:fs");
-    if (existsSync(macAppBundleCjs)) {
+    const { existsSync: existsSync2 } = await import("node:fs");
+    if (existsSync2(macAppBundleCjs)) {
       return { cmd: "node", prefixArgs: [macAppBundleCjs] };
     }
   } catch {}
@@ -795,7 +833,7 @@ function fireZcodeWake(msg, cfg) {
         return;
       }
       const { spawn } = await import("node:child_process");
-      await new Promise((resolve) => {
+      await new Promise((resolve2) => {
         const child = spawn(cmd, args, {
           cwd: cfg.workspacePath || process.cwd(),
           env,
@@ -814,7 +852,7 @@ function fireZcodeWake(msg, cfg) {
         child.on("error", (err) => {
           clearTimeout(timer);
           log(`[agentchat] zcode wake spawn error (${sessionId}): ${err}`);
-          resolve();
+          resolve2();
         });
         child.on("close", (code) => {
           clearTimeout(timer);
@@ -822,7 +860,7 @@ function fireZcodeWake(msg, cfg) {
           if (!succeeded) {
             log(`[agentchat] zcode wake (${sessionId}) exited code=${code}${stderr ? `: ${stderr.trim().slice(0, 200)}` : ""}`);
           }
-          resolve();
+          resolve2();
         });
       });
     } catch (e) {
@@ -2320,10 +2358,10 @@ var TOOL_GROUPS = [
   },
   {
     name: "media",
-    summary: "Send images and voice/audio clips into channels (upload a local file or attach an already-hosted url).",
+    summary: "Send images, videos, and voice/audio clips into channels (upload a local file or attach an already-hosted url).",
     tags: ["chat", "media"],
-    estimated_tokens: 700,
-    tools: ["send_image", "send_voice", "set_voice", "list_voices", "transcribe"]
+    estimated_tokens: 750,
+    tools: ["send_image", "send_video", "send_voice", "set_voice", "list_voices", "transcribe"]
   }
 ];
 var TOOL_NAME_TO_GROUP = new Map;
@@ -2386,6 +2424,24 @@ var ALL_TOOL_DEFS = [
         caption: { type: "string", description: "Optional text shown alongside the image" },
         width: { type: "number", description: "Image width in px (optional; prevents receiver list reflow)" },
         height: { type: "number", description: "Image height in px (optional)" }
+      },
+      required: ["chat_id"]
+    }
+  },
+  {
+    name: "send_video",
+    description: "Send a video clip into a channel. Give a local file `path` (mp4/mov/webm/m4v; the plugin uploads it for you) OR an already-hosted `url` (/api/file/uploads/*). `caption` becomes the message text.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        chat_id: { type: "string", description: "Channel id to post into" },
+        path: { type: "string", description: "Local video file to upload (mp4/mov/webm/m4v; \u226450MB). Provide this OR url." },
+        url: { type: "string", description: "Already-uploaded proxy url (/api/file/uploads/<name>). Provide this OR path." },
+        caption: { type: "string", description: "Optional text shown alongside the video" },
+        width: { type: "number", description: "Video width in px (optional)" },
+        height: { type: "number", description: "Video height in px (optional)" },
+        duration_ms: { type: "number", description: "Video duration in milliseconds (optional)" },
+        transcript: { type: "string", description: "Optional transcript or summary of the video" }
       },
       required: ["chat_id"]
     }
@@ -3332,24 +3388,31 @@ var MEDIA_MIME_BY_EXT = {
   heic: "image/heic",
   heif: "image/heif",
   avif: "image/avif",
+  mp4: "video/mp4",
+  mov: "video/quicktime",
+  m4v: "video/x-m4v",
+  webm: "video/webm",
+  "3gp": "video/3gpp",
   m4a: "audio/mp4",
-  mp4: "audio/mp4",
   aac: "audio/aac",
   mp3: "audio/mpeg",
   wav: "audio/wav",
   weba: "audio/webm",
-  webm: "audio/webm",
   ogg: "audio/ogg",
   oga: "audio/ogg"
 };
-function mimeFromPath(p) {
+function mimeFromPath(p, kindHint) {
   const ext = p.split(".").pop()?.toLowerCase() ?? "";
+  if (kindHint === "audio" && ext === "mp4")
+    return "audio/mp4";
+  if (kindHint === "audio" && ext === "webm")
+    return "audio/webm";
   return MEDIA_MIME_BY_EXT[ext] ?? "application/octet-stream";
 }
-async function uploadLocalFile(path) {
+async function uploadLocalFile(path, kindHint) {
   if (!existsSync5(path))
     throw new Error(`file not found: ${path}`);
-  const mime = mimeFromPath(path);
+  const mime = mimeFromPath(path, kindHint);
   const buf = readFileSync5(path);
   const name = path.split("/").pop() || "upload";
   const form = new FormData;
@@ -3387,18 +3450,18 @@ async function sendMediaMessage(kind, args) {
     let ttsDuration;
     if (text) {
       const voice = typeof args.voice === "string" && args.voice ? args.voice : undefined;
-      const r = await apiFetch(`${REST_URL}/api/tts`, {
+      const r2 = await apiFetch(`${REST_URL}/api/tts`, {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${TOKEN}` },
         body: JSON.stringify({ text, ...voice ? { voice } : {} })
       });
-      const t = await r.text();
-      if (r.status === 429 && /MEDIA_BUDGET_EXCEEDED/i.test(t))
+      const t = await r2.text();
+      if (r2.status === 429 && /MEDIA_BUDGET_EXCEEDED/i.test(t))
         return { content: [{ type: "text", text: "Voice budget exhausted for today (MEDIA_BUDGET_EXCEEDED) \u2014 try again tomorrow, or send a recorded clip via path/url." }], isError: true };
-      if (r.status === 400 && /INVALID_VOICE/i.test(t))
+      if (r2.status === 400 && /INVALID_VOICE/i.test(t))
         return { content: [{ type: "text", text: "Invalid voice for TTS. Call list_voices for valid names, or omit `voice` to use your configured one." }], isError: true };
-      if (!r.ok)
-        return { content: [{ type: "text", text: `TTS failed (${r.status}): ${t.slice(0, 140)}` }], isError: true };
+      if (!r2.ok)
+        return { content: [{ type: "text", text: `TTS failed (${r2.status}): ${t.slice(0, 140)}` }], isError: true };
       let d;
       try {
         d = JSON.parse(t);
@@ -3411,13 +3474,13 @@ async function sendMediaMessage(kind, args) {
       mime = d.mime || "audio/mpeg";
       ttsDuration = typeof d.duration_ms === "number" ? d.duration_ms : undefined;
     } else if (path) {
-      const up = await uploadLocalFile(path);
+      const up = await uploadLocalFile(path, kind);
       finalUrl = up.url;
       mime = up.mime;
       size = up.size;
     } else {
       finalUrl = url;
-      mime = mimeFromPath(finalUrl);
+      mime = mimeFromPath(finalUrl, kind);
     }
     const attachment = { type: kind, url: finalUrl };
     if (mime && mime !== "application/octet-stream")
@@ -3429,6 +3492,15 @@ async function sendMediaMessage(kind, args) {
         attachment.width = args.width;
       if (typeof args.height === "number")
         attachment.height = args.height;
+    } else if (kind === "video") {
+      if (typeof args.width === "number")
+        attachment.width = args.width;
+      if (typeof args.height === "number")
+        attachment.height = args.height;
+      if (typeof args.duration_ms === "number")
+        attachment.duration_ms = args.duration_ms;
+      if (typeof args.transcript === "string" && args.transcript)
+        attachment.transcript = args.transcript;
     } else {
       const dur = typeof args.duration_ms === "number" ? args.duration_ms : ttsDuration;
       if (dur != null)
@@ -3454,6 +3526,7 @@ async function sendMediaMessage(kind, args) {
   }
 }
 HANDLERS.set("send_image", (args) => sendMediaMessage("image", args));
+HANDLERS.set("send_video", (args) => sendMediaMessage("video", args));
 HANDLERS.set("send_voice", (args) => sendMediaMessage("audio", args));
 HANDLERS.set("list_voices", async (args) => {
   const { language } = args || {};
@@ -4607,7 +4680,7 @@ ${results}` }] };
         } catch {}
       }
       try {
-        await new Promise((r) => setTimeout(r, 500));
+        await new Promise((r2) => setTimeout(r2, 500));
         const r = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(chat_id)}/members`, { headers: { Authorization: `Bearer ${TOKEN}` } });
         if (r.ok) {
           const data = await r.json();
@@ -4992,6 +5065,15 @@ ${list}` }] };
             const dim = a.width && a.height ? ` ${a.width}\xD7${a.height}` : "";
             line += `
     \uD83D\uDDBC image${dim}: ${a.url}`;
+          } else if (a.type === "video") {
+            const dim = a.width && a.height ? ` ${a.width}\xD7${a.height}` : "";
+            const dur = typeof a.duration_ms === "number" ? ` ${(a.duration_ms / 1000).toFixed(1)}s` : "";
+            line += `
+    \uD83C\uDFAC video${dim}${dur}: ${a.url}`;
+            if (a.transcript) {
+              line += `
+       transcript: "${String(a.transcript).slice(0, 400)}"`;
+            }
           } else {
             line += `
     \uD83D\uDCCE ${a.type || "file"}: ${a.url}`;
@@ -5783,7 +5865,7 @@ function connectWS() {
               }
               const truncatedMsgs = trimmed.length < msgs.length;
               if (trimmed.length > 0) {
-                const context = trimmed.map((m) => `${m.sender_id}: ${m.content}`).join(`
+                const context = trimmed.map((m) => `${m.sender_id}: ${m.content}${formatWakeAttachments(m.attachments)}`).join(`
 `);
                 const note = truncatedMsgs ? `[\u9891\u9053\u4E0A\u4E0B\u6587 - \u6700\u8FD1 ${trimmed.length} \u6761\u6D88\u606F\uFF08\u66F4\u65E9\u7684\u5DF2\u622A\u65AD\u4FDD\u62A4\u4E0A\u4E0B\u6587\u7A97\u53E3\uFF09]` : `[\u9891\u9053\u4E0A\u4E0B\u6587 - \u81EA\u4E0A\u6B21 @mention \u4EE5\u6765 ${trimmed.length} \u6761\u6D88\u606F]`;
                 contextPrefix = `${note}
@@ -5807,10 +5889,11 @@ ${context}
         process.stderr.write(`[agentchat] ${isDM ? "DM" : isMentioned ? "@mention" : isOwnLoopTick ? "loop-tick" : "HI-active"} from ${String(data.sender_id ?? "?").slice(0, 8)}: ${String(data.content ?? "").slice(0, 50)}
 `);
         try {
+          const notifAtt = formatWakeAttachments(data.attachments);
           await server.notification({
             method: process.env.CLAUDE_CODE_ENTRYPOINT ? "notifications/claude/channel" : "notifications/chat/channel",
             params: {
-              content: contextPrefix + data.content,
+              content: contextPrefix + (data.content || "") + notifAtt,
               meta: {
                 chat_id: data.channel_id,
                 sender_id: data.sender_id,
@@ -5827,15 +5910,15 @@ ${context}
         if (process.env.AGENTCHAT_WAKE_MODE === "grok") {
           (async () => {
             try {
-              const { readFileSync, existsSync } = await import("fs");
-              const gwPath = resolveGrokGatewayPath(process.env.AGENTCHAT_GROK_GATEWAY, existsSync);
+              const { readFileSync: readFileSync6, existsSync: existsSync6 } = await import("fs");
+              const gwPath = resolveGrokGatewayPath(process.env.AGENTCHAT_GROK_GATEWAY, existsSync6);
               let agentId = process.env.AGENTCHAT_GROK_AGENT_ID || "";
               if (!agentId) {
                 agentId = await resolveGrokAgentId({
                   explicitId: "",
                   agentschatName: profile.display_name || AGENT_ID,
                   listAgents: async () => {
-                    const gwcfg = JSON.parse(readFileSync(gwPath, "utf8"));
+                    const gwcfg = JSON.parse(readFileSync6(gwPath, "utf8"));
                     const token = grokBearerFromGatewayConfig(gwcfg);
                     const port = grokPortFromGatewayConfig(gwcfg);
                     const res = await fetch(`http://127.0.0.1:${port}/api/listAgents`, {

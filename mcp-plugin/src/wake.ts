@@ -33,12 +33,24 @@ export const WAKE_CONTENT_MAX = 500;
 /** Cap for native IDE/CLI wake prompts (Antigravity / ZCode), matching get_history per-message cap. */
 export const NATIVE_WAKE_CONTENT_MAX = 4000;
 
+export interface WakeAttachment {
+  type?: string;
+  url?: string;
+  mime?: string;
+  size?: number;
+  width?: number;
+  height?: number;
+  duration_ms?: number;
+  transcript?: string;
+}
+
 export interface WakeMessage {
   type?: string;
   id?: string;
   channel_id?: string;
   sender_id?: string;
   content?: string;
+  attachments?: WakeAttachment[];
   mentioned_ids?: string[];
   timestamp?: string;
   /** Anything credential-shaped is stripped; these are accepted only to be dropped. */
@@ -53,8 +65,29 @@ export interface WakePayload {
   message_id?: string;
   sender_id?: string;
   content?: string;
+  attachments?: WakeAttachment[];
   mentioned_ids?: string[];
   timestamp?: string;
+}
+
+export function formatWakeAttachments(attachments: unknown): string {
+  if (!Array.isArray(attachments) || attachments.length === 0) return "";
+  const lines: string[] = [];
+  for (const raw of attachments) {
+    if (!raw || typeof raw !== "object") continue;
+    const a = raw as WakeAttachment;
+    if (typeof a.url !== "string" || !a.url) continue;
+    const t = typeof a.type === "string" ? a.type : "file";
+    const dim = typeof a.width === "number" && typeof a.height === "number" ? ` ${a.width}×${a.height}` : "";
+    const dur = typeof a.duration_ms === "number" ? ` ${(a.duration_ms / 1000).toFixed(1)}s` : "";
+    const icon = t === "image" ? "🖼" : t === "video" ? "🎬" : t === "audio" ? "🔊" : "📎";
+    let desc = `${icon} ${t}${dim}${dur}: ${a.url}`;
+    if (typeof a.transcript === "string" && a.transcript.trim()) {
+      desc += ` (transcript: "${redactSecrets(a.transcript.trim().slice(0, 300))}")`;
+    }
+    lines.push(desc);
+  }
+  return lines.length > 0 ? ` [附件: ${lines.join("; ")}]` : "";
 }
 
 /**
@@ -67,12 +100,27 @@ export function buildWakePayload(msg: WakeMessage): WakePayload {
   // caption/status) — a message with an ac_ key or JWT pasted into it must not leak
   // it into the wake body either.
   const content = typeof msg.content === "string" ? redactSecrets(msg.content.slice(0, WAKE_CONTENT_MAX)) : undefined;
+  const attachments = Array.isArray(msg.attachments) && msg.attachments.length > 0
+    ? msg.attachments
+        .filter((a) => a && typeof a === "object" && typeof a.url === "string")
+        .map((a) => ({
+          type: typeof a.type === "string" ? a.type : undefined,
+          url: a.url,
+          mime: typeof a.mime === "string" ? a.mime : undefined,
+          size: typeof a.size === "number" ? a.size : undefined,
+          width: typeof a.width === "number" ? a.width : undefined,
+          height: typeof a.height === "number" ? a.height : undefined,
+          duration_ms: typeof a.duration_ms === "number" ? a.duration_ms : undefined,
+          transcript: typeof a.transcript === "string" ? redactSecrets(a.transcript.slice(0, 300)) : undefined,
+        }))
+    : undefined;
   return {
     type: typeof msg.type === "string" ? msg.type : "message",
     channel_id: msg.channel_id,
     message_id: msg.id,
     sender_id: msg.sender_id,
     content,
+    ...(attachments && attachments.length > 0 ? { attachments } : {}),
     mentioned_ids: Array.isArray(msg.mentioned_ids) ? msg.mentioned_ids.filter((x) => typeof x === "string") : undefined,
     timestamp: typeof msg.timestamp === "string" ? msg.timestamp : undefined,
   };
@@ -183,10 +231,12 @@ export function buildGrokPrompt(msg: WakeMessage, agentId: string, contextPrefix
   const actionHint = isTruncated
     ? `——消息已截断，可调 get_history 查看全文，再用 reply 回复`
     : `——请直接用 reply 回复；仅需更早历史时调 get_history`;
+  const attSummary = formatWakeAttachments(msg.attachments);
   const prompt =
     (cleanPrefix ? `${cleanPrefix}\n\n` : "") +
     `[AgentsChat] ${sender} 在${where}提到了你` +
     (content ? `："${content}${isTruncated ? " …[truncated]" : ""}"` : "。") +
+    attSummary +
     (msgId ? ` (channel_id=${channel}, message_id=${msgId}${actionHint})` : "");
   return { agentId, prompt };
 }
@@ -359,10 +409,12 @@ export function buildWakePrompt(msg: WakeMessage, contextPrefix = ""): string {
   const actionHint = isTruncated
     ? ` —— 消息过长已截断，可调用 get_history(chat_id, message_id) 查看全文，再用 reply 回复并 mark_read 标记已读`
     : ` —— 请直接用 reply 回复并用 mark_read 标记已读；仅在需要更早上下文时调用 get_history`;
+  const attSummary = formatWakeAttachments(msg.attachments);
   return (
     (cleanPrefix ? `${cleanPrefix}\n\n` : "") +
     `[AgentsChat] ${sender} 在${where}给你发了消息` +
     (content ? `："${content}${isTruncated ? " …[truncated]" : ""}"` : "。") +
+    attSummary +
     ` (channel_id=${channel}` +
     (msgId ? `, message_id=${msgId}` : "") +
     `${actionHint})`
