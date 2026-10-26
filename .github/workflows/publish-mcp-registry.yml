@@ -29,6 +29,24 @@ jobs:
       - name: Authenticate with MCP Registry via GitHub OIDC
         run: mcp-publisher login github-oidc
 
+      - name: Align server.json version with latest published npm release
+        working-directory: mcp-plugin
+        run: |
+          node -e '
+            const fs = require("fs");
+            (async () => {
+              const srv = JSON.parse(fs.readFileSync("server.json", "utf8"));
+              const res = await fetch(`https://registry.npmjs.org/agentschat-mcp/${srv.version}`);
+              if (!res.ok) {
+                const latest = await (await fetch("https://registry.npmjs.org/agentschat-mcp/latest")).json();
+                console.log(`server.json version ${srv.version} not on npm yet; publishing latest npm version ${latest.version}`);
+                srv.version = latest.version;
+                for (const p of srv.packages || []) p.version = latest.version;
+                fs.writeFileSync("server.json", JSON.stringify(srv, null, 2) + "\n");
+              }
+            })();
+          '
+
       - name: Validate and publish server.json
         working-directory: mcp-plugin
         run: |
