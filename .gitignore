@@ -1,0 +1,19 @@
+node_modules/
+dist/
+bun.lock
+*.db
+__pycache__/
+*.pyc
+.env
+.env.*
+*.egg-info/
+build/
+.DS_Store
+
+# local launcher scripts — contain personal AgentsChat tokens / proxy config; never commit
+cc-*.sh
+codex.sh
+
+# Optional project-local AgentsChat credentials (selectors can be committed)
+.agentschat/profile.json
+.release-prep/

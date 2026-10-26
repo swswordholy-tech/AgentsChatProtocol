@@ -1,0 +1,846 @@
+/**
+ * Perspective: agents registering and operators preserving bot attribution.
+ * Invariant: explicit registration notifies without acceptance, existing/invalid
+ * bindings do not mint replacement identities, and unusable profiles never boot.
+ * Goal: catch registration side effects, credential writes and startup failures.
+ * Migration: retain with identity policy and real CLI protocol integration tests.
+ *
+ * Unit tests cover the decision function, but they cannot catch the failure that
+ * actually shipped: the register call site was hoisted above apiFetch's `const`
+ * dependencies, so every /api/account/register threw a TDZ ReferenceError that the
+ * surrounding catch reported as "Server unreachable". Registration was silently dead
+ * and no unit test noticed. The only probe that proves the claim is one that COUNTS
+ * REAL HTTP CALLS against a hub we control.
+ *
+ * Safety: the hub URL is pinned to a local mock via BOTH --url and AGENTCHAT_REST_URL,
+ * and HOME is a throwaway temp dir. Registration creates real accounts (deletable via
+ * DELETE /api/account/<id>, but only while you still hold the key — a test that loses
+ * it leaves permanent litter), so this test must never be able to reach production.
+ */
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { spawn } from "node:child_process";
+import { mkdtempSync, existsSync, mkdirSync, writeFileSync, readFileSync, readdirSync, chmodSync, statSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import { TERMS_VERSION } from "../src/terms.ts";
+
+const ENTRY = resolve(import.meta.dir, "../src/server.ts");
+let calls: string[] = [];
+let authRequests: Array<{ path: string; authorization: string | null }> = [];
+let registerBodies: any[] = [];
+let hub: ReturnType<typeof Bun.serve>;
+let BASE = "";
+
+beforeAll(() => {
+  hub = Bun.serve({
+    port: 0,
+    async fetch(req) {
+      const u = new URL(req.url);
+      calls.push(`${req.method} ${u.pathname}`);
+      authRequests.push({ path: u.pathname, authorization: req.headers.get("Authorization") });
+      if (req.method === "POST" && u.pathname === "/api/account/register") {
+        // Mirror self-service registration: Terms are informational, not a gate.
+        // Capture the actual client payload so tests reject fabricated acceptance.
+        const body = await req.json().catch(() => ({})) as any;
+        registerBodies.push(body);
+        // Test-only lever: lets a test exercise hub-side rejection independently of
+        // Terms notification, without a production flag existing just for tests.
+        if (body?.name === "RejectMe") {
+          return Response.json({ error: "name unavailable" }, { status: 400 });
+        }
+        return Response.json({ id: "srv-assigned-id", key: "ac_mock_key", claim_url: BASE + "/chat/srv-assigned-id?key=ac_mock_key" });
+      }
+      return Response.json({});
+    },
+  });
+  BASE = `http://127.0.0.1:${hub.port}`;
+});
+afterAll(() => hub.stop(true));
+
+const registerCalls = () => calls.filter((c) => c.includes("/api/account/register")).length;
+
+const INIT = { jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "t", version: "0" } } };
+const INITED = { jsonrpc: "2.0", method: "notifications/initialized" };
+const LIST = { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} };
+const callTool = (id: number, name: string, args: any = {}) =>
+  ({ jsonrpc: "2.0", id, method: "tools/call", params: { name, arguments: args } });
+
+/** Spawn the real server against the mock hub; send frames one at a time, awaiting each. */
+function drive(args: string[], home: string, frames: any[], waitMs = 3000, extraEnv: Record<string, string> = {}, cwd?: string) {
+  return new Promise<{ res: Map<number, any>; err: string; code: number | null }>((done) => {
+    const child = spawn(process.execPath, [ENTRY, "--url", BASE, ...args], {
+      env: {
+        PATH: process.env.PATH!,
+        HOME: home,
+        AGENTCHAT_NO_PROXY: "1",
+        AGENTCHAT_REST_URL: BASE, // belt-and-suspenders: never production
+        AGENTCHAT_URL: "ws://127.0.0.1:1/ws", // dead WS; we only exercise stdio
+        ...extraEnv,
+      },
+      cwd,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    let out = "", err = "", code: number | null = null;
+    const res = new Map<number, any>();
+    child.stdout.on("data", (d) => {
+      out += d;
+      let nl: number;
+      while ((nl = out.indexOf("\n")) >= 0) {
+        const line = out.slice(0, nl).trim();
+        out = out.slice(nl + 1);
+        if (line) try { const m = JSON.parse(line); if (m.id !== undefined) res.set(m.id, m); } catch {}
+      }
+    });
+    child.stderr.on("data", (d) => { err += d; });
+    child.on("exit", (c) => { code = c; });
+    (async () => {
+      for (const f of frames) {
+        child.stdin.write(JSON.stringify(f) + "\n");
+        if (f.id === undefined) continue;
+        // Await this id before sending the next — otherwise an async handler (whoami
+        // awaits REST) interleaves with a later frame (switch_profile) and we'd assert
+        // on the wrong snapshot.
+        const deadline = Date.now() + 2000;
+        while (!res.has(f.id) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 20));
+      }
+    })();
+    setTimeout(() => { try { child.kill("SIGKILL"); } catch {} done({ res, err, code }); }, waitMs);
+  });
+}
+
+const freshHome = (tag: string) => mkdtempSync(join(tmpdir(), `acid-${tag}-`));
+
+/** Everything the run persisted under a config dir ([] if the dir was never created). */
+const written = (home: string, dir: string) => {
+  const p = join(home, dir);
+  return existsSync(p) ? readdirSync(p).sort() : [];
+};
+
+describe("identity policy, end-to-end against a mock hub", () => {
+  test("bare start registers NOTHING and still answers tools/list", async () => {
+    calls = [];
+    const home = freshHome("bare");
+    const { res, err } = await drive([], home, [INIT, INITED, LIST]);
+
+    expect(registerCalls()).toBe(0);
+    // "Writes nothing" is a NEW guarantee, not prior behavior: on 0.29.1 a bare-ish run
+    // still persisted a dev-token profile (the register-failure fallback). Pin it hard —
+    // nothing may land in EITHER config dir, incl. the legacy one nameToPath falls back to.
+    expect(written(home, ".agentschat")).toEqual([]);
+    expect(written(home, ".agentchat")).toEqual([]);
+    expect(err).toMatch(/Refusing to auto-register/);
+    // Introspection contract (Glama builds and runs this with zero config) must survive.
+    expect(res.get(1)?.result).toBeTruthy();
+    expect(res.get(2)?.result?.tools?.length ?? 0).toBeGreaterThan(0);
+  }, 15_000);
+
+  test("paired environment credentials resist runtime Grok binding", async () => {
+    calls = [];
+    const home = freshHome("env-grok");
+    mkdirSync(join(home, ".agentschat"));
+    writeFileSync(join(home, ".agentschat", "A.json"), JSON.stringify({ agent_id: "a-id", token: "ac_a" }));
+    writeFileSync(join(home, ".agentschat", "grok-binds.json"), JSON.stringify({ conversation: "A" }));
+    const { res } = await drive([], home, [INIT, INITED, callTool(3, "whoami")], 3000, {
+      AGENTCHAT_AGENT_ID: "explicit-id", AGENTCHAT_TOKEN: "ac_explicit", CURSOR_CONVERSATION_ID: "conversation",
+    });
+    expect(res.get(3)?.result?.content?.[0]?.text ?? "").toContain("Agent ID: explicit-id");
+    expect(calls).toContain("GET /api/account/explicit-id");
+    expect(calls).not.toContain("GET /api/account/a-id");
+    expect(registerCalls()).toBe(0);
+  });
+
+  test("switch_profile rejects invalid credentials without changing live identity", async () => {
+    const home = freshHome("bad-switch");
+    mkdirSync(join(home, ".agentschat"));
+    writeFileSync(join(home, ".agentschat", "A.json"), JSON.stringify({ agent_id: "a-id", token: "ac_a" }));
+    writeFileSync(join(home, ".agentschat", "bad.json"), "{}");
+    const { res } = await drive(["--profile", "A"], home, [INIT, INITED, callTool(3, "switch_profile", { profile_name: "bad" }), callTool(4, "whoami")], 3000);
+    expect(res.get(3)?.result?.isError).toBe(true);
+    expect(res.get(4)?.result?.content?.[0]?.text ?? "").toContain("Agent ID: a-id");
+  });
+
+  test("explicit token repairs a dev-token profile without migration", async () => {
+    calls = [];
+    authRequests = [];
+    const home = freshHome("override");
+    mkdirSync(join(home, ".agentschat"));
+    const file = join(home, ".agentschat", "A.json");
+    writeFileSync(file, JSON.stringify({ agent_id: "a-id", token: "dev-token" }));
+    const { res, err } = await drive(["--profile", "A"], home, [INIT, INITED, callTool(3, "whoami")], 3000, { AGENTCHAT_TOKEN: "ac_override" });
+    expect(res.get(3)?.result?.content?.[0]?.text).toContain("Agent ID: a-id");
+    expect(registerCalls()).toBe(0);
+    expect(err).not.toContain("no identity was declared");
+    const accountRequests = authRequests.filter(r => r.path === "/api/account/a-id");
+    expect(accountRequests.length).toBeGreaterThan(0);
+    expect(accountRequests.every(r => r.authorization === "Bearer ac_override")).toBe(true);
+    expect(JSON.parse(readFileSync(file, "utf8")).token).toBe("dev-token");
+  });
+
+  test("--name opts in: exactly one register call, profile persisted", async () => {
+    calls = [];
+    registerBodies = [];
+    const home = freshHome("name");
+    const { err } = await drive(["--name", "Foo", "--accept-terms"], home, [INIT, INITED, LIST]);
+
+    // Guards the TDZ regression: a swallowed ReferenceError makes this 0.
+    expect(registerCalls()).toBe(1);
+    expect(err).toMatch(/Registered!/);
+    expect(existsSync(join(home, ".agentschat", "Foo.json"))).toBe(true);
+    // Control group for the `written(...) === []` assertions above: prove the helper
+    // actually observes a persisted profile, so those empty expectations aren't vacuous.
+    // (identity-guard.json is the trust record written for every identified boot.)
+    expect(written(home, ".agentschat")).toEqual(["Foo.json", "identity-guard.json"]);
+    // Control for the failure-path test below: on success we must NOT print that line.
+    expect(err).not.toMatch(/Registration failed/);
+    expect(registerBodies[0]).not.toHaveProperty("accepted_terms");
+    expect(registerBodies[0]?.terms_notice_version).toBe(TERMS_VERSION);
+  }, 15_000);
+
+  test("--name without acceptance flags registers after a notice and persists a working identity", async () => {
+    calls = [];
+    registerBodies = [];
+    const home = freshHome("noterms");
+    const { err, code, res } = await drive(["--name", "Foo"], home, [INIT], 2500);
+
+    expect(registerCalls()).toBe(1);
+    expect(code).not.toBe(1);
+    expect(err).toContain("Terms notice: https://agents-chat.com/terms");
+    expect(err).toContain("Registered!");
+    expect(res.get(1)?.result?.protocolVersion).toBe("2024-11-05");
+    expect(registerBodies[0]).not.toHaveProperty("accepted_terms");
+    expect(JSON.parse(readFileSync(join(home, ".agentschat", "Foo.json"), "utf8")).token).toBe("ac_mock_key");
+    expect(written(home, ".agentchat")).toEqual([]);
+  }, 15_000);
+
+  test("a 400 from the hub leaves NO dev-token profile behind and exits 1", async () => {
+    // A server rejection must not write a `dev-token`
+    // profile and starts anyway → client shows a connected server with a full tool
+    // list while every authenticated call 401s, and the placeholder then loads as
+    // authoritative forever. A dead agent must not look like a live one.
+    calls = [];
+    const home = freshHome("dead");
+    const { err, code } = await drive(["--name", "RejectMe"], home, [INIT], 2500);
+
+    expect(code).toBe(1);
+    expect(err).toMatch(/ERROR/);
+    // The decisive assertion: nothing persisted, so no later run inherits a dead identity.
+    expect(written(home, ".agentschat")).toEqual([]);
+    expect(written(home, ".agentchat")).toEqual([]);
+    expect(err).not.toMatch(/Profile saved/);
+  }, 15_000);
+
+  test("a written profile is 0600 even with a stale world-readable .tmp present", async () => {
+    calls = [];
+    const home = freshHome("perm");
+    mkdirSync(join(home, ".agentschat"), { recursive: true });
+    // Crash residue from an earlier run, world-readable. writeFileSync's `mode` is ignored
+    // for an existing file and renameSync preserves the source's mode, so without the
+    // unlink this .tmp's 0644 would carry straight into the profile that holds the key.
+    const stale = join(home, ".agentschat", "Foo.json.tmp");
+    writeFileSync(stale, "{}", { mode: 0o644 });
+    chmodSync(stale, 0o644);
+
+    const { err } = await drive(["--name", "Foo", "--accept-terms"], home, [INIT, INITED, LIST]);
+
+    const profilePath = join(home, ".agentschat", "Foo.json");
+    expect(registerCalls()).toBe(1);
+    expect(statSync(profilePath).mode & 0o777).toBe(0o600); // holds a live agent key
+    expect(existsSync(stale)).toBe(false); // no world-readable residue left behind
+    expect(err).not.toMatch(/WARNING/); // and nothing degraded silently
+  }, 15_000);
+
+  test("a failed registration prints the real cause, not a fabricated one", async () => {
+    calls = [];
+    // Point at a dead port (last --url wins in parseArgs) so the fetch genuinely throws.
+    const home = freshHome("regfail");
+    const { err, code } = await drive(
+      ["--name", "Foo", "--accept-terms", "--url", "http://127.0.0.1:1"],
+      home,
+      [INIT, INITED, LIST],
+      2500,
+    );
+
+    expect(registerCalls()).toBe(0); // never reached the hub
+    // The cause must be surfaced. The old code reported every failure — including a TDZ
+    // ReferenceError — as "Server unreachable", a fluent lie pointing at the network.
+    expect(err).toMatch(/Registration failed: .+/);
+    expect(err).not.toMatch(/Server unreachable/);
+    // CONTRACT CHANGE (was: "still comes up, a degradation not a crash"). Coming up
+    // after a failed registration is exactly what made the dead agent look alive —
+    // the client saw a healthy server and a full tool list. Fail loudly instead.
+    expect(code).toBe(1);
+    expect(written(home, ".agentschat")).toEqual([]);
+    expect(written(home, ".agentchat")).toEqual([]);
+  }, 15_000);
+
+  test("dev-token profile on the shared default path is NOT re-registered", async () => {
+    calls = [];
+    const home = freshHome("devtok");
+    mkdirSync(join(home, ".agentschat"), { recursive: true });
+    writeFileSync(
+      join(home, ".agentschat", "profile.json"),
+      JSON.stringify({ agent_id: "local", display_name: "Ghost", token: "dev-token", capabilities: [] }),
+    );
+    const { err, code } = await drive([], home, [INIT, INITED, LIST], 2500);
+
+    expect(registerCalls()).toBe(0);
+    expect(err).toMatch(/refusing to auto-register/i);
+    // A dev-token cannot authenticate — every call 401s. Booting anyway is the same
+    // "dead agent wearing a live one's clothes" this release exists to kill; it was
+    // simply reached down a different branch than the failed-registration one.
+    expect(code).toBe(1);
+    expect(err).not.toMatch(/MCP server started/);
+  }, 15_000);
+
+  test("a declared dev-token profile repairs itself after a nonblocking Terms notice", async () => {
+    calls = [];
+    const home = freshHome("devtokterms");
+    mkdirSync(join(home, ".agentschat"), { recursive: true });
+    writeFileSync(
+      join(home, ".agentschat", "victim.json"),
+      JSON.stringify({ agent_id: "local", display_name: "Victim", token: "dev-token", capabilities: [] }),
+    );
+    const { err, code, res } = await drive(["--profile", "victim"], home, [INIT, INITED, LIST], 2500);
+
+    expect(registerCalls()).toBe(1);
+    expect(code).not.toBe(1);
+    expect(err).toContain("Terms notice: https://agents-chat.com/terms");
+    expect(err).toContain("Migrated!");
+    expect(res.get(2)?.result?.tools.some((tool: any) => tool.name === "whoami")).toBe(true);
+    expect(JSON.parse(readFileSync(join(home, ".agentschat", "victim.json"), "utf8")).token).toBe("ac_mock_key");
+  }, 15_000);
+
+  test("a real key still boots normally (control for the dev-token guard)", async () => {
+    // Without this, the two assertions above would also pass if the guard were too
+    // broad and refused to start for ANY profile.
+    calls = [];
+    const home = freshHome("realkey");
+    mkdirSync(join(home, ".agentschat"), { recursive: true });
+    writeFileSync(
+      join(home, ".agentschat", "real.json"),
+      JSON.stringify({ agent_id: "real-id", display_name: "Real", token: "ac_realish_key", capabilities: ["chat"] }),
+    );
+    const { err, res } = await drive(["--profile", "real"], home, [INIT, INITED, LIST]);
+
+    expect(err).toMatch(/MCP server started/);
+    expect(res.get(2)?.result?.tools?.length ?? 0).toBeGreaterThan(0);
+  }, 15_000);
+
+  test("declared-but-missing profile exits non-zero without registering or writing", async () => {
+    calls = [];
+    const home = freshHome("missing");
+    const { err, code } = await drive(["--profile", "nope"], home, [INIT], 2500);
+
+    expect(registerCalls()).toBe(0);
+    expect(code).toBe(1);
+    expect(err).toMatch(/nope/);
+    expect(written(home, ".agentschat")).toEqual([]);
+    expect(written(home, ".agentchat")).toEqual([]);
+  }, 15_000);
+
+  test("identity guard: a silent fallback to the default profile gates writes until whoami confirms (the 2026-09-27 incident)", async () => {
+    // Incident replay: boot 1 runs as chevron via an EXPLICIT selector (recorded
+    // trusted). Boot 2 (the respawn) loses the selector, resolves the DEFAULT
+    // profile (academic) — writes must refuse loudly until whoami confirms.
+    const home = freshHome("guard");
+    mkdirSync(join(home, ".agentschat"), { recursive: true });
+    writeFileSync(
+      join(home, ".agentschat", "Antigravity-2.json"),
+      JSON.stringify({ agent_id: "acc_chevron", display_name: "chevron", token: "ac_chevron", capabilities: ["chat"] }),
+    );
+    writeFileSync(
+      join(home, ".agentschat", "profile.json"),
+      JSON.stringify({ agent_id: "acc_academic", display_name: "academic", token: "ac_academic", capabilities: ["chat"] }),
+    );
+
+    // Boot 1: explicit selector, trusted — no alarm.
+    const boot1 = await drive(["--profile", "Antigravity-2"], home, [INIT, INITED, LIST]);
+    expect(boot1.err).not.toMatch(/IDENTITY CHANGED/);
+
+    // Boot 2: bare start → default profile = different identity → LOUD + gated.
+    const boot2 = await drive([], home, [INIT, INITED, callTool(3, "reply", { chat_id: "welcome", text: "evidence" }), callTool(4, "whoami"), callTool(5, "reply", { chat_id: "welcome", text: "evidence" })], 6000);
+    expect(boot2.err).toMatch(/IDENTITY CHANGED/);
+    expect(boot2.err).toMatch(/acc_chevron/);
+
+    const gatedReply = boot2.res.get(3);
+    expect(gatedReply?.result?.isError).toBe(true);
+    expect(gatedReply?.result?.content?.[0]?.text ?? "").toMatch(/whoami/);
+    expect(gatedReply?.result?.content?.[0]?.text ?? "").toMatch(/acc_chevron/);
+
+    // whoami surfaces the gate notice AND confirms — the next write is unblocked.
+    const confirm = boot2.res.get(4)?.result?.content?.[0]?.text ?? "";
+    expect(confirm).toMatch(/IDENTITY GUARD/);
+    expect(confirm).toMatch(/Agent ID: acc_academic/);
+    const after = boot2.res.get(5)?.result?.content?.[0]?.text ?? "";
+    expect(after).not.toMatch(/IDENTITY CHANGED|REFUSED until identity/);
+
+    // Boot 3: same (now confirmed) identity → no alarm again (guard learned the
+    // confirmation, not the unconfirmed fallback).
+    const boot3 = await drive([], home, [INIT, INITED, LIST], 2500);
+    expect(boot3.err).not.toMatch(/IDENTITY CHANGED/);
+  }, 30_000);
+
+  test("identity guard: repeat respawns into the WRONG identity keep alarming (record does not learn the fallback)", async () => {
+    const home = freshHome("guard2");
+    mkdirSync(join(home, ".agentschat"), { recursive: true });
+    writeFileSync(
+      join(home, ".agentschat", "Antigravity-2.json"),
+      JSON.stringify({ agent_id: "acc_chevron", display_name: "chevron", token: "ac_chevron", capabilities: ["chat"] }),
+    );
+    writeFileSync(
+      join(home, ".agentschat", "profile.json"),
+      JSON.stringify({ agent_id: "acc_academic", display_name: "academic", token: "ac_academic", capabilities: ["chat"] }),
+    );
+    await drive(["--profile", "Antigravity-2"], home, [INIT, INITED, LIST]);
+    // Two consecutive bare boots WITHOUT a whoami confirmation: both must alarm —
+    // a gated boot must not teach the guard that the wrong identity is fine.
+    const b1 = await drive([], home, [INIT, INITED, LIST], 2500);
+    const b2 = await drive([], home, [INIT, INITED, LIST], 2500);
+    expect(b1.err).toMatch(/IDENTITY CHANGED/);
+    expect(b2.err).toMatch(/IDENTITY CHANGED/);
+  }, 30_000);
+
+  test("tools/list emits MCP annotations on every visible tool (OpenAI directory requirement)", async () => {
+    const home = freshHome("annotations");
+    const { res } = await drive([], home, [INIT, INITED, LIST]);
+    const tools = res.get(2)?.result?.tools ?? [];
+    expect(tools.length).toBeGreaterThan(5);
+    const unannotated = tools.filter((t: any) => !t.annotations || typeof t.annotations.readOnlyHint !== "boolean");
+    expect(unannotated.map((t: any) => t.name)).toEqual([]);
+    const whoami = tools.find((t: any) => t.name === "whoami");
+    expect(whoami?.annotations?.readOnlyHint).toBe(true);
+    const reply = tools.find((t: any) => t.name === "reply");
+    expect(reply?.annotations?.readOnlyHint).toBe(false);
+    expect(reply?.annotations?.openWorldHint).toBe(true);
+  }, 15_000);
+
+  test("whoami preserves unknown ownership and offers a secret-free claim entry", async () => {
+    // Boss hit this with the Hermes identity: whoami pointed at a bare /chat/<id>,
+    // the room opened with an EMPTY claim form (chat.html renders it only when
+    // ?key= is present). The hint must carry the full format with a placeholder —
+    // and must NOT leak the real token into the transcript.
+    calls = [];
+    const home = freshHome("claimhint");
+    mkdirSync(join(home, ".agentschat"), { recursive: true });
+    writeFileSync(
+      join(home, ".agentschat", "unclaimed.json"),
+      JSON.stringify({ agent_id: "unclaimed-id", display_name: "U", token: "ac_realsecretkey", capabilities: ["chat"] }),
+    );
+    const { res } = await drive(
+      ["--profile", "unclaimed"],
+      home,
+      [INIT, INITED, callTool(3, "whoami")],
+      4000,
+    );
+    const text = res.get(3)?.result?.content?.[0]?.text ?? "";
+
+    expect(text).toMatch(/Claimed: unknown/);
+    // The actionable claim format with the placeholder key (the mock hub returns
+    // no claim_url, so the fallback hint is what an operator sees).
+    expect(text).toContain(`/chat/unclaimed-id?claim=1`);
+    expect(text).not.toContain("?key=");
+    // The real key never appears — this is the "key out of prose" leak surface.
+    expect(text).not.toContain("ac_realsecretkey");
+  }, 15_000);
+
+  test("whoami's `Profile file:` follows switch_profile", async () => {
+    calls = [];
+    const home = freshHome("switch");
+    mkdirSync(join(home, ".agentschat"), { recursive: true });
+    for (const n of ["alpha", "beta"]) {
+      writeFileSync(
+        join(home, ".agentschat", `${n}.json`),
+        JSON.stringify({ agent_id: `${n}-id`, display_name: n, token: `ac_${n}`, capabilities: ["chat"] }),
+      );
+    }
+    const { res } = await drive(
+      ["--profile", "alpha"],
+      home,
+      [INIT, INITED, callTool(3, "whoami"), callTool(4, "switch_profile", { profile_name: "beta" }), callTool(5, "whoami")],
+      5000,
+    );
+    const text = (id: number) => res.get(id)?.result?.content?.[0]?.text ?? "";
+
+    expect(text(3)).toMatch(/Agent ID: alpha-id/);
+    expect(text(3)).toMatch(/Profile file:.*alpha\.json/);
+    expect(text(5)).toMatch(/Agent ID: beta-id/);
+    expect(text(5)).toMatch(/Profile file:.*beta\.json/); // was stale: still reported alpha
+  }, 15_000);
+
+  test("grok-bind hit: CURSOR_CONVERSATION_ID selects that profile, not a sibling", async () => {
+    calls = [];
+    const home = freshHome("grokhit");
+    mkdirSync(join(home, ".agentschat"), { recursive: true });
+    writeFileSync(
+      join(home, ".agentschat", "Bot-A.json"),
+      JSON.stringify({ agent_id: "bot-a-id", display_name: "Bot-A", token: "ac_bot_a", capabilities: ["chat"] }),
+    );
+    writeFileSync(
+      join(home, ".agentschat", "Bot-B.json"),
+      JSON.stringify({ agent_id: "bot-b-id", display_name: "Bot-B", token: "ac_bot_b", capabilities: ["chat"] }),
+    );
+    writeFileSync(
+      join(home, ".agentschat", "grok-binds.json"),
+      JSON.stringify({ "grok-uuid-a": "Bot-A", "grok-uuid-b": "Bot-B" }),
+    );
+    const { err, res } = await drive(
+      [],
+      home,
+      [INIT, INITED, callTool(3, "whoami")],
+      4000,
+      { CURSOR_CONVERSATION_ID: "grok-uuid-a" },
+    );
+
+    expect(registerCalls()).toBe(0);
+    expect(err).toMatch(/grok-bind: grok-uuid-a/);
+    expect(err).toMatch(/Bot-A\.json/);
+    const text = res.get(3)?.result?.content?.[0]?.text ?? "";
+    expect(text).toMatch(/Agent ID: bot-a-id/);
+    expect(text).not.toMatch(/bot-b-id/);
+    // Auto-bind must not imply WAKE_MODE.
+    expect(err).not.toMatch(/WAKE_MODE/);
+  }, 15_000);
+
+  const writeLockFixture = (tag: string) => {
+    const home = freshHome(tag);
+    mkdirSync(join(home, ".agentschat"), { recursive: true });
+    for (const [name, id] of [["Jack", "jack-id"], ["Antigravity", "anti-id"], ["Antigravity-3", "anti3-id"]]) {
+      writeFileSync(
+        join(home, ".agentschat", `${name}.json`),
+        JSON.stringify({ agent_id: id, display_name: name, token: `ac_${id}`, capabilities: ["chat"] }),
+      );
+    }
+    writeFileSync(join(home, ".agentschat", "grok-binds.json"), JSON.stringify({ "jack-uuid": "Jack" }));
+    return home;
+  };
+
+  test("Antigravity wake inheriting a bound CURSOR_CONVERSATION_ID can switch_profile", async () => {
+    calls = [];
+    const home = writeLockFixture("anti-switch");
+    const { res } = await drive(
+      ["--profile", "Antigravity"],
+      home,
+      [INIT, INITED, callTool(3, "switch_profile", { profile_name: "Antigravity-3" }), callTool(4, "whoami")],
+      4000,
+      { CURSOR_CONVERSATION_ID: "jack-uuid", AGENTCHAT_ANTIGRAVITY_WAKE: "1", AGENTCHAT_WAKE_KIND: "antigravity" },
+    );
+    const t3 = res.get(3)?.result?.content?.[0]?.text ?? "";
+    expect(t3).not.toMatch(/locked to grok-bind/);
+    expect(t3).toMatch(/Switched to profile "Antigravity-3"/);
+    expect(res.get(4)?.result?.content?.[0]?.text ?? "").toMatch(/Agent ID: anti3-id/);
+  }, 15_000);
+
+  test("Grok-bound Cursor MCP (same conversation id, no wake tag) stays locked", async () => {
+    calls = [];
+    const home = writeLockFixture("grok-lock");
+    const { res } = await drive(
+      ["--profile", "Jack"],
+      home,
+      [INIT, INITED, callTool(3, "switch_profile", { profile_name: "Antigravity-3" }), callTool(4, "whoami")],
+      4000,
+      { CURSOR_CONVERSATION_ID: "jack-uuid" },
+    );
+    expect(res.get(3)?.result?.content?.[0]?.text ?? "").toMatch(/locked to grok-bind profile "Jack"/);
+    expect(res.get(4)?.result?.content?.[0]?.text ?? "").toMatch(/Agent ID: jack-id/);
+  }, 15_000);
+
+  test("ZCode-tagged process ignores inherited grok-bind identity", async () => {
+    calls = [];
+    const home = writeLockFixture("zcode-skip");
+    const { err } = await drive([], home, [INIT, INITED, LIST], 3000, {
+      CURSOR_CONVERSATION_ID: "jack-uuid",
+      AGENTCHAT_WAKE_KIND: "zcode",
+    });
+    expect(err).toMatch(/grok-bind skipped: non-grok wake/);
+    expect(err).not.toMatch(/Jack\.json/);
+    expect(registerCalls()).toBe(0);
+  }, 15_000);
+
+  test("grok-bind miss: logs the uuid and stays anonymous (does not pick a sibling)", async () => {
+    calls = [];
+    const home = freshHome("grokmiss");
+    mkdirSync(join(home, ".agentschat"), { recursive: true });
+    writeFileSync(
+      join(home, ".agentschat", "Bot-A.json"),
+      JSON.stringify({ agent_id: "bot-a-id", display_name: "Bot-A", token: "ac_bot_a", capabilities: ["chat"] }),
+    );
+    writeFileSync(
+      join(home, ".agentschat", "grok-binds.json"),
+      JSON.stringify({ "grok-uuid-a": "Bot-A" }),
+    );
+    const { err, res, code } = await drive(
+      [],
+      home,
+      [INIT, INITED, LIST],
+      3000,
+      { CURSOR_CONVERSATION_ID: "grok-uuid-unknown" },
+    );
+
+    expect(registerCalls()).toBe(0);
+    expect(err).toMatch(/no grok-bind matched CURSOR_CONVERSATION_ID=grok-uuid-unknown/);
+    expect(err).toMatch(/Refusing to auto-register/);
+    expect(res.get(2)?.result?.tools?.length ?? 0).toBeGreaterThan(0);
+    expect(code).not.toBe(1);
+  }, 15_000);
+
+  test("grok-bind hit + missing profile: hard error, does not fall through to a sibling", async () => {
+    calls = [];
+    const home = freshHome("grokghost");
+    mkdirSync(join(home, ".agentschat"), { recursive: true });
+    writeFileSync(
+      join(home, ".agentschat", "Bot-B.json"),
+      JSON.stringify({ agent_id: "bot-b-id", display_name: "Bot-B", token: "ac_bot_b", capabilities: ["chat"] }),
+    );
+    writeFileSync(
+      join(home, ".agentschat", "grok-binds.json"),
+      JSON.stringify({ "grok-uuid-a": "Ghost" }),
+    );
+    const { err, code } = await drive(
+      [],
+      home,
+      [INIT],
+      2500,
+      { CURSOR_CONVERSATION_ID: "grok-uuid-a" },
+    );
+
+    expect(registerCalls()).toBe(0);
+    expect(code).toBe(1);
+    expect(err).toMatch(/Ghost/);
+    expect(err).toMatch(/Refusing to auto-register/);
+    expect(err).not.toMatch(/Bot-B\.json/);
+    expect(err).not.toMatch(/MCP server started/);
+  }, 15_000);
+
+  test("explicit --profile wins over grok-bind", async () => {
+    calls = [];
+    const home = freshHome("grokflag");
+    mkdirSync(join(home, ".agentschat"), { recursive: true });
+    writeFileSync(
+      join(home, ".agentschat", "Bot-A.json"),
+      JSON.stringify({ agent_id: "bot-a-id", display_name: "Bot-A", token: "ac_bot_a", capabilities: ["chat"] }),
+    );
+    writeFileSync(
+      join(home, ".agentschat", "Bot-B.json"),
+      JSON.stringify({ agent_id: "bot-b-id", display_name: "Bot-B", token: "ac_bot_b", capabilities: ["chat"] }),
+    );
+    writeFileSync(
+      join(home, ".agentschat", "grok-binds.json"),
+      JSON.stringify({ "grok-uuid-a": "Bot-A" }),
+    );
+    const { err, res } = await drive(
+      ["--profile", "Bot-B"],
+      home,
+      [INIT, INITED, callTool(3, "whoami")],
+      4000,
+      { CURSOR_CONVERSATION_ID: "grok-uuid-a" },
+    );
+
+    expect(err).not.toMatch(/grok-bind:/);
+    const text = res.get(3)?.result?.content?.[0]?.text ?? "";
+    expect(text).toMatch(/Agent ID: bot-b-id/);
+    expect(text).not.toMatch(/bot-a-id/);
+  }, 15_000);
+
+  test("no CURSOR_CONVERSATION_ID: grok-binds.json is ignored (Claude/Hermes unchanged)", async () => {
+    calls = [];
+    const home = freshHome("groknoid");
+    mkdirSync(join(home, ".agentschat"), { recursive: true });
+    writeFileSync(
+      join(home, ".agentschat", "Bot-A.json"),
+      JSON.stringify({ agent_id: "bot-a-id", display_name: "Bot-A", token: "ac_bot_a", capabilities: ["chat"] }),
+    );
+    writeFileSync(
+      join(home, ".agentschat", "grok-binds.json"),
+      JSON.stringify({ "grok-uuid-a": "Bot-A" }),
+    );
+    const { err, res } = await drive([], home, [INIT, INITED, LIST]);
+
+    expect(registerCalls()).toBe(0);
+    expect(err).not.toMatch(/grok-bind:/);
+    expect(err).not.toMatch(/no grok-bind matched/);
+    expect(err).toMatch(/Refusing to auto-register/);
+    expect(res.get(2)?.result?.tools?.length ?? 0).toBeGreaterThan(0);
+  }, 15_000);
+
+  test("malformed grok-binds.json: fall through to anonymous, do not crash", async () => {
+    calls = [];
+    const home = freshHome("grokbad");
+    mkdirSync(join(home, ".agentschat"), { recursive: true });
+    writeFileSync(join(home, ".agentschat", "grok-binds.json"), "{not json");
+    const { err, res, code } = await drive(
+      [],
+      home,
+      [INIT, INITED, LIST],
+      3000,
+      { CURSOR_CONVERSATION_ID: "grok-uuid-a" },
+    );
+
+    expect(code).not.toBe(1);
+    expect(registerCalls()).toBe(0);
+    expect(err).toMatch(/malformed/);
+    expect(err).toMatch(/no grok-bind matched CURSOR_CONVERSATION_ID=grok-uuid-a/);
+    expect(res.get(2)?.result?.tools?.length ?? 0).toBeGreaterThan(0);
+  }, 15_000);
+
+  test("AGENTCHAT_GROK_BINDS override path is consulted", async () => {
+    calls = [];
+    const home = freshHome("grokoverride");
+    mkdirSync(join(home, ".agentschat"), { recursive: true });
+    writeFileSync(
+      join(home, ".agentschat", "Bot-A.json"),
+      JSON.stringify({ agent_id: "bot-a-id", display_name: "Bot-A", token: "ac_bot_a", capabilities: ["chat"] }),
+    );
+    const alt = join(home, "alt-binds.json");
+    writeFileSync(alt, JSON.stringify({ "grok-uuid-a": "Bot-A" }));
+    // Default binds file, if consulted, would miss.
+    writeFileSync(join(home, ".agentschat", "grok-binds.json"), JSON.stringify({ "other": "Nope" }));
+    const { err, res } = await drive(
+      [],
+      home,
+      [INIT, INITED, callTool(3, "whoami")],
+      4000,
+      { CURSOR_CONVERSATION_ID: "grok-uuid-a", AGENTCHAT_GROK_BINDS: alt },
+    );
+
+    expect(err).toMatch(/grok-bind: grok-uuid-a/);
+    const text = res.get(3)?.result?.content?.[0]?.text ?? "";
+    expect(text).toMatch(/Agent ID: bot-a-id/);
+  }, 15_000);
+});
+
+
+test("MCP CLI beats project/env; project and runtime bindings beat global default", async () => {
+  const home = freshHome("precedence");
+  const cwd = join(home, "work");
+  mkdirSync(join(cwd, ".agentschat"), { recursive: true });
+  mkdirSync(join(home, ".agentschat/profiles"), { recursive: true });
+  for (const name of ["flag", "project", "runtime", "global", "profile"])
+    writeFileSync(join(home, ".agentschat/profiles", `${name}.json`), JSON.stringify({ agent_id: name, token: `ac_test_${name}` }));
+  const config = join(cwd, ".agentschat/config.json");
+  writeFileSync(config, JSON.stringify({ profile: "project" }));
+  writeFileSync(join(home, ".agentschat/grok-binds.json"), JSON.stringify({ conversation: "runtime" }));
+  const env = { AGENTSCHAT_PROFILE: "global", CURSOR_CONVERSATION_ID: "conversation" };
+  for (const [args, expected] of [[["--profile", "flag"], "flag"], [[], "project"]] as const) {
+    const { res } = await drive([...args], home, [INIT, INITED, callTool(3, "whoami")], 3000, env, cwd);
+    expect(res.get(3)?.result?.content?.[0]?.text).toContain(`Agent ID: ${expected}`);
+  }
+  writeFileSync(config, JSON.stringify({ profile: "project", agent_id: "wrong" }));
+  calls = [];
+  const mismatch = await drive([], home, [INIT], 500, env, cwd);
+  expect(mismatch.code).toBe(1);
+  expect(mismatch.err).toContain("Project agent_id does not match");
+  expect(registerCalls()).toBe(0);
+  writeFileSync(config, "{}");
+  const { res } = await drive([], home, [INIT, INITED, callTool(3, "whoami")], 3000, env, cwd);
+  expect(res.get(3)?.result?.content?.[0]?.text).toContain("Agent ID: runtime");
+  calls = [];
+  const bad = await drive(["--profile", "missing", "--name", "New", "--register", "--accept-terms"], home, [INIT], 500, env, cwd);
+  expect(bad.code).toBe(1);
+  expect(registerCalls()).toBe(0);
+}, 20000);
+
+describe("multi-bot host: per-bot identity pin (AGENTSCHAT_PROFILE + AGENTCHAT_EXPECT_AGENT_ID)", () => {
+  const fixture = (tag: string) => {
+    const home = freshHome(tag);
+    mkdirSync(join(home, ".agentschat"), { recursive: true });
+    for (const [name, id] of [["Antigravity", "anti-id"], ["Antigravity-2", "anti2-id"]]) {
+      writeFileSync(
+        join(home, ".agentschat", `${name}.json`),
+        JSON.stringify({ agent_id: id, display_name: name, token: `ac_${id}`, capabilities: ["chat"] }),
+      );
+    }
+    return home;
+  };
+
+  // An explicit --profile outranks AGENTSCHAT_PROFILE (flags > project > grok-bind
+  // > env), so a shared host config must NOT hard-code --profile: the per-bot pin
+  // only works through a wrapper that turns AGENTSCHAT_PROFILE into --profile
+  // (scripts/example-agy-mcp-wrapper.sh) or a config with no selector at all.
+  test("shared host config with a hard-coded --profile overrides the receiver's AGENTSCHAT_PROFILE", async () => {
+    calls = [];
+    const home = fixture("pin-flag-wins");
+    const { res } = await drive(
+      ["--profile", "Antigravity"],
+      home,
+      [INIT, INITED, callTool(3, "whoami")],
+      4000,
+      { AGENTSCHAT_PROFILE: "Antigravity-2" },
+    );
+    expect(res.get(3)?.result?.content?.[0]?.text ?? "").toMatch(/Agent ID: anti-id/);
+  }, 15_000);
+
+  test("AGENTSCHAT_PROFILE pins the identity when the host config carries no selector", async () => {
+    calls = [];
+    const home = fixture("pin-env");
+    const { res } = await drive(
+      [],
+      home,
+      [INIT, INITED, callTool(3, "whoami")],
+      4000,
+      { AGENTSCHAT_PROFILE: "Antigravity-2" },
+    );
+    const text = res.get(3)?.result?.content?.[0]?.text ?? "";
+    expect(text).toMatch(/Agent ID: anti2-id/);
+    expect(text).not.toMatch(/Agent ID: anti-id/);
+    expect(registerCalls()).toBe(0);
+  }, 15_000);
+
+  test("expected-id mismatch refuses writes, keeps whoami/switch_profile open, clears after switching", async () => {
+    calls = [];
+    const home = fixture("pin-expect");
+    const { res, err } = await drive(
+      ["--profile", "Antigravity"],
+      home,
+      [
+        INIT,
+        INITED,
+        callTool(3, "reply", { chat_id: "c1", text: "hi" }),
+        callTool(4, "whoami"),
+        callTool(5, "switch_profile", { profile_name: "Antigravity-2" }),
+        callTool(6, "whoami"),
+        callTool(7, "reply", { chat_id: "c1", text: "hi" }),
+      ],
+      5000,
+      { AGENTCHAT_EXPECT_AGENT_ID: "anti2-id" },
+    );
+    expect(err).toMatch(/IDENTITY PIN/);
+    const r3 = res.get(3)?.result;
+    expect(r3?.isError).toBe(true);
+    expect(r3?.content?.[0]?.text ?? "").toMatch(/IDENTITY PIN: this MCP process is "anti-id".*"anti2-id"/);
+    expect(res.get(4)?.result?.content?.[0]?.text ?? "").toMatch(/Expected agent .*anti2-id — MISMATCH/);
+    const t5 = res.get(5)?.result?.content?.[0]?.text ?? "";
+    expect(t5).toMatch(/Switched to profile "Antigravity-2"/);
+    expect(t5).toMatch(/only to THIS MCP process/);
+    expect(res.get(6)?.result?.content?.[0]?.text ?? "").toMatch(/Agent ID: anti2-id[\s\S]*anti2-id — ok/);
+    // Write no longer blocked by the pin (it may still fail against the mock hub).
+    expect(res.get(7)?.result?.content?.[0]?.text ?? "").not.toMatch(/IDENTITY PIN/);
+  }, 20_000);
+
+  test("AGENTSCHAT_EXPECT_AGENT_ID (canonical alias) is honoured too", async () => {
+    calls = [];
+    const home = fixture("pin-alias");
+    const { res } = await drive(
+      ["--profile", "Antigravity"],
+      home,
+      [INIT, INITED, callTool(3, "reply", { chat_id: "c1", text: "hi" })],
+      4000,
+      { AGENTSCHAT_EXPECT_AGENT_ID: "anti2-id" },
+    );
+    expect(res.get(3)?.result?.isError).toBe(true);
+    expect(res.get(3)?.result?.content?.[0]?.text ?? "").toMatch(/IDENTITY PIN/);
+  }, 15_000);
+
+  test("matching expected id changes nothing", async () => {
+    calls = [];
+    const home = fixture("pin-match");
+    const { res, err } = await drive(
+      ["--profile", "Antigravity-2"],
+      home,
+      [INIT, INITED, callTool(3, "reply", { chat_id: "c1", text: "hi" })],
+      4000,
+      { AGENTCHAT_EXPECT_AGENT_ID: "anti2-id" },
+    );
+    expect(err).not.toMatch(/IDENTITY PIN/);
+    expect(res.get(3)?.result?.content?.[0]?.text ?? "").not.toMatch(/IDENTITY PIN/);
+  }, 15_000);
+});

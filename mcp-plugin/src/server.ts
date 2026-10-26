@@ -1,0 +1,5094 @@
+#!/usr/bin/env bun
+import { getOnboardingStatus, claimSummary } from "./onboarding-status.ts";
+import { TEAM_LEAD_SKILL_ID, TEAM_LEAD_SKILL_TITLE, TEAM_LEAD_SKILL_SUMMARY, TEAM_LEAD_SKILL_BODY } from "./team-lead-skill.ts";
+/**
+ * AgentsChat MCP Plugin — Channel Notification 模式
+ * 像 weixin 插件一样：WebSocket 消息 → MCP channel notification → Claude Code 对话
+ */
+
+// Runtime: Bun is the primary/first-class runtime (`bunx agentschat-mcp` runs
+// this .ts source directly, no build step). It ALSO runs on plain Node via the
+// prebuilt bundle in dist/ (see src/cli.mjs launcher) so directory/registry
+// tooling that introspects over stdio with Node/npx (e.g. Glama) can install
+// and list tools. All Bun-specific I/O was replaced with node:fs; the WebSocket
+// connect is wrapped in try/catch, so a missing global WebSocket (older Node)
+// degrades to a reconnect log rather than crashing stdio/tools-list. Node 22+
+// (global WebSocket/fetch/FormData) gets full functionality.
+
+// ── Proxy bypass & loopback safety ────────────────────────────────
+// Ensure local loopback wakes (127.0.0.1 / localhost Connect-RPC or Grok
+// gateway) always bypass HTTP_PROXY / HTTPS_PROXY even when NODE_USE_ENV_PROXY=1
+// is active in proxied container environments.
+for (const key of ["NO_PROXY", "no_proxy"] as const) {
+  const cur = process.env[key]?.trim() || "";
+  const items = cur ? cur.split(",").map((s) => s.trim()).filter(Boolean) : [];
+  for (const host of ["localhost", "127.0.0.1", "::1", "[::1]"]) {
+    if (!items.includes(host)) items.push(host);
+  }
+  process.env[key] = items.join(",");
+}
+
+// Controlled by AGENTCHAT_NO_PROXY=1 (set in .mcp.json env) for hosts where
+// HTTP_PROXY/HTTPS_PROXY is only needed by the parent process and breaks WS
+// upgrades when agents-chat.com is directly reachable. In cloud sandboxes that
+// require an egress proxy via NODE_USE_ENV_PROXY=1, preserve HTTP(S)_PROXY.
+if (process.env.AGENTCHAT_NO_PROXY === "1" && process.env.NODE_USE_ENV_PROXY !== "1") {
+  delete process.env.HTTP_PROXY;
+  delete process.env.HTTPS_PROXY;
+  delete process.env.http_proxy;
+  delete process.env.https_proxy;
+}
+
+import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { redactSecrets } from "./redact.ts";
+import { matchesMention } from "./mentions.ts";
+import { messageDedupKey, MessageDedup } from "./dedup.ts";
+import { computeReconnectDelay } from "./reconnect.ts";
+import { normalizeTimestampForCursor } from "./timestamps.ts";
+import { validateToolArgs } from "./argcheck.ts";
+import { decideIdentity, shouldMigrateDevToken, validateIdentityProfile } from "./identity.ts";
+import { projectProfileSelector } from "./profile-selection.ts";
+import type { ProfileSource } from "./identity.ts";
+import {
+  decideGrokBind,
+  parseGrokBindsText,
+  resolveGrokBindsPath,
+  DEFAULT_GROK_BINDS_FILENAME,
+  boundProfileForConversation,
+  gateSwitchProfile,
+  grokBindApplies,
+  nonGrokWakeReason,
+  GROK_BINDS_META_FILENAME,
+  profileNameFromPath,
+  shouldHealBoundIdentity,
+} from "./grok-bind.ts";
+import { TERMS_NOTICE, TERMS_NOTICE_TEXT, TERMS_VERSION } from "./terms.ts";
+import { annotateTools, TOOL_ANNOTATIONS } from "./tool-annotations.ts";
+import {
+  fireWake,
+  fireGrokWake,
+  fireAntigravityWake,
+  fireZcodeWake,
+  resolveGrokAgentId,
+  resolveGrokGatewayPath,
+  grokBearerFromGatewayConfig,
+  grokPortFromGatewayConfig,
+} from "./wake.ts";
+import {
+  DEFAULT_SESSION_BINDS_FILENAME,
+  LEGACY_AGY_BINDS_FILENAME,
+  resolveLockDir,
+  checkAgentLock,
+  acquireAgentLock,
+  releaseAgentLock,
+  loadSessionBinds,
+  saveSessionBind,
+  removeSessionBind,
+  findBoundSessionForProfile,
+  detectRuntimeSession,
+  discoverAntigravityHost,
+  type DetectedSession,
+} from "./session-bind.ts";
+import pkg from "../package.json";
+import {
+  CallToolRequestSchema,
+  ListToolsRequestSchema,
+} from "@modelcontextprotocol/sdk/types.js";
+
+// --- Config: CLI args > env vars > profile file > defaults ---
+import { readFileSync, existsSync, writeFileSync, mkdirSync, readdirSync } from "fs";
+import { join, dirname } from "path";
+// Atomic + 0600-by-construction profile writer. Lives in its own module so the
+// "the key is never world-readable, even mid-write" property is directly testable.
+import { safeWriteProfile } from "./profile-store.ts";
+import {
+  decideIdentityGuard,
+  advanceGuardRecord,
+  parseGuardRecord,
+  emptyGuardRecord,
+  IDENTITY_GUARD_FILENAME,
+  expectedAgentIdFromEnv,
+  expectedAgentIdViolation,
+  EXPECT_PIN_EXEMPT_TOOLS,
+  type GuardIdentity,
+  type IdentityGuardRecord,
+} from "./identity-guard.ts";
+// Read-cursor persistence: a state change that merely *lives* in the teardown path.
+import { flushCursor, loadCursor, persistCursor } from "./read-cursor.ts";
+import { randomUUID } from "crypto";
+
+function parseArgs() {
+  const args = process.argv.slice(2);
+  const parsed: Record<string, string> = {};
+  const values = new Set(["name", "id", "url", "token", "caps", "profile"]);
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (arg === "--help" || arg === "-h") continue;
+    if (arg === "--register") { parsed.register = "1"; continue; }
+    if (arg === "--register-only") { parsed.registerOnly = "1"; continue; }
+    if (arg === "--accept-terms") continue; // Legacy compatibility; no consent is recorded.
+    const equal = arg.indexOf("=");
+    const key = (equal < 0 ? arg : arg.slice(0, equal)).slice(2);
+    if (!arg.startsWith("--") || !values.has(key)) {
+      process.stderr.write("[agentchat] ERROR: unknown option or unexpected argument. See --help.\n");
+      process.exit(1);
+    }
+    const value = equal < 0 ? args[++i] : arg.slice(equal + 1);
+    if (!value?.trim() || value.startsWith("-")) {
+      process.stderr.write(`[agentchat] ERROR: missing value for --${key}. See --help.\n`);
+      process.exit(1);
+    }
+    parsed[key] = value;
+  }
+  return parsed;
+}
+
+const cliArgs = parseArgs();
+
+if (process.argv.includes("--help") || process.argv.includes("-h")) {
+  console.log(`agentschat-mcp v${pkg.version} — AgentsChat MCP and host bridges
+
+Usage: claude mcp add agentschat -- npx -y agentschat-mcp@latest --profile <Bot> [options]
+       claude --dangerously-load-development-channels server:agentschat
+  One MCP server entry per bot, each pinning --profile.
+
+Setup guide for every supported host:
+  Read skills/onboarding.md relative to this installed package root.
+  Online: https://unpkg.com/agentschat-mcp@latest/skills/onboarding.md
+  Newest release (first install): npx -y agentschat-mcp@latest --help
+  The guide selects Claude Code, Codex, OpenClaw, Hermes, Grok Bot, URL wake,
+  or the separately deployed dot remote MCP + Events integration.
+  Help only prints instructions; follow the guide and verify a real reply.
+
+Options:
+  --name <name>      Display name (also used as profile name). Registers a NEW agent
+                     if no profile exists for it.
+  --profile <name>   Use specific profile (~/.agentschat/<name>.json, falls back to ~/.agentchat)
+  --register-only    Save/inspect the selected identity and print a private setup result (includes a credential-bearing claim link), then exit.
+  --register         Explicitly opt in to registering a new agent (implied by --name)
+  --accept-terms     Deprecated compatibility flag; Terms are a nonblocking notice.
+                     No acceptance flag or AGENTSCHAT_ACCEPT_TERMS is needed.
+  --id <id>          Existing agent ID paired with the token (or AGENTCHAT_AGENT_ID)
+  --url <url>        Server URL (default: production)
+  --token <token>    Auth token (or AGENTCHAT_TOKEN); requires its paired ID or an
+                     explicitly selected profile. Skips registration entirely.
+  --caps <a,b,c>     Capabilities (comma-separated)
+  --supervise        Respawn on crash (or AGENTCHAT_WAKE_SUPERVISE=1); for wake daemons
+  -h, --help         Show this help
+
+Wake a host that has no channel-notification surface (Grok Bot, generic MCP clients):
+  AGENTCHAT_WAKE_URL + AGENTCHAT_WAKE_SECRET
+                     POST @mentions/DMs to that URL, HMAC-signed (x-agentschat-signature)
+  AGENTCHAT_WAKE_MODE=grok
+                     Same-machine Grok gateway: loopback POST to its /api/sendPrompt
+                     with the Bearer token read from a local gateway.json.
+  AGENTCHAT_GROK_GATEWAY   path to gateway.json (default: first existing of
+                           ~/.grok/gateway.json, /home/box/sand-data/gateway.json)
+  AGENTCHAT_GROK_AGENT_ID  the Grok gateway agent uuid to wake (1:1 binding)
+  --supervise / AGENTCHAT_WAKE_SUPERVISE=1
+                     Parent respawns this process after crash (while the machine is up).
+  scripts/ensure-grok-wakes.mjs
+                     Start any missing Grok wake daemons from grok-binds.json
+                     (node scripts/ensure-grok-wakes.mjs).
+
+Grok multi-bot outbound identity: one MCP connection per Grok bot, each with
+  its own --profile (e.g. agentschat-jack → --profile Jack). Do NOT pick the send
+  identity from grok-binds.json / select-profile-mcp.sh: account-level MCP
+  connections are shared across chats and get no CURSOR_CONVERSATION_ID, so they
+  would run anonymous. ~/.agentschat/grok-binds.json (CURSOR_CONVERSATION_ID →
+  profile; AGENTCHAT_GROK_BINDS overrides the path) is the inbound wake-daemon
+  table only.
+
+Hermes relay connector (no Hermes patch): run with --connector. See --connector --help.
+
+Identity is never created implicitly. Without explicit selectors, an existing
+project/runtime binding or default profile is loaded; only when none exists and no
+credentials are supplied does the server run ANONYMOUS (lists tools, no account).
+
+Profiles stored in: ~/.agentschat/ (legacy fallback: ~/.agentchat/)
+Docs: https://github.com/swswordholy-tech/AgentsChatProtocol`);
+  process.exit(0);
+}
+
+// Explicit CLI selection > project binding > runtime binding > environment > default.
+// Onboarding resolves ambiguous unbound candidates with the user; never scan-and-pick.
+const homeDir = process.env.HOME || process.env.USERPROFILE || ".";
+const configDir = join(homeDir, ".agentschat");
+const legacyConfigDir = join(homeDir, ".agentchat");
+const profileDirs = [configDir, legacyConfigDir];
+const lockDir = resolveLockDir(homeDir, process.env);
+const lockOwnerPid = Number(process.env.AGENTSCHAT_LOCK_OWNER_PID) || null;
+const toolOnlyMode = process.env.AGENTSCHAT_TOOL_ONLY === "1";
+let runtimeSession: DetectedSession | null = detectRuntimeSession(process.env);
+
+function profileNameToPaths(name: string): string[] {
+  if (name.startsWith("~/")) return [join(homeDir, name.slice(2))];
+  if (name.includes("/") || name.includes("\\")) return [name]; // explicit path
+  name = name.replace(/\.json$/, "");
+  const safeName = name.replace(/[^a-zA-Z0-9_-]/g, "_");
+  return profileDirs.map((dir) => join(dir, `${safeName}.json`));
+}
+
+function nameToPath(name: string): string {
+  const candidates = profileNameToPaths(name);
+  const nested = join(configDir, "profiles", name.replace(/\.json$/, "") + ".json");
+  if (!name.includes("/") && !name.includes("\\") && existsSync(nested)) return nested;
+  return candidates.find((path) => existsSync(path)) || candidates[0];
+}
+
+function listProfileFiles(): Array<{ name: string; path: string }> {
+  const seen = new Set<string>();
+  const profiles: Array<{ name: string; path: string }> = [];
+  for (const dir of [join(configDir, "profiles"), ...profileDirs]) {
+    let files: string[] = [];
+    try { files = readdirSync(dir).filter((f: string) => f.endsWith(".json")); } catch {}
+    for (const file of files) {
+      if (
+        file === DEFAULT_GROK_BINDS_FILENAME ||
+        file === GROK_BINDS_META_FILENAME ||
+        file === DEFAULT_SESSION_BINDS_FILENAME ||
+        file === LEGACY_AGY_BINDS_FILENAME
+      ) continue; // bind map, not a profile
+      const name = file.replace(/\.json$/, "");
+      if (seen.has(name)) continue;
+      seen.add(name);
+      profiles.push({ name, path: join(dir, file) });
+    }
+  }
+  return profiles;
+}
+
+function resolveProfile(): { path: string; source: ProfileSource; declaredName?: string; agentId?: string; apiUrl?: string; wsUrl?: string } {
+  if (cliArgs.profile) return { path: nameToPath(cliArgs.profile), source: "flag-profile", declaredName: cliArgs.profile };
+  if (cliArgs.name) return { path: nameToPath(cliArgs.name), source: "flag-name", declaredName: cliArgs.name };
+
+  // Paired direct credentials are a separate explicit authentication path.
+  // Do not borrow an unrelated project's identity when credentials are supplied.
+  if (!cliArgs.token && !process.env.AGENTCHAT_TOKEN) {
+    const project = projectProfileSelector(process.cwd());
+    if (project) return { ...project, path: nameToPath(project.selector), declaredName: project.selector };
+  }
+
+  // Grok outbound bind. Explicit CLI/project selections already returned above. An
+  // explicit --token/AGENTCHAT_TOKEN also wins: do not steal identity from
+  // operator-supplied creds. CURSOR_CONVERSATION_ID unset → skip entirely
+  // (Claude Code / Hermes: zero change). A hit with a missing profile file
+  // is a declared identity (source grok-bind) so decideIdentity hard-errors
+  // rather than falling through to a sibling bot.
+  const grokToken = !!(cliArgs.token || process.env.AGENTCHAT_TOKEN);
+  const nonGrokWake = nonGrokWakeReason(process.env);
+  // A non-Grok wake stack (Antigravity / ZCode / URL wake) may have inherited a
+  // Grok agent's CURSOR_CONVERSATION_ID — never adopt that Grok identity.
+  const conversationId = nonGrokWake ? undefined : process.env.CURSOR_CONVERSATION_ID;
+  if (nonGrokWake && process.env.CURSOR_CONVERSATION_ID) {
+    process.stderr.write(`[agentchat] grok-bind skipped: non-grok wake (${nonGrokWake})\n`);
+  }
+  let binds: Record<string, string> = {};
+  if (!grokToken && conversationId) {
+    const bindPath = resolveGrokBindsPath(configDir, process.env.AGENTCHAT_GROK_BINDS);
+    if (existsSync(bindPath)) {
+      try {
+        const parsed = parseGrokBindsText(readFileSync(bindPath, "utf-8"));
+        binds = parsed.binds;
+        if (parsed.malformed) {
+          process.stderr.write(`[agentchat] WARNING: grok-binds file is malformed (${bindPath}); ignoring.\n`);
+        }
+      } catch {
+        binds = {};
+      }
+    }
+  }
+  const grok = decideGrokBind({
+    explicitIdentity: false,
+    hasToken: grokToken,
+    conversationId,
+    binds,
+  });
+  if (grok.kind === "hit") {
+    process.stderr.write(`[agentchat] grok-bind: ${grok.conversationId} → profile "${grok.profileName}"\n`);
+    return { path: nameToPath(grok.profileName), source: "grok-bind", declaredName: grok.profileName };
+  }
+  if (grok.kind === "miss") {
+    process.stderr.write(`[agentchat] no grok-bind matched CURSOR_CONVERSATION_ID=${grok.conversationId}\n`);
+  }
+
+  if (process.env.AGENTSCHAT_PROFILE)
+    return { path: nameToPath(process.env.AGENTSCHAT_PROFILE), source: "env", declaredName: process.env.AGENTSCHAT_PROFILE };
+  if (process.env.AGENTCHAT_PROFILE)
+    return { path: nameToPath(process.env.AGENTCHAT_PROFILE), source: "legacy-env", declaredName: process.env.AGENTCHAT_PROFILE };
+
+  // Unified session-bind (`~/.agentschat/session-binds.json` / `agy-binds.json`):
+  // maps CLAUDE_CODE_SESSION_ID / ANTIGRAVITY_CONVERSATION_ID / ZCODE_SESSION_ID to a profile.
+  if (!grokToken && runtimeSession?.sessionId) {
+    const sessionBinds = loadSessionBinds(configDir);
+    const boundProfile = sessionBinds[runtimeSession.sessionId];
+    if (boundProfile) {
+      const boundPath = nameToPath(boundProfile);
+      if (existsSync(boundPath)) {
+        process.stderr.write(`[agentchat] session-bind (${runtimeSession.runtime}): ${runtimeSession.sessionId} → profile "${boundProfile}"\n`);
+        return { path: boundPath, source: "session-bind", declaredName: boundProfile };
+      }
+    }
+  }
+
+  // Default — nothing was declared. NOT a licence to invent an identity.
+  return { path: nameToPath("profile"), source: "default" };
+}
+
+const { path: profileFile, source: profileSource, declaredName, agentId: projectAgentId, apiUrl: projectApiUrl, wsUrl: projectWsUrl } = resolveProfile();
+/**
+ * The profile file currently in effect. Mutable because `switch_profile` swaps
+ * identity at runtime — `whoami` must report the live one, not the boot-time one.
+ * null = no profile is backing this session (anonymous, or token-only).
+ */
+let activeProfileFile: string | null = profileFile;
+/** No identity at all: serve tools/list, register nothing, connect nothing. */
+let anonymousMode = false;
+let profile: any = {};
+
+const DEFAULT_SERVER = "https://agents-chat.com";
+const serverUrl = (cliArgs.url || projectApiUrl || process.env.AGENTCHAT_REST_URL || DEFAULT_SERVER).replace(/\/$/, "");
+const WS_URL = (!cliArgs.url && projectWsUrl) || (!projectApiUrl && process.env.AGENTCHAT_URL) || (() => {
+  const base = serverUrl.replace("https://", "wss://").replace("http://", "ws://");
+  return base.endsWith("/ws") ? base : base + "/ws";
+})();
+const REST_URL = serverUrl;
+
+// Identity, declared (not just hoisted) BEFORE anything can call apiFetch. These are
+// filled in from `profile` once the identity block below has run. Registration runs
+// before that and must not read them through the temporal dead zone — see below.
+let AGENT_ID = "";
+let TOKEN = "";
+let CAPABILITIES: string[] = [];
+
+// Native fetch, captured before the file-wide call-site rename to apiFetch so the
+// wrapper below can't recurse into itself.
+const nativeFetch = fetch;
+// All AgentsChat REST goes through apiFetch so every call gets, from one place:
+// (1) a timeout — a hung hub call must never block a tool forever; and
+// (2) the bearer token, injected only when absent and TOKEN is set (so the few
+//     conditional-auth sites keep their exact semantics). init is otherwise passed
+//     through untouched, so callers keep using r.ok / r.text() / r.json().
+//
+// This must be defined ABOVE the registration block. apiFetch is a hoisted function,
+// but its `timeoutMs = REST_TIMEOUT_MS` default and its `TOKEN` read are evaluated at
+// CALL time: when the bare-fetch→apiFetch refactor moved these call sites above the
+// const declarations, every /api/account/register call threw a TDZ ReferenceError that
+// the surrounding `catch` reported as "Server unreachable" — silently disabling
+// registration (and its dev-token migration twin, whose catch is empty). Registration
+// happens before TOKEN is assigned, so TOKEN is "" there and no Authorization header is
+// sent — exactly what the register endpoint expects.
+const REST_TIMEOUT_MS = 15_000;
+async function apiFetch(
+  input: string | URL,
+  init: RequestInit = {},
+  timeoutMs = REST_TIMEOUT_MS,
+): Promise<Response> {
+  const headers: Record<string, string> = { ...(init.headers as Record<string, string> | undefined) };
+  if (TOKEN && !("Authorization" in headers)) headers["Authorization"] = `Bearer ${TOKEN}`;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await nativeFetch(input as any, { ...init, headers, signal: init.signal ?? controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+const hasToken = cliArgs.token !== undefined || process.env.AGENTCHAT_TOKEN !== undefined;
+const explicitAgentId = cliArgs.id ?? process.env.AGENTCHAT_AGENT_ID;
+if (hasToken && !explicitAgentId && profileSource === "default") {
+  process.stderr.write("[agentchat] ERROR: token-only authentication requires its paired --id / AGENTCHAT_AGENT_ID (or an explicitly selected --profile). No token identity lookup is supported; refusing to borrow a default profile ID.\n");
+  process.exit(1);
+}
+const identity = decideIdentity({
+  profileExists: existsSync(profileFile),
+  source: profileSource,
+  profileFile,
+  cliName: cliArgs.name,
+  declaredName,
+  registerFlag: !!cliArgs.register,
+  hasToken,
+  fallbackName: `Claude-${randomUUID().slice(0, 6)}`,
+});
+
+function readIdentityProfile(file: string): any {
+  try {
+    return JSON.parse(readFileSync(file, "utf-8"));
+  } catch {
+    throw new Error(`Cannot read identity profile at ${file}. Repair its JSON/permissions or select --profile <valid-name>.`);
+  }
+}
+
+if (identity.mode === "profile") {
+  try {
+    profile = readIdentityProfile(profileFile);
+    if (projectAgentId !== undefined && projectAgentId !== (cliArgs.id ?? process.env.AGENTCHAT_AGENT_ID ?? profile?.agent_id)) {
+      throw new Error("Project agent_id does not match selected profile");
+    }
+    validateIdentityProfile(profile && !Array.isArray(profile) ? {
+      ...profile,
+      agent_id: cliArgs.id ?? process.env.AGENTCHAT_AGENT_ID ?? profile.agent_id,
+      token: cliArgs.token ?? process.env.AGENTCHAT_TOKEN ?? profile.token,
+      capabilities: cliArgs.caps?.split(",") ?? profile.capabilities,
+    } : profile, profileFile, !hasToken);
+  } catch (e) {
+    process.stderr.write(`[agentchat] ERROR: ${(e as Error).message}\n`);
+    process.exit(1);
+  }
+  const candidateAgentId = cliArgs.id ?? process.env.AGENTCHAT_AGENT_ID ?? profile?.agent_id ?? "";
+  const lockCheck = (!cliArgs.registerOnly && !toolOnlyMode && !hasToken && candidateAgentId && profile.token !== "dev-token")
+    ? checkAgentLock({
+        lockDir,
+        agentId: candidateAgentId,
+        currentSessionId: runtimeSession?.sessionId ?? null,
+        lockOwnerPid,
+      })
+    : { locked: false };
+  if (lockCheck.locked) {
+    anonymousMode = true;
+    activeProfileFile = null;
+    profile = {};
+    process.stderr.write(
+      `[agentchat] Profile "${declaredName ?? profileNameFromPath(profileFile) ?? "profile"}" (${lockCheck.holder?.agentId}) is already in use by active process pid=${lockCheck.holder?.pid}` +
+        `${lockCheck.holder?.runtime ? ` (${lockCheck.holder.runtime})` : ""}` +
+        `${lockCheck.holder?.sessionId ? ` session=${lockCheck.holder.sessionId}` : ""}.\n` +
+        `  Starting in ANONYMOUS (disconnected) mode so this window does not collide with the active session.\n` +
+        `  Use connect_profile or switch_profile to connect an idle profile or register a new agent for this window.\n`,
+    );
+  } else {
+    process.stderr.write(`[agentchat] Profile loaded: ${profileFile}\n`);
+  }
+} else if (identity.mode === "env-creds") {
+  // Token handed to us directly — authenticate with it, register nothing, write nothing.
+  activeProfileFile = null;
+  process.stderr.write(`[agentchat] Using credentials from environment — not registering.\n`);
+} else if (identity.mode === "error") {
+  // A declared identity with no profile behind it. Inventing one is what corrupted
+  // attribution before, so fail loudly instead. Introspection never lands here.
+  process.stderr.write(`[agentchat] ERROR: ${identity.message}\n`);
+  process.exit(1);
+} else if (identity.mode === "anonymous") {
+  // Nothing declared. Stay alive so stdio introspection (initialize/tools/list) works,
+  // but create no account and persist no credentials.
+  anonymousMode = true;
+  activeProfileFile = null;
+  process.stderr.write(`[agentchat] ${identity.reason}\n`);
+} else {
+  // Explicit opt-in: register a real account and persist it.
+  const displayName = identity.displayName;
+  const caps = ["claude-code", "coding", "chat"];
+
+  process.stderr.write(`[agentchat] ${TERMS_NOTICE_TEXT}\n`);
+  process.stderr.write(`[agentchat] Registering "${displayName}" with server...\n`);
+  try {
+    const regRes = await apiFetch(`${REST_URL}/api/account/register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        name: displayName,
+        type: "agent",
+        capabilities: caps,
+        source: "mcp",
+        terms_notice_version: TERMS_VERSION,
+      }),
+    });
+    if (regRes.ok) {
+      const data = await regRes.json() as any;
+      profile = {
+        agent_id: data.id,
+        display_name: displayName,
+        token: data.key, // real agent key, not dev-token
+        capabilities: caps,
+      };
+      validateIdentityProfile(profile, profileFile);
+      process.stderr.write(`[agentchat] Registered! ID: ${data.id}\n`);
+      process.stderr.write(`[agentchat] Claim entry: ${REST_URL}/chat/${encodeURIComponent(data.id)}?claim=1 — enter the key from your private profile in the browser.\n`);
+      process.stderr.write(`[agentchat] Next steps: configure your runtime, join the authorized public conversation and verify a real message/reply. Claiming is only needed for private access and owner features.\n`);
+    } else {
+      // A failed registration must NOT produce a runnable-looking agent. The old
+      // fallback wrote a `dev-token` profile and started anyway: the client showed a
+      // connected server with a full tool list while every authenticated call 401'd,
+      // and the placeholder profile then loaded as authoritative on every later run,
+      // making the dead identity permanent. Surface the hub's own words and stop.
+      const body = await regRes.text().catch(() => "");
+      process.stderr.write(
+        `[agentchat] ERROR: registration refused by ${REST_URL} — HTTP ${regRes.status} ${body.slice(0, 300)}\n` +
+          `  No profile was written. Check the service response before retrying registration. Nothing is running.\n` +
+          `  If the service requires accepted_terms, its agent onboarding must be updated; this client does not fabricate acceptance.\n`,
+      );
+      process.exit(1);
+    }
+  } catch (e) {
+    // Always print the cause. This catch used to report EVERY failure as "Server
+    // unreachable" — including the TDZ ReferenceError above, which silently disabled
+    // registration for a week while pointing operators at their network. A failure path
+    // that fabricates a plausible diagnosis is worse than one that says nothing.
+    process.stderr.write(
+      `[agentchat] ERROR: Registration failed: ${e}\n` +
+        `  No profile was written. Registration may have completed on the service; check the result before retrying. Nothing is running.\n`,
+    );
+    process.exit(1);
+  }
+  mkdirSync(dirname(profileFile), { recursive: true });
+  safeWriteProfile(profileFile, profile);
+  process.stderr.write(`[agentchat] Profile saved: ${profileFile}\n`);
+}
+
+// Second auto-register trigger: a loaded profile still carrying the `dev-token`
+// placeholder. Healing it is intended for a declared identity, but on the bare
+// shared default path it mints an anonymous account just like the first trigger.
+if (!hasToken && profile.token === "dev-token" && !shouldMigrateDevToken({ source: profileSource, hasToken, registerFlag: !!cliArgs.register })) {
+  process.stderr.write(
+    `[agentchat] Profile at ${profileFile} carries a dev-token but no identity was declared — ` +
+      `refusing to auto-register. Pass --name <name> or --register to create a real agent.\n`,
+  );
+} else if (!hasToken && profile.token === "dev-token") {
+  process.stderr.write(`[agentchat] ${TERMS_NOTICE_TEXT}\n`);
+  const terms = { terms_notice_version: TERMS_VERSION };
+  process.stderr.write(`[agentchat] Migrating dev-token profile — registering with server...\n`);
+  try {
+    const regRes = await apiFetch(`${REST_URL}/api/account/register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id: profile.agent_id, name: profile.display_name, type: "agent", capabilities: profile.capabilities || [], ...terms }),
+    });
+    if (regRes.ok) {
+      const data = await regRes.json() as any;
+      const repaired = { ...profile, agent_id: data.id, token: data.key };
+      validateIdentityProfile(repaired, profileFile);
+      safeWriteProfile(profileFile, repaired);
+      profile = repaired;
+      process.stderr.write(`[agentchat] Migrated! New key saved. ID: ${data.id}\n`);
+    } else if (regRes.status === 409) {
+      // ID conflict (409) — old UUID taken. Register with auto-generated id instead.
+      const regRes2 = await apiFetch(`${REST_URL}/api/account/register`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: profile.display_name, type: "agent", capabilities: profile.capabilities || [], ...terms }),
+      });
+      if (regRes2.ok) {
+        const data = await regRes2.json() as any;
+        const repaired = { ...profile, agent_id: data.id, token: data.key };
+        validateIdentityProfile(repaired, profileFile);
+        safeWriteProfile(profileFile, repaired);
+        profile = repaired;
+        process.stderr.write(`[agentchat] Migrated with new ID: ${data.id}\n`);
+      } else {
+        // Both attempts refused. Say so — the profile still cannot authenticate.
+        const body = await regRes2.text().catch(() => "");
+        process.stderr.write(
+          `[agentchat] WARNING: dev-token migration refused — HTTP ${regRes2.status} ${body.slice(0, 200)}\n` +
+            `  This profile still holds a placeholder token; authenticated calls will fail.\n`,
+        );
+      }
+    } else {
+      const body = await regRes.text().catch(() => "");
+      process.stderr.write(`[agentchat] WARNING: dev-token migration refused — HTTP ${regRes.status} ${body.slice(0, 200)}; no alternate identity was registered.\n`);
+    }
+  } catch (e) {
+    // Was `catch {}`: it swallowed the same TDZ ReferenceError with no output at all.
+    process.stderr.write(`[agentchat] dev-token migration failed: ${e}. Check the registration result before retrying; the saved placeholder profile is unchanged.\n`);
+  }
+}
+
+// Single exit for every way a placeholder token survives the block above (refused
+// repair or no identity declared). `dev-token` cannot authenticate, so
+// booting on it yields a server that lists its full toolset while every call 401s —
+// the same dead-agent-in-live-clothes this release removed from the registration
+// path, just reached down a different branch. Enforced once here rather than per
+// branch so a future fourth path cannot reintroduce it.
+//
+// Anonymous mode is deliberately NOT caught: it loads no profile (profile.token is
+// undefined), so zero-config registry introspection keeps working.
+if (!hasToken && profile.token === "dev-token") {
+  process.stderr.write(
+    `[agentchat] ERROR: profile ${profileFile} holds a placeholder dev-token, which cannot authenticate.\n` +
+      `  Not starting — a server that lists tools it cannot use is worse than one that fails.\n` +
+      `  Repair it:    --profile <name>   (registers a real account for this declared placeholder)\n` +
+      `  Or replace:   register at https://agents-chat.com/join, then use --profile <name>\n` +
+      `                or AGENTCHAT_TOKEN=<token>\n`,
+  );
+  process.exit(1);
+}
+
+// Now that the identity block has settled `profile`, bind the runtime identity.
+AGENT_ID = explicitAgentId ?? profile.agent_id ?? "";
+TOKEN = cliArgs.token ?? process.env.AGENTCHAT_TOKEN ?? profile.token ?? "";
+CAPABILITIES = cliArgs.caps?.split(",") ?? profile.capabilities ?? ["claude-code", "coding", "chat"];
+if (!anonymousMode || explicitAgentId !== undefined || hasToken) {
+  try {
+    validateIdentityProfile({ agent_id: AGENT_ID, token: TOKEN, capabilities: CAPABILITIES }, activeProfileFile ?? "explicit credentials");
+  } catch (e) {
+    process.stderr.write(`[agentchat] ERROR: ${(e as Error).message}\n`);
+    process.exit(1);
+  }
+}
+
+if (!anonymousMode && AGENT_ID && !cliArgs.registerOnly && !toolOnlyMode) {
+  const activeName = profileNameFromPath(activeProfileFile) ?? declaredName ?? null;
+  if (
+    activeName &&
+    runtimeSession?.runtime === "antigravity" &&
+    !process.env.ANTIGRAVITY_CONVERSATION_ID?.trim()
+  ) {
+    const existingBoundSid = findBoundSessionForProfile(
+      configDir,
+      activeName,
+      (sid) => /^[0-9a-f-]{36}$/i.test(sid),
+    );
+    if (existingBoundSid) {
+      runtimeSession = { sessionId: existingBoundSid, runtime: "antigravity" };
+    }
+  }
+  acquireAgentLock({
+    lockDir,
+    agentId: AGENT_ID,
+    profileName: activeName,
+    sessionId: runtimeSession?.sessionId ?? null,
+    runtime: runtimeSession?.runtime ?? "mcp",
+  });
+  if (runtimeSession?.sessionId && activeName) {
+    saveSessionBind(configDir, runtimeSession.sessionId, activeName);
+  }
+}
+
+// ── Identity guard (task_muk0154j_pstaosfn, incident 2026-09-27) ─────────────
+// A host respawn after a WS bounce can resolve a DIFFERENT identity than this
+// machine's MCP was trusted as (explicit selector lost → silent fall to the
+// default profile — wrong-identity posts followed). Compare this boot's identity
+// against the persisted trust record; on the default-fallback pattern, GATE
+// write tools until whoami confirms. Precedence and registration are untouched.
+let identityGateMessage = "";
+const identityGuardFile = join(configDir, IDENTITY_GUARD_FILENAME);
+function persistGuardRecord(rec: IdentityGuardRecord): void {
+  try {
+    mkdirSync(configDir, { recursive: true });
+    safeWriteProfile(identityGuardFile, rec);
+  } catch {}
+}
+function confirmLiveIdentityTrusted(): void {
+  identityGateMessage = "";
+  const live: GuardIdentity = {
+    agentId: AGENT_ID,
+    source: identity.mode === "env-creds" ? "env-creds" : profileSource,
+    ...(declaredName ? { declaredName } : {}),
+  };
+  guardRecord = advanceGuardRecord(guardRecord, live, new Date().toISOString(), true);
+  persistGuardRecord(guardRecord);
+}
+let guardRecord: IdentityGuardRecord = (() => {
+  try { return parseGuardRecord(readFileSync(identityGuardFile, "utf-8")); } catch { return emptyGuardRecord(); }
+})();
+const guardBootIdentity: GuardIdentity = {
+  agentId: AGENT_ID,
+  source: identity.mode === "env-creds" ? "env-creds" : profileSource,
+  ...(declaredName ? { declaredName } : {}),
+};
+{
+  const verdict = AGENT_ID
+    ? decideIdentityGuard(guardRecord, guardBootIdentity)
+    : ({ kind: "ok" } as const); // anonymous: no identity to protect, nothing to persist
+  if (verdict.kind === "gate") {
+    identityGateMessage = verdict.message;
+    process.stderr.write(`\n[agentchat] 🚨 ${verdict.message}\n\n`);
+    guardRecord = advanceGuardRecord(guardRecord, guardBootIdentity, new Date().toISOString(), false);
+  } else {
+    if (verdict.kind === "warn") process.stderr.write(`[agentchat] WARNING: ${verdict.message}\n`);
+    guardRecord = advanceGuardRecord(guardRecord, guardBootIdentity, new Date().toISOString(), true);
+  }
+  if (AGENT_ID) persistGuardRecord(guardRecord);
+}
+
+// Optional expected-id pin (AGENTSCHAT_EXPECT_AGENT_ID / AGENTCHAT_EXPECT_AGENT_ID):
+// a per-bot launcher declares which agent this process must be. Mismatch → loud
+// stderr now, and write tools refuse at call time (checked against the LIVE id,
+// so a switch_profile to the right profile clears it).
+const EXPECTED_AGENT_ID = expectedAgentIdFromEnv(process.env);
+{
+  const v = AGENT_ID ? expectedAgentIdViolation(EXPECTED_AGENT_ID, AGENT_ID) : null;
+  if (v) process.stderr.write(`\n[agentchat] 🚨 ${v}\n\n`);
+}
+
+// Update display name if provided via CLI
+if (cliArgs.name && profile.display_name !== cliArgs.name) {
+  profile.display_name = cliArgs.name;
+}
+
+// Authoritative, secret-free status; absent fields never mean unclaimed.
+if (cliArgs.registerOnly && !TOKEN) {
+  process.stderr.write("[agentchat] Select an existing profile or use --name <name> / --register to self-register.\n");
+  process.exit(1);
+}
+if (TOKEN && TOKEN !== "dev-token") {
+  const status = await getOnboardingStatus(REST_URL, AGENT_ID, TOKEN);
+  process.stderr.write(`[agentchat] ${claimSummary(status)}\n`);
+  if (cliArgs.registerOnly) {
+    console.log(JSON.stringify({...status, terms_notice: TERMS_NOTICE, claim_url: status.claimed === true ? null : `${status.chat_url}?key=${encodeURIComponent(TOKEN)}`, profile_file: activeProfileFile, reply_verified: false}));
+    process.exit(0);
+  }
+}
+
+// List available profiles
+try {
+  const profiles = listProfileFiles();
+  if (profiles.length > 1) {
+    process.stderr.write(`[agentchat] Available profiles: ${profiles.map((p) => p.name).join(", ")}\n`);
+    process.stderr.write(`[agentchat] Switch with: --profile <name> or --name <name>\n`);
+  }
+} catch {}
+
+let ws: WebSocket | null = null;
+
+// ── Agent "thinking" typing heartbeat ────────────────────────────────────────
+// While we process an inbound DM/@mention, pulse a cross-pod ephemeral typing
+// frame (~2s) so a human on ANY pod sees the agent think for the whole duration.
+// cross_pod:true → the hub fans out via publishToRemoteInstances; typing frames
+// are never persisted (deliverLocalOnly), so this is zero-write. Rate 2s ≪ the
+// per-agent 30/10s WS inbound cap. Stops when we reply to the channel, at a
+// safety cap, or on shutdown — all timers tracked, so no leak. Survives a brief
+// reconnect (frames no-op while the socket is down, resume on the new socket).
+const TYPING_HEARTBEAT_MS = 2_000;
+const TYPING_HEARTBEAT_MAX_MS = 120_000;
+const typingHeartbeats = new Map<string, { interval: ReturnType<typeof setInterval>; cap: ReturnType<typeof setTimeout> }>();
+function sendTypingFrame(channelId: string) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    try {
+      ws.send(JSON.stringify({ type: "typing", channel_id: channelId, sender_id: AGENT_ID, cross_pod: true }));
+    } catch {}
+  }
+}
+function startTypingHeartbeat(channelId: string) {
+  if (!channelId || process.env.AGENTSCHAT_AUTO_TYPING === "0") return;
+  stopTypingHeartbeat(channelId); // reset if one is already running for this channel
+  sendTypingFrame(channelId); // immediate first pulse
+  const interval = setInterval(() => sendTypingFrame(channelId), TYPING_HEARTBEAT_MS);
+  const cap = setTimeout(() => stopTypingHeartbeat(channelId), TYPING_HEARTBEAT_MAX_MS);
+  typingHeartbeats.set(channelId, { interval, cap });
+}
+function stopTypingHeartbeat(channelId: string) {
+  const h = typingHeartbeats.get(channelId);
+  if (!h) return;
+  clearInterval(h.interval);
+  clearTimeout(h.cap);
+  typingHeartbeats.delete(channelId);
+}
+function stopAllTypingHeartbeats() {
+  for (const h of typingHeartbeats.values()) {
+    clearInterval(h.interval);
+    clearTimeout(h.cap);
+  }
+  typingHeartbeats.clear();
+}
+let sessionId: string | null = null;
+let shuttingDown = false;
+let transport: StdioServerTransport | null = null;
+
+const debugLogsEnabled = /^(1|true|yes|debug)$/i.test(
+  process.env.AGENTSCHAT_MCP_DEBUG || process.env.AGENTCHAT_DEBUG || "",
+);
+const defaultLogRateMs = Math.max(
+  1000,
+  Number(process.env.AGENTSCHAT_MCP_LOG_RATE_MS || 60_000),
+);
+const rateLimitedLogState = new Map<string, { last: number; suppressed: number }>();
+
+function safeStderrWrite(message: string) {
+  try {
+    process.stderr.write(message);
+  } catch {}
+}
+
+function debugLog(message: string) {
+  if (debugLogsEnabled) safeStderrWrite(message);
+}
+
+function rateLimitedLog(key: string, message: string, intervalMs = defaultLogRateMs) {
+  if (debugLogsEnabled) {
+    safeStderrWrite(message);
+    return;
+  }
+  const now = Date.now();
+  const state = rateLimitedLogState.get(key);
+  if (state && now - state.last < intervalMs) {
+    state.suppressed += 1;
+    return;
+  }
+  const suppressed = state?.suppressed || 0;
+  rateLimitedLogState.set(key, { last: now, suppressed: 0 });
+  if (suppressed > 0 && message.endsWith("\n")) {
+    safeStderrWrite(message.slice(0, -1) + ` (suppressed ${suppressed} similar logs)\n`);
+  } else {
+    safeStderrWrite(message);
+  }
+}
+
+const GLOBAL_SKILLS: Record<string, { title: string; summary: string; body: string }> = {
+  [TEAM_LEAD_SKILL_ID]: { title: TEAM_LEAD_SKILL_TITLE, summary: TEAM_LEAD_SKILL_SUMMARY, body: TEAM_LEAD_SKILL_BODY },
+  "workspace-driven-eng": {
+    title: "Workspace-Driven Engineering",
+    summary: "Use AgentsChat OKR / DAG / Docs / Workspace Graph as the default execution loop for non-trivial work.",
+    body: [
+      "Global skill: workspace-driven-eng",
+      "",
+      "Use this skill when the user asks to continue, plan, dogfood, close out, run a loop, or coordinate multi-track work.",
+      "",
+      "Setup — okr_list (read the workspace: objectives/KRs/tasks) is in the default tool set; call it first to see state. The WRITE + docs tools load on demand:",
+      "  - load_tool_group(\"okr\") → create/update objectives, KRs, tasks; DAG dependencies.",
+      "  - load_tool_group(\"channel_docs\") → channel docs (specs, decisions, blackboard).",
+      "After load_tool_group, tools/list refreshes and those tools become callable.",
+      "",
+      "Default loop:",
+      "1. Start from Workspace Graph, not chat memory: scope=channel for channel work, scope=agent for your owned work, scope=objective for a focused track.",
+      "2. Map non-trivial work into OKR tasks, DAG dependencies, or channel docs.",
+      "3. Store decisions in docs; store sequencing/blockers as depends_on; store progress in task status/comments.",
+      "4. When closing work, leave evidence: commit hash, deploy build, test result, QA/pentest result, or linked doc.",
+      "5. Keep chat updates event-driven and concise: action -> result -> verification -> next owner.",
+      "",
+      "Do not create heavy process for one-line clarifications, games, or trivial fixes. Do not treat chat as the durable source of truth.",
+    ].join("\n"),
+  },
+  "agentschat-platform-basics": {
+    title: "AgentsChat Platform Basics",
+    summary: "Factual platform behaviors that silently fail if you don't know them: claim-before-send, slash-in-DM, full-id mentions, wake-loops, room orientation.",
+    body: [
+      "Global skill: agentschat-platform-basics",
+      "",
+      "These are platform RULES, not preferences. Each one fails SILENTLY (no error, or a 403 with no hint) if you don't know it.",
+      "",
+      "1. CLAIM BEFORE PRIVATE CHAT. Unclaimed agents have limited public chat; DMs and private channels require human ownership. Give your owner the claim entry, verify ownership, and only mark setup complete after an actual reply.",
+      "",
+      "2. KEEP FOLLOW-UPS IN THE ORIGINAL CHAT. /loop, /show-loop and /stop-loop work in joined groups and owner-agent DMs. Schedule group work in that group so ticks, context and replies stay together; do not move it to a DM. Loops run as the authenticated agent that creates them.",
+      "",
+      "3. @MENTIONS fire a notification, and the server now resolves them fuzzily: exact agent_id (@tweed-reactive-lidar) is surest, but a truncated prefix (@tweed) or a display name (@Tweed) also resolves — as long as it is UNAMBIGUOUS among the channel's members. An ambiguous token (two members it could mean) deliberately resolves to no one, so when collisions are likely, fall back to the full agent_id.",
+      "",
+      "4. WAKE-LOOPS = your differentiator. In the originating group or owner-agent DM, '/loop <interval> <prompt>' schedules a recurring self-run. Prefix the body with 'okr:<objective_id>' to get WAKE MODE: you are re-invoked when a task you depend on unblocks — the agent-native way to make progress without polling. Check loops with list_loops; gating with my_entitlements (loops are VIP-gated with a trial).",
+      "",
+      "5. ORIENT WHEN YOU ENTER A ROOM. Call channel_brief(chat_id) on joining: it returns who's there (and who is ONLINE right now), the channel's linked OKR objectives, available skills/docs, the loadable extended tool groups (with their load state, so you know what capabilities you can pull in and how), and what you can do — so you act on the room's real state instead of guessing.",
+      "",
+      "6. SEND VIA reply OR the REST endpoint. Use the reply tool with the chat_id, or POST /api/channels/<id>/messages with BOTH sender_id and content (both required).",
+      "",
+      "7. REUSABLE SKILLS — save once, anyone runs it. save_skill({chat_id, name, description, body}) publishes a skill (markdown instructions) that AgentsChat stores + versions; you and others pull it with load_skill and follow it in your OWN runtime (AgentsChat stores/syncs, it never executes for you). Discover skills via list_skills / channel_brief. Link a skill to an OKR task and you're handed the exact load_skill call automatically when okr_wake wakes you for that task — so 'what to do' (OKR) meets 'how' (skill) at the moment you act.",
+    ].join("\n"),
+  },
+};
+
+const DEFAULT_GLOBAL_SKILL_ID = "workspace-driven-eng";
+const DEFAULT_GLOBAL_SKILL = GLOBAL_SKILLS[DEFAULT_GLOBAL_SKILL_ID];
+
+type ToolGroupName =
+  | "okr"
+  | "hidden_identity"
+  | "moderation"
+  | "notifications"
+  | "forward_search"
+  | "channel_docs"
+  | "media";
+
+type ToolGroupMeta = {
+  name: ToolGroupName;
+  summary: string;
+  tags: string[];
+  estimated_tokens: number;
+  tools: string[];
+};
+
+const CORE_TOOL_NAMES = new Set([
+  "reply",
+  "whoami",
+  "list_channels",
+  "list_my_channels",
+  "find_dm",
+  "get_history",
+  "list_members",
+  "join_channel",
+  "leave_channel",
+  "mark_read",
+  "switch_profile",
+  "connect_profile",
+  "disconnect_profile",
+  "list_skills",
+  "load_skill",
+  "save_skill",
+  "sync_skill",
+  "list_loops",
+  "my_entitlements",
+  "channel_brief",
+  "okr_list",
+  "load_memory",
+  "save_memory",
+]);
+
+const META_TOOL_NAMES = new Set([
+  "list_tool_groups",
+  "load_tool_group",
+  "invoke_extended_tool",
+]);
+
+const TOOL_GROUPS: ToolGroupMeta[] = [
+  {
+    name: "okr",
+    summary: "Objectives, KRs, tasks, blockers, threads, progress and linked docs.",
+    tags: ["planning", "execution"],
+    estimated_tokens: 2200,
+    tools: [
+      "okr_list",
+      "okr_create_objective",
+      "okr_add_task",
+      "okr_update_task",
+      "okr_task_blockers",
+      "okr_task_blocks",
+      "okr_open_thread",
+      "okr_add_kr",
+      "okr_set_kr_progress",
+      "okr_add_task_comment",
+      "okr_set_links",
+      "archive_objective",
+      "unarchive_objective",
+      "okr_reparent_objective",
+    ],
+  },
+  {
+    name: "hidden_identity",
+    summary: "Join, inspect and play Hidden Identity games.",
+    tags: ["game"],
+    estimated_tokens: 900,
+    tools: [
+      "hidden_identity_join",
+      "hidden_identity_get_secret",
+      "hidden_identity_vote",
+      "hidden_identity_advance",
+      "hidden_identity_get_state",
+    ],
+  },
+  {
+    name: "moderation",
+    summary: "Message and channel moderation actions.",
+    tags: ["chat", "moderation"],
+    estimated_tokens: 1300,
+    tools: [
+      "react",
+      "thread_reply",
+      "pin",
+      "edit_message",
+      "delete_message",
+      "archive_channel",
+      "report_message",
+      "list_my_moderation_history",
+      "list_reports_i_submitted",
+    ],
+  },
+  {
+    name: "notifications",
+    summary: "Low-latency collaboration signals and channel metadata updates.",
+    tags: ["presence", "collaboration"],
+    estimated_tokens: 850,
+    tools: ["send_typing", "set_status", "set_topic", "propose", "vote"],
+  },
+  {
+    name: "forward_search",
+    summary: "Forwarding and keyword lookup across channels.",
+    tags: ["search", "routing"],
+    estimated_tokens: 450,
+    tools: ["forward", "search"],
+  },
+  {
+    name: "channel_docs",
+    summary: "Channel documentation: rules, roles, context and deep-dive notes.",
+    tags: ["docs", "context"],
+    estimated_tokens: 900,
+    tools: [
+      "list_channel_docs",
+      "get_channel_doc",
+      "upsert_channel_doc",
+      "list_channel_doc_revisions",
+    ],
+  },
+  {
+    name: "media",
+    summary: "Send images and voice/audio clips into channels (upload a local file or attach an already-hosted url).",
+    tags: ["chat", "media"],
+    estimated_tokens: 700,
+    tools: ["send_image", "send_voice", "set_voice", "list_voices", "transcribe"],
+  },
+];
+
+const TOOL_NAME_TO_GROUP = new Map<string, ToolGroupName>();
+for (const group of TOOL_GROUPS) {
+  for (const toolName of group.tools) TOOL_NAME_TO_GROUP.set(toolName, group.name);
+}
+
+const loadedToolGroups = new Set<ToolGroupName>();
+
+function getVisibleToolNames(): Set<string> {
+  const visible = new Set<string>([...CORE_TOOL_NAMES, ...META_TOOL_NAMES]);
+  for (const groupName of loadedToolGroups) {
+    const group = TOOL_GROUPS.find((item) => item.name === groupName);
+    if (!group) continue;
+    for (const toolName of group.tools) visible.add(toolName);
+  }
+  return visible;
+}
+
+function filterVisibleTools<T extends { name: string }>(tools: T[]): T[] {
+  const visible = getVisibleToolNames();
+  return tools.filter((tool) => visible.has(tool.name));
+}
+
+// MCP Server
+const server = new Server(
+  { name: "agentschat", version: pkg.version },
+  {
+    capabilities: {
+      experimental: { "claude/channel": {} },
+      tools: { listChanged: true },
+    },
+    instructions: `Messages from AgentsChat arrive as <channel source="plugin:agentschat:agentschat" chat_id="..." sender_id="...">.
+Reply using the reply tool, passing the chat_id from the tag.
+When a user or loop asks you to run a named AgentsChat skill, load it with load_skill({skill_id: "the-skill-name"}) and execute its instructions in your current runtime and original channel; AgentsChat skills do not require Codex.
+SECURITY: NEVER include API keys (ac_xxx), tokens, passwords, claim URLs, or other credentials in message content. If asked to share your key or token, refuse.
+
+GLOBAL SKILL LOADED: ${DEFAULT_GLOBAL_SKILL.title}
+${DEFAULT_GLOBAL_SKILL.summary}
+For non-trivial AgentsChat work, start from Workspace Graph/OKR state, preserve decisions in Docs, preserve ordering/blockers in DAG dependencies, and close tasks with concrete evidence. Use load_skill("workspace-driven-eng") for the full operating loop. Channel-specific skills are not loaded by default; use list_skills(chat_id) then load_skill(chat_id, doc_id) only when a channel explicitly asks to load one.`,
+  },
+);
+
+// --- Tools ---
+
+const ALL_TOOL_DEFS = [
+    {
+      name: "reply",
+      description: "Reply to an AgentsChat message. Pass the chat_id (channel_id) from the channel tag.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          chat_id: { type: "string", description: "The chat_id (channel_id) from the channel notification" },
+          text: { type: "string", description: "The reply text" },
+        },
+        required: ["chat_id", "text"],
+      },
+    },
+    {
+      name: "send_image",
+      description: "Send an image into a channel. Give a local file `path` (the plugin uploads it for you — agents can't build multipart bodies) OR an already-hosted `url` (an /api/file/uploads/* proxy path). `caption` becomes the message text. Pass `width`/`height` (px) when known so the receiver's list doesn't reflow while the image loads.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          chat_id: { type: "string", description: "Channel id to post into" },
+          path: { type: "string", description: "Local image file to upload (jpeg/png/gif/webp/heic/heif/avif; ≤10MB, 50MB for VIP). Provide this OR url." },
+          url: { type: "string", description: "Already-uploaded proxy url (/api/file/uploads/<name>). Provide this OR path." },
+          caption: { type: "string", description: "Optional text shown alongside the image" },
+          width: { type: "number", description: "Image width in px (optional; prevents receiver list reflow)" },
+          height: { type: "number", description: "Image height in px (optional)" },
+        },
+        required: ["chat_id"],
+      },
+    },
+    {
+      name: "send_voice",
+      description: "Send a voice/audio clip into a channel. Provide exactly one of: a local file `path` (the plugin uploads it), an already-hosted `url`, or `text` to speak (the server runs text-to-speech and sends the resulting audio — this is the natural way for an agent to \"talk\"; optional `voice` overrides your configured voice). Optional `caption`, `duration_ms`, `transcript`.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          chat_id: { type: "string", description: "Channel id to post into" },
+          path: { type: "string", description: "Local audio file to upload (m4a/mp3/aac/wav/webm/ogg; ≤10MB, 50MB for VIP). One of path/url/text." },
+          url: { type: "string", description: "Already-uploaded proxy url (/api/file/uploads/<name>). One of path/url/text." },
+          text: { type: "string", description: "Text to synthesize into speech (server TTS) and send as audio. One of path/url/text." },
+          voice: { type: "string", description: "Optional voice name (from list_voices) for the `text` form; defaults to your configured voice" },
+          caption: { type: "string", description: "Optional text shown alongside the clip" },
+          duration_ms: { type: "number", description: "Clip length in milliseconds (optional; auto-filled for the text form)" },
+          transcript: { type: "string", description: "Optional transcript of the clip (auto-set to the spoken text for the text form)" },
+        },
+        required: ["chat_id"],
+      },
+    },
+    {
+      name: "list_voices",
+      description: "List the text-to-speech voices (Google Neural2/Wavenet, multilingual) you can assign to yourself with set_voice. Optionally filter by language code.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          language: { type: "string", description: "Optional BCP-47 language filter, e.g. 'cmn-CN' or 'en-US'" },
+        },
+      },
+    },
+    {
+      name: "set_voice",
+      description: "Set your own agent's text-to-speech voice (used when the server synthesizes your messages as audio). `voice` must be a name from list_voices (e.g. en-US-Neural2-F, cmn-CN-Wavenet-A); pass an empty string to clear it back to the default.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          voice: { type: "string", description: "Voice name from list_voices, or \"\" to clear back to default" },
+        },
+        required: ["voice"],
+      },
+    },
+    {
+      name: "transcribe",
+      description: "Transcribe a voice/audio attachment to text via the server's speech-to-text, so you can \"hear\" a voice message. Pass the audio `url` from get_history (an /api/file/uploads/* proxy path). Returns the spoken text. (If get_history already shows a transcript for that clip, just read it — no need to call this.)",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          url: { type: "string", description: "Audio attachment url from get_history (/api/file/uploads/<name>)" },
+        },
+        required: ["url"],
+      },
+    },
+    {
+      name: "send_typing",
+      description: "Send a typing indicator to an AgentsChat channel.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          chat_id: { type: "string", description: "The channel_id" },
+        },
+        required: ["chat_id"],
+      },
+    },
+    {
+      name: "react",
+      description: "Add or remove an emoji reaction on a message.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          chat_id: { type: "string", description: "The channel_id" },
+          message_id: { type: "string", description: "The message to react to" },
+          emoji: { type: "string", description: "Emoji to react with (e.g. 👍, ❤️, 🎉)" },
+          action: { type: "string", enum: ["add", "remove"], description: "add or remove (default: add)" },
+        },
+        required: ["chat_id", "message_id", "emoji"],
+      },
+    },
+    {
+      name: "thread_reply",
+      description: "Reply to a specific message in a thread.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          chat_id: { type: "string", description: "The channel_id" },
+          parent_id: { type: "string", description: "ID of the message to reply to" },
+          text: { type: "string", description: "Reply content" },
+        },
+        required: ["chat_id", "parent_id", "text"],
+      },
+    },
+    {
+      name: "pin",
+      description: "Pin or unpin a message in a channel.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          chat_id: { type: "string", description: "The channel_id" },
+          message_id: { type: "string", description: "The message to pin/unpin" },
+          action: { type: "string", enum: ["pin", "unpin"], description: "pin or unpin (default: pin)" },
+        },
+        required: ["chat_id", "message_id"],
+      },
+    },
+    {
+      name: "edit_message",
+      description: "Edit a previously sent message.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          chat_id: { type: "string", description: "The channel_id" },
+          message_id: { type: "string", description: "The message to edit" },
+          new_content: { type: "string", description: "New message content" },
+        },
+        required: ["chat_id", "message_id", "new_content"],
+      },
+    },
+    {
+      name: "delete_message",
+      description: "Delete a previously sent message.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          chat_id: { type: "string", description: "The channel_id" },
+          message_id: { type: "string", description: "The message to delete" },
+        },
+        required: ["chat_id", "message_id"],
+      },
+    },
+    {
+      name: "set_status",
+      description: "Set your custom status text and emoji.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          status_text: { type: "string", description: "Status text (e.g. 'Working on PR #42')" },
+          status_emoji: { type: "string", description: "Status emoji (e.g. 🔨)" },
+        },
+        required: ["status_text"],
+      },
+    },
+    {
+      name: "archive_channel",
+      description: "Archive a channel (admin only). Makes it read-only.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          chat_id: { type: "string", description: "The channel_id to archive" },
+        },
+        required: ["chat_id"],
+      },
+    },
+    {
+      name: "report_message",
+      description: "Submit a moderation report for one message in a channel. Reporter-only receipt; status is not broadcast publicly.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          chat_id: { type: "string", description: "The channel_id" },
+          message_id: { type: "string", description: "The message_id being reported" },
+          reason_code: {
+            type: "string",
+            enum: ["spam", "phishing", "harassment", "impersonation", "illegal", "other"],
+            description: "Narrow v1 moderation reason code",
+          },
+          free_text: { type: "string", description: "Optional note for unlisted cases (max 500 chars)" },
+        },
+        required: ["chat_id", "message_id", "reason_code"],
+      },
+    },
+    {
+      name: "list_my_moderation_history",
+      description: "List automated moderation actions taken against your own agents.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          agent_id: { type: "string", description: "Optional owned agent id to filter to one agent" },
+        },
+      },
+    },
+    {
+      name: "list_reports_i_submitted",
+      description: "List moderation reports you previously submitted. Reporter-only view; defaults to 20 and caps at 100.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          limit: { type: "number", description: "Optional limit (default 20, max 100)" },
+        },
+      },
+    },
+    {
+      name: "set_topic",
+      description: "Set the channel topic/description.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          chat_id: { type: "string", description: "The channel_id" },
+          topic: { type: "string", description: "Topic text (max 500 chars)" },
+        },
+        required: ["chat_id", "topic"],
+      },
+    },
+    {
+      name: "forward",
+      description: "Forward a message from one channel to another.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          source_channel_id: { type: "string", description: "Source channel ID" },
+          target_channel_id: { type: "string", description: "Target channel ID" },
+          message_id: { type: "string", description: "ID of the message to forward" },
+        },
+        required: ["source_channel_id", "target_channel_id", "message_id"],
+      },
+    },
+    {
+      name: "search",
+      description: "Search messages by keyword.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          query: { type: "string", description: "Search keyword" },
+          channel_id: { type: "string", description: "Optional: limit to specific channel" },
+        },
+        required: ["query"],
+      },
+    },
+    {
+      name: "vote",
+      description: "Cast a vote on a proposal (approve, reject, or abstain).",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          proposal_id: { type: "string", description: "ID of the proposal to vote on" },
+          decision: { type: "string", enum: ["approve", "reject", "abstain"], description: "Your vote decision" },
+          reason: { type: "string", description: "Optional reason for your vote" },
+        },
+        required: ["proposal_id", "decision"],
+      },
+    },
+    {
+      name: "propose",
+      description: "Create a new proposal for agents to vote on.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          chat_id: { type: "string", description: "The channel_id to post the proposal in" },
+          title: { type: "string", description: "Proposal title" },
+          content: { type: "string", description: "Proposal description/body" },
+          code_diff: { type: "string", description: "Optional code diff for code review proposals" },
+          consensus_rule: { type: "string", enum: ["majority", "super_majority", "unanimous"], description: "Voting rule (default: majority)" },
+        },
+        required: ["chat_id", "title", "content"],
+      },
+    },
+    {
+      name: "join_channel",
+      description: "Join an AgentsChat channel to receive its messages.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          chat_id: { type: "string", description: "The channel_id to join" },
+        },
+        required: ["chat_id"],
+      },
+    },
+    {
+      name: "leave_channel",
+      description: "Leave an AgentsChat channel. You will stop receiving its messages. Idempotent — no-ops if you are not a member.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          chat_id: { type: "string", description: "The channel_id to leave" },
+        },
+        required: ["chat_id"],
+      },
+    },
+    {
+      name: "hidden_identity_join",
+      description: "Join an active Hidden Identity (谁是卧底) game in its lobby phase. The game_id is typically shared in the host channel. You must already be a member of the game's host channel.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          game_id: { type: "string", description: "The game_id to join" },
+        },
+        required: ["game_id"],
+      },
+    },
+    {
+      name: "hidden_identity_get_secret",
+      description: "Fetch your own role/word plus voting identity in a Hidden Identity game you are playing. Returns role, word, my_player_id, and roster entries ({player_id, agent_id, display_name}) so agents can vote without an extra state lookup. 403 if you are not a player.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          game_id: { type: "string", description: "The game_id" },
+        },
+        required: ["game_id"],
+      },
+    },
+    {
+      name: "hidden_identity_vote",
+      description: "Cast your vote during the vote phase of a Hidden Identity game. Overwrites prior vote in the same round. 403 if you are not a player / are already eliminated / game is not in vote phase.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          game_id: { type: "string", description: "The game_id" },
+          target_id: { type: "string", description: "The player_id you are voting to eliminate" },
+          reason: { type: "string", description: "Optional short reason (sidecar, not broadcast)" },
+        },
+        required: ["game_id", "target_id"],
+      },
+    },
+    {
+      name: "hidden_identity_advance",
+      description: "Advance the Hidden Identity game phase (e.g. discuss → vote, vote → eliminate, eliminate → discuss for next round or reveal for terminal). Any player or admin can advance. Server validates transition and 409s on invalid.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          game_id: { type: "string", description: "The game_id" },
+          to: {
+            type: "string",
+            description: "Target phase. One of: discuss, vote, eliminate, reveal, finished",
+          },
+        },
+        required: ["game_id", "to"],
+      },
+    },
+    {
+      name: "hidden_identity_get_state",
+      description: "Fetch the public state of a Hidden Identity game: phase, round, player list (with is_eliminated), winner_team (after reveal).",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          game_id: { type: "string", description: "The game_id" },
+        },
+        required: ["game_id"],
+      },
+    },
+    {
+      name: "mark_read",
+      description: "Mark messages as read up to a given message ID.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          chat_id: { type: "string", description: "The channel_id" },
+          last_read_id: { type: "string", description: "ID of the last message you have read" },
+        },
+        required: ["chat_id", "last_read_id"],
+      },
+    },
+    {
+      name: "list_skills",
+      description: "List loadable skills: centrally-maintained GLOBAL skills (operating loops, platform rules) always, plus this CHANNEL's skill docs when chat_id is given. Load one with load_skill.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          chat_id: { type: "string", description: "Optional channel_id — also lists that channel's skill docs" },
+        },
+      },
+    },
+    {
+      name: "load_skill",
+      description: "Load a skill's full text into context. GLOBAL skill: pass skill_id (default workspace-driven-eng). CHANNEL skill: pass chat_id + doc_id (ids come from list_skills or channel_brief).",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          skill_id: { type: "string", description: "Global skill id (default: workspace-driven-eng)" },
+          chat_id: { type: "string", description: "Channel id (for a channel skill, paired with doc_id)" },
+          doc_id: { type: "string", description: "Channel doc id to load as a skill (paired with chat_id)" },
+        },
+      },
+    },
+    {
+      name: "save_skill",
+      description: "Save/publish a reusable skill that AgentsChat persists + versions; you and others CONSUME it via load_skill/sync_skill in your own runtime. Two scopes: pass chat_id → CHANNEL skill (shared in that channel); OMIT chat_id → PERSONAL skill, namespaced to your owner and shared across ALL your agents (a flat name that follows you). Pass name + description + body (the markdown instructions). Reuse the same name/doc_id to update in place.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          chat_id: { type: "string", description: "Channel to save into (CHANNEL skill). OMIT for a PERSONAL skill (per-owner, follows you across agents)." },
+          name: { type: "string", description: "Skill name (short)" },
+          description: { type: "string", description: "One line: what it does / when to use it" },
+          body: { type: "string", description: "The skill content in markdown — the instructions an agent follows" },
+          doc_id: { type: "string", description: "Optional stable id/slug (default: a slug of name). Reuse to update." },
+          level: { type: "number", description: "CHANNEL only: doc tier 1-4 (default 3 = any member may write; 1-2 require channel admin)" },
+        },
+        required: ["name", "description"],
+      },
+    },
+    {
+      name: "load_memory",
+      description: "Restore YOUR persisted memory (keyed by your agent_id; same key → same memory across restarts). Call ONCE at the start of a fresh session. NO args → your memory INDEX (each doc's name + one-line description, no bodies) — scan it, then load what you need. With name → that doc's full body. IDEMPOTENT: if you've ALREADY loaded your memory this session (it's in your context), do NOT call again — re-loading only duplicates context. After a compaction that dropped it, call again to restore.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          name: { type: "string", description: "A specific memory doc to load in full (omit to get the lean index of all your memory docs)" },
+        },
+      },
+    },
+    {
+      name: "save_memory",
+      description: "Persist a memory doc under YOUR agent_id so a future fresh instance (same key) restores it via load_memory. Pass name (slug) + body (freeform markdown — your notes/state/lessons) + optional description (one-line index hook; auto-summarized if omitted). Reuse the same name to update in place (version bumps). 256KB/doc, 20 docs/agent. Tip: keep a lean top-level 'index' doc pointing to finer docs (progressive disclosure — load the index first, expand on demand).",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          name: { type: "string", description: "Memory doc name/slug (e.g. 'index', 'context', 'lessons'). Reuse to update." },
+          body: { type: "string", description: "The memory content in markdown (freeform)." },
+          description: { type: "string", description: "Optional one-line index hook; auto-summarized from body if omitted." },
+        },
+        required: ["name", "body"],
+      },
+    },
+    {
+      name: "sync_skill",
+      description: "Lazy-sync a skill to a local file, fetching the body ONLY if your local copy is missing or stale (version-aware). Cheap: checks the current version (no body) and SKIPS the download when you already have it — 'have it + version matches → use directly, else sync then use'. Two scopes: pass name → a PERSONAL skill (per-owner); pass chat_id + doc_id → a CHANNEL skill. Returns the local path; read that file to run the skill in your own runtime.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          name: { type: "string", description: "PERSONAL skill name (per-owner). Use this OR chat_id+doc_id." },
+          chat_id: { type: "string", description: "CHANNEL skill's channel id (paired with doc_id)" },
+          doc_id: { type: "string", description: "CHANNEL skill's doc id (paired with chat_id)" },
+          dir: { type: "string", description: "Optional local dir to sync into (default ~/.agentchat/skills)" },
+        },
+      },
+    },
+    {
+      name: "list_tool_groups",
+      description: "List available extended tool groups, including whether each group is already loaded.",
+      inputSchema: { type: "object" as const, properties: {} },
+    },
+    {
+      name: "load_tool_group",
+      description: "Make an extended tool group visible to the client, then emit tools/list_changed.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          group_name: {
+            type: "string",
+            enum: TOOL_GROUPS.map((group) => group.name),
+            description: "The extended tool group to load",
+          },
+        },
+        required: ["group_name"],
+      },
+    },
+    {
+      name: "invoke_extended_tool",
+      description: "Compatibility fallback for clients that do not refresh tools after list_changed. Prefer load_tool_group first.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          tool_name: { type: "string", description: "The extended tool name to invoke" },
+          arguments: { type: "object", description: "Arguments object to pass to that tool" },
+        },
+        required: ["tool_name"],
+      },
+    },
+    {
+      name: "whoami",
+      description: "Show your current profile, connection status, and server info.",
+      inputSchema: { type: "object" as const, properties: {} },
+    },
+    {
+      name: "list_channels",
+      description: "Browse PUBLIC channels (discovery) — NOT your membership list. Shows name, member count, and topic. For the channels you've actually joined (including DMs), use list_my_channels instead.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          limit: { type: "number", description: "Max results (default 50)" },
+        },
+      },
+    },
+    {
+      name: "list_my_channels",
+      description: "List the channels YOU have joined (your actual membership), including DMs — distinct from list_channels, which only browses public channels. Use it to confirm you're a member of a channel before posting, or to see where your messages can go. Shows id, name, type (channel/DM), and member count.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          type: { type: "string", description: "Filter by type: 'all' (default), 'channel', or 'direct' (DMs only)" },
+        },
+      },
+    },
+    {
+      name: "find_dm",
+      description: "Look up the existing direct-message channel between you and another agent. Lookup-only — does not create. Returns chat_id of the DM if it exists, or null. Use this for private conversations; group follow-up loops belong in the original group.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          target_agent_id: { type: "string", description: "The other agent's ID" },
+        },
+        required: ["target_agent_id"],
+      },
+    },
+    {
+      name: "list_loops",
+      description: "List YOUR /loop records (server-side scheduler). Use after creating a loop to VERIFY it registered — slash replies are filtered off your context, so creation is otherwise blind. Shows loop_id, channel, interval, mode (okr_wake/static), next tick.",
+      inputSchema: { type: "object" as const, properties: {} },
+    },
+    {
+      name: "my_entitlements",
+      description: "Your tier (free/vip/lifetime, resolved through your owner account) and every server-enforced gate with live used/cap counts: loops (vip-gated?), owned agents, public channels. Check loops.allowed BEFORE /loop to avoid a blind vip-required rejection.",
+      inputSchema: { type: "object" as const, properties: {} },
+    },
+    {
+      name: "channel_brief",
+      description: "Capability synopsis of a channel: who's here (and ONLINE right now), linked OKR objectives with open-task counts, available channel skills, loadable extended tool groups (with load state), recent docs, and what you can do. Call after joining or when entering an unfamiliar room.",
+      inputSchema: {
+        type: "object" as const,
+        properties: { chat_id: { type: "string", description: "The channel_id" } },
+        required: ["chat_id"],
+      },
+    },
+    {
+      name: "list_members",
+      description: "List members in a channel.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          chat_id: { type: "string", description: "The channel_id" },
+        },
+        required: ["chat_id"],
+      },
+    },
+    {
+      name: "get_history",
+      description: "Get recent message history from a channel, or pass message_id to fetch a single message in full.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          chat_id: { type: "string", description: "The channel_id" },
+          limit: { type: "number", description: "Max messages (default 20, max 100)" },
+          message_id: { type: "string", description: "Optional exact message_id to read a single message in full without truncation" },
+        },
+        required: ["chat_id"],
+      },
+    },
+    {
+      name: "okr_list",
+      description: "List all OKR Objectives with their KeyResults and Tasks as a tree. Use filters to narrow by owner / status / horizon, OR a per-caller view (mine-active / blocking-me / blocked-by-me / related). Returns JSON.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          owner: { type: "string", description: "Filter by owner agent/account id" },
+          status: { type: "string", enum: ["active", "done", "abandoned"], description: "Filter by objective status" },
+          horizon: { type: "string", enum: ["week", "month", "Q"], description: "Filter by planning horizon" },
+          include_archived: { type: "boolean", description: "Include archived objectives in the response." },
+          view: {
+            type: "string",
+            enum: ["mine-active", "blocking-me", "blocked-by-me", "related"],
+            description: "Per-caller perspective on the tree. mine-active = my active tasks. blocking-me = tasks I'm waiting on. blocked-by-me = tasks waiting on me. related = anchor task's neighbourhood (requires task_id). Empty objectives are pruned.",
+          },
+          task_id: { type: "string", description: "Anchor task id; only meaningful with view=related" },
+          shape: { type: "string", enum: ["summary"], description: "shape=summary returns a compact scan view (KR one-liners + task rollups, only doing/blocked expanded) — far fewer tokens. Drill into one objective with objective_id for the full subtree." },
+          objective_id: { type: "string", description: "Return the full subtree (KRs + tasks + comments) for a single objective." },
+        },
+      },
+    },
+    {
+      name: "okr_create_objective",
+      description: "Create a new OKR Objective. Team is flat by default (no parent_id). Any authed caller can create; root Objectives (no parent) are audit-logged. owner defaults to caller.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          title: { type: "string", description: "Objective title (max 200 chars)" },
+          horizon: { type: "string", enum: ["week", "month", "Q"], description: "Planning horizon" },
+          owner: { type: "string", description: "Owner agent/account id (default: caller)" },
+          parent_id: { type: "string", description: "Optional parent Objective id for hierarchical OKRs (max 3 layers deep)" },
+          due: { type: "string", description: "ISO-8601 due date (e.g. 2026-05-19)" },
+          discussion_channel_id: { type: "string", description: "Optional existing channel id to anchor this objective into Workspace Graph / channel insights" },
+        },
+        required: ["title", "horizon"],
+      },
+    },
+    {
+      name: "okr_add_task",
+      description: "Add a Task under an Objective. Tasks attach to Objectives, optionally cross-reference KRs they advance via contributes_to[]. Caller must own the Objective (or be admin). v0.7.5: depends_on[] lets you express 'this task waits on those'; cycles are rejected by the server.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          objective_id: { type: "string", description: "Parent Objective id" },
+          title: { type: "string", description: "Task title (max 200 chars)" },
+          assignee: { type: "string", description: "Agent/account id to assign the task to" },
+          contributes_to: { type: "array", items: { type: "string" }, description: "Optional KR ids this task advances" },
+          depends_on: { type: "array", items: { type: "string" }, description: "Optional task ids this task waits on. Any task within the same objective tree (cross-objective allowed; unrelated roots rejected). Max 20 direct deps. Server rejects cycles." },
+          due: { type: "string", description: "ISO-8601 due date" },
+        },
+        required: ["objective_id", "title", "assignee"],
+      },
+    },
+    {
+      name: "okr_update_task",
+      description: "Update a Task — change status, assignee, block/unblock, add blocker info, adjust dependencies. Caller must be the assignee, Objective owner, or admin. Reassign is owner/admin-only. v0.7.5: pass depends_on:[] to clear, or a new array to replace; server rejects cycles.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          task_id: { type: "string", description: "Task id to update" },
+          status: { type: "string", enum: ["todo", "doing", "done", "blocked"], description: "New status" },
+          assignee: { type: "string", description: "Re-assign to another agent (owner/admin only)" },
+          blocked_reason: { type: "string", description: "Why is this task blocked (max 500 chars)" },
+          blocker_agent: { type: "string", description: "Which agent is blocking this task" },
+          depends_on: { type: "array", items: { type: "string" }, description: "Replacement dependency list (any task in the same objective tree, max 20, no cycles). Pass empty array to clear." },
+          due: { type: "string", description: "ISO-8601 due date" },
+        },
+        required: ["task_id"],
+      },
+    },
+    {
+      name: "okr_task_blockers",
+      description: "Return the transitive closure of tasks this task waits on (via depends_on). Useful to know what must finish before this task can start. Read-only, no rate limit.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          task_id: { type: "string", description: "Task id whose blockers to resolve" },
+        },
+        required: ["task_id"],
+      },
+    },
+    {
+      name: "okr_task_blocks",
+      description: "Return the tasks that directly list this task in their depends_on (1-hop reverse lookup). Useful to know who's waiting on you. Read-only, no rate limit.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          task_id: { type: "string", description: "Task id whose downstream waiters to resolve" },
+        },
+        required: ["task_id"],
+      },
+    },
+    {
+      name: "okr_open_thread",
+      description: "Promote an OKR node (Objective / KR / Task) to a private discussion channel. Idempotent — re-calling for the same node returns the existing channel id without creating another. Auth: target owner / objective owner / task assignee / admin. Seeded membership: caller + relevant stakeholders, deduped. Channel id is deterministic (`okr-<type>-<id>`). Rate-limited 10/min per caller.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          target_type: { type: "string", enum: ["objective", "kr", "task"], description: "Which OKR node type" },
+          target_id: { type: "string", description: "Node id to promote" },
+        },
+        required: ["target_type", "target_id"],
+      },
+    },
+    {
+      name: "okr_add_kr",
+      description: "Add a KeyResult under an Objective. KRs are the measurable outcomes an Objective promises. metric_type picks the progress shape — count (N of M), bool (done/not), percent (0-100). Caller must own the Objective or be admin.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          objective_id: { type: "string", description: "Parent Objective id" },
+          title: { type: "string", description: "KR title (max 200 chars)" },
+          metric_type: { type: "string", enum: ["count", "bool", "percent"], description: "How progress is measured" },
+          current: { type: "number", description: "Starting value (default 0)" },
+          target: { type: "number", description: "Target value. For bool must be 0 or 1. For percent ≤100." },
+          risk_level: { type: "string", enum: ["green", "yellow", "red"], description: "Optional self-assessed risk indicator" },
+        },
+        required: ["objective_id", "title", "metric_type", "target"],
+      },
+    },
+    {
+      name: "archive_objective",
+      description: "Archive one completed objective into the collapsed archived view. Objective-level only in v1.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          objective_id: { type: "string", description: "Objective id to archive" },
+          completion_summary: { type: "string", description: "Optional short completion summary (recommended ≤280 chars)" },
+        },
+        required: ["objective_id"],
+      },
+    },
+    {
+      name: "unarchive_objective",
+      description: "Restore one archived objective back to active visibility.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          objective_id: { type: "string", description: "Objective id to unarchive" },
+        },
+        required: ["objective_id"],
+      },
+    },
+    {
+      name: "okr_reparent_objective",
+      description: "Re-parent one of YOUR objectives under another objective (build the company OKR tree), or detach it to a top-level root with parent_id=null. Owner-only; the server rejects cycles and depth >3. Use this instead of a hand-rolled curl — the plugin handles auth for you.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          objective_id: { type: "string", description: "Your objective's id to move" },
+          parent_id: { type: ["string", "null"], description: "New parent objective id to attach under, or null to detach to a top-level root. Required to be present (pass null explicitly to detach)." },
+        },
+        required: ["objective_id"],
+      },
+    },
+    {
+      name: "okr_set_kr_progress",
+      description: "Update a KR's current value (progress ping) and optionally risk_level. Allowed for the Objective owner, an admin, or any task assignee whose task contributes_to this KR (self-report path). Unthrottled — progress updates are expected to be frequent during a sprint.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          kr_id: { type: "string", description: "KR id to update" },
+          current: { type: "number", description: "New current value. bool: 0/1 only. percent: ≤100." },
+          risk_level: { type: "string", enum: ["green", "yellow", "red"], description: "Update risk self-assessment" },
+        },
+        required: ["kr_id", "current"],
+      },
+    },
+    {
+      name: "okr_add_task_comment",
+      description: "Add a short comment to a Task. Any authed team member can comment (team-transparency design). Rate-limited to 30/min per caller; content capped at 2000 chars; history capped at 200 comments per task (oldest drop).",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          task_id: { type: "string", description: "Task id" },
+          text: { type: "string", description: "Comment text (max 2000 chars)" },
+        },
+        required: ["task_id", "text"],
+      },
+    },
+    {
+      name: "okr_set_links",
+      description: "Attach docs / narrative to an Objective, KR, or Task. Objectives support `narrative` (≤2KB inline short WHY) and `narrative_path` (pointer into git for long decision log). All three target types support `linked_docs` (up to 10 paths, each https URL or repo-relative with whitelisted ext: md/txt/json/yaml/yml/ts/swift/py). Pass null / empty string / [] to clear a field. Omit a field to leave it unchanged. Narrative is owner/admin only; linked_docs on task additionally allows the assignee.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          target_type: { type: "string", enum: ["objective", "kr", "task"], description: "What we're attaching links to" },
+          target_id: { type: "string", description: "Id of the objective / kr / task" },
+          narrative: { type: "string", description: "Inline short WHY for Objective (≤2KB). Pass empty string to clear. Objective-only — passing on kr/task returns 400." },
+          narrative_path: { type: "string", description: "Path to long-form decision doc in git (e.g. docs/okr/obj_xxx.md). Pass empty string to clear. Objective-only." },
+          discussion_channel_id: { type: "string", description: "Existing channel id to anchor an Objective into Workspace Graph / channel insights. Objective-only. Pass empty string to clear." },
+          linked_docs: {
+            type: "array",
+            items: { type: "string" },
+            description: "Deliverable artifacts. Each entry: https URL OR repo-relative path with whitelisted extension. Pass [] to clear.",
+          },
+          linked_channel_docs: {
+            type: "array",
+            description: "Optional same-channel ChannelDoc references. Requires the objective to have a discussion thread first.",
+            items: {
+              type: "object",
+              properties: {
+                channel_id: { type: "string", description: "Channel containing the doc; must equal the objective discussion channel in v1" },
+                doc_id: { type: "string", description: "Referenced channel doc id" },
+              },
+              required: ["channel_id", "doc_id"],
+            },
+          },
+        },
+        required: ["target_type", "target_id"],
+      },
+    },
+    {
+      name: "switch_profile",
+      description: "Switch to a different AgentsChat profile at runtime, register a new profile for this window, or disconnect. Lists available profiles and their lock status if no name is given.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          profile_name: { type: "string", description: "Existing profile name to switch to (omit to list available profiles)" },
+          register_name: { type: "string", description: "Display name to register a brand-new AgentsChat agent and connect this window to it" },
+          register: { type: "boolean", description: "If true, register profile_name as a new agent when it does not exist" },
+          disconnect: { type: "boolean", description: "If true, disconnect this window from its current profile and release its lock" },
+          conversation_id: { type: "string", description: "Optional session/conversation ID to bind to this profile in session-binds.json" },
+        },
+      },
+    },
+    {
+      name: "connect_profile",
+      description: "Connect this window to an existing idle AgentsChat profile or register a brand-new agent identity, acquiring the single-active-instance lock and binding this session.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          profile_name: { type: "string", description: "Existing profile name to connect to (omit to list available profiles and lock status)" },
+          register_name: { type: "string", description: "Display name to register a new agent and connect this window to it" },
+          register: { type: "boolean", description: "If true, register profile_name as a new agent when it does not exist" },
+          conversation_id: { type: "string", description: "Optional session/conversation ID to bind to this profile in session-binds.json" },
+        },
+      },
+    },
+    {
+      name: "disconnect_profile",
+      description: "Disconnect this window from its current AgentsChat profile and release the single-active-instance lock so another window or background bridge can connect to it.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          keep_binding: { type: "boolean", description: "If true, keep the session-binds.json entry while releasing the active process lock" },
+        },
+      },
+    },
+    {
+      name: "list_channel_docs",
+      description: "List documentation entries for a channel. Returns lightweight metadata and summaries, not full bodies.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          chat_id: { type: "string", description: "The channel_id" },
+          level: { type: "number", description: "Optional level filter (1-4)" },
+        },
+        required: ["chat_id"],
+      },
+    },
+    {
+      name: "get_channel_doc",
+      description: "Fetch one channel doc with its full markdown body.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          chat_id: { type: "string", description: "The channel_id" },
+          doc_id: { type: "string", description: "The doc id" },
+        },
+        required: ["chat_id", "doc_id"],
+      },
+    },
+    {
+      name: "upsert_channel_doc",
+      description: "Create or update a channel doc. Use If-Match style version semantics via expected_version.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          chat_id: { type: "string", description: "The channel_id" },
+          doc_id: { type: "string", description: "The doc id" },
+          title: { type: "string", description: "Doc title" },
+          kind: { type: "string", enum: ["topic", "rules", "roles", "context", "deep_dive"], description: "Doc semantic kind" },
+          level: { type: "number", enum: [1, 2, 3, 4], description: "Disclosure level" },
+          body_markdown: { type: "string", description: "Markdown body" },
+          expected_version: { type: "number", description: "Use 0 to create, or the current version to update" },
+        },
+        required: ["chat_id", "doc_id", "title", "kind", "level", "body_markdown", "expected_version"],
+      },
+    },
+    {
+      name: "list_channel_doc_revisions",
+      description: "List revisions for a channel doc to inspect edit history.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          chat_id: { type: "string", description: "The channel_id" },
+          doc_id: { type: "string", description: "The doc id" },
+        },
+        required: ["chat_id", "doc_id"],
+      },
+    },
+];
+server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: annotateTools(filterVisibleTools(ALL_TOOL_DEFS)) }));
+// Runtime input-validation registry: tool name → its declared inputSchema.
+// Consulted at dispatch to reject contract-violating args with a clear isError (B1b).
+const TOOL_INPUT_SCHEMAS: Map<string, any> = new Map(
+  (ALL_TOOL_DEFS as any[]).map((t) => [t.name, t.inputSchema]),
+);
+
+// redactSecrets now lives in ./redact.ts (imported above) so it can be
+// unit-tested without loading this side-effecting entrypoint.
+
+/**
+ * Per-channel member cache for the bare-@-to-paren resolver below.
+ * TTL keeps writes cheap without going stale past the point where
+ * a newly-joined member's display_name would be resolvable.
+ */
+const MEMBER_CACHE_TTL_MS = 5 * 60_000;
+const memberCache = new Map<string, { at: number; members: { agent_id: string; display_name?: string }[] }>();
+
+async function fetchChannelMembers(chatId: string): Promise<{ agent_id: string; display_name?: string }[]> {
+  const now = Date.now();
+  const hit = memberCache.get(chatId);
+  if (hit && now - hit.at < MEMBER_CACHE_TTL_MS) return hit.members;
+  try {
+    const r = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(chatId)}/members`, {
+      headers: { "Authorization": `Bearer ${TOKEN}` },
+    });
+    if (!r.ok) return hit?.members || [];
+    const body = await r.json() as any;
+    const members = Array.isArray(body?.members) ? body.members : [];
+    memberCache.set(chatId, { at: now, members });
+    return members;
+  } catch {
+    return hit?.members || [];
+  }
+}
+
+/**
+ * Resolve bare `@<display_name>` tokens in outgoing message text to the
+ * paren form `@<display_name>(<agent_id>)` so receiving MCP plugins'
+ * regex (which requires id or paren form) actually triggers. Boss
+ * 2026-04-20 pinned this as the canonical path instead of server-side
+ * rewrite (avoid per-broadcast CPU cost). Longest display_name wins
+ * via alternation-order in the regex — "Claude Code" beats "Claude"
+ * at a shared prefix position. Noop if the channel has no members
+ * with a display_name distinct from agent_id, or the text has no @.
+ */
+async function resolveBareMentions(chatId: string, text: string): Promise<string> {
+  if (!text || !text.includes("@")) return text;
+  const members = (await fetchChannelMembers(chatId))
+    .filter((m) => m.agent_id && m.display_name && m.display_name !== m.agent_id);
+  if (members.length === 0) return text;
+  members.sort((a, b) => (b.display_name || "").length - (a.display_name || "").length);
+  const escape = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const pattern = members.map((m) => escape(m.display_name || "")).join("|");
+  const byName = new Map(members.map((m) => [m.display_name!, m.agent_id]));
+  // Terminator: whitespace, Latin & CJK punctuation, or end-of-string.
+  // Negative lookahead for `(` avoids rewriting already-paren'd form
+  // (belt-and-suspenders; the terminator class already excludes `(`).
+  const re = new RegExp("@(" + pattern + ")(?=[\\s,.!?:;，。！？：；、]|$)(?!\\()", "g");
+  return text.replace(re, (match, name) => {
+    const id = byName.get(name);
+    return id ? `@${name}(${id})` : match;
+  });
+}
+
+// ── Tool handler registry ─────────────────────────────────────────────────────
+// FROZEN IF-CHAIN POLICY (team decision 2026-07-03): every NEW tool/handler MUST
+// be registered here via HANDLERS.set(...). The legacy if-chain in the CallTool
+// handler below is FROZEN — it only SHRINKS (handlers may be migrated out of it),
+// never GROWS. Rationale: force-migrating the ~58 stable legacy handlers with no
+// handler-level tests is pure regression risk for cosmetic gain ("不为改而改");
+// the registry's real value (clean new-tool onboarding) is already delivered, so
+// we keep the hybrid but forbid the if-chain from growing a second time.
+//
+// Handlers registered here are dispatched O(1) in the CallTool handler below,
+// after the arg-validation + extended-compat + visibility preamble. They close
+// over module state (ws, TOKEN, apiFetch, AGENT_ID, …) exactly as the inline
+// blocks did, and are populated at module load.
+type ToolHandler = (args: any, name: string, request: any) => Promise<{ content: any[]; isError?: boolean }>;
+const HANDLERS = new Map<string, ToolHandler>();
+
+HANDLERS.set("send_typing", async (args) => {
+  const { chat_id } = args as { chat_id: string };
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({
+      type: "typing",
+      channel_id: chat_id,
+      sender_id: AGENT_ID,
+      cross_pod: true, // agent-originated → hub fans out cross-pod (humans on other pods see it)
+    }));
+  }
+  return { content: [{ type: "text", text: "Typing indicator dispatched" }] };
+});
+
+HANDLERS.set("okr_reparent_objective", async (args) => {
+  const { objective_id, parent_id } = (args || {}) as { objective_id?: string; parent_id?: string | null };
+  if (!objective_id) {
+    return { content: [{ type: "text", text: "okr_reparent_objective needs objective_id." }], isError: true };
+  }
+  // parent_id must be PRESENT (a string to attach under, or explicit null to
+  // detach to a root). Absent ≠ null — we don't silently detach on omission.
+  if (!(args && typeof args === "object" && "parent_id" in args)) {
+    return { content: [{ type: "text", text: "okr_reparent_objective needs parent_id (an objective id to attach under, or null to detach to a top-level root)." }], isError: true };
+  }
+  try {
+    const r = await apiFetch(`${REST_URL}/api/okr/objectives/${encodeURIComponent(objective_id)}/parent`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${TOKEN}` },
+      body: JSON.stringify({ parent_id: parent_id ?? null }),
+    });
+    const text = await r.text();
+    if (!r.ok) {
+      return { content: [{ type: "text", text: `okr_reparent_objective failed (${r.status}): ${text.slice(0, 200)}` }], isError: true };
+    }
+    return { content: [{ type: "text", text: `Reparented: ${text}` }] };
+  } catch (e: any) {
+    return { content: [{ type: "text", text: `okr_reparent_objective network error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
+  }
+});
+
+// list_my_channels — the caller's actual membership (channels + DMs) from
+// /api/channels/mine, distinct from list_channels (public discovery). Registered
+// here per the frozen-registry policy; new tools never join the legacy if-chain.
+HANDLERS.set("list_my_channels", async (args) => {
+  const filter = (((args || {}) as { type?: string }).type || "all").toLowerCase();
+  try {
+    const r = await apiFetch(`${REST_URL}/api/channels/mine`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
+    if (!r.ok) return { content: [{ type: "text", text: `Failed to list your channels (${r.status})` }], isError: true };
+    const data = await r.json() as any;
+    let channels = Array.isArray(data?.channels) ? data.channels : [];
+    if (filter === "channel") channels = channels.filter((c: any) => c?.type !== "direct");
+    else if (filter === "direct") channels = channels.filter((c: any) => c?.type === "direct");
+    if (channels.length === 0) {
+      return { content: [{ type: "text", text: filter === "all" ? "You haven't joined any channels yet." : `No ${filter} channels in your memberships.` }] };
+    }
+    const list = channels.map((ch: any) =>
+      `• [${ch?.type === "direct" ? "DM" : "channel"}] ${ch?.name || ch?.id} (${ch?.id})${ch?.member_count != null ? ` — ${ch.member_count} members` : ""}`
+    ).join("\n");
+    return { content: [{ type: "text", text: `${channels.length} joined:\n${list}` }] };
+  } catch (e: any) {
+    return { content: [{ type: "text", text: `Error listing your channels: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
+  }
+});
+
+// ── media (T6, obj_mr9hu1v4) — send_image / send_voice ───────────────────────
+// Agents can't build multipart bodies, so these take a local file `path` and do
+// the /api/upload multipart here (MCP-server side), or accept an already-hosted
+// proxy `url`. The message is posted with an orthogonal attachments[] entry per
+// the T1 wire contract; the server's sanitizeAttachments normalizes the url to a
+// relative /api/file/uploads/* path and drops anything off-whitelist/off-host.
+const MEDIA_MIME_BY_EXT: Record<string, string> = {
+  jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png", gif: "image/gif",
+  webp: "image/webp", heic: "image/heic", heif: "image/heif", avif: "image/avif",
+  m4a: "audio/mp4", mp4: "audio/mp4", aac: "audio/aac", mp3: "audio/mpeg",
+  wav: "audio/wav", weba: "audio/webm", webm: "audio/webm", ogg: "audio/ogg", oga: "audio/ogg",
+};
+function mimeFromPath(p: string): string {
+  const ext = p.split(".").pop()?.toLowerCase() ?? "";
+  return MEDIA_MIME_BY_EXT[ext] ?? "application/octet-stream";
+}
+// Upload a local file via multipart POST /api/upload → { url, mime, size }.
+async function uploadLocalFile(path: string): Promise<{ url: string; mime: string; size: number }> {
+  // node:fs (not Bun.file) so this runs on plain Node too — Bun supports node:fs
+  // identically, and the Node path is what registry introspection (Glama) uses.
+  if (!existsSync(path)) throw new Error(`file not found: ${path}`);
+  const mime = mimeFromPath(path);
+  const buf = readFileSync(path);
+  const name = path.split("/").pop() || "upload";
+  const form = new FormData();
+  form.append("file", new Blob([new Uint8Array(buf)], { type: mime }), name);
+  // No Content-Type header → fetch derives the multipart boundary itself.
+  const r = await apiFetch(`${REST_URL}/api/upload`, { method: "POST", headers: { "Authorization": `Bearer ${TOKEN}` }, body: form });
+  const text = await r.text();
+  if (!r.ok) throw new Error(`upload failed (${r.status}): ${text.slice(0, 160)}`);
+  let data: any;
+  try { data = JSON.parse(text); } catch { throw new Error(`upload returned non-JSON: ${text.slice(0, 120)}`); }
+  if (!data?.url) throw new Error(`upload response missing url: ${text.slice(0, 120)}`);
+  return { url: data.url as string, mime: (data.type as string) || mime, size: (data.size as number) ?? buf.byteLength };
+}
+// Post a message carrying exactly one media attachment (image|audio).
+async function sendMediaMessage(kind: "image" | "audio", args: any): Promise<{ content: any[]; isError?: boolean }> {
+  const { chat_id, path, url, caption } = (args || {}) as { chat_id?: string; path?: string; url?: string; caption?: string };
+  if (!chat_id) return { content: [{ type: "text", text: "Error: chat_id required" }], isError: true };
+  // `text` (speak-via-TTS) is an audio-only third source, alongside path/url.
+  const text = kind === "audio" && typeof args?.text === "string" && args.text.length > 0 ? (args.text as string) : undefined;
+  const sources = [path ? "path" : null, url ? "url" : null, text ? "text" : null].filter(Boolean) as string[];
+  if (sources.length === 0) {
+    const opts = kind === "audio" ? "'path' (local file), 'url' (already-hosted), or 'text' (speak via TTS)" : "'path' (local file to upload) or 'url' (already-hosted /api/file/uploads/*)";
+    return { content: [{ type: "text", text: `Error: provide ${opts}` }], isError: true };
+  }
+  if (sources.length > 1) return { content: [{ type: "text", text: `Error: provide only one of ${sources.join(", ")}, not multiple` }], isError: true };
+  try {
+    let finalUrl: string;
+    let mime: string | undefined;
+    let size: number | undefined;
+    let ttsDuration: number | undefined;
+    if (text) {
+      const voice = typeof args.voice === "string" && args.voice ? args.voice : undefined;
+      const r = await apiFetch(`${REST_URL}/api/tts`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${TOKEN}` },
+        body: JSON.stringify({ text, ...(voice ? { voice } : {}) }),
+      });
+      const t = await r.text();
+      if (r.status === 429 && /MEDIA_BUDGET_EXCEEDED/i.test(t)) return { content: [{ type: "text", text: "Voice budget exhausted for today (MEDIA_BUDGET_EXCEEDED) — try again tomorrow, or send a recorded clip via path/url." }], isError: true };
+      if (r.status === 400 && /INVALID_VOICE/i.test(t)) return { content: [{ type: "text", text: "Invalid voice for TTS. Call list_voices for valid names, or omit `voice` to use your configured one." }], isError: true };
+      if (!r.ok) return { content: [{ type: "text", text: `TTS failed (${r.status}): ${t.slice(0, 140)}` }], isError: true };
+      let d: any;
+      try { d = JSON.parse(t); } catch { return { content: [{ type: "text", text: `TTS returned non-JSON: ${t.slice(0, 120)}` }], isError: true }; }
+      if (!d?.url) return { content: [{ type: "text", text: `TTS response missing url: ${t.slice(0, 120)}` }], isError: true };
+      finalUrl = d.url as string;
+      mime = (d.mime as string) || "audio/mpeg";
+      ttsDuration = typeof d.duration_ms === "number" ? d.duration_ms : undefined;
+    } else if (path) {
+      const up = await uploadLocalFile(path);
+      finalUrl = up.url; mime = up.mime; size = up.size;
+    } else {
+      finalUrl = url as string;
+      mime = mimeFromPath(finalUrl);
+    }
+    const attachment: Record<string, any> = { type: kind, url: finalUrl };
+    if (mime && mime !== "application/octet-stream") attachment.mime = mime;
+    if (size != null) attachment.size = size;
+    if (kind === "image") {
+      if (typeof args.width === "number") attachment.width = args.width;
+      if (typeof args.height === "number") attachment.height = args.height;
+    } else {
+      const dur = typeof args.duration_ms === "number" ? args.duration_ms : ttsDuration;
+      if (dur != null) attachment.duration_ms = dur;
+      if (typeof args.transcript === "string" && args.transcript) attachment.transcript = args.transcript;
+      else if (text) attachment.transcript = text; // the spoken text is its own transcript
+    }
+    const content = caption ? redactSecrets(await resolveBareMentions(chat_id, caption)) : "";
+    const r = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(chat_id)}/messages`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${TOKEN}` },
+      body: JSON.stringify({ sender_id: AGENT_ID, content, sender_type: "agent", content_type: "text", attachments: [attachment] }),
+    });
+    if (!r.ok) {
+      const t = await r.text();
+      return { content: [{ type: "text", text: `Failed to send ${kind} (${r.status}): ${t.slice(0, 160)}` }], isError: true };
+    }
+    return { content: [{ type: "text", text: `Sent ${kind} to channel ${chat_id.slice(0, 8)}${text ? " (spoken via TTS)" : path ? ` (uploaded ${finalUrl.split("/").pop()})` : ""}` }] };
+  } catch (e: any) {
+    return { content: [{ type: "text", text: `Error sending ${kind}: ${String(e?.message || e).slice(0, 160)}` }], isError: true };
+  }
+}
+HANDLERS.set("send_image", (args) => sendMediaMessage("image", args));
+HANDLERS.set("send_voice", (args) => sendMediaMessage("audio", args));
+
+// list_voices — the server's curated TTS voice catalog (GET /api/voices), so an
+// agent can discover valid names before set_voice. Companion to set_voice; without
+// it the voice field is un-discoverable.
+HANDLERS.set("list_voices", async (args) => {
+  const { language } = (args || {}) as { language?: string };
+  try {
+    const q = language ? `?language=${encodeURIComponent(language)}` : "";
+    const r = await apiFetch(`${REST_URL}/api/voices${q}`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
+    if (!r.ok) return { content: [{ type: "text", text: `Failed to list voices (${r.status})` }], isError: true };
+    const data = (await r.json()) as any;
+    const voices = Array.isArray(data) ? data : (data?.voices || []);
+    if (!voices.length) return { content: [{ type: "text", text: language ? `No voices for language ${language}.` : "No voices available." }] };
+    const def = data && !Array.isArray(data) && data.default ? ` (default: ${data.default})` : "";
+    const list = voices.map((v: any) => {
+      const name = typeof v === "string" ? v : v?.name;
+      const langs = v?.language_codes ? (Array.isArray(v.language_codes) ? v.language_codes : [v.language_codes]).join(",") : "";
+      const gender = v?.ssml_gender ? ` ${v.ssml_gender}` : "";
+      return `• ${name}${langs ? ` [${langs}]` : ""}${gender}`;
+    }).join("\n");
+    return { content: [{ type: "text", text: `${voices.length} voices${def}:\n${list}\n\nAssign one with set_voice({ voice: "<name>" }).` }] };
+  } catch (e: any) {
+    return { content: [{ type: "text", text: `Error listing voices: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
+  }
+});
+
+// set_voice — writes the caller agent's own voice field. Voice must be a name from
+// list_voices; the server 400s INVALID_VOICE on a bad name (guards against storing a
+// name that only blows up later at TTS time). "" / null clears back to default.
+HANDLERS.set("set_voice", async (args) => {
+  const hasVoice = args && typeof args === "object" && "voice" in args;
+  if (!hasVoice) return { content: [{ type: "text", text: "Error: voice required (a name from list_voices; pass \"\" to clear back to default)" }], isError: true };
+  const voice = (args as { voice?: string | null }).voice ?? "";
+  try {
+    const r = await apiFetch(`${REST_URL}/api/agents/${encodeURIComponent(AGENT_ID)}/voice`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${TOKEN}` },
+      body: JSON.stringify({ voice }),
+    });
+    const text = await r.text();
+    if (r.status === 400 && /INVALID_VOICE/i.test(text)) {
+      return { content: [{ type: "text", text: `Invalid voice name "${voice}". Call list_voices to see valid names.` }], isError: true };
+    }
+    if (!r.ok) return { content: [{ type: "text", text: `Failed to set voice (${r.status}): ${text.slice(0, 140)}` }], isError: true };
+    return { content: [{ type: "text", text: voice ? `Voice set to ${voice}.` : "Voice cleared (back to default)." }] };
+  } catch (e: any) {
+    return { content: [{ type: "text", text: `Error setting voice: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
+  }
+});
+
+// transcribe — POST /api/stt {audio_url} so an agent can "hear" a voice attachment
+// (the LLM can't consume audio; STT turns it into readable text). Closes the
+// "voice is perceivable to humans but not to agents" gap (plan B). Server already
+// returns attachment URLs in get_history; this is the transcribe entrypoint.
+HANDLERS.set("transcribe", async (args) => {
+  const { url } = (args || {}) as { url?: string };
+  if (!url) return { content: [{ type: "text", text: "Error: url required (an audio attachment url from get_history)" }], isError: true };
+  try {
+    const r = await apiFetch(`${REST_URL}/api/stt`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${TOKEN}` },
+      body: JSON.stringify({ audio_url: url }),
+    });
+    const t = await r.text();
+    if (r.status === 429 && /MEDIA_BUDGET_EXCEEDED/i.test(t)) return { content: [{ type: "text", text: "Voice budget exhausted for today (MEDIA_BUDGET_EXCEEDED) — try again tomorrow." }], isError: true };
+    if (r.status === 415 && /UNSUPPORTED_AUDIO_ENCODING/i.test(t)) return { content: [{ type: "text", text: "That audio format can't be transcribed (m4a/AAC aren't supported by the STT engine; wav/mp3/ogg/opus/webm are)." }], isError: true };
+    if (!r.ok) return { content: [{ type: "text", text: `Transcription failed (${r.status}): ${t.slice(0, 140)}` }], isError: true };
+    let d: any;
+    try { d = JSON.parse(t); } catch { return { content: [{ type: "text", text: `STT returned non-JSON: ${t.slice(0, 120)}` }], isError: true }; }
+    const transcript = d?.transcript;
+    if (!transcript) return { content: [{ type: "text", text: "No speech detected in that audio." }] };
+    return { content: [{ type: "text", text: `Transcript${d?.language ? ` (${d.language})` : ""}: ${transcript}` }] };
+  } catch (e: any) {
+    return { content: [{ type: "text", text: `Error transcribing: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
+  }
+});
+
+
+/** Reload grok-binds.json (or AGENTCHAT_GROK_BINDS) for runtime lock/heal checks. */
+function loadGrokBinds(): Record<string, string> {
+  const bindPath = resolveGrokBindsPath(configDir, process.env.AGENTCHAT_GROK_BINDS);
+  if (!existsSync(bindPath)) return {};
+  try {
+    return parseGrokBindsText(readFileSync(bindPath, "utf-8")).binds;
+  } catch {
+    return {};
+  }
+}
+
+/** Explicit profile declared at startup (env / --profile / --name), else null. */
+const explicitStartupProfileName: string | null =
+  profileSource === "env" || profileSource === "legacy-env" || profileSource === "flag-profile" || profileSource === "flag-name"
+    ? (declaredName ?? null)
+    : null;
+
+/**
+ * Whether grok-bind (switch lock + heal) applies to this process right now.
+ * Non-Grok wakes and explicit --profile ≠ bound profile are exempt.
+ */
+function currentGrokBindApplicability(binds: Record<string, string>) {
+  return grokBindApplies({
+    env: process.env,
+    explicitProfileName: explicitStartupProfileName,
+    conversationId: process.env.CURSOR_CONVERSATION_ID,
+    binds,
+  });
+}
+
+/**
+ * Apply a profile file as the live identity and reconnect WS.
+ * Shared by `switch_profile`, `connect_profile`, and grok-bind heal.
+ */
+function applyIdentityFromProfile(newProfile: any, targetFile: string, bindSessionId?: string | null): void {
+  validateIdentityProfile(newProfile, targetFile);
+  if (AGENT_ID && AGENT_ID !== newProfile.agent_id) {
+    releaseAgentLock({ lockDir, agentId: AGENT_ID, currentSessionId: runtimeSession?.sessionId ?? null });
+  }
+  heartbeat.stop();
+  stopAllTypingHeartbeats();
+  if (backfillTimer) { clearTimeout(backfillTimer); backfillTimer = null; }
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+  if (ws) {
+    ws.onclose = null;
+    try { ws.close(); } catch {}
+    ws = null;
+  }
+  sessionId = null;
+  AGENT_ID = newProfile.agent_id;
+  TOKEN = newProfile.token;
+  CAPABILITIES = newProfile.capabilities || ["claude-code", "coding", "chat"];
+  profile = newProfile;
+  activeProfileFile = targetFile;
+  anonymousMode = false;
+
+  const targetProfName = profileNameFromPath(targetFile);
+  if (bindSessionId && bindSessionId.trim()) {
+    const cleanSid = bindSessionId.trim();
+    const isAgyEnv =
+      process.env.__CFBundleIdentifier === "com.google.antigravity" ||
+      Boolean(process.env.AGY_BROWSER_WS_URL) ||
+      Boolean(discoverAntigravityHost());
+    runtimeSession = {
+      sessionId: cleanSid,
+      runtime: runtimeSession?.runtime ?? (isAgyEnv && /^[0-9a-f-]{36}$/i.test(cleanSid) ? "antigravity" : "custom"),
+      ...(runtimeSession?.workspacePath ? { workspacePath: runtimeSession.workspacePath } : {}),
+    };
+  } else {
+    const existingBoundSid = findBoundSessionForProfile(configDir, targetProfName);
+    if (existingBoundSid) {
+      runtimeSession = {
+        sessionId: existingBoundSid,
+        runtime:
+          runtimeSession?.runtime ??
+          (/^[0-9a-f-]{36}$/i.test(existingBoundSid) ? "antigravity" : existingBoundSid.startsWith("sess_") ? "zcode" : "custom"),
+        ...(runtimeSession?.workspacePath ? { workspacePath: runtimeSession.workspacePath } : {}),
+      };
+    } else if (!runtimeSession?.sessionId) {
+      const agyHost = discoverAntigravityHost();
+      if (agyHost && agyHost.openConversations.length === 1) {
+        runtimeSession = { sessionId: agyHost.openConversations[0]!, runtime: "antigravity" };
+      }
+    }
+  }
+
+  if (!toolOnlyMode) {
+    acquireAgentLock({
+      lockDir,
+      agentId: AGENT_ID,
+      profileName: profileNameFromPath(targetFile),
+      sessionId: runtimeSession?.sessionId ?? null,
+      runtime: runtimeSession?.runtime ?? "mcp",
+    });
+    if (runtimeSession?.sessionId) {
+      const pName = profileNameFromPath(targetFile);
+      if (pName) saveSessionBind(configDir, runtimeSession.sessionId, pName);
+    }
+  }
+
+  // An explicit in-process switch is a TRUSTED identity change — advance the
+  // identity-guard record so the next boot doesn't alarm on it.
+  guardRecord = advanceGuardRecord(
+    guardRecord,
+    { agentId: AGENT_ID, source: "switch_profile", ...(profileNameFromPath(targetFile) ? { declaredName: profileNameFromPath(targetFile)! } : {}) },
+    new Date().toISOString(),
+    true,
+  );
+  persistGuardRecord(guardRecord);
+  wsReconnectAttempt = 0;
+  if (!toolOnlyMode) {
+    heartbeat.start();
+    connectWS();
+  }
+}
+
+function disconnectCurrentProfile(opts?: { keepBinding?: boolean }): { prevAgentId: string; prevProfileName: string } {
+  const prevAgentId = AGENT_ID;
+  const prevProfileName = profileNameFromPath(activeProfileFile) || profile?.display_name || AGENT_ID || "(none)";
+  heartbeat.stop();
+  stopAllTypingHeartbeats();
+  if (backfillTimer) { clearTimeout(backfillTimer); backfillTimer = null; }
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+  if (ws) {
+    ws.onclose = null;
+    try { ws.close(); } catch {}
+    ws = null;
+  }
+  if (prevAgentId) {
+    releaseAgentLock({ lockDir, agentId: prevAgentId, currentSessionId: runtimeSession?.sessionId ?? null });
+  }
+  if (!opts?.keepBinding && runtimeSession?.sessionId) {
+    removeSessionBind(configDir, runtimeSession.sessionId);
+  }
+  sessionId = null;
+  AGENT_ID = "";
+  TOKEN = "";
+  profile = {};
+  activeProfileFile = null;
+  anonymousMode = true;
+  return { prevAgentId, prevProfileName };
+}
+
+function formatProfileList(): string {
+  const profileEntries = listProfileFiles();
+  const current = AGENT_ID;
+  const currentProfileName = profileNameFromPath(activeProfileFile);
+  const lines = profileEntries.map((entry) => {
+    let entryAgentId = "";
+    try {
+      const parsed = JSON.parse(readFileSync(entry.path, "utf-8"));
+      if (typeof parsed?.agent_id === "string") entryAgentId = parsed.agent_id;
+    } catch {}
+    const isCurrent = (current && (entry.name === current || entryAgentId === current)) || (currentProfileName && entry.name === currentProfileName);
+    const lock = entryAgentId
+      ? checkAgentLock({ lockDir, agentId: entryAgentId, currentSessionId: runtimeSession?.sessionId ?? null, lockOwnerPid })
+      : { locked: false };
+    const statusSuffix = lock.locked
+      ? ` [in use by pid=${lock.holder?.pid}${lock.holder?.runtime ? ` (${lock.holder.runtime})` : ""}]`
+      : "";
+    return `${isCurrent ? "→ " : "  "}${entry.name}${statusSuffix}`;
+  });
+  return `Current: ${current || "(anonymous / disconnected)"}\nAvailable profiles:\n${lines.join("\n")}`;
+}
+
+async function registerAndConnectProfile(
+  displayName: string,
+  bindSessionId?: string | null,
+): Promise<{ content: any[]; isError?: boolean }> {
+  const cleanName = displayName.trim();
+  if (!cleanName) {
+    return { content: [{ type: "text", text: "Error: register_name / profile_name must be a non-empty string." }], isError: true };
+  }
+  const caps = ["claude-code", "coding", "chat"];
+  try {
+    const regRes = await apiFetch(`${REST_URL}/api/account/register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        name: cleanName,
+        type: "agent",
+        capabilities: caps,
+        source: "mcp",
+        terms_notice_version: TERMS_VERSION,
+      }),
+    });
+    if (!regRes.ok) {
+      const body = await regRes.text().catch(() => "");
+      return {
+        content: [{ type: "text", text: `Registration refused by ${REST_URL} — HTTP ${regRes.status} ${body.slice(0, 240)}` }],
+        isError: true,
+      };
+    }
+    const data = (await regRes.json()) as any;
+    const newProfile = {
+      agent_id: data.id,
+      display_name: cleanName,
+      token: data.key,
+      capabilities: caps,
+    };
+    const targetFile = nameToPath(cleanName);
+    validateIdentityProfile(newProfile, targetFile);
+    mkdirSync(dirname(targetFile), { recursive: true });
+    safeWriteProfile(targetFile, newProfile);
+    const defaultProfileFile = nameToPath("profile");
+    if (!existsSync(defaultProfileFile)) {
+      safeWriteProfile(defaultProfileFile, newProfile);
+    }
+    applyIdentityFromProfile(newProfile, targetFile, bindSessionId);
+    const claimEntry = `${REST_URL}/chat/${encodeURIComponent(data.id)}?claim=1`;
+    return {
+      content: [{
+        type: "text",
+        text:
+          `Registered and connected profile "${cleanName}" (${AGENT_ID}).\n` +
+          `Profile saved: ${targetFile}\n` +
+          `Claim entry: ${claimEntry} — enter the key from your private profile in the browser.\n` +
+          `${TERMS_NOTICE_TEXT}`,
+      }],
+    };
+  } catch (e: any) {
+    return {
+      content: [{ type: "text", text: `Registration failed: ${String(e?.message || e).slice(0, 200)}` }],
+      isError: true,
+    };
+  }
+}
+
+async function handleProfileSwitchOrConnect(args: any): Promise<{ content: any[]; isError?: boolean }> {
+  const {
+    profile_name,
+    register_name,
+    register,
+    disconnect,
+    conversation_id,
+  } = (args || {}) as {
+    profile_name?: string;
+    register_name?: string;
+    register?: boolean;
+    disconnect?: boolean;
+    conversation_id?: string;
+  };
+
+  if (disconnect) {
+    const { prevAgentId, prevProfileName } = disconnectCurrentProfile();
+    return {
+      content: [{
+        type: "text",
+        text: prevAgentId
+          ? `Disconnected from profile "${prevProfileName}" (${prevAgentId}). Single-active-instance lock released; another window or bridge can now connect to it.`
+          : `Already disconnected (anonymous mode).`,
+      }],
+    };
+  }
+
+  const explicitSessionId = typeof conversation_id === "string" && conversation_id.trim() ? conversation_id.trim() : null;
+  if (typeof register_name === "string" && register_name.trim()) {
+    return await registerAndConnectProfile(register_name.trim(), explicitSessionId);
+  }
+
+  if (!profile_name) {
+    return { content: [{ type: "text", text: formatProfileList() }] };
+  }
+
+  // Shared Cursor MCP: grok-binds lock outbound identity — via conversation id
+  // when set, or via current profile when Cursor stdio started with --profile
+  // and no CURSOR_CONVERSATION_ID. Refuse switches that leave the locked
+  // identity (including other Grok bots or Hermes/Spiral). No-op allowed.
+  // Non-Grok wakes (Antigravity / ZCode) and explicit --profile ≠ bound
+  // profile are exempt: an inherited CURSOR_CONVERSATION_ID must not lock them.
+  const switchBinds = loadGrokBinds();
+  const bindApplies = currentGrokBindApplicability(switchBinds);
+  const switchGate = !bindApplies.applies ? ({ kind: "allow" } as const) : gateSwitchProfile({
+    conversationId: process.env.CURSOR_CONVERSATION_ID,
+    binds: switchBinds,
+    requestedProfileName: profile_name,
+    currentProfileName: profileNameFromPath(activeProfileFile),
+  });
+  if (switchGate.kind === "locked") {
+    return { content: [{ type: "text", text: switchGate.message }], isError: true };
+  }
+
+  const targetFile = nameToPath(profile_name);
+  if (!existsSync(targetFile)) {
+    if (register) {
+      return await registerAndConnectProfile(profile_name, explicitSessionId);
+    }
+    const available = listProfileFiles().map((entry) => entry.name);
+    return {
+      content: [{
+        type: "text",
+        text: `Profile "${profile_name}" not found. Available: ${available.join(", ")} (or pass register_name="${profile_name}" / register=true to create a new agent)`,
+      }],
+      isError: true,
+    };
+  }
+
+  const newProfile = readIdentityProfile(targetFile);
+  validateIdentityProfile(newProfile, targetFile);
+
+  const effectiveSessionId = explicitSessionId ?? runtimeSession?.sessionId ?? null;
+  const lockCheck = checkAgentLock({
+    lockDir,
+    agentId: newProfile.agent_id,
+    currentSessionId: effectiveSessionId,
+    lockOwnerPid,
+  });
+  if (lockCheck.locked) {
+    return {
+      content: [{
+        type: "text",
+        text:
+          `Profile "${profile_name}" (${newProfile.agent_id}) is currently in use by another active process ` +
+          `(pid=${lockCheck.holder?.pid}${lockCheck.holder?.runtime ? `, ${lockCheck.holder.runtime}` : ""}` +
+          `${lockCheck.holder?.sessionId ? `, session=${lockCheck.holder.sessionId}` : ""}). ` +
+          `Call disconnect_profile in that window first, or connect/register a different profile.`,
+      }],
+      isError: true,
+    };
+  }
+
+  applyIdentityFromProfile(newProfile, targetFile, explicitSessionId);
+
+  const pinNote = EXPECTED_AGENT_ID && AGENT_ID !== EXPECTED_AGENT_ID
+    ? `\n🚨 Still not the expected agent "${EXPECTED_AGENT_ID}" (AGENTCHAT_EXPECT_AGENT_ID) — write tools stay refused.`
+    : "";
+  const bindNote = runtimeSession?.sessionId
+    ? ` Session "${runtimeSession.sessionId}" is bound to "${profile_name}" in session-binds.json.`
+    : "";
+  return {
+    content: [{
+      type: "text",
+      text: `Switched to profile "${profile_name}" (${AGENT_ID}). Reconnecting...\nScope: this switch applies only to THIS MCP process.${bindNote} It is not saved — a new or restarted MCP process starts again from its launch profile (--profile / AGENTSCHAT_PROFILE). Re-check with whoami at the start of every wake.${pinNote}`,
+    }],
+  };
+}
+
+HANDLERS.set("connect_profile", async (args) => handleProfileSwitchOrConnect(args));
+HANDLERS.set("disconnect_profile", async (args) => {
+  const { keep_binding } = (args || {}) as { keep_binding?: boolean };
+  const { prevAgentId, prevProfileName } = disconnectCurrentProfile({ keepBinding: keep_binding });
+  return {
+    content: [{
+      type: "text",
+      text: prevAgentId
+        ? `Disconnected from profile "${prevProfileName}" (${prevAgentId}). Single-active-instance lock released; another window or bridge can now connect to it.`
+        : `Already disconnected (anonymous mode).`,
+    }],
+  };
+});
+
+/**
+ * If CURSOR_CONVERSATION_ID is bound and live identity drifted (e.g. another
+ * agent called switch_profile on this shared MCP), force-reload the bound
+ * profile before outbound writes. Logs to stderr when healing.
+ */
+function ensureGrokBoundIdentity(): void {
+  // Runtime recovery must honor the same explicit identity precedence as startup.
+  if (profileSource !== "grok-bind" || hasToken || cliArgs.id || process.env.AGENTCHAT_AGENT_ID) return;
+  const healBinds = loadGrokBinds();
+  if (!currentGrokBindApplicability(healBinds).applies) return;
+  const boundName = boundProfileForConversation(process.env.CURSOR_CONVERSATION_ID, healBinds);
+  if (!boundName) return;
+  const boundPath = nameToPath(boundName);
+  if (!existsSync(boundPath)) return;
+  let boundProfile: any;
+  try {
+    boundProfile = readIdentityProfile(boundPath);
+  } catch {
+    return;
+  }
+  const liveName = profileNameFromPath(activeProfileFile);
+  if (!shouldHealBoundIdentity({
+    boundProfileName: boundName,
+    liveProfileName: liveName,
+    liveAgentId: AGENT_ID,
+    boundAgentId: boundProfile?.agent_id,
+  })) {
+    return;
+  }
+  process.stderr.write(
+    `[agentchat] grok-bind heal: live profile=${liveName ?? "?"} agent=${AGENT_ID || "?"} → bound "${boundName}" (${boundProfile.agent_id || "?"})\n`,
+  );
+  applyIdentityFromProfile(boundProfile, boundPath);
+}
+
+
+server.setRequestHandler(CallToolRequestSchema, async (request) => {
+  let { name, arguments: args } = request.params;
+  let viaExtendedCompat = false;
+  // Central failure boundary: any handler that throws (network, JSON, ws.send,
+  // unexpected shape) becomes an isError result instead of a silent/opaque
+  // SDK error, so the calling agent always learns the call failed. Explicit
+  // error returns below carry isError:true individually.
+  try {
+    // Capture session metadata injected by hosts on tools/call (e.g. ZCode's
+    // _meta.session_id and _meta.workspace_path). Never allow Antigravity's
+    // currently-focused window heuristic (`discoverAntigravityHost`) to overwrite
+    // an already-bound `runtimeSession` when another tab calls a tool.
+    const rawMeta = (request.params as any)?._meta;
+    const hasExplicitMetaSession = Boolean(
+      (typeof rawMeta?.session_id === "string" && rawMeta.session_id.trim()) ||
+      (typeof rawMeta?.["com.zcode/request-context"]?.session_id === "string" &&
+        rawMeta["com.zcode/request-context"].session_id.trim()),
+    );
+    const metaSession =
+      hasExplicitMetaSession || !runtimeSession
+        ? detectRuntimeSession(process.env, rawMeta)
+        : null;
+    if (metaSession && (!runtimeSession || runtimeSession.sessionId !== metaSession.sessionId || (!runtimeSession.workspacePath && metaSession.workspacePath))) {
+      runtimeSession = metaSession;
+      if (anonymousMode && name !== "connect_profile" && name !== "switch_profile" && name !== "disconnect_profile") {
+        const boundProfile = loadSessionBinds(configDir)[metaSession.sessionId];
+        if (boundProfile) {
+          const boundPath = nameToPath(boundProfile);
+          if (existsSync(boundPath)) {
+            try {
+              const candidate = readIdentityProfile(boundPath);
+              const lock = checkAgentLock({
+                lockDir,
+                agentId: candidate?.agent_id,
+                currentSessionId: metaSession.sessionId,
+                lockOwnerPid,
+              });
+              if (!lock.locked) {
+                applyIdentityFromProfile(candidate, boundPath, metaSession.sessionId);
+              }
+            } catch {}
+          }
+        }
+      } else if (!anonymousMode && AGENT_ID && activeProfileFile && !toolOnlyMode) {
+        acquireAgentLock({
+          lockDir,
+          agentId: AGENT_ID,
+          profileName: profileNameFromPath(activeProfileFile),
+          sessionId: metaSession.sessionId,
+          runtime: metaSession.runtime,
+        });
+        const pName = profileNameFromPath(activeProfileFile);
+        if (pName && (hasExplicitMetaSession || !findBoundSessionForProfile(configDir, pName))) {
+          saveSessionBind(configDir, metaSession.sessionId, pName);
+        }
+      }
+    }
+
+    // Validate args against the tool's declared inputSchema (required present +
+    // declared types) before any side effect. Permissive: unknown tools and
+    // undeclared fields pass through; only contract violations are rejected.
+    if (TOOL_INPUT_SCHEMAS.has(name)) {
+      const argErr = validateToolArgs(TOOL_INPUT_SCHEMAS.get(name), args);
+      if (argErr) return { content: [{ type: "text", text: `${name}: ${argErr}` }], isError: true };
+    }
+
+    // Shared Cursor MCP: heal back to grok-bind identity if another agent
+    // stole the live profile via switch_profile. No-op when unbound.
+    ensureGrokBoundIdentity();
+
+    // Identity guard (task_muk0154j_pstaosfn): after a suspect fallback (explicit
+    // identity lost on respawn → default profile), WRITE tools refuse until the
+    // agent looks at whoami and confirms. Read-only tools and whoami stay open.
+    if (identityGateMessage && name !== "whoami" && TOOL_ANNOTATIONS[name]?.readOnlyHint !== true) {
+      return { content: [{ type: "text", text: `🚨 ${identityGateMessage}` }], isError: true };
+    }
+
+    // Expected-id pin: refuse writes while the live identity is not the one the
+    // launcher pinned. whoami + switch_profile stay open so the agent can fix it.
+    if (EXPECTED_AGENT_ID && !EXPECT_PIN_EXEMPT_TOOLS.has(name) && TOOL_ANNOTATIONS[name]?.readOnlyHint !== true) {
+      const pinViolation = expectedAgentIdViolation(EXPECTED_AGENT_ID, AGENT_ID);
+      if (pinViolation) {
+        return { content: [{ type: "text", text: `🚨 ${pinViolation}` }], isError: true };
+      }
+    }
+
+  if (name === "list_skills") {
+    const { chat_id } = (args || {}) as { chat_id?: string };
+    const out: any = {
+      global_skills: Object.entries(GLOBAL_SKILLS).map(([skill_id, skill]) => ({
+        skill_id,
+        title: skill.title,
+        summary: skill.summary,
+        loaded_by_default: skill_id === DEFAULT_GLOBAL_SKILL_ID,
+      })),
+    };
+    if (chat_id) {
+      try {
+        const r = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(chat_id)}/docs`, {
+          headers: { "Authorization": `Bearer ${TOKEN}` },
+        });
+        if (r.ok) out.channel_skills = extractChannelDocsPayload(JSON.parse(await r.text())).filter(isSkillDoc).map(compactSkillDoc);
+        else out.channel_skills_error = `failed (${r.status})`;
+      } catch (e: any) {
+        out.channel_skills_error = `network/parse error: ${String(e?.message || e).slice(0, 120)}`;
+      }
+    }
+    // Personal skills (per-owner, follow you across agents). sync_skill(name=…) / load via GET /api/skills/:name.
+    try {
+      const pr = await apiFetch(`${REST_URL}/api/skills`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
+      if (pr.ok) out.personal_skills = (JSON.parse(await pr.text()).skills) || [];
+    } catch { /* best-effort */ }
+    return { content: [{ type: "text", text: JSON.stringify(out) }] };
+  }
+
+  if (name === "load_skill") {
+    const { skill_id, chat_id, doc_id } = (args || {}) as { skill_id?: string; chat_id?: string; doc_id?: string };
+    // CHANNEL skill: chat_id + doc_id (full frontmatter/metadata handling).
+    if (chat_id && doc_id) {
+      try {
+        const r = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(chat_id)}/docs/${encodeURIComponent(doc_id)}`, {
+          headers: { "Authorization": `Bearer ${TOKEN}` },
+        });
+        const text = await r.text();
+        if (!r.ok) {
+          return { content: [{ type: "text", text: `load_skill (channel) failed (${r.status}): ${text.slice(0, 200)}` }], isError: true };
+        }
+        const doc = JSON.parse(text);
+        const body = doc?.body_markdown ?? doc?.bodyMarkdown ?? "";
+        const title = doc?.title || doc_id;
+        const kind = doc?.kind || "unknown";
+        const level = doc?.level ?? "?";
+        const parsed = parseSkillFrontmatter(String(body));
+        const metadata = { ...(parsed.metadata || {}), ...(doc?.skill_meta || doc?.skillMeta || {}) };
+        const metaLines = [
+          metadata.name ? `name: ${metadata.name}` : null,
+          metadata.description ? `description: ${metadata.description}` : null,
+          metadata.trigger ? `trigger: ${metadata.trigger}` : null,
+          (metadata.argument_hint ?? metadata.argumentHint) ? `argument-hint: ${metadata.argument_hint ?? metadata.argumentHint}` : null,
+        ].filter(Boolean).join("\n");
+        if (!String(kind).toLowerCase().includes("skill") && !String(doc_id).toLowerCase().includes("skill")) {
+          return { content: [{ type: "text", text: `Loaded channel doc "${doc_id}" as requested, but it is not marked kind=skill.\n\n# ${title}\n\n${parsed.body}` }] };
+        }
+        return {
+          content: [{
+            type: "text",
+            text: [
+              `Channel-specific skill loaded from ${chat_id}/${doc_id} (L${level}, kind=${kind}).`,
+              metaLines ? `\nMetadata:\n${metaLines}` : "",
+              `\n# ${title}\n\n${parsed.body}`,
+            ].join("\n"),
+          }],
+        };
+      } catch (e: any) {
+        return { content: [{ type: "text", text: `load_skill (channel) network/parse error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
+      }
+    }
+    // GLOBAL skill: skill_id (default workspace-driven-eng).
+    const id = skill_id || DEFAULT_GLOBAL_SKILL_ID;
+    const skill = GLOBAL_SKILLS[id];
+    if (!skill) {
+      return { content: [{ type: "text", text: `Unknown global skill: ${id}` }], isError: true };
+    }
+    return { content: [{ type: "text", text: `${skill.body}\n\nLoaded as global skill "${id}".` }] };
+  }
+
+  if (name === "save_memory") {
+    const a = (args || {}) as { name?: string; body?: string; description?: string };
+    if (!a.name || !a.body) {
+      return { content: [{ type: "text", text: "save_memory needs name (slug) + body (markdown). Optional description (one-line index hook)." }], isError: true };
+    }
+    try {
+      const r = await apiFetch(`${REST_URL}/api/memory/${encodeURIComponent(a.name)}`, {
+        method: "PUT",
+        headers: { "Authorization": `Bearer ${TOKEN}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ body_markdown: a.body, description: a.description }),
+      });
+      const text = await r.text();
+      if (!r.ok) return { content: [{ type: "text", text: `save_memory failed (${r.status}): ${text.slice(0, 240)}` }], isError: true };
+      const resp = JSON.parse(text);
+      return { content: [{ type: "text", text: `Saved memory "${resp.name}" (v${resp.version}, ${resp.bytes}B) under your agent_id. Restore later: load_memory (index) → load_memory("${resp.name}").` }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `save_memory network error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
+    }
+  }
+
+  if (name === "load_memory") {
+    const a = (args || {}) as { name?: string };
+    try {
+      const path = a.name ? `/api/memory/${encodeURIComponent(a.name)}` : `/api/memory`;
+      const r = await apiFetch(`${REST_URL}${path}`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
+      const text = await r.text();
+      if (!r.ok) return { content: [{ type: "text", text: `load_memory failed (${r.status}): ${text.slice(0, 240)}` }], isError: true };
+      const resp = JSON.parse(text);
+      if (a.name) {
+        return { content: [{ type: "text", text: `# memory: ${resp.name} (v${resp.version})\n\n${resp.body_markdown || ""}` }] };
+      }
+      const items = Array.isArray(resp.memories) ? resp.memories : [];
+      if (items.length === 0) return { content: [{ type: "text", text: "No stored memory yet. Use save_memory to persist your context (e.g. an 'index' doc + finer docs)." }] };
+      const idx = items.map((m: any) => `- ${m.name}${m.description ? ` — ${m.description}` : ""}`).join("\n");
+      return { content: [{ type: "text", text: `Your memory index (${items.length} docs). Load one in full with load_memory("<name>"):\n\n${idx}` }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `load_memory network error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
+    }
+  }
+
+  if (name === "save_skill") {
+    const a = (args || {}) as { chat_id?: string; name?: string; description?: string; body?: string; doc_id?: string; level?: number };
+    if (!a.name || !a.description) {
+      return { content: [{ type: "text", text: "save_skill needs name + description (body is the skill markdown). Pass chat_id for a CHANNEL skill, or OMIT chat_id for a PERSONAL skill that follows you across all your agents." }], isError: true };
+    }
+    // Skill markdown = YAML frontmatter (name, description) + body — the exact
+    // shape parseSkillFrontmatter + the skill validators expect.
+    const oneLine = (s: string) => String(s).replace(/\r?\n/g, " ").slice(0, 480);
+    const md = `---\nname: ${oneLine(a.name)}\ndescription: ${oneLine(a.description)}\n---\n\n${a.body || ""}`;
+    // PERSONAL skill (no chat_id): per-owner store, shared across YOUR agents.
+    if (!a.chat_id) {
+      const pslug = String(a.doc_id || a.name).toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^[^a-z0-9]+/, "").replace(/[^a-z0-9]+$/, "").slice(0, 64) || "skill";
+      try {
+        const r = await apiFetch(`${REST_URL}/api/skills/${encodeURIComponent(pslug)}`, {
+          method: "PUT",
+          headers: { "Authorization": `Bearer ${TOKEN}`, "Content-Type": "application/json" },
+          body: JSON.stringify({ body_markdown: md }),
+        });
+        const text = await r.text();
+        if (!r.ok) return { content: [{ type: "text", text: `save_skill (personal) failed (${r.status}): ${text.slice(0, 240)}` }], isError: true };
+        const resp = JSON.parse(text);
+        return { content: [{ type: "text", text: `Saved PERSONAL skill "${a.name}" as "${pslug}" (v${resp.version}) — shared across all your agents. Pull/refresh: sync_skill(name="${pslug}"); list: list_skills.` }] };
+      } catch (e: any) {
+        return { content: [{ type: "text", text: `save_skill (personal) network error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
+      }
+    }
+    // CHANNEL skill (chat_id given). Stable doc id: caller-supplied, else slug of name.
+    const slug = String(a.name).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 48) || "skill";
+    const docId = (a.doc_id && String(a.doc_id).trim()) || `skill-${slug}`;
+    const level = (typeof a.level === "number" && a.level >= 1 && a.level <= 4) ? a.level : 3; // 3 = member-writable
+    try {
+      // If-Match: fetch current version (0 = create). The doc store uses
+      // optimistic concurrency; "0" creates, current version updates.
+      let ifMatch = "0";
+      const cur = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(a.chat_id)}/docs/${encodeURIComponent(docId)}`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
+      if (cur.ok) {
+        const curDoc = await cur.json().catch(() => null) as any;
+        if (curDoc && curDoc.version != null) ifMatch = String(curDoc.version);
+      }
+      const r = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(a.chat_id)}/docs/${encodeURIComponent(docId)}`, {
+        method: "PUT",
+        headers: { "Authorization": `Bearer ${TOKEN}`, "Content-Type": "application/json", "If-Match": ifMatch },
+        body: JSON.stringify({ kind: "channel_skill", level, title: a.name, body_markdown: md }),
+      });
+      const text = await r.text();
+      if (!r.ok) {
+        return { content: [{ type: "text", text: `save_skill failed (${r.status}): ${text.slice(0, 240)}` }], isError: true };
+      }
+      const verb = ifMatch === "0" ? "Saved" : "Updated";
+      return { content: [{ type: "text", text: `${verb} skill "${a.name}" → ${a.chat_id}/${docId} (L${level}). Others load it with: load_skill(chat_id="${a.chat_id}", doc_id="${docId}") — discoverable via list_skills(chat_id="${a.chat_id}").` }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `save_skill network error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
+    }
+  }
+
+  if (name === "sync_skill") {
+    const a = (args || {}) as { chat_id?: string; doc_id?: string; name?: string; dir?: string };
+    const home = process.env.HOME || process.env.USERPROFILE || ".";
+    const cacheDir = (a.dir && String(a.dir).trim()) || `${home}/.agentchat/skills`;
+    const safe = (s: string) => String(s).replace(/[^A-Za-z0-9_.-]/g, "_");
+    // PERSONAL skill: sync_skill({name}) — version from GET /api/skills (cheap,
+    // no body), body from GET /api/skills/:name only when missing/stale.
+    if (a.name && !a.chat_id) {
+      const pBase = `${cacheDir}/personal__${safe(a.name)}`;
+      const pMd = `${pBase}.md`; const pMeta = `${pBase}.json`;
+      try {
+        const listR = await apiFetch(`${REST_URL}/api/skills`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
+        if (!listR.ok) return { content: [{ type: "text", text: `sync_skill (personal): list failed (${listR.status})` }], isError: true };
+        const meta = (JSON.parse(await listR.text()).skills || []).find((s: any) => s.name === a.name);
+        if (!meta) return { content: [{ type: "text", text: `sync_skill: personal skill "${a.name}" not found (save it with save_skill — no chat_id).` }], isError: true };
+        const currentVersion = Number(meta.version ?? 0);
+        let cachedVersion: number | null = null;
+        try { cachedVersion = Number(JSON.parse(readFileSync(pMeta, "utf8")).version); } catch {}
+        if (cachedVersion !== null && cachedVersion === currentVersion) {
+          return { content: [{ type: "text", text: `up-to-date: personal skill "${a.name}" v${currentVersion} already at ${pMd} — no download. Read that file to run it.` }] };
+        }
+        const bodyR = await apiFetch(`${REST_URL}/api/skills/${encodeURIComponent(a.name)}`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
+        if (!bodyR.ok) return { content: [{ type: "text", text: `sync_skill (personal): body fetch failed (${bodyR.status})` }], isError: true };
+        const doc = JSON.parse(await bodyR.text());
+        // node:fs (not Bun.write) — runs on plain Node too. Bun.write auto-creates
+        // parent dirs; writeFileSync does not, so mkdir the cache dir first.
+        mkdirSync(dirname(pMd), { recursive: true });
+        writeFileSync(pMd, String(doc?.body_markdown ?? ""));
+        writeFileSync(pMeta, JSON.stringify({ version: currentVersion, name: a.name, syncedAt: new Date().toISOString() }));
+        return { content: [{ type: "text", text: `synced personal skill "${a.name}" v${currentVersion} → ${pMd} (was ${cachedVersion === null ? "missing" : `stale v${cachedVersion}`}). Read that file to run it.` }] };
+      } catch (e: any) {
+        return { content: [{ type: "text", text: `sync_skill (personal) error: ${String(e?.message || e).slice(0, 140)}` }], isError: true };
+      }
+    }
+    // CHANNEL skill: chat_id + doc_id.
+    if (!a.chat_id || !a.doc_id) {
+      return { content: [{ type: "text", text: "sync_skill needs (chat_id + doc_id) for a CHANNEL skill, or (name) for a PERSONAL skill." }], isError: true };
+    }
+    const base = `${cacheDir}/${safe(a.chat_id)}__${safe(a.doc_id)}`;
+    const mdPath = `${base}.md`;
+    const metaPath = `${base}.json`;
+    try {
+      // 1. Cheap version check: docs-list returns each doc's version WITHOUT the
+      // body, so "is my local copy current?" costs one light call.
+      const listR = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(a.chat_id)}/docs`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
+      if (!listR.ok) return { content: [{ type: "text", text: `sync_skill: docs-list failed (${listR.status})` }], isError: true };
+      const docs = extractChannelDocsPayload(JSON.parse(await listR.text()));
+      const meta = docs.find((d: any) => (d?.id ?? d?.doc_id) === a.doc_id);
+      if (!meta) return { content: [{ type: "text", text: `sync_skill: skill "${a.doc_id}" not found in channel ${a.chat_id}` }], isError: true };
+      const currentVersion = Number(meta.version ?? 0);
+      // 2. Local cache check — skip the body fetch if we already have this version.
+      let cachedVersion: number | null = null;
+      try { cachedVersion = Number(JSON.parse(readFileSync(metaPath, "utf8")).version); } catch {}
+      if (cachedVersion !== null && cachedVersion === currentVersion) {
+        return { content: [{ type: "text", text: `up-to-date: "${a.doc_id}" v${currentVersion} already at ${mdPath} — no download. Read that file to run it.` }] };
+      }
+      // 3. Missing/stale → fetch the body (the only expensive call, on the cold path).
+      const docR = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(a.chat_id)}/docs/${encodeURIComponent(a.doc_id)}`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
+      if (!docR.ok) return { content: [{ type: "text", text: `sync_skill: fetch body failed (${docR.status})` }], isError: true };
+      const doc = JSON.parse(await docR.text());
+      const body = String(doc?.body_markdown ?? doc?.bodyMarkdown ?? "");
+      // 4. Write the local mirror + version sidecar (node:fs, not Bun.write, for
+      // Node compat; mkdir the cache dir first since writeFileSync won't auto-create).
+      mkdirSync(dirname(mdPath), { recursive: true });
+      writeFileSync(mdPath, body);
+      writeFileSync(metaPath, JSON.stringify({ version: currentVersion, title: doc?.title, doc_id: a.doc_id, chat_id: a.chat_id, syncedAt: new Date().toISOString() }));
+      const was = cachedVersion === null ? "missing" : `stale v${cachedVersion}`;
+      return { content: [{ type: "text", text: `synced "${doc?.title || a.doc_id}" v${currentVersion} → ${mdPath} (was ${was}). Read that file to run it in your runtime.` }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `sync_skill error: ${String(e?.message || e).slice(0, 140)}` }], isError: true };
+    }
+  }
+
+  if (name === "list_tool_groups") {
+    return {
+      content: [{
+        type: "text",
+        text: JSON.stringify({
+          groups: TOOL_GROUPS.map((group) => ({
+            name: group.name,
+            summary: group.summary,
+            tool_count: group.tools.length,
+            estimated_tokens: group.estimated_tokens,
+            loaded: loadedToolGroups.has(group.name),
+            tags: group.tags,
+          })),
+        }, null, 2),
+      }],
+    };
+  }
+
+  if (name === "load_tool_group") {
+    const { group_name } = (args || {}) as { group_name: ToolGroupName };
+    const group = TOOL_GROUPS.find((item) => item.name === group_name);
+    if (!group) {
+      return { content: [{ type: "text", text: `Unknown tool group: ${String(group_name)}` }], isError: true };
+    }
+    const wasLoaded = loadedToolGroups.has(group.name);
+    if (!wasLoaded) {
+      loadedToolGroups.add(group.name);
+      await server.sendToolListChanged();
+    }
+    return {
+      content: [{
+        type: "text",
+        text: JSON.stringify({
+          ok: true,
+          group: group.name,
+          loaded: true,
+          changed: !wasLoaded,
+          tools: group.tools,
+        }, null, 2),
+      }],
+    };
+  }
+
+  if (name === "invoke_extended_tool") {
+    const { tool_name, arguments: forwardedArgs } = (args || {}) as { tool_name?: string; arguments?: Record<string, unknown> };
+    const groupName = tool_name ? TOOL_NAME_TO_GROUP.get(tool_name) : undefined;
+    if (!tool_name || !groupName) {
+      return { content: [{ type: "text", text: `invoke_extended_tool only supports known extended tools.` }], isError: true };
+    }
+    name = tool_name;
+    args = forwardedArgs || {};
+    viaExtendedCompat = true;
+  }
+
+  const visibleToolNames = getVisibleToolNames();
+  if (!visibleToolNames.has(name) && !viaExtendedCompat) {
+    const groupName = TOOL_NAME_TO_GROUP.get(name);
+    if (groupName) {
+      return {
+        content: [{
+          type: "text",
+          text: `Tool "${name}" is currently hidden. Call load_tool_group("${groupName}") first, or use invoke_extended_tool as a compatibility fallback.`,
+        }],
+      };
+    }
+  }
+
+  // Registry dispatch: registered handlers (all NEW tools) are looked up O(1)
+  // here; stable legacy tools fall through to the FROZEN if-chain below. New
+  // handlers MUST be added to HANDLERS — see the frozen-if-chain policy at its def.
+  {
+    const registered = HANDLERS.get(name);
+    if (registered) return await registered(args, name, request);
+  }
+
+  if (name === "reply") {
+    const { chat_id, text: rawText } = args as { chat_id: string; text: string };
+    stopTypingHeartbeat(chat_id); // we're answering this channel → stop the "thinking" pulse
+    // Order: resolve bare @<display_name> to paren form FIRST (so the
+    // receiving MCP plugin's regex triggers), then redact secrets so
+    // an accidental `ac_xxx` in the text gets masked regardless of
+    // how it arrived.
+    const text = redactSecrets(await resolveBareMentions(chat_id, rawText));
+    // Use REST API for reliable delivery (WebSocket may be half-open after deploy)
+    try {
+      const r = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(chat_id)}/messages`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${TOKEN}` },
+        body: JSON.stringify({
+          sender_id: AGENT_ID,
+          content: text,
+          sender_type: "agent",
+          content_type: "text",
+        }),
+      });
+      if (r.ok) {
+        return { content: [{ type: "text", text: `Sent to channel ${chat_id.slice(0, 8)}` }] };
+      }
+      const err = await r.text();
+      return { content: [{ type: "text", text: `Send failed: ${err.slice(0, 100)}` }] };
+    } catch (e) {
+      // Fallback to WebSocket if REST fails
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({
+          type: "message", id: crypto.randomUUID(),
+          channel_id: chat_id, sender_id: AGENT_ID,
+          sender_type: "agent", content: text,
+          content_type: "text", timestamp: new Date().toISOString(),
+        }));
+        return { content: [{ type: "text", text: `Sent via WS to ${chat_id.slice(0, 8)}` }] };
+      }
+      return { content: [{ type: "text", text: `Send failed: ${e}` }] };
+    }
+  }
+
+  if (name === "react") {
+    const { chat_id, message_id, emoji, action } = args as any;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({
+        type: "reaction", message_id, channel_id: chat_id,
+        sender_id: AGENT_ID, emoji, action: action || "add",
+        timestamp: new Date().toISOString(),
+      }));
+      return { content: [{ type: "text", text: `${action === "remove" ? "Removal" : "Addition"} of ${emoji} dispatched; verify in channel` }] };
+    }
+    return { content: [{ type: "text", text: "Not connected" }] };
+  }
+
+  if (name === "thread_reply") {
+    const { chat_id, parent_id, text: rawText } = args as any;
+    const text = redactSecrets(await resolveBareMentions(chat_id, rawText));
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({
+        type: "thread_reply", id: crypto.randomUUID(), parent_id,
+        channel_id: chat_id, sender_id: AGENT_ID, sender_type: "agent",
+        content: text, timestamp: new Date().toISOString(),
+      }));
+      return { content: [{ type: "text", text: `Thread reply dispatched; verify in channel` }] };
+    }
+    return { content: [{ type: "text", text: "Not connected" }] };
+  }
+
+  if (name === "pin") {
+    const { chat_id, message_id, action } = args as any;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({
+        type: "pin", message_id, channel_id: chat_id,
+        sender_id: AGENT_ID, action: action || "pin",
+      }));
+      return { content: [{ type: "text", text: `${action === "unpin" ? "Unpin" : "Pin"} dispatched; server may reject (admin only)` }] };
+    }
+    return { content: [{ type: "text", text: "Not connected" }] };
+  }
+
+  if (name === "edit_message") {
+    const { chat_id, message_id, new_content: rawNewContent } = args as any;
+    if (typeof rawNewContent !== "string") {
+      return { content: [{ type: "text", text: "Error: new_content (string) required" }] };
+    }
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      // Mirror reply(): resolve bare @mentions then redact secrets so an
+      // accidental ac_/JWT in edited content is masked like every other
+      // outbound content path (this was the one hole that bypassed it).
+      const new_content = redactSecrets(await resolveBareMentions(chat_id, rawNewContent));
+      ws.send(JSON.stringify({
+        type: "edit_message", message_id, channel_id: chat_id,
+        sender_id: AGENT_ID, new_content, timestamp: new Date().toISOString(),
+      }));
+      return { content: [{ type: "text", text: "Edit dispatched; server may reject (must be original sender, within edit window)" }] };
+    }
+    return { content: [{ type: "text", text: "Not connected" }] };
+  }
+
+  if (name === "delete_message") {
+    const { chat_id, message_id } = args as any;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({
+        type: "delete_message", message_id, channel_id: chat_id, sender_id: AGENT_ID,
+      }));
+      return { content: [{ type: "text", text: "Delete dispatched; server may reject (must be original sender)" }] };
+    }
+    return { content: [{ type: "text", text: "Not connected" }] };
+  }
+
+  if (name === "set_status") {
+    const { status_text, status_emoji } = args as any;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({
+        type: "set_status", sender_id: AGENT_ID,
+        status_text: typeof status_text === "string" ? redactSecrets(status_text) : status_text,
+        status_emoji,
+      }));
+      return { content: [{ type: "text", text: `Status update dispatched: ${status_emoji || ''} ${status_text}` }] };
+    }
+    return { content: [{ type: "text", text: "Not connected" }] };
+  }
+
+  if (name === "archive_channel") {
+    const { chat_id } = args as any;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: "archive_channel", channel_id: chat_id, sender_id: AGENT_ID }));
+      return { content: [{ type: "text", text: `Archive dispatched; server may reject (admin only — channel goes read-only on success)` }] };
+    }
+    return { content: [{ type: "text", text: "Not connected" }] };
+  }
+
+  if (name === "report_message") {
+    const { chat_id, message_id, reason_code, free_text } = args as {
+      chat_id: string;
+      message_id: string;
+      reason_code: "spam" | "phishing" | "harassment" | "impersonation" | "illegal" | "other";
+      free_text?: string;
+    };
+    try {
+      const r = await apiFetch(`${REST_URL}/api/moderation/report`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${TOKEN}`,
+        },
+        body: JSON.stringify({
+          channel_id: chat_id,
+          message_id,
+          reason_code,
+          ...(typeof free_text === "string" && free_text.trim() ? { free_text: free_text.trim().slice(0, 500) } : {}),
+        }),
+      });
+      const text = await r.text();
+      if (!r.ok) {
+        return { content: [{ type: "text", text: `report_message failed (${r.status}): ${text.slice(0, 240)}` }], isError: true };
+      }
+      return { content: [{ type: "text", text }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `report_message network error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
+    }
+  }
+
+  if (name === "list_my_moderation_history") {
+    const { agent_id } = args as { agent_id?: string };
+    const qs = new URLSearchParams();
+    if (agent_id) qs.set("agent_id", agent_id);
+    try {
+      const r = await apiFetch(`${REST_URL}/api/me/moderation_history${qs.toString() ? `?${qs.toString()}` : ""}`, {
+        headers: { "Authorization": `Bearer ${TOKEN}` },
+      });
+      const text = await r.text();
+      if (!r.ok) {
+        return { content: [{ type: "text", text: `list_my_moderation_history failed (${r.status}): ${text.slice(0, 240)}` }], isError: true };
+      }
+      return { content: [{ type: "text", text }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `list_my_moderation_history network error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
+    }
+  }
+
+  if (name === "list_reports_i_submitted") {
+    const { limit = 20 } = args as { limit?: number };
+    const capped = Math.max(1, Math.min(Number(limit) || 20, 100));
+    try {
+      const r = await apiFetch(`${REST_URL}/api/me/reports_submitted?limit=${capped}`, {
+        headers: { "Authorization": `Bearer ${TOKEN}` },
+      });
+      const text = await r.text();
+      if (!r.ok) {
+        return { content: [{ type: "text", text: `list_reports_i_submitted failed (${r.status}): ${text.slice(0, 240)}` }], isError: true };
+      }
+      return { content: [{ type: "text", text }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `list_reports_i_submitted network error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
+    }
+  }
+
+  if (name === "set_topic") {
+    const { chat_id, topic } = args as any;
+    if (typeof chat_id !== "string" || typeof topic !== "string") {
+      return { content: [{ type: "text", text: "Error: chat_id and topic (strings) required" }] };
+    }
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: "set_topic", channel_id: chat_id, sender_id: AGENT_ID, topic }));
+      return { content: [{ type: "text", text: `Topic update dispatched; server may reject (admin only): ${topic.slice(0,50)}` }] };
+    }
+    return { content: [{ type: "text", text: "Not connected" }] };
+  }
+
+  if (name === "forward") {
+    const { source_channel_id, target_channel_id, message_id } = args as any;
+    if (typeof target_channel_id !== "string" || typeof message_id !== "string") {
+      return { content: [{ type: "text", text: "Error: target_channel_id and message_id (strings) required" }] };
+    }
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({
+        type: "forward", id: crypto.randomUUID(),
+        source_channel_id, target_channel_id, message_id,
+        sender_id: AGENT_ID, timestamp: new Date().toISOString(),
+      }));
+      return { content: [{ type: "text", text: `Forward dispatched to ${target_channel_id.slice(0,8)}; server may reject (must be member of both channels)` }] };
+    }
+    return { content: [{ type: "text", text: "Not connected" }] };
+  }
+
+  if (name === "search") {
+    const { query, channel_id } = args as any;
+    if (typeof query !== "string" || query.length === 0) {
+      return { content: [{ type: "text", text: "Error: query (non-empty string) required" }] };
+    }
+    try {
+      const params = new URLSearchParams({ q: query, limit: "20" });
+      if (channel_id) params.set("channel_id", channel_id);
+      const r = await apiFetch(`${REST_URL}/api/search?${params}`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
+      if (!r.ok) {
+        return { content: [{ type: "text", text: `Search failed (${r.status})` }], isError: true };
+      }
+      const data = await r.json() as any;
+      if (data.messages?.length > 0) {
+        const results = data.messages.map((m: any) =>
+          `[${m.sender_id?.slice(0, 8)}] ${m.content?.slice(0, 80)}`
+        ).join("\n");
+        return { content: [{ type: "text", text: `Found ${data.messages.length} results:\n${results}` }] };
+      }
+      return { content: [{ type: "text", text: `No results for "${query}"` }] };
+    } catch {
+      return { content: [{ type: "text", text: "Search failed" }] };
+    }
+  }
+
+  if (name === "vote") {
+    const { proposal_id, decision, reason } = args as any;
+    if (typeof proposal_id !== "string" || typeof decision !== "string") {
+      return { content: [{ type: "text", text: "Error: proposal_id and decision (strings) required" }] };
+    }
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({
+        type: "vote", proposal_id, voter_id: AGENT_ID,
+        voter_type: "agent", decision, reason,
+      }));
+      return { content: [{ type: "text", text: `Vote '${decision}' dispatched for proposal ${proposal_id.slice(0, 8)}; server may reject (invalid proposal_id or expired)` }] };
+    }
+    return { content: [{ type: "text", text: "Not connected" }] };
+  }
+
+  if (name === "propose") {
+    const { chat_id, title, content, code_diff, consensus_rule } = args as any;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      const proposalId = crypto.randomUUID();
+      ws.send(JSON.stringify({
+        type: "proposal", id: proposalId, channel_id: chat_id,
+        sender_id: AGENT_ID, title, content, code_diff,
+        consensus_rule: consensus_rule || "majority",
+        expires_at: new Date(Date.now() + 86400_000).toISOString(),
+        timestamp: new Date().toISOString(),
+      }));
+      return { content: [{ type: "text", text: `Proposal '${title}' dispatched (client-generated ID ${proposalId.slice(0, 8)}); server may reject — verify via next inbound event` }] };
+    }
+    return { content: [{ type: "text", text: "Not connected" }] };
+  }
+
+  // P3 capability synopsis (kr_mq66wu4u): everything an agent can DO in a
+  // channel, composed from existing REST reads. Sections fail soft (null)
+  // so a single flaky fetch never blanks the brief.
+  async function channelBrief(chatId: string): Promise<string> {
+    const get = async (path: string) => {
+      try {
+        const r = await apiFetch(`${REST_URL}${path}`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
+        return r.ok ? await r.json() as any : null;
+      } catch { return null; }
+    };
+    const [membersData, docsData, okrData] = await Promise.all([
+      get(`/api/channels/${encodeURIComponent(chatId)}/members`),
+      get(`/api/channels/${encodeURIComponent(chatId)}/docs`),
+      get(`/api/channels/${encodeURIComponent(chatId)}/okr_snapshot`),
+    ]);
+    // membersData === null means the /members read FAILED (most often a 403 because
+    // you are not a member of this channel, or the channel does not exist) — NOT an
+    // empty roster. Rendering total:0 there silently told agents "0 members" when the
+    // truth was "you cannot see this channel's roster", corrupting their self-model.
+    const membersReadable = membersData !== null;
+    const memberIds: string[] = (membersData?.members || []).map((m: any) => m?.agent_id).filter(Boolean);
+    let online: string[] = [];
+    if (memberIds.length > 0) {
+      // Batch the presence query in chunks of 50 so channels with >50 members
+      // report accurately (was: memberIds.slice(0,50) — silently wrong past 50).
+      const onlineSet = new Set<string>();
+      for (let i = 0; i < memberIds.length; i += 50) {
+        const batch = memberIds.slice(i, i + 50);
+        const pres = await get(`/api/presence?ids=${encodeURIComponent(batch.join(","))}`);
+        for (const [k, v] of Object.entries(pres?.presence || {})) {
+          if (v === "online") onlineSet.add(k);
+        }
+      }
+      online = [...onlineSet];
+    }
+    const allDocs = docsData ? extractChannelDocsPayload(docsData) : [];
+    const skills = allDocs.filter(isSkillDoc).map((d: any) => ({ doc_id: d.id, title: d.title }));
+    const docs = allDocs.filter((d: any) => !isSkillDoc(d)).slice(0, 10).map((d: any) => ({ doc_id: d.id, title: d.title, kind: d.kind }));
+    const objectives = (okrData?.objectives || []).filter((o: any) => !o.archived).map((o: any) => {
+      const open = (okrData?.tasks || []).filter((t: any) => t.objective_id === o.id && t.status !== "done").length;
+      return { id: o.id, title: o.title, open_tasks: open };
+    });
+    // Loadable extended tool groups — surfaced here so entering a room hands
+    // you the full capability menu (not just skills). Without this an agent has
+    // to already KNOW to call list_tool_groups; now "what can I do here / how to
+    // load X" is answered on entry. Compact (name+summary+count+loaded); the
+    // actual tools appear when you load_tool_group(name).
+    const toolGroups = TOOL_GROUPS.map((g) => ({
+      name: g.name,
+      summary: g.summary,
+      tool_count: g.tools.length,
+      loaded: loadedToolGroups.has(g.name),
+    }));
+    return JSON.stringify({
+      channel: chatId,
+      members: membersReadable
+        ? { total: memberIds.length, online }
+        : { total: null, note: "roster unreadable — you are likely not a member of this channel (or it does not exist)" },
+      okr_objectives: objectives,
+      skills,
+      docs,
+      tool_groups: toolGroups,
+      tips: [
+        "load_tool_group(name) reveals an extended group's tools (see tool_groups above; loaded:false = not yet active)",
+        "load_skill(chat_id, doc_id) activates a channel skill; list_skills(chat_id) lists them",
+        "okr_list / get_history for deeper context",
+        "/loop <interval> <prompt> works in joined groups and owner-agent DMs; keep group follow-ups in that group (okr: prefix = wake mode)",
+      ],
+    });
+  }
+
+  if (name === "join_channel") {
+    const { chat_id } = args as any;
+    // Try WebSocket join first, then verify membership via REST
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      try { ws.send(JSON.stringify({ type: "join_channel", channel_id: chat_id, agent_id: AGENT_ID })); } catch {}
+    }
+    // Verify by checking membership
+    try {
+      await new Promise(r => setTimeout(r, 500)); // wait for server to process
+      const r = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(chat_id)}/members`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
+      if (r.ok) {
+        const data = await r.json() as any;
+        const isMember = (data.members || []).some((m: any) => m.agent_id === AGENT_ID);
+        if (isMember) {
+          // P3: joining hands you the room's capability synopsis immediately.
+          const brief = await channelBrief(chat_id).catch(() => "");
+          return { content: [{ type: "text", text: `Joined channel ${chat_id.slice(0, 8)}\n${brief}` }] };
+        }
+      }
+      return { content: [{ type: "text", text: `Join failed — channel may be private. Ask an admin to invite you.` }] };
+    } catch {
+      return { content: [{ type: "text", text: `Join sent but could not verify membership` }] };
+    }
+  }
+
+  if (name === "leave_channel") {
+    const { chat_id } = args as any;
+    // Prefer REST /leave (authoritative HTTP response confirms eviction);
+    // fall through to WS leave_channel if REST is unreachable so existing
+    // server-side WS handler still fires and updates in-memory state.
+    try {
+      const r = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(chat_id)}/leave`, {
+        method: "POST",
+        headers: { "Authorization": `Bearer ${TOKEN}`, "Content-Type": "application/json" },
+        body: "{}",
+      });
+      if (r.ok) {
+        // Prune so knownChannels / lastSeenMessageTs don't grow unbounded and
+        // turn every reconnect backfill into a serial REST fetch over channels
+        // we've already left.
+        knownChannels.delete(chat_id);
+        if (lastSeenMessageTs.delete(chat_id)) scheduleLastSeenMessageTsSave();
+        const data = await r.json().catch(() => ({})) as any;
+        if (data.note === "not a member") {
+          return { content: [{ type: "text", text: `Already not a member of ${chat_id.slice(0, 8)}` }] };
+        }
+        return { content: [{ type: "text", text: `Left channel ${chat_id.slice(0, 8)}` }] };
+      }
+      if (r.status === 404) {
+        return { content: [{ type: "text", text: `Channel ${chat_id.slice(0, 8)} not found` }], isError: true };
+      }
+      return { content: [{ type: "text", text: `Leave failed with status ${r.status}` }] };
+    } catch (e: any) {
+      // REST unreachable — fall back to WS leave so at least in-memory state updates
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        try { ws.send(JSON.stringify({ type: "leave_channel", channel_id: chat_id, agent_id: AGENT_ID })); } catch {}
+        knownChannels.delete(chat_id);
+        if (lastSeenMessageTs.delete(chat_id)) scheduleLastSeenMessageTsSave();
+        return { content: [{ type: "text", text: `Leave sent via WS (REST unreachable: ${String(e?.message || e).slice(0, 60)})` }] };
+      }
+      return { content: [{ type: "text", text: `Leave failed — no connectivity` }] };
+    }
+  }
+
+  // ── Hidden Identity (谁是卧底) ────────────────────────────────────
+  // See docs/MCP-HIDDEN-IDENTITY-SCHEMA.md + spec/hidden-identity.md.
+  // Agents playing the game need tool access to join / fetch secret /
+  // vote / advance / inspect state. Without these, the game is driven
+  // only by humans and bots become decorative. These wrap the server
+  // REST endpoints 1:1; the dispatcher at spec/schema §WS broadcasts
+  // tells the agent _when_ to call (via meta on channel notifications).
+
+  if (name === "hidden_identity_join") {
+    const { game_id } = args as any;
+    try {
+      const r = await apiFetch(`${REST_URL}/api/hidden-identity/games/${encodeURIComponent(game_id)}/join`, {
+        method: "POST",
+        headers: { "Authorization": `Bearer ${TOKEN}`, "Content-Type": "application/json" },
+        body: "{}",
+      });
+      const data = await r.json().catch(() => ({})) as any;
+      if (r.ok) {
+        const channelId = data?.game?.channel_id || data?.game?.channelId || await fetchHiddenIdentityChannelId(game_id);
+        if (typeof channelId === "string") activateHiddenIdentityGame(game_id, channelId);
+        const count = data?.game?.player_ids?.length ?? data?.game?.players?.length ?? "?";
+        const activeNote = channelId ? ` HI active mode enabled for channel ${String(channelId).slice(0, 8)}.` : "";
+        return { content: [{ type: "text", text: `Joined game ${String(game_id).slice(0, 8)} — ${count} players in lobby.${activeNote}` }] };
+      }
+      return { content: [{ type: "text", text: `Join failed (${r.status}): ${String(data?.error || "").slice(0, 120)}` }], isError: true };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `Join failed: ${String(e?.message || e).slice(0, 80)}` }] };
+    }
+  }
+
+  if (name === "hidden_identity_get_secret") {
+    const { game_id } = args as any;
+    try {
+      const r = await apiFetch(`${REST_URL}/api/hidden-identity/games/${encodeURIComponent(game_id)}/secret`, {
+        headers: { "Authorization": `Bearer ${TOKEN}` },
+      });
+      const data = await r.json().catch(() => ({})) as any;
+      if (r.ok) {
+        const myPlayerId = data.my_player_id || data.myPlayerId || AGENT_ID;
+        const roster = Array.isArray(data.roster) ? data.roster : [];
+        const rosterText = roster.length
+          ? roster.map((p: any) => {
+              const playerId = p.player_id || p.playerId || p.id || "?";
+              const agentId = p.agent_id || p.agentId || playerId;
+              const displayName = p.display_name || p.displayName || agentId;
+              return `- ${displayName}: player_id=${playerId}, agent_id=${agentId}`;
+            }).join("\n")
+          : "- roster unavailable";
+        return {
+          content: [{
+            type: "text",
+            text: [
+              `Your role: ${data.role}. Your word: ${data.word}.`,
+              `Your player_id: ${myPlayerId}.`,
+              "Roster for voting:",
+              rosterText,
+              "Do NOT reveal the word directly in discussion — describe it.",
+            ].join("\n"),
+          }],
+        };
+      }
+      if (r.status === 403) return { content: [{ type: "text", text: `You are not a player in this game (403)` }] };
+      if (r.status === 404) return { content: [{ type: "text", text: `Game or secret not allocated yet (game may still be in lobby)` }] };
+      return { content: [{ type: "text", text: `Secret fetch failed (${r.status})` }], isError: true };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `Secret fetch failed: ${String(e?.message || e).slice(0, 80)}` }] };
+    }
+  }
+
+  if (name === "hidden_identity_vote") {
+    const { game_id, target_id, reason } = args as any;
+    try {
+      const body: any = { target_id };
+      if (typeof reason === "string" && reason) body.reason = reason;
+      const r = await apiFetch(`${REST_URL}/api/hidden-identity/games/${encodeURIComponent(game_id)}/vote`, {
+        method: "POST",
+        headers: { "Authorization": `Bearer ${TOKEN}`, "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const data = await r.json().catch(() => ({})) as any;
+      if (r.ok) {
+        return { content: [{ type: "text", text: `Vote cast against ${String(target_id).slice(0, 12)} in round ${data?.round}` }] };
+      }
+      return { content: [{ type: "text", text: `Vote failed (${r.status}): ${String(data?.error || "").slice(0, 120)}` }], isError: true };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `Vote failed: ${String(e?.message || e).slice(0, 80)}` }] };
+    }
+  }
+
+  if (name === "hidden_identity_advance") {
+    const { game_id, to } = args as any;
+    try {
+      const r = await apiFetch(`${REST_URL}/api/hidden-identity/games/${encodeURIComponent(game_id)}/advance`, {
+        method: "POST",
+        headers: { "Authorization": `Bearer ${TOKEN}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ to }),
+      });
+      const data = await r.json().catch(() => ({})) as any;
+      if (r.ok) {
+        return { content: [{ type: "text", text: `Phase advanced to ${data?.phase || to}, round ${data?.round ?? "?"}` }] };
+      }
+      if (r.status === 409) return { content: [{ type: "text", text: `Invalid transition to ${to} (409): ${String(data?.error || "").slice(0, 120)}` }], isError: true };
+      return { content: [{ type: "text", text: `Advance failed (${r.status}): ${String(data?.error || "").slice(0, 120)}` }], isError: true };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `Advance failed: ${String(e?.message || e).slice(0, 80)}` }] };
+    }
+  }
+
+  if (name === "hidden_identity_get_state") {
+    const { game_id } = args as any;
+    try {
+      const r = await apiFetch(`${REST_URL}/api/hidden-identity/games/${encodeURIComponent(game_id)}`, {
+        headers: { "Authorization": `Bearer ${TOKEN}` },
+      });
+      const data = await r.json().catch(() => ({})) as any;
+      if (r.ok) {
+        const g = data?.game || {};
+        const players = (g.players || []).map((p: any) => {
+          return `${p.display_name || p.player_id}${p.is_eliminated ? " (out)" : ""}`;
+        }).join(", ");
+        return { content: [{ type: "text", text: `Phase: ${g.phase}, Round: ${g.round}, Winner: ${g.winner_team || "—"}. Players: ${players}` }] };
+      }
+      return { content: [{ type: "text", text: `Game state fetch failed (${r.status})` }], isError: true };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `Game state fetch failed: ${String(e?.message || e).slice(0, 80)}` }] };
+    }
+  }
+
+  if (name === "mark_read") {
+    const { chat_id, last_read_id } = args as any;
+    if (typeof chat_id !== "string" || typeof last_read_id !== "string") {
+      return { content: [{ type: "text", text: "Error: chat_id and last_read_id (strings) required" }] };
+    }
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({
+        type: "read_receipt", channel_id: chat_id,
+        sender_id: AGENT_ID, last_read_id, timestamp: new Date().toISOString(),
+      }));
+      return { content: [{ type: "text", text: `Read cursor update dispatched (up to ${last_read_id.slice(0, 8)})` }] };
+    }
+    if (toolOnlyMode) {
+      return { content: [{ type: "text", text: `Read cursor noted (up to ${last_read_id.slice(0, 8)})` }] };
+    }
+    return { content: [{ type: "text", text: "Not connected" }] };
+  }
+
+  if (name === "whoami") {
+    const wsState = ws?.readyState === WebSocket.OPEN ? "connected" : ws?.readyState === WebSocket.CONNECTING ? "connecting" : "disconnected";
+    let healthLine = "REST health: unknown";
+    let authLine = "REST auth: unknown";
+    try {
+      const r = await apiFetch(`${REST_URL}/health`);
+      if (r.ok) {
+        const h = await r.json() as any;
+        const build = h?.build ? ` build=${h.build}` : "";
+        const redis = h?.redis ? ` redis=${h.redis}` : "";
+        healthLine = `REST health: ok${build}${redis}`;
+      } else {
+        healthLine = `REST health: failed (${r.status})`;
+      }
+    } catch (e: any) {
+      healthLine = `REST health: error (${String(e?.message || e).slice(0, 80)})`;
+    }
+    const onboarding = await getOnboardingStatus(REST_URL, AGENT_ID, TOKEN);
+    let claimedLine = claimSummary(onboarding);
+    const claimHint = "";
+    authLine = `REST auth: ${onboarding.authentication}`;
+    // Older servers may not implement onboarding status. Check authentication
+    // separately without turning missing ownership fields into a negative claim.
+    if (onboarding.authentication === "unknown") {
+      try {
+        const r = await apiFetch(`${REST_URL}/api/account/${encodeURIComponent(AGENT_ID)}`, {
+          headers: TOKEN ? {Authorization: `Bearer ${TOKEN}`} : {},
+        });
+        authLine = r.ok ? "REST auth: ok" : `REST auth: failed (${r.status})`;
+      } catch { authLine = "REST auth: unknown"; }
+    }
+    // Identity guard: a whoami call IS the confirmation. Surface the gate state
+    // prominently on this response, then trust the live identity and unblock writes.
+    const gateNotice = identityGateMessage
+      ? `🚨 IDENTITY GUARD: ${identityGateMessage}\n(This whoami call confirms identity — writes are now unblocked. If this is NOT the intended identity, relaunch with the correct profile selector instead of proceeding.)\n\n`
+      : "";
+    const wasGated = identityGateMessage !== "";
+    const text = `Profile: ${profile.display_name || AGENT_ID}\nAgent ID: ${AGENT_ID}\nServer: ${REST_URL}\nWeb chat: ${REST_URL}/chat/${encodeURIComponent(AGENT_ID)}\nWebSocket: ${wsState}${sessionId ? `\nSession: ${sessionId.slice(0, 12)}...` : ""}\n${healthLine}\n${authLine}\n${claimedLine}${claimHint ? `\n${claimHint}` : ""}\nCapabilities: ${CAPABILITIES.join(", ")}\nProfile file: ${activeProfileFile ?? (anonymousMode ? "(none — anonymous, no profile written)" : "(none — credentials from environment)")}`;
+    if (wasGated) confirmLiveIdentityTrusted();
+    const pinViolation = expectedAgentIdViolation(EXPECTED_AGENT_ID, AGENT_ID);
+    const pinLine = EXPECTED_AGENT_ID
+      ? `\nExpected agent (AGENTCHAT_EXPECT_AGENT_ID): ${EXPECTED_AGENT_ID} — ${pinViolation ? "MISMATCH, write tools refused" : "ok"}`
+      : "";
+    return { content: [{ type: "text", text: gateNotice + text + pinLine }] };
+  }
+
+  if (name === "list_channels") {
+    const { limit = 50 } = args as any;
+    try {
+      const r = await apiFetch(`${REST_URL}/api/channels/discover?limit=${Math.max(1, Math.min(Number(limit) || 50, 500))}`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
+      if (r.ok) {
+        const data = await r.json() as any;
+        const channels = (data.channels || []);
+        if (channels.length === 0) return { content: [{ type: "text", text: "No public channels found." }] };
+        // Show the FULL channel id — agents copy it straight into reply /
+        // get_history / join_channel, all of which need the complete UUID.
+        // A truncated 8-char prefix here makes every downstream call 404.
+        const list = channels.map((ch: any) => `• ${ch.name || ch.id} (${ch.id}) — ${ch.member_count || "?"} members${ch.topic ? ` — ${ch.topic.slice(0, 60)}` : ""}`).join("\n");
+        return { content: [{ type: "text", text: `${channels.length} channels:\n${list}` }] };
+      }
+      return { content: [{ type: "text", text: `Failed to list channels (${r.status})` }] };
+    } catch (e) {
+      return { content: [{ type: "text", text: `Error: ${e}` }] };
+    }
+  }
+
+  if (name === "find_dm") {
+    const { target_agent_id } = args as any;
+    if (!target_agent_id || typeof target_agent_id !== "string") {
+      return { content: [{ type: "text", text: "Error: target_agent_id required" }] };
+    }
+    if (target_agent_id === AGENT_ID) {
+      return { content: [{ type: "text", text: JSON.stringify({ chat_id: null, reason: "cannot DM yourself" }) }] };
+    }
+    try {
+      // /api/channels/mine returns the caller's joined channels (including
+      // DMs). DM channel ids are deterministic on iOS but the source of
+      // truth for "does this DM exist between us" is server membership,
+      // so we list + filter rather than replay the hash.
+      const r = await apiFetch(`${REST_URL}/api/channels/mine`, {
+        headers: { "Authorization": `Bearer ${TOKEN}` },
+      });
+      if (!r.ok) {
+        return { content: [{ type: "text", text: `Failed (${r.status})` }] };
+      }
+      const data = await r.json() as any;
+      const channels = Array.isArray(data?.channels) ? data.channels : [];
+      // /mine returns metadata but not member rosters; need a per-channel
+      // members fetch only for the type=direct candidates.
+      for (const ch of channels) {
+        if (ch?.type !== "direct") continue;
+        try {
+          const mr = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(ch.id)}/members`, {
+            headers: { "Authorization": `Bearer ${TOKEN}` },
+          });
+          if (!mr.ok) continue;
+          const md = await mr.json() as any;
+          const memberIds = (md?.members || []).map((m: any) => m?.agent_id).filter(Boolean);
+          if (memberIds.length === 2 && memberIds.includes(AGENT_ID) && memberIds.includes(target_agent_id)) {
+            return { content: [{ type: "text", text: JSON.stringify({ chat_id: ch.id, name: ch.name || null }) }] };
+          }
+        } catch {}
+      }
+      return { content: [{ type: "text", text: JSON.stringify({ chat_id: null }) }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `Error: ${String(e?.message || e).slice(0, 120)}` }] };
+    }
+  }
+
+  if (name === "list_loops") {
+    try {
+      const r = await apiFetch(`${REST_URL}/api/loops/mine`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
+      if (!r.ok) return { content: [{ type: "text", text: `Failed (${r.status})` }] };
+      const data = await r.json() as any;
+      const loops = Array.isArray(data?.loops) ? data.loops : [];
+      if (loops.length === 0) return { content: [{ type: "text", text: "No loops registered for you." }] };
+      const lines = loops.map((l: any) => {
+        const mode = l.mode === "okr_wake" ? `okr_wake → ${l.objective_id}${Array.isArray(l.target_agents) && l.target_agents.length ? ` @[${l.target_agents.join(", ")}]` : ""}` : "static";
+        const nextIn = typeof l.next_tick_ms === "number" ? Math.max(0, Math.round((l.next_tick_ms - Date.now()) / 60000)) : "?";
+        return `• ${l.loop_id} | ch ${String(l.channel_id).slice(0, 16)} | every ${Math.round(l.interval_ms / 60000)}m | ${mode} | next ~${nextIn}m`;
+      }).join("\n");
+      return { content: [{ type: "text", text: `${loops.length} loop(s):\n${lines}` }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `Error: ${String(e?.message || e).slice(0, 120)}` }] };
+    }
+  }
+
+  if (name === "my_entitlements") {
+    try {
+      const r = await apiFetch(`${REST_URL}/api/me/entitlements`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
+      if (!r.ok) return { content: [{ type: "text", text: `Failed (${r.status})` }] };
+      const data = await r.json() as any;
+      return { content: [{ type: "text", text: JSON.stringify(data) }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `Error: ${String(e?.message || e).slice(0, 120)}` }] };
+    }
+  }
+
+  if (name === "channel_brief") {
+    const { chat_id } = args as any;
+    if (!chat_id) return { content: [{ type: "text", text: "Error: chat_id required" }] };
+    const brief = await channelBrief(chat_id).catch((e: any) => `Error: ${String(e?.message || e).slice(0, 120)}`);
+    return { content: [{ type: "text", text: brief }] };
+  }
+
+  if (name === "list_members") {
+    const { chat_id } = args as any;
+    try {
+      const r = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(chat_id)}/members`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
+      if (r.ok) {
+        const data = await r.json() as any;
+        const members = data.members || [];
+        if (members.length === 0) return { content: [{ type: "text", text: "No members found." }] };
+        const list = members.map((m: any) => `• ${m.display_name || m.agent_id} (${m.agent_id.slice(0, 12)})${m.role ? ` [${m.role}]` : ""}`).join("\n");
+        return { content: [{ type: "text", text: `${members.length} members in ${chat_id.slice(0, 8)}:\n${list}` }] };
+      }
+      return { content: [{ type: "text", text: `Failed to list members (${r.status})` }] };
+    } catch (e) {
+      return { content: [{ type: "text", text: `Error: ${e}` }] };
+    }
+  }
+
+  if (name === "get_history") {
+    const { chat_id, limit = 20, message_id } = args as any;
+    const targetMsgId = typeof message_id === "string" && message_id.trim() ? message_id.trim() : null;
+    const MAX_HISTORY_MESSAGE_CHARS = 4000;
+    const formatHistoryMessage = (m: any, full = false): string => {
+      const time = m.timestamp ? new Date(m.timestamp).toLocaleString() : "?";
+      const rawContent = String(m.content ?? "");
+      const body =
+        full || rawContent.length <= MAX_HISTORY_MESSAGE_CHARS
+          ? rawContent
+          : `${rawContent.slice(0, MAX_HISTORY_MESSAGE_CHARS)}… [truncated ${rawContent.length - MAX_HISTORY_MESSAGE_CHARS} chars; pass message_id="${m.id || ""}" to get_history for full text]`;
+      let line = `[${time}] ${m.sender_id?.slice(0, 12)}: ${body}`;
+      // Surface media attachments so an agent can perceive voice/image messages,
+      // not just their text caption. Audio: show any server transcript inline
+      // (agent reads it directly); otherwise point at transcribe(url).
+      const atts = Array.isArray(m.attachments) ? m.attachments : [];
+      for (const a of atts) {
+        if (!a?.url) continue;
+        if (a.type === "audio") {
+          const dur = typeof a.duration_ms === "number" ? ` ${(a.duration_ms / 1000).toFixed(1)}s` : "";
+          line += `\n    🔊 audio${dur}: ${a.url}`;
+          line += a.transcript
+            ? `\n       transcript: "${String(a.transcript).slice(0, 400)}"`
+            : `\n       (no transcript — call transcribe(url) to read what was said)`;
+        } else if (a.type === "image") {
+          const dim = a.width && a.height ? ` ${a.width}×${a.height}` : "";
+          line += `\n    🖼 image${dim}: ${a.url}`;
+        } else {
+          line += `\n    📎 ${a.type || "file"}: ${a.url}`;
+        }
+      }
+      return line;
+    };
+    try {
+      const fetchLimit = targetMsgId ? 100 : Math.max(1, Math.min(Number(limit) || 20, 100));
+      const r = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(chat_id)}/messages?limit=${fetchLimit}`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
+      if (r.ok) {
+        const data = await r.json() as any;
+        const msgs = (data.messages || []).filter((m: any) => m.content !== "__typing__");
+        if (targetMsgId) {
+          let exact = msgs.find((m: any) => m.id === targetMsgId);
+          if (!exact) {
+            try {
+              const mcpRes = await apiFetch(`${REST_URL}/mcp`, {
+                method: "POST",
+                headers: {
+                  "Authorization": `Bearer ${TOKEN}`,
+                  "Content-Type": "application/json",
+                  ...(AGENT_ID ? { "X-Agent-Id": AGENT_ID } : {}),
+                },
+                body: JSON.stringify({
+                  jsonrpc: "2.0",
+                  id: 1,
+                  method: "tools/call",
+                  params: {
+                    name: "agentschat_read_messages",
+                    arguments: { channel_id: chat_id, message_id: targetMsgId },
+                  },
+                }),
+              });
+              if (mcpRes.ok) {
+                const rpcData = await mcpRes.json() as any;
+                const structured = rpcData?.result?.structuredContent;
+                const textPayload = rpcData?.result?.content?.[0]?.text;
+                const parsed = structured || (typeof textPayload === "string" ? JSON.parse(textPayload) : null);
+                if (Array.isArray(parsed?.messages) && parsed.messages.length > 0) {
+                  exact = parsed.messages[0];
+                }
+              }
+            } catch {}
+          }
+          if (!exact) {
+            return { content: [{ type: "text", text: `Message ${targetMsgId} not found in channel ${chat_id}.` }], isError: true };
+          }
+          return { content: [{ type: "text", text: `1 message (id=${exact.id}):\n${formatHistoryMessage(exact, true)}` }] };
+        }
+        if (msgs.length === 0) return { content: [{ type: "text", text: "No messages in this channel." }] };
+        const list = msgs.map((m: any) => formatHistoryMessage(m, false)).join("\n");
+        return { content: [{ type: "text", text: `${msgs.length} messages:\n${list}` }] };
+      }
+      return { content: [{ type: "text", text: `Failed to get history (${r.status})` }] };
+    } catch (e) {
+      return { content: [{ type: "text", text: `Error: ${e}` }] };
+    }
+  }
+
+  if (name === "switch_profile") {
+    return await handleProfileSwitchOrConnect(args);
+  }
+
+  if (name === "list_channel_docs") {
+    const { chat_id, level } = args as { chat_id: string; level?: number | string };
+    const qs = new URLSearchParams();
+    const normalizedLevel = normalizeChannelDocLevel(level);
+    if (level !== undefined && normalizedLevel === null) {
+      return { content: [{ type: "text", text: "list_channel_docs failed: level must be 1|2|3|4" }], isError: true };
+    }
+    if (normalizedLevel !== null) qs.set("level", String(normalizedLevel));
+    const url = `${REST_URL}/api/channels/${encodeURIComponent(chat_id)}/docs${qs.toString() ? `?${qs}` : ""}`;
+    try {
+      const r = await apiFetch(url, { headers: { "Authorization": `Bearer ${TOKEN}` } });
+      const text = await r.text();
+      if (!r.ok) {
+        return { content: [{ type: "text", text: `list_channel_docs failed (${r.status}): ${text.slice(0, 200)}` }], isError: true };
+      }
+      return { content: [{ type: "text", text }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `list_channel_docs network error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
+    }
+  }
+
+  if (name === "get_channel_doc") {
+    const { chat_id, doc_id } = args as { chat_id: string; doc_id: string };
+    try {
+      const r = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(chat_id)}/docs/${encodeURIComponent(doc_id)}`, {
+        headers: { "Authorization": `Bearer ${TOKEN}` },
+      });
+      const text = await r.text();
+      if (!r.ok) {
+        return { content: [{ type: "text", text: `get_channel_doc failed (${r.status}): ${text.slice(0, 200)}` }], isError: true };
+      }
+      return { content: [{ type: "text", text }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `get_channel_doc network error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
+    }
+  }
+
+  if (name === "upsert_channel_doc") {
+    const { chat_id, doc_id, title, kind, level, body_markdown, expected_version } = args as {
+      chat_id: string;
+      doc_id: string;
+      title: string;
+      kind: string;
+      level: number | string;
+      body_markdown: string;
+      expected_version: number;
+    };
+    const normalizedLevel = normalizeChannelDocLevel(level);
+    if (normalizedLevel === null) {
+      return { content: [{ type: "text", text: "upsert_channel_doc failed: level must be 1|2|3|4" }], isError: true };
+    }
+    try {
+      const r = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(chat_id)}/docs/${encodeURIComponent(doc_id)}`, {
+        method: "PUT",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${TOKEN}`,
+          "If-Match": String(expected_version),
+        },
+        body: JSON.stringify({ title, kind, level: normalizedLevel, body_markdown }),
+      });
+      const text = await r.text();
+      if (!r.ok) {
+        return { content: [{ type: "text", text: `upsert_channel_doc failed (${r.status}): ${text.slice(0, 240)}` }], isError: true };
+      }
+      return { content: [{ type: "text", text }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `upsert_channel_doc network error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
+    }
+  }
+
+  if (name === "list_channel_doc_revisions") {
+    const { chat_id, doc_id } = args as { chat_id: string; doc_id: string };
+    try {
+      const r = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(chat_id)}/docs/${encodeURIComponent(doc_id)}/revisions`, {
+        headers: { "Authorization": `Bearer ${TOKEN}` },
+      });
+      const text = await r.text();
+      if (!r.ok) {
+        return { content: [{ type: "text", text: `list_channel_doc_revisions failed (${r.status}): ${text.slice(0, 200)}` }], isError: true };
+      }
+      return { content: [{ type: "text", text }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `list_channel_doc_revisions network error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
+    }
+  }
+
+  // OKR v0.1 tools — dogfood the OKR system without dropping to curl.
+  // Maps 1:1 to the server-side routes shipped in commit 5229aab
+  // (projects/AgentChat/Server/src/okr.ts + index.ts dispatch block).
+  if (name === "okr_list") {
+    const { owner, status, horizon, include_archived, view, task_id, shape, objective_id } = args as { owner?: string; status?: string; horizon?: string; include_archived?: boolean; view?: string; task_id?: string; shape?: string; objective_id?: string };
+    const qs = new URLSearchParams();
+    if (owner) qs.set("owner", owner);
+    if (status) qs.set("status", status);
+    if (horizon) qs.set("horizon", horizon);
+    if (include_archived) qs.set("include_archived", "true");
+    if (view) qs.set("view", view);
+    if (task_id) qs.set("task_id", task_id);
+    if (shape) qs.set("shape", shape);
+    if (objective_id) qs.set("objective_id", objective_id);
+    const url = `${REST_URL}/api/okr/objectives${qs.toString() ? "?" + qs.toString() : ""}`;
+    try {
+      const r = await apiFetch(url, { headers: { "Authorization": `Bearer ${TOKEN}` } });
+      if (!r.ok) {
+        const err = await r.text();
+        return { content: [{ type: "text", text: `okr_list failed (${r.status}): ${err.slice(0, 120)}` }], isError: true };
+      }
+      const data = await r.json() as any;
+      return { content: [{ type: "text", text: JSON.stringify(data) }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `okr_list network error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
+    }
+  }
+
+  if (name === "okr_create_objective") {
+    const { title, horizon, owner, parent_id, due, discussion_channel_id } = args as {
+      title: string; horizon: string; owner?: string; parent_id?: string; due?: string; discussion_channel_id?: string;
+    };
+    const body: Record<string, unknown> = { title, horizon };
+    if (owner) body.owner = owner;
+    if (parent_id) body.parent_id = parent_id;
+    if (due) body.due = due;
+    if (discussion_channel_id) body.discussion_channel_id = discussion_channel_id;
+    try {
+      const r = await apiFetch(`${REST_URL}/api/okr/objectives`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${TOKEN}` },
+        body: JSON.stringify(body),
+      });
+      const text = await r.text();
+      if (!r.ok) {
+        return { content: [{ type: "text", text: `okr_create_objective failed (${r.status}): ${text.slice(0, 160)}` }], isError: true };
+      }
+      return { content: [{ type: "text", text: `Created: ${text}` }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `okr_create_objective network error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
+    }
+  }
+
+  if (name === "okr_add_task") {
+    const { objective_id, title, assignee, contributes_to, depends_on, due } = args as {
+      objective_id: string; title: string; assignee: string; contributes_to?: string[]; depends_on?: string[]; due?: string;
+    };
+    const body: Record<string, unknown> = { title, assignee };
+    if (Array.isArray(contributes_to) && contributes_to.length > 0) body.contributes_to = contributes_to;
+    if (Array.isArray(depends_on) && depends_on.length > 0) body.depends_on = depends_on;
+    if (due) body.due = due;
+    try {
+      const r = await apiFetch(`${REST_URL}/api/okr/objectives/${encodeURIComponent(objective_id)}/tasks`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${TOKEN}` },
+        body: JSON.stringify(body),
+      });
+      const text = await r.text();
+      if (!r.ok) {
+        return { content: [{ type: "text", text: `okr_add_task failed (${r.status}): ${text.slice(0, 160)}` }], isError: true };
+      }
+      return { content: [{ type: "text", text: `Added: ${text}` }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `okr_add_task network error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
+    }
+  }
+
+  if (name === "okr_update_task") {
+    const { task_id, status, assignee, blocked_reason, blocker_agent, depends_on, due } = args as { task_id: string; status?: string; assignee?: string; blocked_reason?: string; blocker_agent?: string; depends_on?: string[]; due?: string };
+    const patch: Record<string, unknown> = {};
+    if (status) patch.status = status;
+    if (assignee) patch.assignee = assignee;
+    if (blocked_reason !== undefined) patch.blocked_reason = blocked_reason;
+    if (blocker_agent !== undefined) patch.blocker_agent = blocker_agent;
+    if (Array.isArray(depends_on)) patch.depends_on = depends_on;
+    if (due) patch.due = due;
+    try {
+      const r = await apiFetch(`${REST_URL}/api/okr/tasks/${encodeURIComponent(task_id)}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${TOKEN}` },
+        body: JSON.stringify(patch),
+      });
+      const text = await r.text();
+      if (!r.ok) {
+        return { content: [{ type: "text", text: `okr_update_task failed (${r.status}): ${text.slice(0, 160)}` }], isError: true };
+      }
+      return { content: [{ type: "text", text: `Updated: ${text}` }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `okr_update_task network error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
+    }
+  }
+
+  if (name === "okr_task_blockers" || name === "okr_task_blocks") {
+    const { task_id } = args as { task_id: string };
+    const path = name === "okr_task_blockers" ? "blockers" : "blocks";
+    try {
+      const r = await apiFetch(`${REST_URL}/api/okr/tasks/${encodeURIComponent(task_id)}/${path}`, {
+        headers: { "Authorization": `Bearer ${TOKEN}` },
+      });
+      const text = await r.text();
+      if (!r.ok) {
+        return { content: [{ type: "text", text: `${name} failed (${r.status}): ${text.slice(0, 160)}` }], isError: true };
+      }
+      return { content: [{ type: "text", text }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `${name} network error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
+    }
+  }
+
+  if (name === "okr_open_thread") {
+    const { target_type, target_id } = args as { target_type: string; target_id: string };
+    try {
+      const r = await apiFetch(`${REST_URL}/api/okr/threads`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${TOKEN}` },
+        body: JSON.stringify({ target_type, target_id }),
+      });
+      const text = await r.text();
+      if (!r.ok) {
+        return { content: [{ type: "text", text: `okr_open_thread failed (${r.status}): ${text.slice(0, 160)}` }], isError: true };
+      }
+      return { content: [{ type: "text", text }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `okr_open_thread network error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
+    }
+  }
+
+  if (name === "okr_add_kr") {
+    const { objective_id, title, metric_type, current, target, risk_level } = args as {
+      objective_id: string; title: string; metric_type: string; current?: number; target: number; risk_level?: string;
+    };
+    const body: Record<string, unknown> = { title, metric_type, target };
+    if (typeof current === "number") body.current = current;
+    if (risk_level) body.risk_level = risk_level;
+    try {
+      const r = await apiFetch(`${REST_URL}/api/okr/objectives/${encodeURIComponent(objective_id)}/krs`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${TOKEN}` },
+        body: JSON.stringify(body),
+      });
+      const text = await r.text();
+      if (!r.ok) {
+        return { content: [{ type: "text", text: `okr_add_kr failed (${r.status}): ${text.slice(0, 160)}` }], isError: true };
+      }
+      return { content: [{ type: "text", text: `Added: ${text}` }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `okr_add_kr network error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
+    }
+  }
+
+  if (name === "archive_objective") {
+    const { objective_id, completion_summary } = args as { objective_id: string; completion_summary?: string };
+    try {
+      const r = await apiFetch(`${REST_URL}/api/okr/objectives/${encodeURIComponent(objective_id)}/archive`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${TOKEN}` },
+        body: JSON.stringify(completion_summary !== undefined ? { completion_summary } : {}),
+      });
+      const text = await r.text();
+      if (!r.ok) {
+        return { content: [{ type: "text", text: `archive_objective failed (${r.status}): ${text.slice(0, 200)}` }], isError: true };
+      }
+      return { content: [{ type: "text", text: `Archived: ${text}` }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `archive_objective network error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
+    }
+  }
+
+  if (name === "unarchive_objective") {
+    const { objective_id } = args as { objective_id: string };
+    try {
+      const r = await apiFetch(`${REST_URL}/api/okr/objectives/${encodeURIComponent(objective_id)}/unarchive`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${TOKEN}` },
+      });
+      const text = await r.text();
+      if (!r.ok) {
+        return { content: [{ type: "text", text: `unarchive_objective failed (${r.status}): ${text.slice(0, 200)}` }], isError: true };
+      }
+      return { content: [{ type: "text", text: `Unarchived: ${text}` }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `unarchive_objective network error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
+    }
+  }
+
+  if (name === "okr_set_kr_progress") {
+    const { kr_id, current, risk_level } = args as { kr_id: string; current: number; risk_level?: string };
+    const body: Record<string, unknown> = { current };
+    if (risk_level) body.risk_level = risk_level;
+    try {
+      const r = await apiFetch(`${REST_URL}/api/okr/krs/${encodeURIComponent(kr_id)}/progress`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${TOKEN}` },
+        body: JSON.stringify(body),
+      });
+      const text = await r.text();
+      if (!r.ok) {
+        return { content: [{ type: "text", text: `okr_set_kr_progress failed (${r.status}): ${text.slice(0, 160)}` }], isError: true };
+      }
+      return { content: [{ type: "text", text: `Updated: ${text}` }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `okr_set_kr_progress network error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
+    }
+  }
+
+  if (name === "okr_add_task_comment") {
+    const { task_id, text: rawText } = args as { task_id: string; text: string };
+    const text = redactSecrets(rawText);
+    try {
+      const r = await apiFetch(`${REST_URL}/api/okr/tasks/${encodeURIComponent(task_id)}/comments`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${TOKEN}` },
+        body: JSON.stringify({ text }),
+      });
+      const body = await r.text();
+      if (!r.ok) {
+        return { content: [{ type: "text", text: `okr_add_task_comment failed (${r.status}): ${body.slice(0, 160)}` }], isError: true };
+      }
+      return { content: [{ type: "text", text: `Commented: ${body}` }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `okr_add_task_comment network error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
+    }
+  }
+
+  if (name === "okr_set_links") {
+    const { target_type, target_id, narrative, narrative_path, discussion_channel_id, linked_docs, linked_channel_docs } = args as {
+      target_type: "objective" | "kr" | "task";
+      target_id: string;
+      narrative?: string;
+      narrative_path?: string;
+      discussion_channel_id?: string;
+      linked_docs?: string[];
+      linked_channel_docs?: Array<{ channel_id: string; doc_id: string }>;
+    };
+    const body: Record<string, unknown> = {};
+    if (narrative !== undefined) body.narrative = narrative;
+    if (narrative_path !== undefined) body.narrative_path = narrative_path;
+    if (discussion_channel_id !== undefined) body.discussion_channel_id = discussion_channel_id;
+    if (linked_docs !== undefined) body.linked_docs = linked_docs;
+    if (linked_channel_docs !== undefined) body.linked_channel_docs = linked_channel_docs;
+    try {
+      const r = await apiFetch(`${REST_URL}/api/okr/links/${encodeURIComponent(target_type)}/${encodeURIComponent(target_id)}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${TOKEN}` },
+        body: JSON.stringify(body),
+      });
+      const text = await r.text();
+      if (!r.ok) {
+        return { content: [{ type: "text", text: `okr_set_links failed (${r.status}): ${text.slice(0, 200)}` }], isError: true };
+      }
+      return { content: [{ type: "text", text: `Updated: ${text}` }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `okr_set_links network error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
+    }
+  }
+
+  return { content: [{ type: "text", text: `Unknown tool: ${name}` }], isError: true };
+  } catch (e: any) {
+    return { content: [{ type: "text", text: `${name} failed: ${String(e?.message || e).slice(0, 300)}` }], isError: true };
+  }
+});
+
+// --- WebSocket Connection ---
+
+// Track last @mention timestamp per channel (for context windowing)
+// Persisted to disk so reconnect/restart doesn't lose state
+const mentionTsFile = join(configDir, `mention-ts-${AGENT_ID}.json`);
+function loadMentionTimestamps(): Map<string, string> {
+  return loadCursor(mentionTsFile, safeStderrWrite);
+}
+// Re-attempted on the next mention, but a persistent failure (perms, full disk) would
+// retry just as silently forever — and the state is gone on restart. So it reports.
+function saveMentionTimestamps(m: Map<string, string>) {
+  persistCursor(mentionTsFile, m, safeStderrWrite);
+}
+const lastMentionTimestamp = loadMentionTimestamps();
+
+// Task #119: track the last-seen message timestamp per channel so a
+// reconnect can backfill messages the WS missed. Separate from
+// mention-ts because mention-ts only advances on mentions — we need
+// all messages (including non-mention ones) to compute the correct
+// backfill cursor. Persisted to disk: plugin restart resumes from
+// where it left off.
+//
+// Bug this fixes: even without a visible WS disconnect, Redis
+// ac:ch:* subscribe can briefly miss a broadcast (subscriber rebuild
+// window, transient network hiccup). Claude Code log 2026-04-20
+// 12:49 showed boss's @-mention never firing notifications/claude/
+// channel for claude-code-live even though my gcloud had no
+// disconnect event — so the "reconnect" trigger alone doesn't
+// cover this class. Backfill runs on every auth_ok whether first
+// connect or reconnect; if we missed anything, we find it.
+const lastSeenMessageTsFile = join(configDir, `last-seen-msg-ts-${AGENT_ID}.json`);
+function loadLastSeenMessageTs(): Map<string, string> {
+  return loadCursor(lastSeenMessageTsFile, safeStderrWrite);
+}
+const lastSeenMessageTs = loadLastSeenMessageTs();
+const cursorFlushIntervalMs = Math.max(
+  500,
+  Number(process.env.AGENTSCHAT_MCP_CURSOR_FLUSH_MS || 5000),
+);
+/** Dirty flag lives in an object so flushCursor can clear it only on a landed write. */
+const cursorState = { dirty: false };
+let lastSeenMessageTsTimer: ReturnType<typeof setTimeout> | null = null;
+
+function flushLastSeenMessageTs() {
+  if (!cursorState.dirty) return;
+  if (lastSeenMessageTsTimer) {
+    clearTimeout(lastSeenMessageTsTimer);
+    lastSeenMessageTsTimer = null;
+  }
+  // Stays dirty if the write fails, so the shutdown fallback flush actually retries.
+  flushCursor(cursorState, () => persistCursor(lastSeenMessageTsFile, lastSeenMessageTs, safeStderrWrite));
+}
+
+function scheduleLastSeenMessageTsSave() {
+  cursorState.dirty = true;
+  if (lastSeenMessageTsTimer) return;
+  lastSeenMessageTsTimer = setTimeout(() => {
+    lastSeenMessageTsTimer = null;
+    flushLastSeenMessageTs();
+  }, cursorFlushIntervalMs);
+  (lastSeenMessageTsTimer as any).unref?.();
+}
+
+// normalizeTimestampForCursor now lives in ./timestamps.ts (imported above),
+// where it also handles whole-second timestamps so lexical cursor comparison
+// matches chronological order.
+
+function normalizeChannelDocLevel(level: unknown): number | null {
+  if (typeof level === "number" && Number.isInteger(level) && level >= 1 && level <= 4) {
+    return level;
+  }
+  if (typeof level === "string") {
+    const m = level.trim().match(/^(?:L)?([1-4])$/i);
+    if (m) return Number(m[1]);
+  }
+  return null;
+}
+
+function extractChannelDocsPayload(payload: any): any[] {
+  if (Array.isArray(payload)) return payload;
+  if (Array.isArray(payload?.docs)) return payload.docs;
+  if (Array.isArray(payload?.channel_docs)) return payload.channel_docs;
+  return [];
+}
+
+function isSkillDoc(doc: any): boolean {
+  const kind = String(doc?.kind || "").toLowerCase();
+  const id = String(doc?.id || doc?.doc_id || "").toLowerCase();
+  const title = String(doc?.title || "").toLowerCase();
+  return kind === "skill" || kind === "channel_skill" || id.includes("skill") || title.includes("skill");
+}
+
+function compactSkillDoc(doc: any) {
+  const meta = doc?.skill_meta || doc?.skillMeta || {};
+  return {
+    doc_id: doc?.id ?? doc?.doc_id,
+    title: doc?.title,
+    kind: doc?.kind,
+    level: doc?.level,
+    updated_at: doc?.updatedAt ?? doc?.updated_at,
+    name: meta.name,
+    description: meta.description,
+    trigger: meta.trigger,
+    argument_hint: meta.argument_hint ?? meta.argumentHint,
+  };
+}
+
+function parseSkillFrontmatter(md: string): { metadata: Record<string, string>; body: string } {
+  if (typeof md !== "string" || !md.startsWith("---\n")) return { metadata: {}, body: md };
+  const end = md.indexOf("\n---", 4);
+  if (end < 0) return { metadata: {}, body: md };
+  const raw = md.slice(4, end);
+  const body = md.slice(end + "\n---".length).replace(/^\s*\r?\n/, "");
+  const metadata: Record<string, string> = {};
+  for (const line of raw.split(/\r?\n/)) {
+    const m = line.match(/^([A-Za-z0-9_-]+):\s*(.*)$/);
+    if (!m) continue;
+    const key = m[1].toLowerCase().replace(/-/g, "_");
+    let value = m[2].trim();
+    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+      value = value.slice(1, -1);
+    }
+    if (key === "name" || key === "description" || key === "trigger" || key === "argument_hint") {
+      metadata[key] = value;
+    }
+  }
+  return { metadata, body };
+}
+
+// Hidden Identity active-player mode lives entirely in the MCP client.
+// When this agent joins a game, it temporarily surfaces all messages from
+// that game's channel even without an @mention, so players can follow live
+// descriptions/discussion. The server remains the game-state authority; this
+// local mode is bounded by both reveal/finished detection and a hard TTL.
+type ActiveHiddenIdentityGame = {
+  gameId: string;
+  channelId: string;
+  expiresAt: number;
+};
+const activeHiddenIdentityGames = new Map<string, ActiveHiddenIdentityGame>(); // game_id -> state
+const HI_ACTIVE_TTL_MS = 60 * 60 * 1000;
+
+function pruneActiveHiddenIdentityGames(now = Date.now()) {
+  for (const [gameId, state] of activeHiddenIdentityGames) {
+    if (state.expiresAt <= now) {
+      activeHiddenIdentityGames.delete(gameId);
+      process.stderr.write(`[agentchat] HI active mode expired game=${gameId.slice(0, 8)} channel=${state.channelId.slice(0, 12)}\n`);
+    }
+  }
+}
+
+function activateHiddenIdentityGame(gameId: string, channelId?: string) {
+  if (!gameId || !channelId) return;
+  activeHiddenIdentityGames.set(gameId, {
+    gameId,
+    channelId,
+    expiresAt: Date.now() + HI_ACTIVE_TTL_MS,
+  });
+  process.stderr.write(`[agentchat] HI active mode ON game=${gameId.slice(0, 8)} channel=${channelId.slice(0, 12)} ttl=${Math.round(HI_ACTIVE_TTL_MS / 60000)}m\n`);
+}
+
+async function fetchHiddenIdentityChannelId(gameId: string): Promise<string | undefined> {
+  try {
+    const r = await apiFetch(`${REST_URL}/api/hidden-identity/games/${encodeURIComponent(gameId)}`, {
+      headers: { "Authorization": `Bearer ${TOKEN}` },
+    });
+    if (!r.ok) return undefined;
+    const data = await r.json().catch(() => ({})) as any;
+    const g = data?.game || {};
+    const channelId = g.channel_id || g.channelId;
+    return typeof channelId === "string" ? channelId : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function activeHiddenIdentityForChannel(channelId: string | undefined): ActiveHiddenIdentityGame | null {
+  if (!channelId) return null;
+  pruneActiveHiddenIdentityGames();
+  for (const state of activeHiddenIdentityGames.values()) {
+    if (state.channelId === channelId) return state;
+  }
+  return null;
+}
+
+function clearActiveHiddenIdentityGame(gameId: string, reason: string) {
+  const state = activeHiddenIdentityGames.get(gameId);
+  if (!state) return;
+  activeHiddenIdentityGames.delete(gameId);
+  process.stderr.write(`[agentchat] HI active mode OFF game=${gameId.slice(0, 8)} reason=${reason}\n`);
+}
+
+function clearFinishedHiddenIdentityGamesFromMessage(data: any) {
+  const content = String(data?.content || "");
+  if (!content) return;
+  for (const gameId of [...activeHiddenIdentityGames.keys()]) {
+    if (!content.includes(gameId)) continue;
+    if (/\b(reveal|finished)\b/i.test(content) || /Game over|游戏结束|villagers won|spies won|平民获胜|卧底获胜/i.test(content)) {
+      clearActiveHiddenIdentityGame(gameId, "finished_message");
+    }
+  }
+}
+
+// Local ingress dedup for live WS + reconnect backfill races.
+//
+// `lastSeenMessageTs` is a cursor, not message identity. A reconnect can
+// legitimately receive the same persisted message once via live WS and once
+// via REST backfill; timestamp guards alone would either fail to drop that
+// duplicate or drop older out-of-order messages that were never processed.
+// Dedup core (key derivation + bounded set) lives in ./dedup.ts; this file
+// keeps the thin logging wrapper so call sites and stderr output are unchanged.
+const messageDedup = new MessageDedup();
+function deliverySource(data: any): string {
+  return typeof data?.__source === "string" ? data.__source : "live";
+}
+function recordOrSkipDeliveredMessage(data: any): boolean {
+  const key = messageDedupKey(data);
+  if (!key) return false;
+  const skip = messageDedup.recordOrSkip(key);
+  if (skip) {
+    process.stderr.write(
+      `[agentchat] Duplicate message skipped source=${deliverySource(data)} chat=${String(data.channel_id).slice(0, 12)} id=${String(data.id).slice(0, 12)}\n`,
+    );
+  }
+  return skip;
+}
+// Channels we believe we're a member of. Populated from
+// `channel_created` events on auth_ok. Used as the backfill target set.
+const knownChannels = new Set<string>();
+// Task #119: exposed handler reference so backfillAllChannels (module-
+// scope) can reuse connectWS's handleWSMessage closure without
+// duplicating the mention/notification gate logic.
+let currentHandleWSMessage: ((data: any) => Promise<void>) | null = null;
+let wsReconnectAttempt = 0;
+let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+// Tracked so shutdown / switchIdentity can cancel a pending auth_ok backfill.
+let backfillTimer: ReturnType<typeof setTimeout> | null = null;
+
+function scheduleReconnect(delayMs: number) {
+  if (shuttingDown) return; // don't resurrect the socket after shutdown
+  if (reconnectTimer) clearTimeout(reconnectTimer);
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    connectWS();
+  }, delayMs);
+}
+
+/**
+ * Task #119: fetch any channel messages that arrived while the WS
+ * was unreliable or down. Invoked 2s after every auth_ok — covers
+ * both cold start (empty cursors = no backfill) and reconnect
+ * (cursor points to last-seen, REST returns the gap).
+ *
+ * Iterates channels we believe we're in (populated from the
+ * channel_created events that follow auth_ok). For each, GETs
+ * /api/channels/:id/messages?after=<lastSeenTs> and re-injects
+ * every message through handleWSMessage — same code path as live
+ * delivery, so @mention detection + notification emission go
+ * through the same gate. Self-messages are filtered by the handler
+ * (sender_id !== AGENT_ID).
+ *
+ * Deduplication is by message id in handleWSMessage. Timestamp cursors
+ * decide what backfill requests should ask for, but they are not a safe
+ * identity check under live/backfill races or out-of-order delivery.
+ */
+async function backfillAllChannels(): Promise<void> {
+  if (knownChannels.size === 0) return;
+  for (const channelId of knownChannels) {
+    try {
+      const after = lastSeenMessageTs.get(channelId);
+      const params = after ? `?after=${encodeURIComponent(after)}&limit=50` : `?limit=1`;
+      const url = `${REST_URL}/api/channels/${encodeURIComponent(channelId)}/messages${params}`;
+      const res = await apiFetch(url, {
+        headers: TOKEN ? { "Authorization": `Bearer ${TOKEN}` } : {},
+      });
+      if (!res.ok) continue;
+      const data = await res.json() as { messages?: any[] };
+      const msgs = data.messages || [];
+      // No cursor yet (cold start / freshly joined channel): DON'T replay —
+      // seed the cursor from the newest message so later backfills fetch only
+      // genuinely new messages. Replaying here would surface a possibly
+      // hours-old DM/@mention as a live notification (contract: empty cursor
+      // = no backfill).
+      if (!after) {
+        let newestTs = "";
+        for (const m of msgs) {
+          const t = String(m?.timestamp || "");
+          if (t > newestTs) newestTs = t;
+        }
+        if (newestTs) {
+          lastSeenMessageTs.set(channelId, newestTs);
+          scheduleLastSeenMessageTsSave();
+        }
+        continue;
+      }
+      // Filter out self-messages upfront (faster than re-entering the
+      // handler just to bail) and typing placeholders (plugin ignores
+      // them anyway).
+      const replay = msgs.filter((m: any) =>
+        m && m.sender_id !== AGENT_ID && m.content !== "__typing__");
+      const dedupedReplay = after
+        ? replay.filter((m: any) => {
+            const msgTs = normalizeTimestampForCursor(m?.timestamp, "after");
+            const afterTs = normalizeTimestampForCursor(after, "after");
+            return typeof msgTs === "string" && typeof afterTs === "string" && msgTs > afterTs;
+          })
+        : replay;
+      if (dedupedReplay.length === 0) continue;
+      process.stderr.write(`[agentchat] Backfill ${channelId.slice(0, 12)}: ${dedupedReplay.length} missed msg(s)\n`);
+      // Sort ascending so replay order matches live chronology —
+      // lastSeenMessageTs advances monotonically.
+      dedupedReplay.sort((a: any, b: any) => String(a.timestamp).localeCompare(String(b.timestamp)));
+      for (const m of dedupedReplay) {
+        try {
+          // Wrap as a `message` envelope to match ws.onmessage shape.
+          if (currentHandleWSMessage) {
+            await currentHandleWSMessage({ ...m, type: "message", __source: "backfill" });
+          }
+        } catch (e) {
+          process.stderr.write(`[agentchat] Backfill replay error: ${e}\n`);
+        }
+      }
+    } catch (e) {
+      process.stderr.write(`[agentchat] Backfill fetch failed for ${channelId.slice(0, 12)}: ${e}\n`);
+    }
+  }
+}
+
+function connectWS() {
+  // Don't spin up a new socket after stdio shutdown — a stray reconnect
+  // timer must never resurrect the connection.
+  if (shuttingDown) return;
+
+  // Capture THIS socket locally. Every handler below guards on
+  // `ws !== socket`, so a superseded socket (e.g. a dead-TCP connection
+  // whose close event is delayed past the point a replacement is already
+  // live) can never clobber the current session or schedule a duplicate
+  // reconnect — the root cause of the orphan/double-connection race.
+  let socket: WebSocket;
+  try {
+    socket = new WebSocket(WS_URL);
+    ws = socket;
+  } catch (e) {
+    process.stderr.write(`[agentchat] WebSocket constructor failed: ${e}, retrying in 5s\n`);
+    scheduleReconnect(5000); // route through the single tracked timer
+    return;
+  }
+
+  ws.onopen = () => {
+    if (ws !== socket) return; // superseded by a newer socket
+    try {
+      socket.send(JSON.stringify({
+        type: "auth",
+        agent_id: AGENT_ID,
+        token: TOKEN,
+        capabilities: CAPABILITIES,
+      }));
+    } catch (e) {
+      process.stderr.write(`[agentchat] Auth send failed: ${e}\n`);
+    }
+  };
+
+  ws.onmessage = async (event) => {
+    if (ws !== socket) return; // ignore late frames from a superseded socket
+    let data: any;
+    try { data = JSON.parse(String(event.data)); } catch { return; }
+    if (data && typeof data === "object" && !data.__source) data.__source = "live";
+    try { await handleWSMessage(data); } catch (e) {
+      process.stderr.write(`[agentchat] Message handler error: ${e}\n`);
+    }
+  };
+
+  currentHandleWSMessage = handleWSMessage;
+  async function handleWSMessage(data: any) {
+
+    if (data.type === "pong") {
+      heartbeat.receivedPong();
+      return;
+    }
+    if ((data.type === "hidden_identity.reveal" || data.type === "hidden_identity.finished") && typeof data.game_id === "string") {
+      clearActiveHiddenIdentityGame(data.game_id, data.type);
+    }
+
+    if (data.type === "auth_ok") {
+      sessionId = data.session_id;
+      wsReconnectAttempt = 0; // reset backoff on successful auth
+      heartbeat.receivedPong(); // treat auth_ok as alive signal
+      process.stderr.write(`[agentchat] Connected as ${AGENT_ID}\n`);
+      // Task #119: fire a backfill 2s after auth_ok to pick up any
+      // messages that arrived while the WS was down or that the Redis
+      // ac:ch:* subscribe happened to miss. Delay gives the server
+      // time to emit channel_created for each joined channel so
+      // knownChannels is populated. backfillAllChannels does the
+      // per-channel REST fetch and re-injects each missed message
+      // through handleWSMessage so @mention detection + notification
+      // path is identical to live delivery — no divergent code paths.
+      if (backfillTimer) clearTimeout(backfillTimer);
+      backfillTimer = setTimeout(() => {
+        backfillTimer = null;
+        if (!shuttingDown) void backfillAllChannels();
+      }, 2000);
+    } else if ((data.type === "message" || data.type === "thread_reply") &&
+      data.sender_id === AGENT_ID && typeof data.content === "string" && data.content !== "__typing__" &&
+      !["loop_tick", "slash_input", "loop_status", "slash_response"].includes(data.meta?.kind)) {
+      // A separate connection of this identity may have produced the reply.
+      stopTypingHeartbeat(data.channel_id);
+    } else if (
+      // thread_reply is a bidirectional protocol frame (Server -> Client too).
+      // Route it through the same @mention / notification / cursor path as a
+      // plain message, otherwise thread @mentions are silently invisible.
+      (data.type === "message" || data.type === "thread_reply") &&
+      // Loop ticks are server-fired with sender_id=loop.agent_id, which
+      // equals AGENT_ID when the loop owner is THIS plugin. Without this
+      // exception the outer "skip own messages" gate swallows every tick
+      // before the slash filter below ever sees it, so /loop silently
+      // never fires the LLM for the loop creator. Empirically confirmed
+      // 2026-05-03 in dm-dsplvj (loop_39d587464e3c): tick landed in
+      // history but never surfaced to the plugin's LLM path.
+      (data.sender_id !== AGENT_ID ||
+        (data.meta &&
+          typeof data.meta === "object" &&
+          (data.meta as { kind?: unknown }).kind === "loop_tick"))
+    ) {
+      // 跳过 typing 状态消息
+      if (data.content === "__typing__") return;
+
+      // Slash side-channel skip (boss directive 2026-05-03 msg:caf95079).
+      // /loop, /show-loop, /stop-loop are command channels — LLM must NOT
+      // be invoked by them. Server tags envelopes server-authoritatively:
+      //   • meta.kind="slash_input"  — user's literal slash text (hub.ts
+      //     preprocessSlashCommand, force-overwrite to prevent client spoof)
+      //   • meta.kind="loop_status"  — system reply from slash-router
+      //     (success/error/placeholder for /loop /stop-loop /show-loop)
+      // loop_tick (broadcastLoopTick) is intentionally NOT filtered —
+      // that's the engine firing the loop owner's LLM and IS meant for
+      // consumption.
+      const metaKind = (data.meta && typeof data.meta === "object")
+        ? (data.meta as { kind?: unknown }).kind
+        : undefined;
+      if (metaKind === "slash_input" || metaKind === "loop_status" || metaKind === "slash_response") {
+        rateLimitedLog(
+          `slash-skip:${metaKind}`,
+          `[agentchat] [slash-skip] ${metaKind} in ${(data.channel_id || "").slice(0, 12)}\n`,
+        );
+        return;
+      }
+
+      if (recordOrSkipDeliveredMessage(data)) return;
+
+      // Task #119: record the timestamp so a future auth_ok backfill
+      // knows where to resume. Only advance forward (defensive against
+      // out-of-order delivery from Redis subscribe vs REST backfill replay).
+      // Persist on a short debounce so busy public channels do not turn
+      // every silent message into a synchronous disk write.
+      if (typeof data.channel_id === "string" && typeof data.timestamp === "string") {
+        const prev = lastSeenMessageTs.get(data.channel_id) || "";
+        const currentTs = normalizeTimestampForCursor(data.timestamp, "after") || data.timestamp;
+        const prevTs = normalizeTimestampForCursor(prev, "after") || prev;
+        if (currentTs > prevTs) {
+          lastSeenMessageTs.set(data.channel_id, data.timestamp);
+          scheduleLastSeenMessageTsSave();
+        }
+      }
+
+      const isDM = data.channel_id?.startsWith("dm-");
+      // Match `@<agentId>` and `@<displayName>(<agentId>)`; see matchesMention
+      // (mentions.ts) for why the second clause must not fire on incidental
+      // `(<id>)` substrings like "User joined: name (acc_xyz)".
+      const isMentioned = matchesMention(data.content || "", AGENT_ID || "");
+      const activeHi = activeHiddenIdentityForChannel(data.channel_id);
+      // A group's self-run tick targets its creator without an @mention. Keep it
+      // in this same channel for both MCP notifications and host wake transports.
+      // Another bot's tick does not grant this exception.
+      const isOwnLoopTick = metaKind === "loop_tick" && data.sender_id === AGENT_ID;
+
+      if (isDM || isMentioned || activeHi || isOwnLoopTick) {
+        // DM or @mention → respond. Start a cross-pod typing heartbeat so a human
+        // on any pod sees the agent "thinking" for the whole processing duration.
+        // The hub now cross-pod-broadcasts agent typing frames (cross_pod:true)
+        // and never persists them, so this is ephemeral + zero-write. Stops when
+        // we reply to the channel (reply handler), at the 120s cap, or on shutdown.
+        if (isDM || isMentioned) startTypingHeartbeat(data.channel_id);
+
+        // For @mention in channels, fetch context since last mention
+        let contextPrefix = "";
+        if (!isDM && isMentioned) {
+          try {
+            const lastTs = lastMentionTimestamp.get(data.channel_id) || "";
+            // Cap the request size: 50 messages max, plus client-side byte
+            // and per-message-content trimming below. Boss msg:fc8b9b1a —
+            // long-silent agents would pull a 200-message backlog on first
+            // @mention, blowing up small-context models. 50 + 15KB +
+            // per-msg 2KB matches "recent conversation" without overshoot.
+            const params = `limit=50${lastTs ? '&after=' + encodeURIComponent(lastTs) : ''}`;
+            const historyUrl = `${REST_URL}/api/channels/${encodeURIComponent(data.channel_id)}/messages?${params}`;
+            // Channel reads are auth-gated (login for public channels,
+            // membership for private). Without the Bearer header the
+            // MCP agent would get 401/403 and answer the @mention
+            // without any conversation context.
+            const historyRes = await apiFetch(historyUrl, {
+              headers: TOKEN ? { "Authorization": `Bearer ${TOKEN}` } : {},
+            });
+            if (historyRes.ok) {
+              const historyData = await historyRes.json() as any;
+              let msgs = (historyData.messages || [])
+                .filter((m: any) => m.id !== data.id && m.content !== "__typing__");
+              // Cumulative byte cap (newest-first walk so we keep the most
+              // recent messages when total exceeds the budget). Per-message
+              // content also clipped to 2KB to defang occasional copy-paste
+              // walls of text — a single mega-message no longer eats the
+              // whole budget alone.
+              let totalBytes = 0;
+              const maxBytes = 15_000;
+              const maxPerMsg = 2_000;
+              const trimmed: any[] = [];
+              for (let i = msgs.length - 1; i >= 0; i--) {
+                const raw = (msgs[i].content || "");
+                const clipped = raw.length > maxPerMsg
+                  ? raw.slice(0, maxPerMsg) + " …[truncated]"
+                  : raw;
+                const size = Buffer.byteLength(clipped, "utf8"); // real UTF-8 bytes (CJK is 3B/char, not 1)
+                if (totalBytes + size > maxBytes) break;
+                totalBytes += size;
+                trimmed.unshift({ ...msgs[i], content: clipped });
+              }
+              const truncatedMsgs = trimmed.length < msgs.length;
+              if (trimmed.length > 0) {
+                const context = trimmed
+                  .map((m: any) => `${m.sender_id}: ${m.content}`)
+                  .join("\n");
+                const note = truncatedMsgs
+                  ? `[频道上下文 - 最近 ${trimmed.length} 条消息（更早的已截断保护上下文窗口）]`
+                  : `[频道上下文 - 自上次 @mention 以来 ${trimmed.length} 条消息]`;
+                contextPrefix = `${note}\n${context}\n\n[你被 @mention 了，请回复]\n`;
+              }
+            }
+            // Record this mention timestamp for next time
+            lastMentionTimestamp.set(data.channel_id, data.timestamp);
+            saveMentionTimestamps(lastMentionTimestamp);
+          } catch (e) {
+            process.stderr.write(`[agentchat] Failed to fetch context: ${e}\n`);
+          }
+        }
+        if (!isDM && !isMentioned && activeHi) {
+          contextPrefix = `[HI游戏进行中 - 你是 game ${activeHi.gameId.slice(0, 8)} 的上桌玩家；此消息无需 @mention 也被实时推送。只在轮到你行动、需要讨论或需要投票时回复，否则可以旁观。]\n`;
+        }
+
+        process.stderr.write(`[agentchat] ${isDM ? 'DM' : isMentioned ? '@mention' : isOwnLoopTick ? 'loop-tick' : 'HI-active'} from ${String(data.sender_id ?? "?").slice(0, 8)}: ${String(data.content ?? "").slice(0, 50)}\n`);
+
+        // 推送给 Claude Code
+        try {
+          await server.notification({
+            method: process.env.CLAUDE_CODE_ENTRYPOINT ? "notifications/claude/channel" : "notifications/chat/channel",
+            params: {
+              content: contextPrefix + data.content,
+              meta: {
+                chat_id: data.channel_id,
+                sender_id: data.sender_id,
+                message_id: data.id,
+              },
+            },
+          });
+          debugLog(`[agentchat] Notification pushed to Claude Code\n`);
+        } catch (notifErr) {
+          process.stderr.write(`[agentchat] Notification FAILED: ${notifErr}\n`);
+        }
+        // Wake-webhook (host-agnostic): hosts without an MCP channel-notification
+        // surface (Grok Bot, generic MCP clients) are woken by an outbound POST to
+        // AGENTCHAT_WAKE_URL instead. Best-effort — never blocks the notification
+        // path above. The ac_ token stays local; the body carries message metadata
+        // + an HMAC signature (AGENTCHAT_WAKE_SECRET) so the receiver can verify.
+        // Grok mode (AGENTCHAT_WAKE_MODE=grok): a same-machine Grok gateway expects
+        // loopback /api/sendPrompt with its own Bearer (read from gateway.json) and
+        // a {agentId, prompt} body — a different transport, same trigger.
+        if (process.env.AGENTCHAT_WAKE_MODE === "grok") {
+          // 1:1 mapping: this plugin instance (one AgentsChat agent) wakes ONE Grok
+          // agent. Explicit AGENTCHAT_GROK_AGENT_ID wins; else resolve by matching
+          // the AgentsChat display name against the gateway's listAgents (warns);
+          // else fail closed (no wake). The gateway token/port come from gateway.json.
+          void (async () => {
+            try {
+              const { readFileSync, existsSync } = await import("node:fs");
+              // env override wins; else first existing candidate (~/.grok default,
+              // production GrokBot /home/box/sand-data) — never guess a path blindly.
+              const gwPath = resolveGrokGatewayPath(process.env.AGENTCHAT_GROK_GATEWAY, existsSync);
+              let agentId = process.env.AGENTCHAT_GROK_AGENT_ID || "";
+              if (!agentId) {
+                agentId = (await resolveGrokAgentId({
+                  explicitId: "",
+                  agentschatName: profile.display_name || AGENT_ID,
+                  listAgents: async () => {
+                    const gwcfg = JSON.parse(readFileSync(gwPath, "utf8"));
+                    const token = grokBearerFromGatewayConfig(gwcfg);
+                    const port = grokPortFromGatewayConfig(gwcfg);
+                    const res = await fetch(`http://127.0.0.1:${port}/api/listAgents`, {
+                      headers: token ? { Authorization: `Bearer ${token}` } : {},
+                    });
+                    if (!res.ok) throw new Error(`listAgents HTTP ${res.status}`);
+                    const d = (await res.json()) as any;
+                    return Array.isArray(d) ? d : d?.agents ?? [];
+                  },
+                })) ?? "";
+              }
+              if (agentId) {
+                void fireGrokWake(data, { gatewayConfigPath: gwPath, agentId, contextPrefix });
+              }
+            } catch (e) {
+              process.stderr.write(`[agentchat] grok wake resolve failed: ${e}\n`);
+            }
+          })();
+        } else if (process.env.AGENTCHAT_WAKE_URL) {
+          void fireWake(data, {
+            url: process.env.AGENTCHAT_WAKE_URL,
+            secret: process.env.AGENTCHAT_WAKE_SECRET,
+          });
+        } else if (runtimeSession?.runtime === "zcode" || process.env.AGENTCHAT_WAKE_MODE === "zcode") {
+          const activeProfName = profileNameFromPath(activeProfileFile);
+          const zcodeSid =
+            runtimeSession?.sessionId ||
+            findBoundSessionForProfile(configDir, activeProfName, (sid) => sid.startsWith("sess_")) ||
+            "";
+          if (zcodeSid) {
+            void fireZcodeWake(data, {
+              sessionId: zcodeSid,
+              workspacePath: runtimeSession?.workspacePath,
+              profileName: activeProfName ?? undefined,
+              lockOwnerPid: process.pid,
+              contextPrefix,
+              logger: (m) => process.stderr.write(`${m}\n`),
+            });
+          }
+        } else {
+          // Native Antigravity (agy) Connect-RPC wake when running under language_server
+          void (async () => {
+            try {
+              const agyHost = discoverAntigravityHost();
+              const lsAddress = process.env.ANTIGRAVITY_LS_ADDRESS?.trim() || "";
+              const csrfToken = (process.env.ANTIGRAVITY_CSRF_TOKEN || agyHost?.csrfToken || "").trim();
+              if (!agyHost && !lsAddress) return;
+              const activeProfName = profileNameFromPath(activeProfileFile);
+              const allBinds = loadSessionBinds(configDir);
+              let targetCid =
+                findBoundSessionForProfile(configDir, activeProfName, (sid) => /^[0-9a-f-]{36}$/i.test(sid)) ||
+                (runtimeSession?.runtime === "antigravity" ? runtimeSession.sessionId : "") ||
+                "";
+              if (!targetCid && agyHost) {
+                if (agyHost.openConversations.length === 1) {
+                  targetCid = agyHost.openConversations[0]!;
+                } else if (agyHost.openConversations.length > 1) {
+                  const unboundOrSame = agyHost.openConversations.find(
+                    (cid) => !allBinds[cid] || allBinds[cid] === activeProfName,
+                  );
+                  targetCid = unboundOrSame || agyHost.openConversations[0]!;
+                }
+              }
+              if (targetCid && csrfToken) {
+                await fireAntigravityWake(data, {
+                  conversationId: targetCid,
+                  csrfToken,
+                  lsAddress: lsAddress || undefined,
+                  ports: agyHost?.ports,
+                  contextPrefix,
+                  logger: (m) => process.stderr.write(`${m}\n`),
+                });
+              }
+            } catch (e) {
+              process.stderr.write(`[agentchat] antigravity wake error: ${e}\n`);
+            }
+          })();
+        }
+        if (activeHi) clearFinishedHiddenIdentityGamesFromMessage(data);
+      } else {
+        // Channel message without @mention → silent (just log)
+        rateLimitedLog(
+          "silent-channel-message",
+          `[agentchat] [silent] ${String(data.sender_id ?? "?").slice(0, 8)} in ${String(data.channel_id ?? "?").slice(0, 12)}: ${String(data.content ?? "").slice(0, 30)}\n`,
+        );
+      }
+    } else if (data.type === "channel_created") {
+      // 自动加入新频道
+      try {
+        ws?.send(JSON.stringify({
+          type: "join_channel",
+          channel_id: data.channel_id,
+          agent_id: AGENT_ID,
+        }));
+      } catch {}
+      process.stderr.write(`[agentchat] Joined channel: ${data.name}\n`);
+      // Task #119: track channel id for reconnect backfill target set.
+      if (typeof data.channel_id === "string") knownChannels.add(data.channel_id);
+    } else if (data.type === "shard_moved") {
+      // Server instance shutting down or channel moved — a PLANNED hop.
+      // Detach the socket's onclose so it can't also run the unplanned
+      // backoff path, reset the backoff counter, and fast-reconnect. This
+      // keeps a rolling deploy (several pods closing in sequence) from
+      // pushing each successive reconnect 2s, 4s, 6s ... further out.
+      process.stderr.write(`[agentchat] Shard moved, reconnecting...\n`);
+      if (data.redirect_url) {
+        const newUrl = data.redirect_url.replace(/^https/, "wss").replace(/^http/, "ws") + "/ws";
+        process.stderr.write(`[agentchat] Redirecting to: ${newUrl}\n`);
+        // Note: for simplicity we reconnect to original URL and let /api/shard handle routing
+      }
+      if (ws) { ws.onclose = null; try { ws.close(); } catch {} }
+      ws = null;
+      sessionId = null;
+      wsReconnectAttempt = 0;
+      scheduleReconnect(500);
+    } else if (data.type === "error") {
+      process.stderr.write(`[agentchat] Error: ${data.message}\n`);
+    }
+  }
+
+  ws.onclose = (event) => {
+    if (ws !== socket) return; // a superseded socket's delayed close — leave live state alone
+    sessionId = null;
+    heartbeat.resetReconnecting(); // allow heartbeat to reconnect again if needed
+    // Only genuine UNPLANNED drops reach here now. Planned paths
+    // (shard_moved / heartbeat.reconnect / switchIdentity) detach this
+    // handler and self-schedule a fast reconnect, so there is no
+    // isPlannedReconnect flag to consume and no fast/slow ambiguity.
+    wsReconnectAttempt++;
+    const delay = computeReconnectDelay(wsReconnectAttempt);
+    process.stderr.write(`[agentchat] Disconnected (code=${(event as any)?.code ?? "?"}), reconnecting in ${Math.round(delay/100)/10}s (attempt ${wsReconnectAttempt})...\n`);
+    scheduleReconnect(delay);
+  };
+
+  ws.onerror = (err) => {
+    if (ws !== socket) return;
+    process.stderr.write(`[agentchat] WebSocket error: ${err}\n`);
+  };
+}
+
+// Heartbeat with dead-connection detection (15s ping, 45s timeout for faster recovery)
+import { HeartbeatMonitor, WS_OPEN, WS_CLOSED, WS_CONNECTING, WS_CLOSING } from "./heartbeat.ts";
+
+const heartbeat = new HeartbeatMonitor({
+  sendPing: () => {
+    try { ws?.send(JSON.stringify({ type: "ping", timestamp: new Date().toISOString() })); } catch {}
+  },
+  reconnect: () => {
+    process.stderr.write("[agentchat] Heartbeat timeout, forcing reconnect\n");
+    // Detach onclose so the forced close doesn't also run the unplanned
+    // backoff path and downgrade this fast 500ms recovery to 2-5s.
+    if (ws) { ws.onclose = null; try { ws.close(); } catch {} }
+    ws = null;
+    sessionId = null;
+    wsReconnectAttempt = 0; // reset backoff for heartbeat-triggered reconnect
+    scheduleReconnect(500); // short delay to avoid tight loop
+  },
+  getReadyState: () => ws?.readyState ?? WS_CLOSED,
+}, 15_000, 45_000, 30_000); // 15s ping, 45s pong timeout, 30s connect timeout
+if (!anonymousMode && !toolOnlyMode) {
+  heartbeat.start();
+}
+
+function releaseLiveLock() {
+  if (AGENT_ID && !toolOnlyMode) {
+    try {
+      releaseAgentLock({ lockDir, agentId: AGENT_ID, currentSessionId: runtimeSession?.sessionId ?? null });
+    } catch {}
+  }
+}
+
+function shutdownFromStdio(reason: string) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  safeStderrWrite(`[agentchat] Stdio closed (${reason}), shutting down\n`);
+  // Persisting the read cursor is a state change, not teardown: report, never swallow.
+  try { flushLastSeenMessageTs(); } catch (e) { safeStderrWrite(`[agentchat] WARNING: read-cursor flush failed on shutdown: ${e}\n`); }
+  releaseLiveLock();
+  try { heartbeat.stop(); } catch {}
+  try { stopAllTypingHeartbeats(); } catch {}
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+  if (backfillTimer) {
+    clearTimeout(backfillTimer);
+    backfillTimer = null;
+  }
+  try { ws?.close(); } catch {}
+  ws = null;
+  sessionId = null;
+  try {
+    const maybeClosed = transport?.close();
+    if (maybeClosed && typeof (maybeClosed as any).catch === "function") {
+      (maybeClosed as Promise<void>).catch(() => {});
+    }
+  } catch {}
+  const timer = setTimeout(() => process.exit(0), 0);
+  (timer as any).unref?.();
+}
+
+function installStdioLifecycleGuards() {
+  process.stdin.on("end", () => shutdownFromStdio("stdin end"));
+  process.stdin.on("close", () => shutdownFromStdio("stdin close"));
+  const handleOutputError = (err: any) => {
+    const code = err?.code || err?.name || "output error";
+    if (code === "EPIPE" || code === "ERR_STREAM_DESTROYED") {
+      shutdownFromStdio(String(code));
+    }
+  };
+  process.stdout.on("error", handleOutputError);
+  process.stderr.on("error", handleOutputError);
+  process.on("SIGPIPE", () => shutdownFromStdio("SIGPIPE"));
+  process.on("beforeExit", () => {
+    releaseLiveLock();
+    try { flushLastSeenMessageTs(); } catch (e) { safeStderrWrite(`[agentchat] WARNING: read-cursor fallback flush failed: ${e}\n`); }
+  });
+  process.on("exit", () => {
+    releaseLiveLock();
+  });
+}
+
+// Startup staleness check: compare the running package version against the npm
+// `latest` and, if behind, print a clear stderr note. New tools/capabilities load
+// only on a SESSION RESTART (hot-reload of new code isn't possible), so surfacing
+// "you're stale" at startup beats discovering it only when a call to a not-yet-
+// loaded tool fails. Best-effort: non-blocking, times out, never crashes startup.
+async function checkVersionStaleness(): Promise<void> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 5000);
+  try {
+    const r = await nativeFetch("https://registry.npmjs.org/agentschat-mcp/latest", { signal: controller.signal });
+    if (!r.ok) return;
+    const latest = (await r.json() as any)?.version;
+    if (typeof latest === "string" && latest !== pkg.version) {
+      process.stderr.write(
+        `[agentchat] Update available: running agentschat-mcp ${pkg.version}, latest published is ${latest}. ` +
+        `New tools/capabilities load only on a SESSION RESTART (hot-reload isn't possible); ` +
+        `update deliberately (bump the pinned agentschat-mcp@<version> in each MCP entry / reinstall) then restart this session to pick them up.\n`,
+      );
+    }
+  } catch {
+    // best-effort: never block or crash startup on the update check
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// --- Start ---
+async function main() {
+  installStdioLifecycleGuards();
+  // Anonymous = no credentials to present. Connecting would just fail auth in a
+  // reconnect loop; stdio (initialize/tools/list) is served either way.
+  if (anonymousMode) {
+    process.stderr.write(`[agentchat] Anonymous — not connecting to the hub.\n`);
+  } else if (toolOnlyMode) {
+    process.stderr.write(`[agentchat] Tool-only mode (AGENTSCHAT_TOOL_ONLY=1) — skipping duplicate WS connection.\n`);
+  } else {
+    connectWS();
+  }
+
+  // Stdio is the only supported transport. The --port HTTP SSE path was
+  // removed in v0.6.7 — OpenClaw users should install the native channel
+  // adapter `openclaw-agentchat` (npm) instead of running this plugin
+  // as an HTTP server.
+  transport = new StdioServerTransport();
+  await server.connect(transport);
+  process.stderr.write("[agentchat] MCP server started (Stdio)\n");
+  void checkVersionStaleness(); // fire-and-forget staleness note; never blocks startup
+}
+
+main().catch((e) => {
+  process.stderr.write(`[agentchat] Fatal: ${e}\n`);
+  process.exit(1);
+});
+
+// Prevent unhandled errors from crashing the process
+process.on("uncaughtException", (e) => {
+  process.stderr.write(`[agentchat] Uncaught exception (non-fatal): ${e}\n`);
+});
+process.on("unhandledRejection", (e) => {
+  process.stderr.write(`[agentchat] Unhandled rejection (non-fatal): ${e}\n`);
+});

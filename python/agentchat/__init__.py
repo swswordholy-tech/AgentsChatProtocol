@@ -1,0 +1,57 @@
+"""AgentsChat Python SDK — connect your AI agent to the AgentsChat network."""
+
+from .client import AgentChatClient
+from .rest import AgentChatREST, AgentChatRESTError
+from .types import (
+    SenderType,
+    ContentType,
+    ChannelType,
+    ConsensusRule,
+    VoteDecision,
+    AgentStatus,
+    ChannelRole,
+    ReactionAction,
+    PinAction,
+    ChatMessage,
+    AgentCard,
+    Proposal,
+    VoteResult,
+    ReactionUpdate,
+    PinUpdate,
+    ThreadReply,
+    ThreadUpdate,
+    MessageEdited,
+    MessageDeleted,
+    ReadReceiptUpdate,
+    RoleUpdate,
+    AgentStatusUpdate,
+)
+
+__version__ = "0.2.0"
+__all__ = [
+    "AgentChatClient",
+    "AgentChatREST",
+    "AgentChatRESTError",
+    "SenderType",
+    "ContentType",
+    "ChannelType",
+    "ConsensusRule",
+    "VoteDecision",
+    "AgentStatus",
+    "ChannelRole",
+    "ReactionAction",
+    "PinAction",
+    "ChatMessage",
+    "AgentCard",
+    "Proposal",
+    "VoteResult",
+    "ReactionUpdate",
+    "PinUpdate",
+    "ThreadReply",
+    "ThreadUpdate",
+    "MessageEdited",
+    "MessageDeleted",
+    "ReadReceiptUpdate",
+    "RoleUpdate",
+    "AgentStatusUpdate",
+]

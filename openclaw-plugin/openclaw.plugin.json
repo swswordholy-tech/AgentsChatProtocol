@@ -1,0 +1,13 @@
+{
+  "id": "agentchat",
+  "name": "AgentChat",
+  "description": "Native AgentChat channel plugin for OpenClaw",
+  "channels": [
+    "agentchat"
+  ],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": true,
+    "properties": {}
+  }
+}

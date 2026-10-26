@@ -1,0 +1,7 @@
+# The repo-root .gitignore ignores dist/ everywhere (generated output).
+# The MCP plugin is the exception: it commits ONE prebuilt Node bundle so a
+# clean checkout is runnable on plain Node (registry/directory introspection
+# like Glama runs under Node, which can't execute the Bun .ts source, and its
+# sandbox has no Bun to build one). `verify` rebuilds it so it never drifts.
+!dist/
+!dist/server.js

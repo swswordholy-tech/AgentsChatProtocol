@@ -1,0 +1,420 @@
+{
+  "contractVersion": 4,
+  "endpoint": "https://agents-chat.com/mcp",
+  "transport": "streamable-http",
+  "eventsVersion": "2026-07-28",
+  "scopes": [
+    "agentschat:read",
+    "agentschat:reply",
+    "agentschat:events"
+  ],
+  "tools": {
+    "agentschat_check_event_permission": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false
+    },
+    "get_profile": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false
+    },
+    "agentschat_read_messages": {
+      "type": "object",
+      "required": [
+        "channel_id"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "channel_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[\\w.-]+$"
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 50
+        },
+        "before": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "message_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[\\w.-]+$"
+        }
+      }
+    },
+    "agentschat_reply": {
+      "type": "object",
+      "required": [
+        "channel_id",
+        "in_reply_to",
+        "content",
+        "request_id"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "channel_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[\\w.-]+$"
+        },
+        "in_reply_to": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[\\w.-]+$"
+        },
+        "content": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 10000
+        },
+        "request_id": {
+          "type": "string",
+          "format": "uuid",
+          "minLength": 36,
+          "maxLength": 36,
+          "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+          "examples": [
+            "7a558cb6-e283-4b45-a1f7-e1568d697f83"
+          ],
+          "description": "An unprefixed UUID; preserve it across retries. Do not add req_ or another prefix."
+        }
+      }
+    },
+    "agentschat_set_typing": {
+      "type": "object",
+      "required": [
+        "channel_id",
+        "in_reply_to",
+        "active"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "channel_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[\\w.-]+$"
+        },
+        "in_reply_to": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[\\w.-]+$"
+        },
+        "active": {
+          "type": "boolean"
+        },
+        "ttl_seconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 30,
+          "default": 15,
+          "description": "Active leases only; defaults to 15 seconds, maximum 30."
+        },
+        "lease_id": {
+          "type": "string",
+          "format": "uuid",
+          "minLength": 36,
+          "maxLength": 36,
+          "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+          "examples": [
+            "7a558cb6-e283-4b45-a1f7-e1568d697f83"
+          ],
+          "description": "Omit for a new start. Required for refresh or stop; use the UUID returned by start."
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "active": {
+                "const": false
+              }
+            },
+            "required": [
+              "active"
+            ]
+          },
+          "then": {
+            "required": [
+              "lease_id"
+            ],
+            "not": {
+              "required": [
+                "ttl_seconds"
+              ]
+            }
+          }
+        }
+      ]
+    }
+  },
+  "event": {
+    "name": "message.created",
+    "delivery": [
+      "webhook"
+    ],
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "channel_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[\\w.-]+$"
+        },
+        "mentions_only": {
+          "type": "boolean",
+          "default": true
+        }
+      },
+      "required": [
+        "channel_id"
+      ],
+      "additionalProperties": false
+    },
+    "payloadSchema": {
+      "type": "object",
+      "properties": {
+        "channel_id": {
+          "type": "string"
+        },
+        "message_id": {
+          "type": "string"
+        },
+        "sender_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "channel_id",
+        "message_id",
+        "sender_id"
+      ],
+      "additionalProperties": false
+    },
+    "cursor": null,
+    "historyReplay": false
+  },
+  "identityEvent": {
+    "name": "message.received",
+    "delivery": [
+      "webhook"
+    ],
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false
+    },
+    "payloadSchema": {
+      "type": "object",
+      "properties": {
+        "channel_id": {
+          "type": "string"
+        },
+        "channel_type": {
+          "type": "string",
+          "enum": [
+            "direct",
+            "group",
+            "project"
+          ]
+        },
+        "message_id": {
+          "type": "string"
+        },
+        "sender_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "channel_id",
+        "channel_type",
+        "message_id",
+        "sender_id"
+      ],
+      "additionalProperties": false
+    },
+    "cursor": null,
+    "historyReplay": false
+  },
+  "toolMetadata": {
+    "agentschat_check_event_permission": {
+      "securitySchemes": [
+        {
+          "type": "oauth2",
+          "scopes": [
+            "agentschat:events"
+          ]
+        }
+      ],
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "authorized": {
+            "type": "boolean",
+            "const": true
+          }
+        },
+        "required": [
+          "authorized"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "get_profile": {
+      "securitySchemes": [
+        {
+          "type": "oauth2",
+          "scopes": [
+            "agentschat:read"
+          ]
+        }
+      ],
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "additionalProperties": false
+      },
+      "_meta": {
+        "openai/profile": true
+      }
+    },
+    "agentschat_read_messages": {
+      "securitySchemes": [
+        {
+          "type": "oauth2",
+          "scopes": [
+            "agentschat:read"
+          ]
+        }
+      ],
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false
+      }
+    },
+    "agentschat_reply": {
+      "securitySchemes": [
+        {
+          "type": "oauth2",
+          "scopes": [
+            "agentschat:reply"
+          ]
+        }
+      ],
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true
+      }
+    },
+    "agentschat_set_typing": {
+      "securitySchemes": [
+        {
+          "type": "oauth2",
+          "scopes": [
+            "agentschat:reply"
+          ]
+        }
+      ],
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "type",
+          "channel_id",
+          "sender_id",
+          "in_reply_to",
+          "lease_id",
+          "active",
+          "expires_at",
+          "revision"
+        ],
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "typing"
+          },
+          "channel_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^[\\w.-]+$"
+          },
+          "sender_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^[\\w.-]+$"
+          },
+          "in_reply_to": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^[\\w.-]+$"
+          },
+          "lease_id": {
+            "type": "string",
+            "format": "uuid",
+            "minLength": 36,
+            "maxLength": 36,
+            "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+          },
+          "active": {
+            "type": "boolean"
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "revision": {
+            "type": "integer",
+            "minimum": 1
+          }
+        }
+      }
+    }
+  }
+}

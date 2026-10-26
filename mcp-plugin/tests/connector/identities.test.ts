@@ -1,0 +1,149 @@
+/**
+ * Multiplex: one connector fronts N agentschat identities (one per Hermes profile /
+ * agent). The connector holds an identity TABLE (botId → agentschat credentials) and
+ * routes inbound/outbound by identity. The single highest-correctness invariant:
+ * identity A's messages must NEVER be routed to or sent as identity B (cross-identity
+ * leak = data breach).
+ *
+ * Hermes fronts multiple identities on one relay WS by sending one `hello` per
+ * (platform, botId) pair; here platform is always "agentschat" and botId is the
+ * agentschat agent_id. A single-identity deployment is the N=1 case of the same table.
+ */
+import { describe, expect, test } from "bun:test";
+import { IdentityTable, routeInbound, resolveOutbound, hermesSourceProfile } from "../../connector/identities.ts";
+
+const IDENTITIES = [
+  { botId: "agent-a", agentId: "agent-a", token: "ac_aaa", gatewayId: "gw-1", secret: "s1" },
+  { botId: "agent-b", agentId: "agent-b", token: "ac_bbb", gatewayId: "gw-1", secret: "s1" },
+];
+
+describe("IdentityTable — botId → agentschat credentials", () => {
+  test("resolves each identity by its botId", () => {
+    const t = new IdentityTable(IDENTITIES);
+    expect(t.forBot("agent-a")?.token).toBe("ac_aaa");
+    expect(t.forBot("agent-b")?.token).toBe("ac_bbb");
+  });
+
+  test("unknown botId resolves to null (fail closed, never guess)", () => {
+    const t = new IdentityTable(IDENTITIES);
+    expect(t.forBot("agent-unknown")).toBeNull();
+  });
+
+  test("rejects two identities sharing a botId (ambiguous routing)", () => {
+    expect(() => new IdentityTable([
+      { botId: "dup", agentId: "a", token: "ac_1", gatewayId: "g", secret: "s" },
+      { botId: "dup", agentId: "b", token: "ac_2", gatewayId: "g", secret: "s" },
+    ])).toThrow();
+  });
+
+  test("single identity (N=1) is just the degenerate table", () => {
+    const t = new IdentityTable([IDENTITIES[0]]);
+    expect(t.forBot("agent-a")?.agentId).toBe("agent-a");
+    expect(t.isSingle()).toBe(true);
+  });
+});
+
+describe("routeInbound — a message reaches ONLY the identity it's addressed to", () => {
+  const t = new IdentityTable(IDENTITIES);
+
+  test("a DM to identity A's channel routes to A, not B", () => {
+    // DM channel belongs to a specific agent; the connector knows which identity owns it.
+    const target = routeInbound(t, { channel_id: "dm-a-owner", dmOwnerBotId: "agent-a" });
+    expect(target?.botId).toBe("agent-a");
+  });
+
+  test("an @mention of identity B routes to B, not A", () => {
+    const target = routeInbound(t, { channel_id: "welcome", mentioned_ids: ["agent-b"] });
+    expect(target?.botId).toBe("agent-b");
+  });
+
+  test("a message mentioning NEITHER routes to no one (fail closed)", () => {
+    const target = routeInbound(t, { channel_id: "welcome", mentioned_ids: [] });
+    expect(target).toBeNull();
+  });
+
+  test("a message for identity A never lands on identity B (the cross-leak control)", () => {
+    const forA = routeInbound(t, { channel_id: "welcome", mentioned_ids: ["agent-a"] });
+    expect(forA?.botId).toBe("agent-a");
+    expect(forA?.botId).not.toBe("agent-b");
+  });
+
+  test("content-based mention routes when no mentioned_ids annotation exists (the real WS shape)", () => {
+    // The agentschat WS pushes joined-channel messages WITHOUT mentioned_ids —
+    // the mention must be parsed from the body, like the MCP path's isMentioned gate.
+    const forB = routeInbound(t, { channel_id: "welcome", content: "@agent-b 看下这个" });
+    expect(forB?.botId).toBe("agent-b");
+  });
+
+  test("display-name mention form `@Name(<id>)` also routes", () => {
+    const forA = routeInbound(t, { channel_id: "welcome", content: "@Forge(agent-a) ping" });
+    expect(forA?.botId).toBe("agent-a");
+  });
+
+  test("group chatter mentioning NO fronted identity routes to no one (token-waste fix)", () => {
+    expect(routeInbound(t, { channel_id: "welcome", content: "随便聊聊" })).toBeNull();
+    expect(routeInbound(t, { channel_id: "welcome", content: "@someone-else 你好" })).toBeNull();
+  });
+
+  test("an incidental `(<id>)` substring is NOT a mention (the msg:fc8b9b1a regression)", () => {
+    expect(routeInbound(t, { channel_id: "welcome", content: "User joined: forge (agent-a)" })).toBeNull();
+  });
+});
+
+describe("resolveOutbound — a send uses the SENDING identity's credentials", () => {
+  const t = new IdentityTable(IDENTITIES);
+
+  test("send as agent-a uses agent-a's token", () => {
+    const cred = resolveOutbound(t, "agent-a");
+    expect(cred?.token).toBe("ac_aaa");
+    expect(cred?.agentId).toBe("agent-a");
+  });
+
+  test("send as an unregistered botId is refused (fail closed)", () => {
+    expect(resolveOutbound(t, "agent-unknown")).toBeNull();
+  });
+
+  test("send as B never uses A's token (cross-identity control)", () => {
+    const cred = resolveOutbound(t, "agent-b");
+    expect(cred?.token).toBe("ac_bbb");
+    expect(cred?.token).not.toBe("ac_aaa");
+  });
+});
+
+describe("hermesSourceProfile — do not stamp AgentsChat agent_id on single-hello", () => {
+  const a = IDENTITIES[0];
+
+  test("single-hello (typical one Hermes, one identity) leaves profile unset", () => {
+    expect(hermesSourceProfile(a, 1)).toBeUndefined();
+  });
+
+  test("a multiplexed connection (frontedCount>1) stamps botId so sessions stay isolated", () => {
+    expect(hermesSourceProfile(a, 2)).toBe("agent-a");
+  });
+
+  test("an explicit Hermes profile name wins over botId", () => {
+    expect(hermesSourceProfile({ ...a, profile: "coder" }, 1)).toBe("coder");
+    expect(hermesSourceProfile({ ...a, profile: "coder" }, 2)).toBe("coder");
+  });
+});
+
+
+describe("IdentityTable.replace — hot-reload RELAY_IDENTITIES", () => {
+  test("replace swaps the set; removed botIds fail closed", () => {
+    const t = new IdentityTable(IDENTITIES);
+    t.replace([
+      { botId: "agent-c", agentId: "agent-c", token: "ac_ccc", gatewayId: "gw-1", secret: "s1" },
+    ]);
+    expect(t.forBot("agent-a")).toBeNull();
+    expect(t.forBot("agent-c")?.token).toBe("ac_ccc");
+    expect(t.size).toBe(1);
+  });
+
+  test("replace rejects duplicate botIds", () => {
+    const t = new IdentityTable(IDENTITIES);
+    expect(() => t.replace([
+      { botId: "x", agentId: "x", token: "ac_1", gatewayId: "g", secret: "s" },
+      { botId: "x", agentId: "y", token: "ac_2", gatewayId: "g", secret: "s" },
+    ])).toThrow();
+  });
+});

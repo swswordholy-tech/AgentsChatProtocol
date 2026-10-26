@@ -1,0 +1,578 @@
+#!/usr/bin/env node
+/**
+ * Idempotent reconcile: ensure each Grok AgentsChat inbound wake daemon is up,
+ * then prune orphans not present in the binds map.
+ *
+ * Reads uuid → profile from AGENTCHAT_GROK_BINDS or ~/.agentschat/grok-binds.json
+ * (legacy ~/.agentchat/). For each entry, if no live process has
+ * AGENTCHAT_WAKE_MODE=grok AND (AGENTCHAT_GROK_AGENT_ID=<uuid> OR matching
+ * --profile), starts one detached:
+ *
+ *   AGENTCHAT_WAKE_MODE=grok AGENTCHAT_GROK_AGENT_ID=<uuid> AGENTCHAT_NO_PROXY=1 \
+ *     <agentschat-mcp> --profile <profileName>
+ *
+ * After starts, prunes any AGENTCHAT_WAKE_MODE=grok process whose
+ * AGENTCHAT_GROK_AGENT_ID is not a binds key AND whose --profile is not a binds
+ * value. A MISSING binds file prunes nothing (only an existing file — even `{}` —
+ * is authoritative). Every prune is logged with its reason. Never kills processes
+ * without WAKE_MODE=grok (outbound Cursor MCP).
+ *
+ * This script NEVER writes the binds file. Each Grok bot registers itself with
+ * `grok-bind-register.sh <profile>` (the only writer; see shouldPruneBindEntry for
+ * its `--prune` rules). No hard-coded bot list.
+ *
+ * Prints already-up|started|stopped|failed lines. Exit 0 if no failures.
+ * Never prints tokens.
+ *
+ * Single-flight: a non-blocking run lock (O_EXCL lockfile holding our pid, with a
+ * stale-pid check) makes an overlapping run print `skip: another run in progress`
+ * and exit 0 — host cron / resident loops / on-wake hooks may all fire at once.
+ * The whole run is capped by AGENTCHAT_ENSURE_TIMEOUT_MS (default 240000) so a
+ * hung /proc read or spawn can never pile up runs. Lock path:
+ * AGENTCHAT_ENSURE_LOCK, else <tmpdir>/agentschat-ensure-grok-wakes-<uid>.lock.
+ */
+import { spawn, spawnSync } from "node:child_process";
+import {
+  existsSync,
+  openSync,
+  readFileSync,
+  readdirSync,
+  closeSync,
+  writeSync,
+  unlinkSync,
+} from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+
+export const DEFAULT_BINDS_FILENAME = "grok-binds.json";
+export const BINDS_ENV = "AGENTCHAT_GROK_BINDS";
+export const BIN_ENV = "AGENTSCHAT_MCP_BIN";
+export const LOG_DIR_ENV = "AGENTCHAT_WAKE_LOG_DIR";
+export const LOCK_ENV = "AGENTCHAT_ENSURE_LOCK";
+export const TIMEOUT_ENV = "AGENTCHAT_ENSURE_TIMEOUT_MS";
+export const DEFAULT_RUN_TIMEOUT_MS = 240_000;
+export const LOCK_OWNER_MARKER = "ensure-grok-wakes";
+
+/** Default run-lock path (per uid so users on one host never block each other). */
+export function defaultLockPath() {
+  const uid = typeof process.getuid === "function" ? process.getuid() : "u";
+  return join(tmpdir(), `agentschat-ensure-grok-wakes-${uid}.lock`);
+}
+
+/** @param {string | undefined} raw */
+export function resolveRunTimeoutMs(raw) {
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : DEFAULT_RUN_TIMEOUT_MS;
+}
+
+/**
+ * Whether the pid recorded in a run lock still belongs to a live ensure run.
+ * A dead pid (or a recycled pid whose cmdline is not an ensure run, when /proc is
+ * readable) is stale.
+ * @param {number} pid
+ * @param {{ kill?: (pid: number, sig: number) => void, readCmdline?: (pid: number) => string | null }} [deps]
+ */
+export function isLockOwnerAlive(pid, deps = {}) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  const kill = deps.kill ?? ((p, sig) => process.kill(p, sig));
+  try {
+    kill(pid, 0);
+  } catch (e) {
+    // EPERM: exists but not ours — treat as alive (never steal a lock we can't vet).
+    if (!(e && /** @type {any} */ (e).code === "EPERM")) return false;
+  }
+  const readCmdline =
+    deps.readCmdline ??
+    ((p) => {
+      try {
+        return readFileSync(`/proc/${p}/cmdline`, "utf8");
+      } catch {
+        return null;
+      }
+    });
+  const cmd = readCmdline(pid);
+  if (cmd === null) return true; // no /proc: trust kill(0)
+  return cmd.includes(LOCK_OWNER_MARKER) || cmd.includes("agentschat-ensure-grok-wakes");
+}
+
+/**
+ * Non-blocking run lock. Returns a release() on success, or null when another
+ * live run holds it. Stale locks (dead/recycled pid, unreadable content) are
+ * removed once and acquisition retried.
+ * @param {string} lockPath
+ * @param {{ pid?: number, isAlive?: (pid: number) => boolean }} [opts]
+ * @returns {(() => void) | null}
+ */
+export function acquireRunLock(lockPath, opts = {}) {
+  const pid = opts.pid ?? process.pid;
+  const isAlive = opts.isAlive ?? ((p) => isLockOwnerAlive(p));
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const fd = openSync(lockPath, "wx", 0o600);
+      writeSync(fd, String(pid));
+      closeSync(fd);
+      let released = false;
+      return () => {
+        if (released) return;
+        released = true;
+        try {
+          if (readFileSync(lockPath, "utf8").trim() === String(pid)) unlinkSync(lockPath);
+        } catch {
+          /* already gone */
+        }
+      };
+    } catch (e) {
+      if (!(e && /** @type {any} */ (e).code === "EEXIST")) throw e;
+      let holder = NaN;
+      try {
+        holder = Number(readFileSync(lockPath, "utf8").trim());
+      } catch {
+        /* unreadable → stale */
+      }
+      if (holder === pid) return null; // never re-enter our own lock
+      if (isAlive(holder)) return null;
+      try {
+        unlinkSync(lockPath);
+      } catch {
+        /* raced with another cleaner */
+      }
+    }
+  }
+  return null;
+}
+
+/** @param {unknown} raw */
+export function parseBinds(raw) {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return {};
+  /** @type {Record<string, string>} */
+  const out = {};
+  for (const [k, v] of Object.entries(/** @type {Record<string, unknown>} */ (raw))) {
+    if (typeof v !== "string") continue;
+    const name = v.trim();
+    const key = k.trim();
+    if (!name || !key) continue;
+    out[key] = name;
+  }
+  return out;
+}
+
+/** Real Grok agent uuid (rejects `sand-subagent-*` and other non-UUID ids). */
+export const AGENT_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** @param {string | undefined | null} id */
+export function isRealAgentUuid(id) {
+  return typeof id === "string" && AGENT_UUID_RE.test(id.trim());
+}
+
+export const BIND_PRUNE_MAX_AGE_DAYS = 7;
+
+/**
+ * Bind-entry prune rule used by grok-bind-register.sh --prune (the only writer).
+ * Returns a reason string when the entry should be removed, else null:
+ *  - its profile file is gone, OR
+ *  - the agent's data dir is missing AND its last registration is older than
+ *    maxAgeDays. Entries with no recorded registration are never age-pruned.
+ * @param {{ profileExists: boolean, agentDirExists: boolean, lastRegisteredEpoch?: number | null, nowEpoch: number, maxAgeDays?: number }} i
+ * @returns {string | null}
+ */
+export function shouldPruneBindEntry(i) {
+  if (!i.profileExists) return "profile file missing";
+  const maxAge = (i.maxAgeDays ?? BIND_PRUNE_MAX_AGE_DAYS) * 86400;
+  if (
+    !i.agentDirExists &&
+    typeof i.lastRegisteredEpoch === "number" &&
+    i.nowEpoch - i.lastRegisteredEpoch > maxAge
+  ) {
+    return "agent dir missing and last registration too old";
+  }
+  return null;
+}
+
+/**
+ * Whether orphan-wake pruning may run at all: only when the binds file exists.
+ * @param {boolean} bindsFileExists
+ */
+export function mayPruneWakes(bindsFileExists) {
+  return bindsFileExists === true;
+}
+
+/** @param {string} text */
+export function parseBindsText(text) {
+  try {
+    return { binds: parseBinds(JSON.parse(text)), malformed: false };
+  } catch {
+    return { binds: {}, malformed: true };
+  }
+}
+
+/**
+ * Resolve binds file path. Prefer AGENTCHAT_GROK_BINDS; else first existing of
+ * ~/.agentschat/grok-binds.json, ~/.agentchat/grok-binds.json.
+ * @param {{ home?: string, envOverride?: string }} [opts]
+ */
+export function resolveBindsPath(opts = {}) {
+  const home = opts.home ?? process.env.HOME ?? homedir();
+  if (opts.envOverride && opts.envOverride.length > 0) return opts.envOverride;
+  const candidates = [
+    join(home, ".agentschat", DEFAULT_BINDS_FILENAME),
+    join(home, ".agentchat", DEFAULT_BINDS_FILENAME),
+  ];
+  return candidates.find((p) => existsSync(p)) ?? candidates[0];
+}
+
+/**
+ * Locate agentschat-mcp entry: AGENTSCHAT_MCP_BIN, else sibling ../src/cli.mjs,
+ * else `agentschat-mcp` on PATH.
+ * @param {{ scriptDir?: string, envBin?: string, pathEnv?: string }} [opts]
+ */
+export function resolveMcpBin(opts = {}) {
+  if (opts.envBin && opts.envBin.length > 0) return opts.envBin;
+  const scriptDir = opts.scriptDir ?? dirname(fileURLToPath(import.meta.url));
+  const sibling = resolve(scriptDir, "../src/cli.mjs");
+  if (existsSync(sibling)) return sibling;
+  const which = spawnSync("which", ["agentschat-mcp"], {
+    encoding: "utf8",
+    env: { PATH: opts.pathEnv ?? process.env.PATH ?? "" },
+  });
+  const found = (which.stdout || "").trim();
+  if (found) return found;
+  return "agentschat-mcp";
+}
+
+/**
+ * @param {string} environNullSep null-separated /proc environ
+ * @param {string} cmdlineNullSep null-separated /proc cmdline
+ * @param {string} uuid
+ * @param {string} profileName
+ */
+export function isLiveWakeDaemon(environNullSep, cmdlineNullSep, uuid, profileName) {
+  const envLines = environNullSep.split("\0");
+  if (!envLines.includes("AGENTCHAT_WAKE_MODE=grok")) return false;
+  if (uuid && envLines.includes(`AGENTCHAT_GROK_AGENT_ID=${uuid}`)) return true;
+  const args = cmdlineNullSep.split("\0").filter(Boolean);
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === "--profile" && args[i + 1] === profileName) return true;
+    if (args[i] === `--profile=${profileName}`) return true;
+  }
+  return false;
+}
+
+/**
+ * One pass over /proc. With `envNeedle` (e.g. "AGENTCHAT_WAKE_MODE=grok"), pids
+ * whose environ lacks it are skipped before cmdline is read — every caller here
+ * only cares about grok wakes, so this halves the reads on a busy box.
+ * @param {{ envNeedle?: string | null }} [opts]
+ * @returns {Array<{ pid: number, environ: string, cmdline: string }>}
+ */
+export function listProcSnapshots(opts = {}) {
+  /** @type {Array<{ pid: number, environ: string, cmdline: string }>} */
+  const out = [];
+  const envNeedle = opts.envNeedle ?? null;
+  let entries;
+  try {
+    entries = readdirSync("/proc");
+  } catch {
+    return out;
+  }
+  for (const ent of entries) {
+    if (!/^\d+$/.test(ent)) continue;
+    const pid = Number(ent);
+    let environ = "";
+    let cmdline = "";
+    try {
+      environ = readFileSync(`/proc/${pid}/environ`, "utf8");
+    } catch {
+      continue;
+    }
+    if (envNeedle && !environ.includes(envNeedle)) continue;
+    try {
+      cmdline = readFileSync(`/proc/${pid}/cmdline`, "utf8");
+    } catch {
+      continue;
+    }
+    out.push({ pid, environ, cmdline });
+  }
+  return out;
+}
+
+/**
+ * @param {string} uuid
+ * @param {string} profileName
+ * @param {ReturnType<typeof listProcSnapshots>} [snapshots]
+ */
+export function findLiveWake(uuid, profileName, snapshots) {
+  const snaps = snapshots ?? listProcSnapshots();
+  for (const s of snaps) {
+    if (isLiveWakeDaemon(s.environ, s.cmdline, uuid, profileName)) return s.pid;
+  }
+  return null;
+}
+
+/**
+ * List PIDs of processes with AGENTCHAT_WAKE_MODE=grok.
+ * @param {ReturnType<typeof listProcSnapshots>} [snapshots]
+ * @returns {number[]}
+ */
+export function listGrokWakePids(snapshots) {
+  const snaps = snapshots ?? listProcSnapshots();
+  /** @type {number[]} */
+  const out = [];
+  for (const s of snaps) {
+    if (s.environ.split("\0").includes("AGENTCHAT_WAKE_MODE=grok")) out.push(s.pid);
+  }
+  return out;
+}
+
+/**
+ * Extract --profile from null-separated cmdline.
+ * @param {string} cmdlineNullSep
+ */
+export function profileFromCmdline(cmdlineNullSep) {
+  const args = cmdlineNullSep.split("\0").filter(Boolean);
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === "--profile" && args[i + 1]) return args[i + 1];
+    if (args[i].startsWith("--profile=")) return args[i].slice("--profile=".length);
+  }
+  return "";
+}
+
+/**
+ * Extract AGENTCHAT_GROK_AGENT_ID from null-separated environ.
+ * @param {string} environNullSep
+ */
+export function agentIdFromEnviron(environNullSep) {
+  for (const line of environNullSep.split("\0")) {
+    if (line.startsWith("AGENTCHAT_GROK_AGENT_ID=")) {
+      return line.slice("AGENTCHAT_GROK_AGENT_ID=".length);
+    }
+  }
+  return "";
+}
+
+/**
+ * True when a WAKE_MODE=grok process should be pruned (not represented in binds).
+ * Keep if agent id is a binds key OR --profile is a binds value.
+ * Processes without WAKE_MODE=grok must never be pruned (caller should filter).
+ * @param {string} environNullSep
+ * @param {string} cmdlineNullSep
+ * @param {Record<string, string>} binds
+ */
+export function shouldPruneWake(environNullSep, cmdlineNullSep, binds) {
+  const envLines = environNullSep.split("\0");
+  if (!envLines.includes("AGENTCHAT_WAKE_MODE=grok")) return false;
+  const uuids = new Set(Object.keys(binds));
+  const profiles = new Set(Object.values(binds));
+  const agentId = agentIdFromEnviron(environNullSep);
+  const profile = profileFromCmdline(cmdlineNullSep);
+  if (agentId && uuids.has(agentId)) return false;
+  if (profile && profiles.has(profile)) return false;
+  return true;
+}
+
+/**
+ * Best-effort stop a wake pid (and obvious parent setsid shell).
+ * @param {number} pid
+ * @returns {boolean}
+ */
+export function stopWakePid(pid) {
+  let parentHint = null;
+  try {
+    const status = readFileSync(`/proc/${pid}/status`, "utf8");
+    const m = status.match(/^PPid:\s+(\d+)/m);
+    if (m) parentHint = Number(m[1]);
+  } catch {
+    /* gone */
+  }
+  try {
+    process.kill(pid, "SIGTERM");
+  } catch {
+    return false;
+  }
+  if (parentHint && parentHint > 1) {
+    try {
+      const pcmd = readFileSync(`/proc/${parentHint}/cmdline`, "utf8");
+      if (pcmd.includes("agentschat-mcp") || pcmd.includes("tail -f /dev/null")) {
+        try {
+          process.kill(parentHint, "SIGTERM");
+        } catch {
+          /* ignore */
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+  return true;
+}
+
+/**
+ * Start a detached wake daemon. Returns true on spawn success (best-effort).
+ * @param {{ bin: string, uuid: string, profileName: string, logDir: string, env?: NodeJS.ProcessEnv }} opts
+ */
+export function startWakeDaemon(opts) {
+  const logDir = opts.logDir;
+  try {
+    spawnSync("mkdir", ["-p", logDir], { stdio: "ignore" });
+  } catch {
+    /* best-effort */
+  }
+  const logPath = join(logDir, `agentschat-wake-${safeLogName(opts.profileName)}.log`);
+  let logFd;
+  try {
+    logFd = openSync(logPath, "a");
+  } catch {
+    return false;
+  }
+  const env = {
+    ...process.env,
+    ...(opts.env ?? {}),
+    AGENTCHAT_WAKE_MODE: "grok",
+    AGENTCHAT_GROK_AGENT_ID: opts.uuid,
+    AGENTCHAT_NO_PROXY: "1",
+  };
+  delete env.AGENTCHAT_TOKEN;
+  delete env.AGENTCHAT_AGENT_ID;
+
+  const bin = opts.bin;
+  const useNode = bin.endsWith(".mjs") || bin.endsWith(".js");
+  const command = useNode ? process.execPath : bin;
+  const args = useNode ? [bin, "--profile", opts.profileName] : ["--profile", opts.profileName];
+
+  try {
+    const child = spawn(command, args, {
+      env,
+      detached: true,
+      stdio: ["ignore", logFd, logFd],
+      cwd: process.cwd(),
+    });
+    child.unref();
+    closeSync(logFd);
+    return child.pid != null;
+  } catch {
+    try {
+      closeSync(logFd);
+    } catch {
+      /* ignore */
+    }
+    return false;
+  }
+}
+
+/** @param {string} name */
+export function safeLogName(name) {
+  return name.replace(/[^a-zA-Z0-9_-]+/g, "_") || "wake";
+}
+
+/** @param {number} ms */
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+const GROK_ENV_NEEDLE = "AGENTCHAT_WAKE_MODE=grok";
+
+async function main() {
+  const release = acquireRunLock(process.env[LOCK_ENV] || defaultLockPath());
+  if (!release) {
+    console.log("skip: another run in progress");
+    process.exit(0);
+  }
+  process.on("exit", release);
+  const timeoutMs = resolveRunTimeoutMs(process.env[TIMEOUT_ENV]);
+  setTimeout(() => {
+    console.error(`failed timeout after ${timeoutMs}ms`);
+    process.exit(1);
+  }, timeoutMs).unref();
+
+  const envOverride = process.env[BINDS_ENV];
+  const bindsPath = resolveBindsPath({ envOverride });
+  /** @type {Record<string, string>} */
+  let binds = {};
+
+  if (envOverride && !existsSync(bindsPath)) {
+    console.error(`failed binds-missing path=${bindsPath}`);
+    process.exit(1);
+  }
+
+  if (existsSync(bindsPath)) {
+    let text;
+    try {
+      text = readFileSync(bindsPath, "utf8");
+    } catch {
+      console.error(`failed binds-read path=${bindsPath}`);
+      process.exit(1);
+    }
+    const parsed = parseBindsText(text);
+    if (parsed.malformed) {
+      console.error(`failed binds-malformed path=${bindsPath}`);
+      process.exit(1);
+    }
+    binds = parsed.binds;
+  } else {
+    console.log(`no-binds path=${bindsPath}`);
+  }
+
+  const entries = Object.entries(binds);
+  const bin = resolveMcpBin({ envBin: process.env[BIN_ENV] });
+  const logDir = process.env[LOG_DIR_ENV] || "/tmp";
+  let failed = 0;
+  let stopped = 0;
+
+  // One /proc pass for the "already up?" checks (was one full scan per entry).
+  const initialSnaps = listProcSnapshots({ envNeedle: GROK_ENV_NEEDLE });
+  for (const [uuid, profileName] of entries) {
+    const existing = findLiveWake(uuid, profileName, initialSnaps);
+    if (existing != null) {
+      console.log(`already-up profile=${profileName} pid=${existing}`);
+      continue;
+    }
+    const ok = startWakeDaemon({ bin, uuid, profileName, logDir });
+    if (!ok) {
+      console.log(`failed profile=${profileName}`);
+      failed++;
+      continue;
+    }
+    await sleep(800);
+    const pid = findLiveWake(uuid, profileName, listProcSnapshots({ envNeedle: GROK_ENV_NEEDLE }));
+    if (pid != null) {
+      console.log(`started profile=${profileName} pid=${pid}`);
+    } else {
+      console.log(`failed profile=${profileName}`);
+      failed++;
+    }
+  }
+
+  const bindsExist = existsSync(bindsPath);
+  if (!mayPruneWakes(bindsExist)) {
+    console.log(`no-binds path=${bindsPath} (missing file: pruning nothing)`);
+  } else {
+    if (entries.length === 0) {
+      console.log(`no-binds-empty path=${bindsPath} (pruning orphans)`);
+    }
+    // Prune orphans — logged one line per stopped process with its reason.
+    const snaps = listProcSnapshots({ envNeedle: GROK_ENV_NEEDLE });
+    for (const s of snaps) {
+      if (!shouldPruneWake(s.environ, s.cmdline, binds)) continue;
+      const profile = profileFromCmdline(s.cmdline) || "?";
+      const agentId = agentIdFromEnviron(s.environ) || "?";
+      if (stopWakePid(s.pid)) {
+        console.log(
+          `stopped orphan pid=${s.pid} profile=${profile} agent_id=${agentId} ts=${new Date().toISOString()} reason=not-in-binds path=${bindsPath}`,
+        );
+        stopped++;
+      }
+    }
+  }
+
+  process.exit(failed > 0 ? 1 : 0);
+}
+
+const isDirect =
+  process.argv[1] &&
+  resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url));
+if (isDirect) {
+  main().catch((err) => {
+    console.error(`failed unexpected ${err instanceof Error ? err.message : String(err)}`);
+    process.exit(1);
+  });
+}

@@ -1,0 +1,185 @@
+/**
+ * Multiplex identity table — one connector fronts N agentschat identities (one per
+ * Hermes profile / agent). The connector holds a botId → credentials table and routes
+ * inbound/outbound by identity.
+ *
+ * The single highest-correctness invariant: identity A's messages must NEVER be
+ * routed to or sent as identity B. A cross-identity leak is a data breach, so every
+ * lookup fails closed (unknown identity → null), and the tests pin the
+ * "A never lands on B" control.
+ *
+ * Hermes fronts multiple identities on one relay WS by sending one `hello` per
+ * (platform, botId); here platform is always "agentschat" and botId is the agentschat
+ * agent_id. A single-identity deployment is the N=1 case of the same table, so this
+ * does not change single-tenant behavior.
+ */
+
+import { matchesMention } from "../src/mentions.ts";
+
+export interface Identity {
+  /** The relay hello botId — the agentschat agent_id this identity fronts. */
+  botId: string;
+  /** agentschat agent id (same value as botId here; kept distinct for clarity). */
+  agentId: string;
+  /** agentschat Bearer token (ac_…) for this identity's sends. */
+  token: string;
+  /** The relay gateway this identity is provisioned under. */
+  gatewayId: string;
+  /** The per-gateway secret for that gateway's upgrade token. */
+  secret: string;
+  /**
+   * Optional Hermes profile name. When set, inbound `source.profile` uses this
+   * so a multiplexed gateway (`gateway.multiplex_profiles`) keys the right
+   * session. This is a Hermes profile, NOT the AgentsChat agent_id.
+   */
+  profile?: string;
+}
+
+export class IdentityTable {
+  private readonly byBot = new Map<string, Identity>();
+
+  constructor(identities: Identity[]) {
+    for (const id of identities) {
+      if (this.byBot.has(id.botId)) {
+        throw new Error(`duplicate identity botId "${id.botId}" — ambiguous routing`);
+      }
+      this.byBot.set(id.botId, id);
+    }
+  }
+
+  /** The identity fronting `botId`, or null when unregistered (fail closed). */
+  forBot(botId: string): Identity | null {
+    return this.byBot.get(botId) ?? null;
+  }
+
+  isSingle(): boolean {
+    return this.byBot.size === 1;
+  }
+
+  get size(): number {
+    return this.byBot.size;
+  }
+
+  all(): Identity[] {
+    return [...this.byBot.values()];
+  }
+
+  /**
+   * Hot-replace the identity set (RELAY_IDENTITIES reload). Fails closed on
+   * duplicate botIds the same way the constructor does.
+   */
+  replace(identities: Identity[]): void {
+    const next = new Map<string, Identity>();
+    for (const id of identities) {
+      if (next.has(id.botId)) {
+        throw new Error(`duplicate identity botId "${id.botId}" — ambiguous routing`);
+      }
+      next.set(id.botId, id);
+    }
+    this.byBot.clear();
+    for (const [k, v] of next) this.byBot.set(k, v);
+  }
+}
+
+/** Platform hooks must never substitute another identity's credentials. */
+export function requireIdentity(identities: readonly Identity[], botId: string): Identity {
+  const id = identities.find(id => id.botId === botId);
+  if (!id) throw new Error(`unknown identity: ${botId}`);
+  return id;
+}
+
+export interface InboundContext {
+  channel_id?: string;
+  mentioned_ids?: string[];
+  /** Message body — the PRIMARY group-mention signal (see routeInbound). */
+  content?: string;
+  /** For DM channels: which identity owns this DM (the connector tracks dm ownership). */
+  dmOwnerBotId?: string;
+}
+
+/**
+ * Decide which identity an inbound agentschat message is for. Returns null when the
+ * message is addressed to no fronted identity (fail closed — never broadcast a
+ * message to the wrong identity).
+ *
+ * Routing rule: a DM goes to its owning identity; a group/channel message goes to
+ * the identity it @mentions. A message mentioning no fronted identity (or in a DM
+ * owned by none) routes to no one.
+ *
+ * Group mention detection is CONTENT-based (matchesMention over the message body):
+ * the agentschat WS pushes every message of a joined channel WITHOUT a mentioned_ids
+ * annotation, so the mention gate the MCP path uses (isDM || isMentioned) must be
+ * reproduced here — otherwise every joined-channel message would be injected into
+ * the agent's session and burn its tokens on chatter not addressed to it.
+ * `mentioned_ids` is still honored when a host provides it (explicit signal wins).
+ */
+function matchesExactMention(content: string, id: string): boolean {
+  if (!id) return false;
+  const escaped = id.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`(?:^|[^\\p{L}\\p{N}_@-])@(?:${escaped}(?![\\p{L}\\p{N}_(-])|[^\\s@()]+\\(${escaped}\\))`, "u").test(content);
+}
+
+/** All exact addressed targets, once each, in identity-table order. */
+export function routeInboundTargets(table: IdentityTable, ctx: InboundContext): Identity[] {
+  if (ctx.channel_id?.startsWith("dm-")) {
+    const owner = ctx.dmOwnerBotId ? table.forBot(ctx.dmOwnerBotId) : null;
+    return owner ? [owner] : [];
+  }
+  const mentioned = Array.isArray(ctx.mentioned_ids) ? ctx.mentioned_ids : [];
+  return table.all().filter(id => mentioned.includes(id.botId) ||
+    matchesExactMention(ctx.content ?? "", id.agentId) || matchesExactMention(ctx.content ?? "", id.botId));
+}
+
+export function routeInbound(table: IdentityTable, ctx: InboundContext): Identity | null {
+  // DM: route to the identity that owns the DM channel.
+  if (ctx.channel_id?.startsWith("dm-")) {
+    return ctx.dmOwnerBotId ? table.forBot(ctx.dmOwnerBotId) : null;
+  }
+  // Group/channel: an explicit mentioned_ids annotation wins when present.
+  const mentioned = Array.isArray(ctx.mentioned_ids) ? ctx.mentioned_ids : [];
+  for (const mid of mentioned) {
+    const id = table.forBot(mid);
+    if (id) return id;
+  }
+  // Otherwise content-based: which fronted identity does the body @mention?
+  // (First match wins — a message @-ing two fronted identities goes to the first;
+  // the other sees it when ITS mention arrives or via channel context.)
+  const content = ctx.content ?? "";
+  if (content) {
+    for (const id of table.all()) {
+      if (matchesMention(content, id.agentId) || matchesMention(content, id.botId)) return id;
+    }
+  }
+  return null;
+}
+
+/**
+ * The credentials to send as `botId`, or null when that identity is not fronted
+ * (fail closed — never send as the wrong identity).
+ */
+export function resolveOutbound(table: IdentityTable, botId: string): Identity | null {
+  return table.forBot(botId);
+}
+
+/**
+ * Hermes session namespace to stamp on inbound `source.profile`.
+ *
+ * Hermes's relay adapter keys `_active_sessions` by `source.profile` whenever
+ * it is set, while the runner only uses that namespace when
+ * `multiplex_profiles` is on. Stamping the AgentsChat agent_id on a
+ * single-hello connection (one Hermes, one identity) splits clarify pending
+ * (`agent:main:…`) from intercept (`agent:<agent_id>:…`), so the user's
+ * answer is treated as an interrupt instead of resolving the prompt.
+ *
+ * Rules:
+ *   - explicit `identity.profile` (Hermes profile name) always wins
+ *   - a gateway connection that hellos MORE THAN ONE identity is multiplexing:
+ *     stamp botId so those sessions stay isolated
+ *   - otherwise leave profile unset so keys stay `agent:main` and clarify matches
+ */
+export function hermesSourceProfile(id: Identity, frontedCount: number): string | undefined {
+  const named = typeof id.profile === "string" ? id.profile.trim() : "";
+  if (named) return named;
+  if (frontedCount > 1) return id.botId;
+  return undefined;
+}

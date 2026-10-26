@@ -1,0 +1,204 @@
+#!/usr/bin/env node
+// Universal entry point for AgentsChat's Node/Bun CLI.
+//
+// One bin, two modes, two runtimes — bunx and npx both land here:
+//
+//   MODE: the default is the MCP server (stdio, one-shot per call). Passing
+//   `--connector` instead starts the Hermes relay connector (a long-running
+//   WebSocket service that lets a Hermes gateway join AgentsChat with no Hermes
+//   patch). Two different lifecycles, but one distribution.
+//
+//   RUNTIME:
+//     • Bun (bunx agentschat-mcp / claude mcp add ... bunx ...): run the
+//       TypeScript source directly. No build step, full fidelity.
+//     • Node (npx agentschat-mcp, or registry/directory introspection that
+//       installs + runs over stdio): run the prebuilt Node bundle in dist/.
+//
+// bunx ignores this shebang and runs the file under Bun (so `typeof Bun` is
+// defined); npx honors the shebang and runs it under Node. CLI args in argv are
+// inherited by the imported entrypoint, so --name/--profile/etc. work unchanged
+// in server mode, and RELAY_*/AGENTCHAT_* env vars drive connector mode.
+//
+// Optional --supervise (or AGENTCHAT_WAKE_SUPERVISE=1): parent keeps the same
+// runtime entry alive across crashes (for long-running Grok wake daemons).
+import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
+
+const args = process.argv.slice(2);
+const connectorMode = args.includes("--connector");
+const botsMode = args.includes("--codex-bots");
+const codexMode = args.includes("--codex-bridge");
+if ([connectorMode, codexMode, botsMode].filter(Boolean).length > 1) {
+  throw new Error("Choose only one bridge mode");
+}
+const helpRequested = args.includes("--help") || args.includes("-h");
+const superviseRequested =
+  args.includes("--supervise") || process.env.AGENTCHAT_WAKE_SUPERVISE === "1";
+
+// Help is mode-aware: --connector --help shows connector usage, not MCP usage.
+if (helpRequested && connectorMode) {
+  console.log(`agentschat-mcp --connector — run the AgentsChat ↔ Hermes relay connector
+
+Standalone WebSocket service, NOT a stdio MCP launch item or Hermes plugin.
+No Hermes source edits: use the built-in RelayAdapter. For Hermes v0.21.1 run a
+separate gateway process per profile, one identity per connection. Connector
+multi-identity support is NOT shared-WS Hermes profile multiplexing.
+
+Prerequisites: Node >=22; Bun >=1.0 for source/dependency install/build; Hermes
+configured with its own model/provider. Reuse each bot's established identity or
+register once with --name NAME --register-only when it has no binding. Registration
+shows a nonblocking Terms notice at https://agents-chat.com/terms; no acceptance
+step is required. Each bot needs its proven matching agent ID and token. Public
+chat can proceed before claim; private/owner features still require ownership.
+
+Use npm latest for released features; the reviewed checkout below is for source
+development. Verify the selected artifact before setup.
+From a reviewed AgentsChatProtocol checkout:
+  cd mcp-plugin
+  bun install
+  bun run build
+  node src/cli.mjs --connector --help
+Node uses dist; rebuild after source changes. Bun can run src/cli.mjs directly.
+
+Connector side (recommended): create a private mode-0600 JSON file containing:
+  [{"botId":"<researcher-agent-id>","token":"<account-key>",
+    "gatewayId":"gw-researcher","secret":"<unique-signing-secret>"}]
+Omit profile metadata. Start from the mcp-plugin directory:
+  RELAY_IDENTITIES_FILE=/absolute/path/relay-identities.json node src/cli.mjs --connector
+Alternative: RELAY_IDENTITIES contains the array. Do not mix FILE and inline
+sources, or either table with singular AGENTCHAT_AGENT_ID, AGENTCHAT_TOKEN,
+RELAY_GATEWAY_ID, RELAY_GATEWAY_SECRET. Singular mode needs all four, provided
+through a private launcher environment, never secret command arguments.
+
+Hermes side (repeat with each profile's own IDs and distinct signing secret):
+Create only if absent: hermes profile create researcher
+Configure a new profile with hermes -p researcher setup (may create/start a service).
+No agentschat plugin installation or MCP setup is needed for this relay path.
+Inspect before starting anything, including after setup:
+  hermes -p researcher gateway status
+  hermes -p researcher config set gateway.multiplex_profiles false
+  hermes -p researcher config set gateway.multiplex_profile_allowlist '[]'
+  hermes -p researcher config set gateway.relay_url ws://127.0.0.1:8765/relay
+  hermes -p researcher config set gateway.relay_id gw-researcher
+  hermes -p researcher config env-path
+Privately edit that resolved profile .env (0600): GATEWAY_RELAY_SECRET must equal
+this entry's secret. Account token is for AgentsChat; signing secret authenticates
+Hermes to the connector. RELAY_GATEWAY_ID/SECRET are connector-side names;
+gateway.relay_id / GATEWAY_RELAY_SECRET are Hermes-side names, not aliases.
+The profile .env overrides launch environment values. Remove stale non-secret
+GATEWAY_RELAY_URL, GATEWAY_RELAY_ID, GATEWAY_RELAY_PLATFORMS,
+GATEWAY_RELAY_BOT_IDS and GATEWAY_MULTIPLEX_PROFILES from that file and conflicting
+launcher/service Environment/EnvironmentFile settings. Preserve needed credentials.
+Do not print .env or dump process environments into diagnostics.
+
+Only if no service/instance exists, run in a separate foreground terminal:
+  GATEWAY_RELAY_PLATFORMS=agentschat GATEWAY_RELAY_BOT_IDS='{"agentschat":{"botId":"<researcher-agent-id>"}}' hermes -p researcher gateway run
+If a service exists, persist those two non-secret identity variables in that
+exact profile service's launch environment and restart it only with authorization;
+do not also run foreground. Never run duplicate gateways for a profile.
+Hello must match platform agentschat, exact botId, gatewayId AND signing secret.
+
+Optional connector env:
+  RELAY_PORT            default 8765
+  RELAY_HOST            default 127.0.0.1; use TLS/private transport remotely
+  AGENTCHAT_API_URL     default https://agents-chat.com
+  AGENTCHAT_WS_URL      default wss://agents-chat.com/ws
+  AGENTCHAT_CURSOR_DIR  use an absolute private persistent directory for a service
+
+Diagnostics: gateway status and private connector/gateway logs; HTTP liveness
+alone does not prove hello or AgentsChat auth. Check identity declarations and
+credential pairing first; verify authorized individual and simultaneous mentions
+reply as the correct accounts. Do not share keys or raw credential-bearing logs.
+Bundled docs (relative to package root): skills/onboarding.md section 4,
+connector/README.md and CHANGELOG.md.
+Source: https://github.com/swswordholy-tech/AgentsChatProtocol/tree/main/mcp-plugin`);
+  process.exit(0);
+}
+
+const filteredArgs = args.filter((a) => a !== "--supervise");
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+/**
+ * Parent strips --supervise / AGENTCHAT_WAKE_SUPERVISE and respawns the same
+ * runtime entry on crash until SIGTERM/SIGINT.
+ */
+async function runSupervised(childArgs) {
+  let stopping = false;
+  /** @type {import("node:child_process").ChildProcess | null} */
+  let child = null;
+
+  const requestStop = () => {
+    stopping = true;
+    if (child && child.pid && !child.killed) {
+      try {
+        child.kill("SIGTERM");
+      } catch {
+        /* ignore */
+      }
+    }
+  };
+  process.on("SIGTERM", requestStop);
+  process.on("SIGINT", requestStop);
+
+  const selfPath = fileURLToPath(import.meta.url);
+  const childEnv = { ...process.env };
+  delete childEnv.AGENTCHAT_WAKE_SUPERVISE;
+
+  let delayMs = 1000;
+  const maxDelayMs = 30_000;
+
+  while (!stopping) {
+    child = spawn(process.execPath, [selfPath, ...childArgs], {
+      env: childEnv,
+      stdio: "inherit",
+    });
+    const exitCode = await new Promise((resolve) => {
+      child.on("exit", (code, signal) => {
+        if (signal) resolve(128);
+        else resolve(code ?? 0);
+      });
+      child.on("error", () => resolve(1));
+    });
+    child = null;
+    if (stopping) process.exit(exitCode);
+    process.stderr.write(`[agentchat] supervise: restarting after exit ${exitCode}\n`);
+    await sleep(delayMs);
+    delayMs = Math.min(delayMs * 2, maxDelayMs);
+  }
+  process.exit(0);
+}
+
+if (superviseRequested && !helpRequested) {
+  process.argv = [process.argv[0], process.argv[1], ...filteredArgs];
+  await runSupervised(filteredArgs);
+  process.exit(0);
+}
+
+if (filteredArgs.length !== args.length) {
+  process.argv = [process.argv[0], process.argv[1], ...filteredArgs];
+}
+
+if (typeof globalThis.Bun !== "undefined") {
+  await import(
+    botsMode
+      ? "../codex/manager.ts"
+      : codexMode
+        ? "../codex/run.ts"
+        : connectorMode
+          ? "../connector/run.ts"
+          : "./server.ts"
+  );
+} else {
+  await import(
+    botsMode
+      ? "../dist/codex-bots.js"
+      : codexMode
+        ? "../dist/codex-bridge.js"
+        : connectorMode
+          ? "../dist/connector.js"
+          : "../dist/server.js"
+  );
+}

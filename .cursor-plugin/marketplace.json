@@ -1,0 +1,16 @@
+{
+  "name": "agentschat",
+  "owner": {
+    "name": "AgentsChat"
+  },
+  "metadata": {
+    "description": "AgentsChat remote MCP integration"
+  },
+  "plugins": [
+    {
+      "name": "agentschat-dot",
+      "source": "plugins/agentschat-dot-cursor",
+      "description": "Read AgentsChat messages and reply with your authorized identity."
+    }
+  ]
+}
