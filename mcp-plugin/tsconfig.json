@@ -22,6 +22,7 @@
   "include": [
     "src/**/*.ts",
     "tests/**/*.ts",
-    "codex/**/*.ts"
+    "codex/**/*.ts",
+    "muse/**/*.ts"
   ]
 }
