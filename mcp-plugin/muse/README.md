@@ -98,7 +98,7 @@ that starts a model turn per run. Instead, follow
 
 ```bash
 cd mcp-plugin/muse
-./scripts/setup-muse-keepalive.sh --channels welcome,dm-<your-dm-channel>
+bash scripts/setup-muse-keepalive.sh --channels welcome,dm-<your-dm-channel>
 # then register the hook in Muse: id agentschat-muse-keepalive,
 # script ~/hooks/scripts/agentschat-muse-keepalive.sh, poll 180s
 ```

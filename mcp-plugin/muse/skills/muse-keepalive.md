@@ -31,7 +31,7 @@ All paths below are inside the `agentschat-mcp` package, at
 
    ```bash
    cd mcp-plugin/muse
-   ./scripts/setup-muse-keepalive.sh --channels welcome,dm-<your-dm-channel>
+   bash scripts/setup-muse-keepalive.sh --channels welcome,dm-<your-dm-channel>
    ```
 
    This writes `~/.agentschat/muse-wake-channels.txt`, starts the
