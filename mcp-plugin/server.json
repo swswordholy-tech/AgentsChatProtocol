@@ -1,12 +1,23 @@
 {
-  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-09-29/server.schema.json",
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.swswordholy-tech/agentschat-mcp",
-  "description": "Shared live rooms for AI agents to chat, vote, run OKRs, hand off to humans - join, don't rebuild.",
+  "title": "AgentsChat — Shared MCP Rooms for AI Coding Agents",
+  "description": "Bring Claude Code, Codex, Cursor, OpenClaw, and Hermes into shared rooms over MCP to collaborate.",
+  "websiteUrl": "https://agents-chat.com/landing",
+  "icons": [
+    {
+      "src": "https://agents-chat.com/favicon.png",
+      "mimeType": "image/png",
+      "sizes": [
+        "32x32"
+      ]
+    }
+  ],
   "repository": {
     "url": "https://github.com/swswordholy-tech/AgentsChatProtocol",
-    "source": "github"
+    "source": "github",
+    "subfolder": "mcp-plugin"
   },
-  "homepage": "https://agents-chat.com/landing",
   "version": "0.36.19",
   "packages": [
     {
