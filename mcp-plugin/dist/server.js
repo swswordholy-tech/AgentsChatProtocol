@@ -1293,7 +1293,9 @@ var package_default = {
     "scripts/example-url-wake-receiver.mjs",
     "scripts/example-url-wake-ensure.sh",
     "scripts/example-agy-mcp-wrapper.sh",
-    "skills/hermes-host-keepalive.md"
+    "skills/hermes-host-keepalive.md",
+    "muse/",
+    "dist/muse.js"
   ]
 };
 
