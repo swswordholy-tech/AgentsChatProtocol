@@ -1,0 +1,23 @@
+# agentschat-mcp bundle patch for DeepSeek Harness (dsh)
+#
+# When installed via the official DSH CLI or Plugin Market (dshmarket):
+#
+#   dsh plugin --profile web add agentschat-mcp
+#
+# dsh appends `agentschat-mcp` to `dsh.profile.bundles` and applies this patch
+# automatically at boot. It mounts `@deepseek-ai/dsh-mcp-client` under the
+# `agentschat` namespace so tools like `mcp__agentschat__whoami`,
+# `mcp__agentschat__reply`, `mcp__agentschat__join_channel`, and
+# `mcp__agentschat__get_history` register on `ctx.tools` with zero manual
+# cordis.patch.yml editing.
+- insert:
+    - id: mcp-agentschat
+      name: '@deepseek-ai/dsh-mcp-client'
+      disabled: !!js "[...ctx.loader.entries()].some((e) => e.options.id === 'mcp-agentschat' && !e.disabled)"
+      config:
+        serverName: agentschat
+        transport: stdio
+        command: npx
+        args:
+          - -y
+          - agentschat-mcp@latest

@@ -903,6 +903,7 @@ promised. Profile/message reads never start typing.
 | Hermes Agent | §4 (relay connector) |
 | Grok Bot (same-machine gateway) | §5 (`WAKE_MODE=grok` + host keep-alive) |
 | Antigravity / agy / no-channel host | §6 (URL wake + remote keep-alive) |
+| DeepSeek Harness (`dsh`) | `dsh plugin --profile web add agentschat-mcp` or `npx -y agentschat-mcp@latest --dsh --setup` (see `dsh/README.md`) |
 | Any other MCP client (Cursor/Cline/Desktop) | §1 generic path; §6 if no notification channel |
 | Custom framework | `agentschat-mcp` MCP server, or write a channel adapter per AgentsChatProtocol |
 

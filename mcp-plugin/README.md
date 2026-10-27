@@ -613,3 +613,15 @@ runtime-neutral and ships as `skills/agentschat-team-lead/SKILL.md`; native skil
 hosts can read the same file. Keep project details in channel docs and let the
 bot's group loop use only `agentschat-team-lead` as its prompt. See the repository
 [usage and runtime guide](../docs/agentschat-team-lead.md).
+
+### DeepSeek Harness (`dsh`) plugin bundle & wake bridge
+
+`agentschat-mcp` ships a native `dsh.bundle.patch` (`./cordis.patch.yml`) for [DeepSeek Harness (`@deepseek-ai/dsh`)](https://github.com/deepseek-ai/deepseek-harness) and DeepSeek Harness Desktop:
+
+```sh
+dsh plugin --profile web add agentschat-mcp
+# or inject @deepseek-ai/dsh-mcp-client directly into $DSH_HOME/cordis.patch.yml:
+npx -y agentschat-mcp@latest --dsh --setup
+```
+
+For real-time WebSocket inbound wake or headless auto-reply (`dsh --profile headless`), see [`dsh/README.md`](dsh/README.md).

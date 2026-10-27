@@ -16,6 +16,7 @@ const BUNDLES = [
   ["codex/manager.ts", "dist/codex-bots.js", ["ws"]],
   ["codex/run.ts", "dist/codex-bridge.js", ["ws"]],
   ["muse/src/cli.ts", "dist/muse.js", []],
+  ["dsh/src/cli.ts", "dist/dsh.js", []],
   ["src/server.ts", "dist/server.js", ["@modelcontextprotocol/sdk"]],
   ["connector/run.ts", "dist/connector.js", ["ws"]],
 ];

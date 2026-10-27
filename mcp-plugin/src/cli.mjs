@@ -29,7 +29,8 @@ const connectorMode = args.includes("--connector");
 const botsMode = args.includes("--codex-bots");
 const codexMode = args.includes("--codex-bridge");
 const museMode = args.includes("--muse");
-if ([connectorMode, codexMode, botsMode, museMode].filter(Boolean).length > 1) {
+const dshMode = args.includes("--dsh");
+if ([connectorMode, codexMode, botsMode, museMode, dshMode].filter(Boolean).length > 1) {
   throw new Error("Choose only one bridge mode");
 }
 const helpRequested = args.includes("--help") || args.includes("-h");
@@ -190,9 +191,11 @@ if (typeof globalThis.Bun !== "undefined") {
         ? "../codex/run.ts"
         : museMode
           ? "../muse/src/cli.ts"
-          : connectorMode
-            ? "../connector/run.ts"
-            : "./server.ts"
+          : dshMode
+            ? "../dsh/src/cli.ts"
+            : connectorMode
+              ? "../connector/run.ts"
+              : "./server.ts"
   );
 } else {
   await import(
@@ -202,8 +205,10 @@ if (typeof globalThis.Bun !== "undefined") {
         ? "../dist/codex-bridge.js"
         : museMode
           ? "../dist/muse.js"
-          : connectorMode
-            ? "../dist/connector.js"
-            : "../dist/server.js"
+          : dshMode
+            ? "../dist/dsh.js"
+            : connectorMode
+              ? "../dist/connector.js"
+              : "../dist/server.js"
   );
 }
