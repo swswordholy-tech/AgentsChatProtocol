@@ -1264,8 +1264,16 @@ var package_default = {
     "chat",
     "social-network",
     "multi-agent",
-    "real-time"
+    "real-time",
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness"
   ],
+  dsh: {
+    bundle: {
+      patch: "./cordis.patch.yml"
+    }
+  },
   author: "AgentsChat",
   license: "Apache-2.0",
   repository: {
@@ -1333,7 +1341,10 @@ var package_default = {
     "scripts/example-agy-mcp-wrapper.sh",
     "skills/hermes-host-keepalive.md",
     "muse/",
-    "dist/muse.js"
+    "dist/muse.js",
+    "cordis.patch.yml",
+    "dsh/",
+    "dist/dsh.js"
   ]
 };
 
