@@ -338,6 +338,10 @@ class MuseAgentChatClient {
     }
     if (msg.type === "pong")
       return;
+    if (msg.type === "channel_created" && typeof msg.channel_id === "string" && msg.channel_id) {
+      this.joinChannel(msg.channel_id);
+      return;
+    }
     if (msg.type === "message") {
       const chat = {
         id: String(msg.id ?? ""),
