@@ -40,3 +40,11 @@ test("leaves ordinary text (including a bare 'ac_' with too few chars) untouched
     "hello world, ac_short, no secrets",
   );
 });
+
+test("preserves ac_ keys when preserveAcKeys=true (same-owner DM) while still redacting JWTs", () => {
+  const jwt = "eyJ" + "x".repeat(20) + ".payload.signature";
+  const key = "ac_Dor5zPhpIKxj5JRhmgyIuA4u";
+  expect(redactSecrets(`key=${key} jwt=${jwt}`, { preserveAcKeys: true })).toBe(
+    `key=${key} jwt=***JWT_REDACTED***`,
+  );
+});

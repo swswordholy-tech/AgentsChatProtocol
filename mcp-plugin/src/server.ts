@@ -1956,7 +1956,7 @@ const TOOL_INPUT_SCHEMAS: Map<string, any> = new Map(
  * a newly-joined member's display_name would be resolvable.
  */
 const MEMBER_CACHE_TTL_MS = 5 * 60_000;
-const memberCache = new Map<string, { at: number; members: { agent_id: string; display_name?: string }[] }>();
+const memberCache = new Map<string, { at: number; members: { agent_id: string; display_name?: string }[]; sameOwnerDirect?: boolean }>();
 
 async function fetchChannelMembers(chatId: string): Promise<{ agent_id: string; display_name?: string }[]> {
   const now = Date.now();
@@ -1969,11 +1969,31 @@ async function fetchChannelMembers(chatId: string): Promise<{ agent_id: string; 
     if (!r.ok) return hit?.members || [];
     const body = await r.json() as any;
     const members = Array.isArray(body?.members) ? body.members : [];
-    memberCache.set(chatId, { at: now, members });
+    const sameOwnerDirect = body?.same_owner_direct === true;
+    memberCache.set(chatId, { at: now, members, sameOwnerDirect });
     return members;
   } catch {
     return hit?.members || [];
   }
+}
+
+async function isSameOwnerDirectChannel(chatId: string): Promise<boolean> {
+  const now = Date.now();
+  const hit = memberCache.get(chatId);
+  if (hit && now - hit.at < MEMBER_CACHE_TTL_MS && typeof hit.sameOwnerDirect === "boolean") {
+    return hit.sameOwnerDirect;
+  }
+  await fetchChannelMembers(chatId);
+  return memberCache.get(chatId)?.sameOwnerDirect === true;
+}
+
+async function redactOutboundForChannel(chatId: string, text: string): Promise<string> {
+  if (!text) return text;
+  if (/ac_[A-Za-z0-9_-]{16,}/.test(text)) {
+    const preserveAcKeys = await isSameOwnerDirectChannel(chatId);
+    return redactSecrets(text, { preserveAcKeys });
+  }
+  return redactSecrets(text);
 }
 
 /**
@@ -2180,7 +2200,7 @@ async function sendMediaMessage(kind: "image" | "video" | "audio", args: any): P
       if (typeof args.transcript === "string" && args.transcript) attachment.transcript = args.transcript;
       else if (text) attachment.transcript = text; // the spoken text is its own transcript
     }
-    const content = caption ? redactSecrets(await resolveBareMentions(chat_id, caption)) : "";
+    const content = caption ? await redactOutboundForChannel(chat_id, await resolveBareMentions(chat_id, caption)) : "";
     const r = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(chat_id)}/messages`, {
       method: "POST",
       headers: { "Content-Type": "application/json", "Authorization": `Bearer ${TOKEN}` },
@@ -3079,7 +3099,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     // receiving MCP plugin's regex triggers), then redact secrets so
     // an accidental `ac_xxx` in the text gets masked regardless of
     // how it arrived.
-    const text = redactSecrets(await resolveBareMentions(chat_id, rawText));
+    const text = await redactOutboundForChannel(chat_id, await resolveBareMentions(chat_id, rawText));
     // Use REST API for reliable delivery (WebSocket may be half-open after deploy)
     try {
       const r = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(chat_id)}/messages`, {
@@ -3127,7 +3147,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
   if (name === "thread_reply") {
     const { chat_id, parent_id, text: rawText } = args as any;
-    const text = redactSecrets(await resolveBareMentions(chat_id, rawText));
+    const text = await redactOutboundForChannel(chat_id, await resolveBareMentions(chat_id, rawText));
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({
         type: "thread_reply", id: crypto.randomUUID(), parent_id,
@@ -3160,7 +3180,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       // Mirror reply(): resolve bare @mentions then redact secrets so an
       // accidental ac_/JWT in edited content is masked like every other
       // outbound content path (this was the one hole that bypassed it).
-      const new_content = redactSecrets(await resolveBareMentions(chat_id, rawNewContent));
+      const new_content = await redactOutboundForChannel(chat_id, await resolveBareMentions(chat_id, rawNewContent));
       ws.send(JSON.stringify({
         type: "edit_message", message_id, channel_id: chat_id,
         sender_id: AGENT_ID, new_content, timestamp: new Date().toISOString(),

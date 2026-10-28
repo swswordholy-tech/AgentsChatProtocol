@@ -56,8 +56,9 @@ import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 
 // src/redact.ts
-function redactSecrets(text) {
-  return text.replace(/ac_[A-Za-z0-9_-]{16,}/g, "ac_***REDACTED***").replace(/eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "***JWT_REDACTED***");
+function redactSecrets(text, opts) {
+  const step = opts?.preserveAcKeys ? text : text.replace(/ac_[A-Za-z0-9_-]{16,}/g, "ac_***REDACTED***");
+  return step.replace(/eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "***JWT_REDACTED***");
 }
 
 // src/mentions.ts
@@ -507,8 +508,9 @@ function annotateTools(tools) {
 import { createHmac, timingSafeEqual } from "node:crypto";
 
 // src/redact.ts
-function redactSecrets2(text) {
-  return text.replace(/ac_[A-Za-z0-9_-]{16,}/g, "ac_***REDACTED***").replace(/eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "***JWT_REDACTED***");
+function redactSecrets2(text, opts) {
+  const step = opts?.preserveAcKeys ? text : text.replace(/ac_[A-Za-z0-9_-]{16,}/g, "ac_***REDACTED***");
+  return step.replace(/eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "***JWT_REDACTED***");
 }
 
 // src/wake.ts
@@ -538,7 +540,8 @@ function formatWakeAttachments(attachments) {
   return lines.length > 0 ? ` [附件: ${lines.join("; ")}]` : "";
 }
 function buildWakePayload(msg) {
-  const content = typeof msg.content === "string" ? redactSecrets2(msg.content.slice(0, WAKE_CONTENT_MAX)) : undefined;
+  const redactOpts = msg.same_owner_direct === true ? { preserveAcKeys: true } : undefined;
+  const content = typeof msg.content === "string" ? redactSecrets2(msg.content.slice(0, WAKE_CONTENT_MAX), redactOpts) : undefined;
   const attachments = Array.isArray(msg.attachments) && msg.attachments.length > 0 ? msg.attachments.filter((a) => a && typeof a === "object" && typeof a.url === "string").map((a) => ({
     type: typeof a.type === "string" ? a.type : undefined,
     url: a.url,
@@ -547,7 +550,7 @@ function buildWakePayload(msg) {
     width: typeof a.width === "number" ? a.width : undefined,
     height: typeof a.height === "number" ? a.height : undefined,
     duration_ms: typeof a.duration_ms === "number" ? a.duration_ms : undefined,
-    transcript: typeof a.transcript === "string" ? redactSecrets2(a.transcript.slice(0, 300)) : undefined
+    transcript: typeof a.transcript === "string" ? redactSecrets2(a.transcript.slice(0, 300), redactOpts) : undefined
   })) : undefined;
   return {
     type: typeof msg.type === "string" ? msg.type : "message",
@@ -598,8 +601,9 @@ async function fireWake(msg, cfg) {
 function buildGrokPrompt(msg, agentId, contextPrefix = "") {
   const rawContent = typeof msg.content === "string" ? msg.content : "";
   const isTruncated = rawContent.length > NATIVE_WAKE_CONTENT_MAX;
-  const content = rawContent ? redactSecrets2(rawContent.slice(0, NATIVE_WAKE_CONTENT_MAX)) : "";
-  const cleanPrefix = contextPrefix ? redactSecrets2(contextPrefix.trim()) : "";
+  const redactOpts = msg.same_owner_direct === true ? { preserveAcKeys: true } : undefined;
+  const content = rawContent ? redactSecrets2(rawContent.slice(0, NATIVE_WAKE_CONTENT_MAX), redactOpts) : "";
+  const cleanPrefix = contextPrefix ? redactSecrets2(contextPrefix.trim(), redactOpts) : "";
   const channel = msg.channel_id ?? "?";
   const sender = msg.sender_id ?? "someone";
   const msgId = msg.id ?? msg.message_id ?? "";
@@ -709,8 +713,9 @@ async function fireGrokWake(msg, cfg) {
 function buildWakePrompt(msg, contextPrefix = "") {
   const rawContent = typeof msg.content === "string" ? msg.content : "";
   const isTruncated = rawContent.length > NATIVE_WAKE_CONTENT_MAX;
-  const content = rawContent ? redactSecrets2(rawContent.slice(0, NATIVE_WAKE_CONTENT_MAX)) : "";
-  const cleanPrefix = contextPrefix ? redactSecrets2(contextPrefix.trim()) : "";
+  const redactOpts = msg.same_owner_direct === true ? { preserveAcKeys: true } : undefined;
+  const content = rawContent ? redactSecrets2(rawContent.slice(0, NATIVE_WAKE_CONTENT_MAX), redactOpts) : "";
+  const cleanPrefix = contextPrefix ? redactSecrets2(contextPrefix.trim(), redactOpts) : "";
   const channel = msg.channel_id ?? "?";
   const sender = msg.sender_id ?? "someone";
   const msgId = msg.id ?? msg.message_id ?? "";
@@ -3309,11 +3314,30 @@ async function fetchChannelMembers(chatId) {
       return hit?.members || [];
     const body = await r.json();
     const members = Array.isArray(body?.members) ? body.members : [];
-    memberCache.set(chatId, { at: now, members });
+    const sameOwnerDirect = body?.same_owner_direct === true;
+    memberCache.set(chatId, { at: now, members, sameOwnerDirect });
     return members;
   } catch {
     return hit?.members || [];
   }
+}
+async function isSameOwnerDirectChannel(chatId) {
+  const now = Date.now();
+  const hit = memberCache.get(chatId);
+  if (hit && now - hit.at < MEMBER_CACHE_TTL_MS && typeof hit.sameOwnerDirect === "boolean") {
+    return hit.sameOwnerDirect;
+  }
+  await fetchChannelMembers(chatId);
+  return memberCache.get(chatId)?.sameOwnerDirect === true;
+}
+async function redactOutboundForChannel(chatId, text) {
+  if (!text)
+    return text;
+  if (/ac_[A-Za-z0-9_-]{16,}/.test(text)) {
+    const preserveAcKeys = await isSameOwnerDirectChannel(chatId);
+    return redactSecrets(text, { preserveAcKeys });
+  }
+  return redactSecrets(text);
 }
 async function resolveBareMentions(chatId, text) {
   if (!text || !text.includes("@"))
@@ -3521,7 +3545,7 @@ async function sendMediaMessage(kind, args) {
       else if (text)
         attachment.transcript = text;
     }
-    const content = caption ? redactSecrets(await resolveBareMentions(chat_id, caption)) : "";
+    const content = caption ? await redactOutboundForChannel(chat_id, await resolveBareMentions(chat_id, caption)) : "";
     const r = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(chat_id)}/messages`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${TOKEN}` },
@@ -4339,7 +4363,7 @@ ${a.body || ""}`;
     if (name === "reply") {
       const { chat_id, text: rawText } = args;
       stopTypingHeartbeat(chat_id);
-      const text = redactSecrets(await resolveBareMentions(chat_id, rawText));
+      const text = await redactOutboundForChannel(chat_id, await resolveBareMentions(chat_id, rawText));
       try {
         const r = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(chat_id)}/messages`, {
           method: "POST",
@@ -4391,7 +4415,7 @@ ${a.body || ""}`;
     }
     if (name === "thread_reply") {
       const { chat_id, parent_id, text: rawText } = args;
-      const text = redactSecrets(await resolveBareMentions(chat_id, rawText));
+      const text = await redactOutboundForChannel(chat_id, await resolveBareMentions(chat_id, rawText));
       if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({
           type: "thread_reply",
@@ -4427,7 +4451,7 @@ ${a.body || ""}`;
         return { content: [{ type: "text", text: "Error: new_content (string) required" }] };
       }
       if (ws && ws.readyState === WebSocket.OPEN) {
-        const new_content = redactSecrets(await resolveBareMentions(chat_id, rawNewContent));
+        const new_content = await redactOutboundForChannel(chat_id, await resolveBareMentions(chat_id, rawNewContent));
         ws.send(JSON.stringify({
           type: "edit_message",
           message_id,

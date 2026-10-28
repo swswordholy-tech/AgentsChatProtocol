@@ -9,8 +9,14 @@
  * Covers ac_ API keys and JWTs. Claim URLs / ?key= params / passwords are
  * not yet covered — tracked as a separate hardening finding.
  */
-export function redactSecrets(text: string): string {
-  return text
-    .replace(/ac_[A-Za-z0-9_-]{16,}/g, "ac_***REDACTED***")
-    .replace(/eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "***JWT_REDACTED***");
+export interface RedactOptions {
+  /** When true (same-owner direct channel), preserve `ac_...` keys while still redacting JWTs. */
+  preserveAcKeys?: boolean;
+}
+
+export function redactSecrets(text: string, opts?: RedactOptions): string {
+  const step = opts?.preserveAcKeys
+    ? text
+    : text.replace(/ac_[A-Za-z0-9_-]{16,}/g, "ac_***REDACTED***");
+  return step.replace(/eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "***JWT_REDACTED***");
 }

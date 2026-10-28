@@ -53,6 +53,8 @@ export interface WakeMessage {
   attachments?: WakeAttachment[];
   mentioned_ids?: string[];
   timestamp?: string;
+  /** True when server verified this DM is between an owner and their own agent, or sibling agents of the same owner. */
+  same_owner_direct?: boolean;
   /** Anything credential-shaped is stripped; these are accepted only to be dropped. */
   token?: string;
   agent_key?: string;
@@ -98,8 +100,9 @@ export function buildWakePayload(msg: WakeMessage): WakePayload {
   // The content excerpt crosses the wire to the wake receiver, so it goes through
   // the same redactSecrets every other outbound content path uses (reply/edit/
   // caption/status) — a message with an ac_ key or JWT pasted into it must not leak
-  // it into the wake body either.
-  const content = typeof msg.content === "string" ? redactSecrets(msg.content.slice(0, WAKE_CONTENT_MAX)) : undefined;
+  // it into the wake body either (except ac_ keys in same-owner direct channels).
+  const redactOpts = msg.same_owner_direct === true ? { preserveAcKeys: true } : undefined;
+  const content = typeof msg.content === "string" ? redactSecrets(msg.content.slice(0, WAKE_CONTENT_MAX), redactOpts) : undefined;
   const attachments = Array.isArray(msg.attachments) && msg.attachments.length > 0
     ? msg.attachments
         .filter((a) => a && typeof a === "object" && typeof a.url === "string")
@@ -111,7 +114,7 @@ export function buildWakePayload(msg: WakeMessage): WakePayload {
           width: typeof a.width === "number" ? a.width : undefined,
           height: typeof a.height === "number" ? a.height : undefined,
           duration_ms: typeof a.duration_ms === "number" ? a.duration_ms : undefined,
-          transcript: typeof a.transcript === "string" ? redactSecrets(a.transcript.slice(0, 300)) : undefined,
+          transcript: typeof a.transcript === "string" ? redactSecrets(a.transcript.slice(0, 300), redactOpts) : undefined,
         }))
     : undefined;
   return {
@@ -221,8 +224,9 @@ export interface GrokPrompt {
 export function buildGrokPrompt(msg: WakeMessage, agentId: string, contextPrefix = ""): GrokPrompt {
   const rawContent = typeof msg.content === "string" ? msg.content : "";
   const isTruncated = rawContent.length > NATIVE_WAKE_CONTENT_MAX;
-  const content = rawContent ? redactSecrets(rawContent.slice(0, NATIVE_WAKE_CONTENT_MAX)) : "";
-  const cleanPrefix = contextPrefix ? redactSecrets(contextPrefix.trim()) : "";
+  const redactOpts = msg.same_owner_direct === true ? { preserveAcKeys: true } : undefined;
+  const content = rawContent ? redactSecrets(rawContent.slice(0, NATIVE_WAKE_CONTENT_MAX), redactOpts) : "";
+  const cleanPrefix = contextPrefix ? redactSecrets(contextPrefix.trim(), redactOpts) : "";
   const channel = msg.channel_id ?? "?";
   const sender = msg.sender_id ?? "someone";
   const msgId = (msg.id ?? (msg as any).message_id ?? "") as string;
@@ -399,8 +403,9 @@ export async function fireGrokWake(msg: WakeMessage, cfg: GrokWakeConfig): Promi
 export function buildWakePrompt(msg: WakeMessage, contextPrefix = ""): string {
   const rawContent = typeof msg.content === "string" ? msg.content : "";
   const isTruncated = rawContent.length > NATIVE_WAKE_CONTENT_MAX;
-  const content = rawContent ? redactSecrets(rawContent.slice(0, NATIVE_WAKE_CONTENT_MAX)) : "";
-  const cleanPrefix = contextPrefix ? redactSecrets(contextPrefix.trim()) : "";
+  const redactOpts = msg.same_owner_direct === true ? { preserveAcKeys: true } : undefined;
+  const content = rawContent ? redactSecrets(rawContent.slice(0, NATIVE_WAKE_CONTENT_MAX), redactOpts) : "";
+  const cleanPrefix = contextPrefix ? redactSecrets(contextPrefix.trim(), redactOpts) : "";
   const channel = msg.channel_id ?? "?";
   const sender = msg.sender_id ?? "someone";
   const msgId = (msg.id ?? (msg as any).message_id ?? "") as string;
