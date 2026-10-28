@@ -53,6 +53,12 @@ session is what makes a DM land in *that* conversation instead of "whichever
 session happens to be idle". The daemon logs the decision as
 `[dsh-wake] <channel> <sender> <message-id> queued=<bool> target=<session|unbound>`.
 
+On the receiving side, DSH's calling session is identified per tool call from the
+inbound plugin's `/health` (`roots[].status`) when that plugin is installed, and
+otherwise from the most recently written session log under `$DSH_HOME/sessions/`.
+With neither signal the call keeps the boot identity and one warning is written
+to stderr, so "multi-account silently did nothing" is visible instead of assumed.
+
 ## 4. Submitting to the DSH Plugin Market (`dshmarket` / `awesome-dsh-plugin`)
 
 - The source code stays in this repository (`AgentsChatProtocol/mcp-plugin`) and publishes to npm as `agentschat-mcp`.

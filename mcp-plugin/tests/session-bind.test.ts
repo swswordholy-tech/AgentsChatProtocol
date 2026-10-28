@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import {
@@ -341,8 +341,13 @@ describe("multi-window lock & connect_profile / disconnect_profile integration t
     params: { name, arguments: args, ...(meta ? { _meta: meta } : {}) },
   });
 
-  function spawnMcpSession(home: string, args: string[] = [], extraEnv: Record<string, string> = {}) {
-    const child: ChildProcessWithoutNullStreams = spawn(process.execPath, [ENTRY, "--url", BASE, ...args], {
+  function spawnMcpSession(
+    home: string,
+    args: string[] = [],
+    extraEnv: Record<string, string> = {},
+    url: string = BASE,
+  ) {
+    const child: ChildProcessWithoutNullStreams = spawn(process.execPath, [ENTRY, "--url", url, ...args], {
       env: {
         PATH: process.env.PATH!,
         HOME: home,
@@ -762,5 +767,106 @@ describe("multi-window lock & connect_profile / disconnect_profile integration t
       await mcp.close();
       wsHub.stop(true);
     }
+  });
+
+  test("concurrent tools/call from two bound sessions never answers as the other identity", async () => {
+    const home = mkdtempSync(join(tmpdir(), "ac-concurrent-"));
+    const cfgDir = join(home, ".agentschat");
+    mkdirSync(cfgDir, { recursive: true });
+    writeFileSync(
+      join(cfgDir, "profile.json"),
+      JSON.stringify({ agent_id: "conc-bot-1", display_name: "ConcBot1", token: "ac_conc_1", capabilities: ["coding"] }),
+    );
+    writeFileSync(
+      join(cfgDir, "SecondBot.json"),
+      JSON.stringify({ agent_id: "conc-bot-2", display_name: "ConcBot2", token: "ac_conc_2", capabilities: ["coding"] }),
+    );
+    writeFileSync(join(cfgDir, "session-binds.json"), JSON.stringify({ sess_A: "profile", sess_B: "SecondBot" }));
+
+    // Slow REST so the first handler is still awaiting when the second request
+    // arrives: without serialization, `whoami` formats its answer from the
+    // globals the *second* request just swapped.
+    const slowRest = Bun.serve({
+      port: 0,
+      async fetch(req) {
+        const auth = req.headers.get("authorization") ?? "";
+        const agent = auth.includes("ac_conc_2") ? "conc-bot-2" : "conc-bot-1";
+        await new Promise((r) => setTimeout(r, 80));
+        return Response.json({ ok: true, build: "conc-test", agent_id: agent, claimed: true });
+      },
+    });
+
+    const mcp = spawnMcpSession(
+      home,
+      [],
+      { AGENTCHAT_URL: "ws://127.0.0.1:1/ws" },
+      `http://127.0.0.1:${slowRest.port}`,
+    );
+    try {
+      await mcp.send(INIT);
+      await mcp.send(INITED);
+
+      const a = mcp.send(callTool(20, "whoami", {}, { session_id: "sess_A" }));
+      const b = mcp.send(callTool(21, "whoami", {}, { session_id: "sess_B" }));
+      const [ra, rb] = await Promise.all([a, b]);
+
+      expect(ra.result.content[0].text).toContain("Agent ID: conc-bot-1");
+      expect(rb.result.content[0].text).toContain("Agent ID: conc-bot-2");
+      // Both sessions kept their own bind; neither stole the other's slot.
+      expect(loadSessionBinds(cfgDir)).toEqual({ sess_A: "profile", sess_B: "SecondBot" });
+    } finally {
+      await mcp.close();
+      slowRest.stop(true);
+    }
+  });
+
+  test("DSH caller detection prefers the session whose log was written last, even without /health", async () => {
+    const dshHome = mkdtempSync(join(tmpdir(), "ac-dsh-logs-"));
+    const writeLog = (project: string, sid: string, ageMs: number) => {
+      const dir = join(dshHome, "sessions", project, sid);
+      mkdirSync(dir, { recursive: true });
+      const file = join(dir, "session.v4.jsonl.zstd");
+      writeFileSync(file, "x");
+      const when = new Date(Date.now() - ageMs);
+      utimesSync(file, when, when);
+    };
+    writeLog("--proj--", "session-a", 20_000);
+    writeLog("--proj--", "session-b", 120);
+
+    const bothRunning = await detectDshCallerSession({
+      dshHome,
+      fetchImpl: (async () =>
+        Response.json({
+          ok: true,
+          roots: [
+            { id: "session-a", status: "running" },
+            { id: "session-b", status: "running" },
+          ],
+        })) as any,
+    });
+    expect(bothRunning).toBe("session-b");
+
+    // No inbound plugin: the log mtime is still enough to route.
+    const noHealth = await detectDshCallerSession({
+      dshHome,
+      fetchImpl: (async () => {
+        throw new Error("health down");
+      }) as any,
+    });
+    expect(noHealth).toBe("session-b");
+
+    // Nothing running: the same fallback applies.
+    const allIdle = await detectDshCallerSession({
+      dshHome,
+      fetchImpl: (async () =>
+        Response.json({
+          ok: true,
+          roots: [
+            { id: "session-a", status: "idle" },
+            { id: "session-b", status: "idle" },
+          ],
+        })) as any,
+    });
+    expect(allIdle).toBe("session-b");
   });
 });

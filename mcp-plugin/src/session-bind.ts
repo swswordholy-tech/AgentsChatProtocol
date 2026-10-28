@@ -586,10 +586,75 @@ export function isDshHostProcess(opts?: {
   return false;
 }
 
+/** mtime of a session directory's log, or 0 when it has none. */
+function sessionDirMtime(dir: string): number {
+  let newest = 0;
+  for (const file of ["session.v4.jsonl.zstd", "session.v4.jsonl"]) {
+    try {
+      const mtime = statSync(join(dir, file)).mtimeMs;
+      if (mtime > newest) newest = mtime;
+    } catch {}
+  }
+  return newest;
+}
+
 /**
- * Identify the active DeepSeek Harness (`dsh`) session (`session-...`) during a tool call
- * by inspecting the local DSH inbound plugin `/health` (`status === "running"`) and
- * `<dshHome>/storages/session_projcache/sessions/<sid>.json` mtimes.
+ * mtime of `sid`'s session log (`<dshHome>/sessions/<project>/<sid>/…`), or 0.
+ *
+ * DSH rewrites the log on every durable row, so during a tool call the caller's
+ * log is the most recently modified one — the only signal that distinguishes
+ * two sessions that are both `running` at the same time.
+ */
+function sessionLogMtime(dshHome: string, sid: string): number {
+  let projects: string[];
+  try {
+    projects = readdirSync(join(dshHome, "sessions"));
+  } catch {
+    return 0;
+  }
+  let newest = 0;
+  for (const project of projects) {
+    const mtime = sessionDirMtime(join(dshHome, "sessions", project, sid));
+    if (mtime > newest) newest = mtime;
+  }
+  return newest;
+}
+
+/** Newest session log within `maxAgeMs`; the fallback when `/health` is unavailable. */
+function newestSessionLog(dshHome: string, nowMs: number, maxAgeMs: number): string | null {
+  const root = join(dshHome, "sessions");
+  let projects: string[];
+  try {
+    projects = readdirSync(root);
+  } catch {
+    return null;
+  }
+  let best: { sid: string; mtime: number } | null = null;
+  for (const project of projects) {
+    let entries: string[];
+    try {
+      entries = readdirSync(join(root, project));
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      if (!entry.startsWith("session-")) continue;
+      const mtime = sessionDirMtime(join(root, project, entry));
+      if (mtime === 0 || nowMs - mtime > maxAgeMs) continue;
+      if (best === null || mtime > best.mtime) best = { sid: entry, mtime };
+    }
+  }
+  return best?.sid ?? null;
+}
+
+/**
+ * Identify the active DeepSeek Harness (`dsh`) session (`session-...`) during a tool call.
+ *
+ * Primary signal: the local DSH inbound plugin's `/health`, whose `roots[].status`
+ * names the session(s) currently mid-turn. Secondary (and the only signal when
+ * that plugin is absent): the most recently written session log under
+ * `<dshHome>/sessions/`. When several sessions are running, the log mtime decides;
+ * otherwise the newest root wins — never the oldest.
  */
 export async function detectDshCallerSession(opts?: {
   dshHome?: string;
@@ -607,20 +672,11 @@ export async function detectDshCallerSession(opts?: {
     env.AGENTSCHAT_DSH_HOME?.trim() ||
     env.DSH_HOME?.trim() ||
     join(homedir(), ".dsh");
-  const sessionsDir = join(dshHome, "storages", "session_projcache", "sessions");
   const healthUrl =
     opts?.healthUrl?.trim() ||
     env.AGENTSCHAT_DSH_HEALTH_URL?.trim() ||
     "http://127.0.0.1:8799/health";
   const nowMs = opts?.nowMs ?? Date.now();
-
-  const getSessionMtime = (sid: string): number => {
-    try {
-      return statSync(join(sessionsDir, `${sid}.json`)).mtimeMs;
-    } catch {
-      return 0;
-    }
-  };
 
   try {
     const f = opts?.fetchImpl ?? fetch;
@@ -638,8 +694,15 @@ export async function detectDshCallerSession(opts?: {
           .map((r) => r.id!);
         if (running.length === 1) return running[0]!;
         if (running.length > 1) {
-          running.sort((a, b) => getSessionMtime(b) - getSessionMtime(a));
-          return running[0]!;
+          // More than one session is mid-turn; the caller is the one that just
+          // wrote a row (its session log mtime is the newest). `roots` is
+          // oldest-first, so the newest root is the fallback when logs are
+          // unavailable — never `running[0]`, which is the *oldest*.
+          const ranked = running
+            .map((sid) => ({ sid, mtime: sessionLogMtime(dshHome, sid) }))
+            .sort((a, b) => b.mtime - a.mtime);
+          if (ranked[0]!.mtime > 0 && ranked[0]!.mtime >= ranked[1]!.mtime) return ranked[0]!.sid;
+          return running[running.length - 1]!;
         }
         const allValid = roots
           .filter((r) => typeof r?.id === "string" && r.id.startsWith("session-"))
@@ -651,21 +714,11 @@ export async function detectDshCallerSession(opts?: {
     }
   } catch {}
 
-  if (existsSync(sessionsDir)) {
-    try {
-      let newestSid: string | null = null;
-      let newestMtime = 0;
-      for (const file of readdirSync(sessionsDir)) {
-        if (!file.startsWith("session-") || !file.endsWith(".json")) continue;
-        const sid = file.slice(0, -5);
-        const mtime = getSessionMtime(sid);
-        if (mtime > newestMtime && nowMs - mtime <= 30_000) {
-          newestMtime = mtime;
-          newestSid = sid;
-        }
-      }
-      if (newestSid) return newestSid;
-    } catch {}
-  }
+  // No health endpoint (older/newer DSH, or the inbound plugin is not
+  // installed): the same log-mtime signal still identifies the session that
+  // just ran a tool call. DSH writes one directory per session under
+  // `<dshHome>/sessions/<project>/session-<uuid>/`.
+  const newestByLog = newestSessionLog(dshHome, nowMs, 30_000);
+  if (newestByLog) return newestByLog;
   return null;
 }

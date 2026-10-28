@@ -227,6 +227,8 @@ const lockDir = resolveLockDir(homeDir, process.env);
 const lockOwnerPid = Number(process.env.AGENTSCHAT_LOCK_OWNER_PID) || null;
 const toolOnlyMode = process.env.AGENTSCHAT_TOOL_ONLY === "1";
 let runtimeSession: DetectedSession | null = detectRuntimeSession(process.env);
+/** One-shot notice when DSH is detected but no session can be resolved (see the DSH branch). */
+let dshRouteWarned = false;
 
 function profileNameToPaths(name: string): string[] {
   if (name.startsWith("~/")) return [join(homeDir, name.slice(2))];
@@ -3008,12 +3010,50 @@ async function resolveCallerSessionForToolCall(
         isPerCallSession: true,
       };
     }
+    // Silence here reads as "multi-account is working" while every call keeps
+    // using the boot identity. Say it once per process instead.
+    if (!dshRouteWarned) {
+      dshRouteWarned = true;
+      process.stderr.write(
+        "[agentchat] DSH detected but no session could be routed to this call: " +
+          "the local /health (roots[].status) was unreachable and no session log matched. " +
+          "Per-session identity is disabled for now; install the DSH inbound plugin or set AGENTSCHAT_DSH_HEALTH_URL.\n",
+      );
+    }
   }
 
   return { session: runtimeSession, isPerCallSession: false };
 }
 
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
+/**
+ * Serialize `tools/call` execution.
+ *
+ * Identity is process-global by construction: `activateSlot()` swaps
+ * `AGENT_ID` / `TOKEN` / `ws` / `runtimeSession`, and handlers read those
+ * globals *after* awaiting the network. MCP transports dispatch requests
+ * concurrently, so two calls from different bound sessions can interleave —
+ * A activates, awaits, B activates, A then formats/answers as B. That is
+ * cross-identity leakage in exactly the scenario multi-account multiplexing
+ * exists for, so this queue is a correctness requirement whenever more than one
+ * identity is live, not a throughput trade-off.
+ *
+ * Every tool here is a short REST/WS round trip (no long-poll tool), so
+ * serializing costs latency, not liveness.
+ */
+let callTail: Promise<unknown> = Promise.resolve();
+function serializeCall<T>(run: () => Promise<T>): Promise<T> {
+  const started = callTail.then(
+    () => run(),
+    () => run(),
+  );
+  callTail = started.then(
+    () => undefined,
+    () => undefined,
+  );
+  return started;
+}
+
+const handleToolCall = async (request: any): Promise<any> => {
   let { name, arguments: args } = request.params;
   let viaExtendedCompat = false;
   // Central failure boundary: any handler that throws (network, JSON, ws.send,
@@ -4637,7 +4677,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   } catch (e: any) {
     return { content: [{ type: "text", text: `${name} failed: ${String(e?.message || e).slice(0, 300)}` }], isError: true };
   }
-});
+};
+
+// One tool call at a time: identity is process-global (see serializeCall).
+server.setRequestHandler(CallToolRequestSchema, (request) => serializeCall(() => handleToolCall(request)));
 
 // --- WebSocket Connection ---
 

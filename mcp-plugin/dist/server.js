@@ -1366,22 +1366,68 @@ function isDshHostProcess(opts) {
   cachedIsDshHost = { at: now, value: false };
   return false;
 }
+function sessionDirMtime(dir) {
+  let newest = 0;
+  for (const file of ["session.v4.jsonl.zstd", "session.v4.jsonl"]) {
+    try {
+      const mtime = statSync2(join3(dir, file)).mtimeMs;
+      if (mtime > newest)
+        newest = mtime;
+    } catch {}
+  }
+  return newest;
+}
+function sessionLogMtime(dshHome, sid) {
+  let projects;
+  try {
+    projects = readdirSync(join3(dshHome, "sessions"));
+  } catch {
+    return 0;
+  }
+  let newest = 0;
+  for (const project of projects) {
+    const mtime = sessionDirMtime(join3(dshHome, "sessions", project, sid));
+    if (mtime > newest)
+      newest = mtime;
+  }
+  return newest;
+}
+function newestSessionLog(dshHome, nowMs, maxAgeMs) {
+  const root = join3(dshHome, "sessions");
+  let projects;
+  try {
+    projects = readdirSync(root);
+  } catch {
+    return null;
+  }
+  let best = null;
+  for (const project of projects) {
+    let entries;
+    try {
+      entries = readdirSync(join3(root, project));
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      if (!entry.startsWith("session-"))
+        continue;
+      const mtime = sessionDirMtime(join3(root, project, entry));
+      if (mtime === 0 || nowMs - mtime > maxAgeMs)
+        continue;
+      if (best === null || mtime > best.mtime)
+        best = { sid: entry, mtime };
+    }
+  }
+  return best?.sid ?? null;
+}
 async function detectDshCallerSession(opts) {
   const env = opts?.env ?? process.env;
   if (!opts?.dshHome && !opts?.healthUrl && !isDshHostProcess({ env })) {
     return null;
   }
   const dshHome = opts?.dshHome?.trim() || env.AGENTSCHAT_DSH_HOME?.trim() || env.DSH_HOME?.trim() || join3(homedir(), ".dsh");
-  const sessionsDir = join3(dshHome, "storages", "session_projcache", "sessions");
   const healthUrl = opts?.healthUrl?.trim() || env.AGENTSCHAT_DSH_HEALTH_URL?.trim() || "http://127.0.0.1:8799/health";
   const nowMs = opts?.nowMs ?? Date.now();
-  const getSessionMtime = (sid) => {
-    try {
-      return statSync2(join3(sessionsDir, `${sid}.json`)).mtimeMs;
-    } catch {
-      return 0;
-    }
-  };
   try {
     const f = opts?.fetchImpl ?? fetch;
     const ctrl = new AbortController;
@@ -1395,8 +1441,10 @@ async function detectDshCallerSession(opts) {
         if (running.length === 1)
           return running[0];
         if (running.length > 1) {
-          running.sort((a, b) => getSessionMtime(b) - getSessionMtime(a));
-          return running[0];
+          const ranked = running.map((sid) => ({ sid, mtime: sessionLogMtime(dshHome, sid) })).sort((a, b) => b.mtime - a.mtime);
+          if (ranked[0].mtime > 0 && ranked[0].mtime >= ranked[1].mtime)
+            return ranked[0].sid;
+          return running[running.length - 1];
         }
         const allValid = roots.filter((r) => typeof r?.id === "string" && r.id.startsWith("session-")).map((r) => r.id);
         if (allValid.length === 1)
@@ -1406,24 +1454,9 @@ async function detectDshCallerSession(opts) {
       clearTimeout(timer);
     }
   } catch {}
-  if (existsSync3(sessionsDir)) {
-    try {
-      let newestSid = null;
-      let newestMtime = 0;
-      for (const file of readdirSync(sessionsDir)) {
-        if (!file.startsWith("session-") || !file.endsWith(".json"))
-          continue;
-        const sid = file.slice(0, -5);
-        const mtime = getSessionMtime(sid);
-        if (mtime > newestMtime && nowMs - mtime <= 30000) {
-          newestMtime = mtime;
-          newestSid = sid;
-        }
-      }
-      if (newestSid)
-        return newestSid;
-    } catch {}
-  }
+  const newestByLog = newestSessionLog(dshHome, nowMs, 30000);
+  if (newestByLog)
+    return newestByLog;
   return null;
 }
 
@@ -1990,6 +2023,7 @@ var lockDir = resolveLockDir(homeDir, process.env);
 var lockOwnerPid = Number(process.env.AGENTSCHAT_LOCK_OWNER_PID) || null;
 var toolOnlyMode = process.env.AGENTSCHAT_TOOL_ONLY === "1";
 var runtimeSession = detectRuntimeSession(process.env);
+var dshRouteWarned = false;
 function profileNameToPaths(name) {
   if (name.startsWith("~/"))
     return [join6(homeDir, name.slice(2))];
@@ -4460,10 +4494,25 @@ async function resolveCallerSessionForToolCall(toolName, toolArgs, rawMeta) {
         isPerCallSession: true
       };
     }
+    if (!dshRouteWarned) {
+      dshRouteWarned = true;
+      process.stderr.write("[agentchat] DSH detected but no session could be routed to this call: " + "the local /health (roots[].status) was unreachable and no session log matched. " + `Per-session identity is disabled for now; install the DSH inbound plugin or set AGENTSCHAT_DSH_HEALTH_URL.
+`);
+    }
   }
   return { session: runtimeSession, isPerCallSession: false };
 }
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
+var callTail = Promise.resolve();
+function serializeCall(run) {
+  const started = callTail.then(() => run(), () => run());
+  callTail = started.then(() => {
+    return;
+  }, () => {
+    return;
+  });
+  return started;
+}
+var handleToolCall = async (request) => {
   let { name, arguments: args } = request.params;
   let viaExtendedCompat = false;
   try {
@@ -6052,7 +6101,8 @@ ${list}` }] };
   } catch (e) {
     return { content: [{ type: "text", text: `${name} failed: ${String(e?.message || e).slice(0, 300)}` }], isError: true };
   }
-});
+};
+server.setRequestHandler(CallToolRequestSchema, (request) => serializeCall(() => handleToolCall(request)));
 var mentionTsFile = join6(configDir, `mention-ts-${AGENT_ID}.json`);
 function loadMentionTimestamps() {
   return loadCursor(mentionTsFile, safeStderrWrite);
