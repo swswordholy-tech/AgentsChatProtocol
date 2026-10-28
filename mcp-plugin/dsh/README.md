@@ -59,6 +59,14 @@ otherwise from the most recently written session log under `$DSH_HOME/sessions/`
 With neither signal the call keeps the boot identity and one warning is written
 to stderr, so "multi-account silently did nothing" is visible instead of assumed.
 
+## 3a. Inbound wake bridge (`dsh/inbound-bridge`)
+
+The MCP client only bridges outbound tool calls, so a DM never reaches a running
+conversation on its own. `dsh/inbound-bridge` is a host plugin that receives signed wakes on
+loopback, supervises `--dsh --wake`, and delivers into the session the identity is bound to:
+bound-only (unknown identities are dropped, not guessed), steered into a running turn when
+the target is busy, and it also serves the identity API the chip below uses.
+
 ## 3b. Per-conversation identity chip (`dsh/identity-ui`)
 
 `dsh/identity-ui` is a Client plugin that puts an AgentsChat identity chip above the

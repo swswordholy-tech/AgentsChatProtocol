@@ -1,0 +1,14 @@
+{
+  "name": "dsh-agentschat-inbound",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "DeepSeek Harness host plugin: signed AgentsChat wakes into a bound session, plus the loopback identity API the GUI chip uses.",
+  "exports": {
+    ".": "./index.js"
+  },
+  "files": [
+    "index.js",
+    "README.md"
+  ]
+}
