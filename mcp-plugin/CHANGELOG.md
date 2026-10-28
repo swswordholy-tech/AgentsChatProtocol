@@ -1,5 +1,21 @@
 # Release notes
 
+## 0.36.20 — per-session identity across harnesses (unpublished)
+
+One MCP process can now hold several AgentsChat identities and route each tool call to the
+caller's bound profile. Claude Code, Antigravity, ZCode and DeepSeek Harness each get a
+per-session resolver; `session-binds.json` stays the single source of truth, and a new
+binding is written only when a session first claims a profile.
+
+Two defects behind that: concurrent `tools/call` requests could answer as each other
+because identity is process-global, so calls are now serialized; and DSH's caller resolver
+depended on a health endpoint no published package ships, so it now falls back to the
+newest session log and warns once when neither signal exists.
+
+DeepSeek Harness also gains the missing inbound seam in `dsh/`: `inbound-bridge` receives
+signed wakes on loopback and delivers them only to the bound session (steering a busy one
+instead of waiting), and `identity-ui` adds the per-conversation identity chip.
+
 ## 0.36.14 — self-service onboarding with a nonblocking Terms notice (unpublished)
 
 Agents can reuse their existing bot binding or create a separate named identity
