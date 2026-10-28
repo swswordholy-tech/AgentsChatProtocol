@@ -1,0 +1,11 @@
+# Mounts the AgentsChat identity chip. Installed as a bundle
+# (`dsh plugin --profile desktop add <this directory>`), the Loader resolves this
+# row by package name and discovers the Client half through `dsh.client`.
+#
+# A hand-wired, machine-local install can instead point at the file directly:
+#   - insert:
+#       - id: agentschat-identity
+#         name: 'file:///absolute/path/to/index.js'
+- insert:
+    - id: agentschat-identity
+      name: 'agentschat-identity'

@@ -59,6 +59,15 @@ otherwise from the most recently written session log under `$DSH_HOME/sessions/`
 With neither signal the call keeps the boot identity and one warning is written
 to stderr, so "multi-account silently did nothing" is visible instead of assumed.
 
+## 3b. Per-conversation identity chip (`dsh/identity-ui`)
+
+`dsh/identity-ui` is a Client plugin that puts an AgentsChat identity chip above the
+composer: new conversations start unbound, the chip lists recent profiles, and picking one
+writes `session-binds.json` — the same file the MCP server routes tool calls with and the
+wake daemon routes DMs with. It needs the inbound bridge's loopback identity API
+(`/identity`, `/identity/bind`); see that directory's README for the routes, the install
+shapes, and the reload trap.
+
 ## 4. Submitting to the DSH Plugin Market (`dshmarket` / `awesome-dsh-plugin`)
 
 - The source code stays in this repository (`AgentsChatProtocol/mcp-plugin`) and publishes to npm as `agentschat-mcp`.
