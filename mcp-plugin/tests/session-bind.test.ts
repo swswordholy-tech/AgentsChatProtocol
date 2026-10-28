@@ -6,6 +6,8 @@ import { join, resolve } from "node:path";
 import {
   acquireAgentLock,
   checkAgentLock,
+  detectAntigravityCallerSession,
+  detectDshCallerSession,
   detectRuntimeSession,
   findBoundSessionForProfile,
   loadSessionBinds,
@@ -34,8 +36,14 @@ describe("session-bind & agent lock unit tests", () => {
     expect(lock).not.toBeNull();
     expect(readAgentLock(dir, "agent-alpha")?.agentId).toBe("agent-alpha");
 
-    // Same PID is allowed
+    // Same PID is allowed when sessionId is omitted or matches, but blocked when a DIFFERENT sessionId in the same process checks the lock
     expect(checkAgentLock({ lockDir: dir, agentId: "agent-alpha", currentPid: process.pid }).locked).toBe(false);
+    expect(
+      checkAgentLock({ lockDir: dir, agentId: "agent-alpha", currentPid: process.pid, currentSessionId: "sess-1" }).locked,
+    ).toBe(false);
+    expect(
+      checkAgentLock({ lockDir: dir, agentId: "agent-alpha", currentPid: process.pid, currentSessionId: "sess-2" }).locked,
+    ).toBe(true);
     // Different PID is blocked
     const otherCheck = checkAgentLock({ lockDir: dir, agentId: "agent-alpha", currentPid: 999999 });
     expect(otherCheck.locked).toBe(true);
@@ -493,6 +501,266 @@ describe("multi-window lock & connect_profile / disconnect_profile integration t
       expect(lock?.runtime).toBe("zcode");
     } finally {
       await zwin.close();
+    }
+  });
+
+  test("detectAntigravityCallerSession & detectDshCallerSession identify active caller sessions", async () => {
+    const brainDir = mkdtempSync(join(tmpdir(), "ac-agy-brain-"));
+    const cidA = "11111111-1111-4111-8111-111111111111";
+    const cidB = "22222222-2222-4222-8222-222222222222";
+    const logDirA = join(brainDir, cidA, ".system_generated", "logs");
+    const logDirB = join(brainDir, cidB, ".system_generated", "logs");
+    mkdirSync(logDirA, { recursive: true });
+    mkdirSync(logDirB, { recursive: true });
+
+    writeFileSync(
+      join(logDirA, "transcript.jsonl"),
+      JSON.stringify({
+        type: "PLANNER_RESPONSE",
+        tool_calls: [
+          {
+            name: "call_mcp_tool",
+            args: { ServerName: '"agentschat"', ToolName: '"whoami"', Arguments: "{}" },
+          },
+        ],
+      }) + "\n",
+    );
+    writeFileSync(
+      join(logDirB, "transcript.jsonl"),
+      JSON.stringify({
+        type: "PLANNER_RESPONSE",
+        tool_calls: [
+          {
+            name: "call_mcp_tool",
+            args: {
+              ServerName: '"agentschat"',
+              ToolName: '"reply"',
+              Arguments: '{"chat_id":"dm-target-99","text":"hello from B"}',
+            },
+          },
+        ],
+      }) + "\n",
+    );
+
+    expect(detectAntigravityCallerSession({ brainDir, toolName: "whoami", args: {} })).toBe(cidA);
+    expect(
+      detectAntigravityCallerSession({
+        brainDir,
+        toolName: "reply",
+        args: { chat_id: "dm-target-99", text: "hello from B" },
+      }),
+    ).toBe(cidB);
+
+    const dshHome = mkdtempSync(join(tmpdir(), "ac-dsh-home-"));
+    const sessionsDir = join(dshHome, "storages", "session_projcache", "sessions");
+    mkdirSync(sessionsDir, { recursive: true });
+    writeFileSync(join(sessionsDir, "session-alpha.json"), "{}");
+    writeFileSync(join(sessionsDir, "session-beta.json"), "{}");
+
+    const detectedRunning = await detectDshCallerSession({
+      dshHome,
+      fetchImpl: (async () =>
+        Response.json({
+          ok: true,
+          roots: [
+            { id: "session-alpha", status: "idle" },
+            { id: "session-beta", status: "running" },
+          ],
+        })) as any,
+    });
+    expect(detectedRunning).toBe("session-beta");
+  });
+
+  test("Single MCP process multiplexes multiple bound sessions (ZCode _meta & Antigravity transcript) with simultaneous WS connections", async () => {
+    const home = mkdtempSync(join(tmpdir(), "ac-multislot-"));
+    const cfgDir = join(home, ".agentschat");
+    const brainDir = mkdtempSync(join(tmpdir(), "ac-agy-live-brain-"));
+    mkdirSync(cfgDir, { recursive: true });
+    writeFileSync(
+      join(cfgDir, "profile.json"),
+      JSON.stringify({
+        agent_id: "slot-bot-1",
+        display_name: "SlotBot1",
+        token: "ac_slot_token_1",
+        capabilities: ["coding"],
+      }),
+    );
+    writeFileSync(
+      join(cfgDir, "SecondBot.json"),
+      JSON.stringify({
+        agent_id: "slot-bot-2",
+        display_name: "SlotBot2",
+        token: "ac_slot_token_2",
+        capabilities: ["coding"],
+      }),
+    );
+    writeFileSync(
+      join(cfgDir, "ThirdBot.json"),
+      JSON.stringify({
+        agent_id: "slot-bot-3",
+        display_name: "SlotBot3",
+        token: "ac_slot_token_3",
+        capabilities: ["coding"],
+      }),
+    );
+
+    // Local mock WS + REST hub that tracks currently authenticated agent_ids
+    const onlineAgents = new Set<string>();
+    const wsHub = Bun.serve<{ agentId?: string }>({
+      port: 0,
+      fetch(req, server) {
+        const u = new URL(req.url);
+        if (u.pathname === "/ws" && server.upgrade(req, { data: {} })) {
+          return undefined;
+        }
+        return Response.json({ ok: true, build: "test" });
+      },
+      websocket: {
+        message(ws, message) {
+          try {
+            const data = JSON.parse(String(message));
+            if (data.type === "auth" && typeof data.agent_id === "string") {
+              ws.data.agentId = data.agent_id;
+              onlineAgents.add(data.agent_id);
+              ws.send(JSON.stringify({ type: "auth_ok", session_id: `ws-sess-${data.agent_id}` }));
+            } else if (data.type === "ping") {
+              ws.send(JSON.stringify({ type: "pong" }));
+            }
+          } catch {}
+        },
+        close(ws) {
+          if (ws.data?.agentId) onlineAgents.delete(ws.data.agentId);
+        },
+      },
+    });
+
+    const cidA = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const cidB = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    const logDirA = join(brainDir, cidA, ".system_generated", "logs");
+    const logDirB = join(brainDir, cidB, ".system_generated", "logs");
+    mkdirSync(logDirA, { recursive: true });
+    mkdirSync(logDirB, { recursive: true });
+
+    const mcp = spawnMcpSession(home, [], {
+      AGENTCHAT_REST_URL: `http://127.0.0.1:${wsHub.port}`,
+      AGENTCHAT_URL: `ws://127.0.0.1:${wsHub.port}/ws`,
+      AGENTSCHAT_AGY_BRAIN_DIR: brainDir,
+    });
+
+    try {
+      await mcp.send(INIT);
+      await mcp.send(INITED);
+
+      // Wait briefly for initial slot-bot-1 WS auth
+      for (let i = 0; i < 25 && !onlineAgents.has("slot-bot-1"); i++) {
+        await new Promise((r) => setTimeout(r, 20));
+      }
+      expect(onlineAgents.has("slot-bot-1")).toBe(true);
+
+      // 1. Conversation A (Antigravity) calls whoami -> claims unbound boot slot ("profile" / slot-bot-1)
+      writeFileSync(
+        join(logDirA, "transcript.jsonl"),
+        JSON.stringify({
+          type: "PLANNER_RESPONSE",
+          tool_calls: [{ name: "call_mcp_tool", args: { ToolName: '"whoami"', Arguments: "{}" } }],
+        }) + "\n",
+      );
+      const whoA1 = await mcp.send(callTool(10, "whoami"));
+      expect(whoA1.result.content[0].text).toContain("Agent ID: slot-bot-1");
+      expect(loadSessionBinds(cfgDir)[cidA]).toBe("profile");
+
+      // 2. Conversation B (Antigravity) calls whoami -> must NOT steal slot-bot-1 from Conversation A!
+      writeFileSync(
+        join(logDirB, "transcript.jsonl"),
+        JSON.stringify({
+          type: "PLANNER_RESPONSE",
+          tool_calls: [{ name: "call_mcp_tool", args: { ToolName: '"whoami"', Arguments: "{}" } }],
+        }) + "\n",
+      );
+      const whoB1 = await mcp.send(callTool(11, "whoami"));
+      expect(whoB1.result.content[0].text).toContain("(none — anonymous, no profile written)");
+      expect(onlineAgents.has("slot-bot-1")).toBe(true);
+
+      // 3. Conversation B tries to connect to "profile" -> refused because Conversation A holds it
+      writeFileSync(
+        join(logDirB, "transcript.jsonl"),
+        JSON.stringify({
+          type: "PLANNER_RESPONSE",
+          tool_calls: [
+            {
+              name: "call_mcp_tool",
+              args: { ToolName: '"connect_profile"', Arguments: '{"profile_name":"profile"}' },
+            },
+          ],
+        }) + "\n",
+      );
+      const trySteal = await mcp.send(callTool(12, "connect_profile", { profile_name: "profile" }));
+      expect(trySteal.result.isError).toBe(true);
+      expect(trySteal.result.content[0].text).toContain("currently in use");
+
+      // 4. Conversation B connects to "SecondBot" -> BOTH slot-bot-1 and slot-bot-2 stay online simultaneously!
+      writeFileSync(
+        join(logDirB, "transcript.jsonl"),
+        JSON.stringify({
+          type: "PLANNER_RESPONSE",
+          tool_calls: [
+            {
+              name: "call_mcp_tool",
+              args: { ToolName: '"connect_profile"', Arguments: '{"profile_name":"SecondBot"}' },
+            },
+          ],
+        }) + "\n",
+      );
+      const connB = await mcp.send(callTool(13, "connect_profile", { profile_name: "SecondBot" }));
+      expect(connB.result.isError).toBeUndefined();
+      expect(connB.result.content[0].text).toContain("slot-bot-2");
+
+      for (let i = 0; i < 25 && !onlineAgents.has("slot-bot-2"); i++) {
+        await new Promise((r) => setTimeout(r, 20));
+      }
+      expect(onlineAgents.has("slot-bot-1")).toBe(true);
+      expect(onlineAgents.has("slot-bot-2")).toBe(true);
+
+      // 5. ZCode Session 3 (via _meta.session_id) connects to "ThirdBot" -> ALL THREE bots online in one process!
+      const connC = await mcp.send(
+        callTool(14, "connect_profile", { profile_name: "ThirdBot" }, { session_id: "sess_zcode_3" }),
+      );
+      expect(connC.result.isError).toBeUndefined();
+      expect(connC.result.content[0].text).toContain("slot-bot-3");
+
+      for (let i = 0; i < 25 && !onlineAgents.has("slot-bot-3"); i++) {
+        await new Promise((r) => setTimeout(r, 20));
+      }
+      expect(onlineAgents.has("slot-bot-1")).toBe(true);
+      expect(onlineAgents.has("slot-bot-2")).toBe(true);
+      expect(onlineAgents.has("slot-bot-3")).toBe(true);
+
+      // 6. Verify automatic per-call routing across all 3 sessions without manual switching!
+      writeFileSync(
+        join(logDirA, "transcript.jsonl"),
+        JSON.stringify({
+          type: "PLANNER_RESPONSE",
+          tool_calls: [{ name: "call_mcp_tool", args: { ToolName: '"whoami"', Arguments: "{}" } }],
+        }) + "\n",
+      );
+      const checkA = await mcp.send(callTool(15, "whoami"));
+      expect(checkA.result.content[0].text).toContain("Agent ID: slot-bot-1");
+
+      writeFileSync(
+        join(logDirB, "transcript.jsonl"),
+        JSON.stringify({
+          type: "PLANNER_RESPONSE",
+          tool_calls: [{ name: "call_mcp_tool", args: { ToolName: '"whoami"', Arguments: "{}" } }],
+        }) + "\n",
+      );
+      const checkB = await mcp.send(callTool(16, "whoami"));
+      expect(checkB.result.content[0].text).toContain("Agent ID: slot-bot-2");
+
+      const checkC = await mcp.send(callTool(17, "whoami", {}, { session_id: "sess_zcode_3" }));
+      expect(checkC.result.content[0].text).toContain("Agent ID: slot-bot-3");
+    } finally {
+      await mcp.close();
+      wsHub.stop(true);
     }
   });
 });

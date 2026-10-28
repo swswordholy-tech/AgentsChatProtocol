@@ -14,8 +14,8 @@
  *    crashed/closed processes automatically release their lock (never deadlocks).
  */
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, readdirSync, unlinkSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, statSync, unlinkSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { safeWriteProfile } from "./profile-store.ts";
@@ -23,7 +23,7 @@ import { safeWriteProfile } from "./profile-store.ts";
 export const DEFAULT_SESSION_BINDS_FILENAME = "session-binds.json";
 export const LEGACY_AGY_BINDS_FILENAME = "agy-binds.json";
 
-export type HarnessRuntime = "claude-code" | "antigravity" | "zcode" | "codex-bridge" | "custom" | "mcp";
+export type HarnessRuntime = "claude-code" | "antigravity" | "zcode" | "dsh" | "codex-bridge" | "custom" | "mcp";
 
 export interface DetectedSession {
   sessionId: string;
@@ -109,7 +109,12 @@ export function checkAgentLock(opts: {
     try { unlinkSync(lockFilePath(lockDir, agentId)); } catch {}
     return { locked: false, stale: true };
   }
-  if (record.pid === currentPid) return { locked: false, holder: record };
+  if (record.pid === currentPid) {
+    if (opts.currentSessionId && record.sessionId && opts.currentSessionId !== record.sessionId) {
+      return { locked: true, holder: record };
+    }
+    return { locked: false, holder: record };
+  }
   if (opts.lockOwnerPid && record.pid === opts.lockOwnerPid) return { locked: false, holder: record };
   if (opts.currentSessionId && record.sessionId && opts.currentSessionId === record.sessionId) {
     return { locked: false, holder: record };
@@ -416,4 +421,251 @@ export function discoverAntigravityHost(opts?: {
     cachedAgyHost = { at: now, info: null };
     return null;
   }
+}
+
+/**
+ * Identify which Antigravity conversation (`<conversationId>`) just invoked an MCP tool.
+ * Immediately before invoking any MCP tool, Antigravity's `language_server` appends a
+ * `PLANNER_RESPONSE` JSONL entry containing the tool call (`call_mcp_tool` or
+ * `mcp_agentschat_<tool>`) to `<brainDir>/<cid>/.system_generated/logs/transcript.jsonl`.
+ */
+export function detectAntigravityCallerSession(opts?: {
+  toolName?: string;
+  args?: Record<string, unknown> | null;
+  brainDir?: string;
+  openConversations?: string[];
+  nowMs?: number;
+  maxAgeMs?: number;
+}): string | null {
+  const brainDir =
+    opts?.brainDir?.trim() ||
+    process.env.AGENTSCHAT_AGY_BRAIN_DIR?.trim() ||
+    join(homedir(), ".gemini", "antigravity", "brain");
+  if (!existsSync(brainDir)) return null;
+
+  const nowMs = opts?.nowMs ?? Date.now();
+  const maxAgeMs = opts?.maxAgeMs ?? 30_000;
+  const uuidRe = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+  const candidateSet = new Set<string>();
+  for (const cid of opts?.openConversations ?? []) {
+    if (uuidRe.test(cid)) candidateSet.add(cid);
+  }
+  try {
+    for (const entry of readdirSync(brainDir)) {
+      if (uuidRe.test(entry)) candidateSet.add(entry);
+    }
+  } catch {}
+  if (candidateSet.size === 0) return null;
+
+  const toolName = opts?.toolName?.trim() || "";
+  const argStrings: string[] = [];
+  if (opts?.args && typeof opts.args === "object") {
+    for (const val of Object.values(opts.args)) {
+      if (typeof val === "string") {
+        const trimmed = val.trim();
+        if (trimmed.length >= 2 && trimmed.length <= 200) {
+          argStrings.push(trimmed);
+        }
+      }
+    }
+  }
+
+  let bestCid: string | null = null;
+  let bestScore = -1;
+  let bestMtime = -1;
+  const recentCids: { cid: string; mtimeMs: number }[] = [];
+
+  for (const cid of candidateSet) {
+    const transcriptPath = join(brainDir, cid, ".system_generated", "logs", "transcript.jsonl");
+    let st: ReturnType<typeof statSync>;
+    try {
+      st = statSync(transcriptPath);
+    } catch {
+      continue;
+    }
+    if (st.size <= 0 || nowMs - st.mtimeMs > maxAgeMs) continue;
+    recentCids.push({ cid, mtimeMs: st.mtimeMs });
+
+    let tail = "";
+    let fd: number | null = null;
+    try {
+      fd = openSync(transcriptPath, "r");
+      const readLen = Math.min(st.size, 16_384);
+      const buf = Buffer.allocUnsafe(readLen);
+      const bytesRead = readSync(fd, buf, 0, readLen, st.size - readLen);
+      tail = buf.toString("utf8", 0, bytesRead);
+    } catch {
+      continue;
+    } finally {
+      if (fd !== null) {
+        try { closeSync(fd); } catch {}
+      }
+    }
+
+    const lines = tail.split(/\r?\n/).filter((l) => l.trim().length > 0);
+    for (let i = lines.length - 1; i >= Math.max(0, lines.length - 12); i--) {
+      const line = lines[i]!;
+      if (!line.includes('"PLANNER_RESPONSE"')) continue;
+      let score = 0;
+      if (toolName) {
+        const hasToolMatch =
+          line.includes(`"mcp_agentschat_${toolName}"`) ||
+          line.includes(`\\"ToolName\\":\\"${toolName}\\"`) ||
+          line.includes(`"ToolName":"\\"${toolName}\\""`) ||
+          line.includes(`"ToolName":"${toolName}"`) ||
+          line.includes(`"name":"${toolName}"`) ||
+          line.includes(`\\"tool_name\\":\\"${toolName}\\"`) ||
+          line.includes(`"tool_name":"${toolName}"`);
+        if (!hasToolMatch) continue;
+        score += 1000;
+      } else {
+        score += 100;
+      }
+      if (i === lines.length - 1) score += 50;
+      for (const s of argStrings) {
+        if (line.includes(s)) score += 200;
+      }
+      if (score > bestScore || (score === bestScore && st.mtimeMs > bestMtime)) {
+        bestScore = score;
+        bestMtime = st.mtimeMs;
+        bestCid = cid;
+      }
+      break;
+    }
+  }
+
+  if (bestCid) return bestCid;
+  if (recentCids.length === 1 && nowMs - recentCids[0]!.mtimeMs <= 5_000) {
+    return recentCids[0]!.cid;
+  }
+  return null;
+}
+
+let cachedIsDshHost: { at: number; value: boolean } | null = null;
+
+/** Check if this MCP server was spawned by DeepSeek Harness (`dsh`). */
+export function isDshHostProcess(opts?: {
+  currentPid?: number;
+  env?: Record<string, string | undefined>;
+  cacheMs?: number;
+}): boolean {
+  const env = opts?.env ?? process.env;
+  if (
+    env.AGENTSCHAT_DSH_HOME?.trim() ||
+    env.DSH_HOME?.trim() ||
+    env.AGENTSCHAT_DSH_HEALTH_URL?.trim()
+  ) {
+    return true;
+  }
+  const now = Date.now();
+  const cacheMs = opts?.cacheMs ?? 15_000;
+  if (cachedIsDshHost && now - cachedIsDshHost.at < cacheMs) return cachedIsDshHost.value;
+  try {
+    let pid = opts?.currentPid ?? process.pid;
+    for (let hop = 0; hop < 4 && pid > 1; hop++) {
+      const ps = spawnSync("ps", ["-ww", "-p", String(pid), "-o", "ppid=,command="], {
+        encoding: "utf8",
+        timeout: 1000,
+      });
+      if (ps.status !== 0 || !ps.stdout) break;
+      const line = ps.stdout.trim().split(/\r?\n/)[0]?.trim() || "";
+      const m = line.match(/^(\d+)\s+(.*)$/);
+      if (!m) break;
+      const ppid = Number(m[1]);
+      const cmd = m[2]!;
+      if (hop > 0 && (cmd.includes("bun test") || cmd.includes("node --test"))) break;
+      if (cmd.includes("@deepseek-ai") || cmd.includes("/.dsh/") || /\bdsh\b/.test(cmd)) {
+        cachedIsDshHost = { at: now, value: true };
+        return true;
+      }
+      pid = ppid;
+    }
+  } catch {}
+  cachedIsDshHost = { at: now, value: false };
+  return false;
+}
+
+/**
+ * Identify the active DeepSeek Harness (`dsh`) session (`session-...`) during a tool call
+ * by inspecting the local DSH inbound plugin `/health` (`status === "running"`) and
+ * `<dshHome>/storages/session_projcache/sessions/<sid>.json` mtimes.
+ */
+export async function detectDshCallerSession(opts?: {
+  dshHome?: string;
+  healthUrl?: string;
+  env?: Record<string, string | undefined>;
+  nowMs?: number;
+  fetchImpl?: typeof fetch;
+}): Promise<string | null> {
+  const env = opts?.env ?? process.env;
+  if (!opts?.dshHome && !opts?.healthUrl && !isDshHostProcess({ env })) {
+    return null;
+  }
+  const dshHome =
+    opts?.dshHome?.trim() ||
+    env.AGENTSCHAT_DSH_HOME?.trim() ||
+    env.DSH_HOME?.trim() ||
+    join(homedir(), ".dsh");
+  const sessionsDir = join(dshHome, "storages", "session_projcache", "sessions");
+  const healthUrl =
+    opts?.healthUrl?.trim() ||
+    env.AGENTSCHAT_DSH_HEALTH_URL?.trim() ||
+    "http://127.0.0.1:8799/health";
+  const nowMs = opts?.nowMs ?? Date.now();
+
+  const getSessionMtime = (sid: string): number => {
+    try {
+      return statSync(join(sessionsDir, `${sid}.json`)).mtimeMs;
+    } catch {
+      return 0;
+    }
+  };
+
+  try {
+    const f = opts?.fetchImpl ?? fetch;
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 150);
+    try {
+      const res = await f(healthUrl, { signal: ctrl.signal });
+      if (res.ok) {
+        const data = (await res.json()) as {
+          roots?: Array<{ id?: string; status?: string }>;
+        };
+        const roots = Array.isArray(data?.roots) ? data.roots : [];
+        const running = roots
+          .filter((r) => typeof r?.id === "string" && r.id.startsWith("session-") && r.status === "running")
+          .map((r) => r.id!);
+        if (running.length === 1) return running[0]!;
+        if (running.length > 1) {
+          running.sort((a, b) => getSessionMtime(b) - getSessionMtime(a));
+          return running[0]!;
+        }
+        const allValid = roots
+          .filter((r) => typeof r?.id === "string" && r.id.startsWith("session-"))
+          .map((r) => r.id!);
+        if (allValid.length === 1) return allValid[0]!;
+      }
+    } finally {
+      clearTimeout(timer);
+    }
+  } catch {}
+
+  if (existsSync(sessionsDir)) {
+    try {
+      let newestSid: string | null = null;
+      let newestMtime = 0;
+      for (const file of readdirSync(sessionsDir)) {
+        if (!file.startsWith("session-") || !file.endsWith(".json")) continue;
+        const sid = file.slice(0, -5);
+        const mtime = getSessionMtime(sid);
+        if (mtime > newestMtime && nowMs - mtime <= 30_000) {
+          newestMtime = mtime;
+          newestSid = sid;
+        }
+      }
+      if (newestSid) return newestSid;
+    } catch {}
+  }
+  return null;
 }

@@ -86,6 +86,7 @@
     "src/profile-selection.ts",
     "src/grok-bind.ts",
     "src/session-bind.ts",
+    "src/session-route.ts",
     "src/tool-annotations.ts",
     "src/identity-guard.ts",
     "src/terms.ts",

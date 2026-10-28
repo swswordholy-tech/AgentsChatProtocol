@@ -886,8 +886,8 @@ function fireZcodeWake(msg, cfg) {
 
 // src/session-bind.ts
 import { createHash } from "node:crypto";
-import { existsSync as existsSync3, mkdirSync, readFileSync as readFileSync3, unlinkSync as unlinkSync2 } from "node:fs";
-import { tmpdir } from "node:os";
+import { closeSync, existsSync as existsSync3, mkdirSync, openSync, readFileSync as readFileSync3, readSync, readdirSync, statSync as statSync2, unlinkSync as unlinkSync2 } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { join as join3 } from "node:path";
 import { spawnSync } from "node:child_process";
 
@@ -980,8 +980,12 @@ function checkAgentLock(opts) {
     } catch {}
     return { locked: false, stale: true };
   }
-  if (record.pid === currentPid)
+  if (record.pid === currentPid) {
+    if (opts.currentSessionId && record.sessionId && opts.currentSessionId !== record.sessionId) {
+      return { locked: true, holder: record };
+    }
     return { locked: false, holder: record };
+  }
   if (opts.lockOwnerPid && record.pid === opts.lockOwnerPid)
     return { locked: false, holder: record };
   if (opts.currentSessionId && record.sessionId && opts.currentSessionId === record.sessionId) {
@@ -1226,6 +1230,358 @@ function discoverAntigravityHost(opts) {
     return null;
   }
 }
+function detectAntigravityCallerSession(opts) {
+  const brainDir = opts?.brainDir?.trim() || process.env.AGENTSCHAT_AGY_BRAIN_DIR?.trim() || join3(homedir(), ".gemini", "antigravity", "brain");
+  if (!existsSync3(brainDir))
+    return null;
+  const nowMs = opts?.nowMs ?? Date.now();
+  const maxAgeMs = opts?.maxAgeMs ?? 30000;
+  const uuidRe = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  const candidateSet = new Set;
+  for (const cid of opts?.openConversations ?? []) {
+    if (uuidRe.test(cid))
+      candidateSet.add(cid);
+  }
+  try {
+    for (const entry of readdirSync(brainDir)) {
+      if (uuidRe.test(entry))
+        candidateSet.add(entry);
+    }
+  } catch {}
+  if (candidateSet.size === 0)
+    return null;
+  const toolName = opts?.toolName?.trim() || "";
+  const argStrings = [];
+  if (opts?.args && typeof opts.args === "object") {
+    for (const val of Object.values(opts.args)) {
+      if (typeof val === "string") {
+        const trimmed = val.trim();
+        if (trimmed.length >= 2 && trimmed.length <= 200) {
+          argStrings.push(trimmed);
+        }
+      }
+    }
+  }
+  let bestCid = null;
+  let bestScore = -1;
+  let bestMtime = -1;
+  const recentCids = [];
+  for (const cid of candidateSet) {
+    const transcriptPath = join3(brainDir, cid, ".system_generated", "logs", "transcript.jsonl");
+    let st;
+    try {
+      st = statSync2(transcriptPath);
+    } catch {
+      continue;
+    }
+    if (st.size <= 0 || nowMs - st.mtimeMs > maxAgeMs)
+      continue;
+    recentCids.push({ cid, mtimeMs: st.mtimeMs });
+    let tail = "";
+    let fd = null;
+    try {
+      fd = openSync(transcriptPath, "r");
+      const readLen = Math.min(st.size, 16384);
+      const buf = Buffer.allocUnsafe(readLen);
+      const bytesRead = readSync(fd, buf, 0, readLen, st.size - readLen);
+      tail = buf.toString("utf8", 0, bytesRead);
+    } catch {
+      continue;
+    } finally {
+      if (fd !== null) {
+        try {
+          closeSync(fd);
+        } catch {}
+      }
+    }
+    const lines = tail.split(/\r?\n/).filter((l) => l.trim().length > 0);
+    for (let i = lines.length - 1;i >= Math.max(0, lines.length - 12); i--) {
+      const line = lines[i];
+      if (!line.includes('"PLANNER_RESPONSE"'))
+        continue;
+      let score = 0;
+      if (toolName) {
+        const hasToolMatch = line.includes(`"mcp_agentschat_${toolName}"`) || line.includes(`\\"ToolName\\":\\"${toolName}\\"`) || line.includes(`"ToolName":"\\"${toolName}\\""`) || line.includes(`"ToolName":"${toolName}"`) || line.includes(`"name":"${toolName}"`) || line.includes(`\\"tool_name\\":\\"${toolName}\\"`) || line.includes(`"tool_name":"${toolName}"`);
+        if (!hasToolMatch)
+          continue;
+        score += 1000;
+      } else {
+        score += 100;
+      }
+      if (i === lines.length - 1)
+        score += 50;
+      for (const s of argStrings) {
+        if (line.includes(s))
+          score += 200;
+      }
+      if (score > bestScore || score === bestScore && st.mtimeMs > bestMtime) {
+        bestScore = score;
+        bestMtime = st.mtimeMs;
+        bestCid = cid;
+      }
+      break;
+    }
+  }
+  if (bestCid)
+    return bestCid;
+  if (recentCids.length === 1 && nowMs - recentCids[0].mtimeMs <= 5000) {
+    return recentCids[0].cid;
+  }
+  return null;
+}
+var cachedIsDshHost = null;
+function isDshHostProcess(opts) {
+  const env = opts?.env ?? process.env;
+  if (env.AGENTSCHAT_DSH_HOME?.trim() || env.DSH_HOME?.trim() || env.AGENTSCHAT_DSH_HEALTH_URL?.trim()) {
+    return true;
+  }
+  const now = Date.now();
+  const cacheMs = opts?.cacheMs ?? 15000;
+  if (cachedIsDshHost && now - cachedIsDshHost.at < cacheMs)
+    return cachedIsDshHost.value;
+  try {
+    let pid = opts?.currentPid ?? process.pid;
+    for (let hop = 0;hop < 4 && pid > 1; hop++) {
+      const ps = spawnSync("ps", ["-ww", "-p", String(pid), "-o", "ppid=,command="], {
+        encoding: "utf8",
+        timeout: 1000
+      });
+      if (ps.status !== 0 || !ps.stdout)
+        break;
+      const line = ps.stdout.trim().split(/\r?\n/)[0]?.trim() || "";
+      const m = line.match(/^(\d+)\s+(.*)$/);
+      if (!m)
+        break;
+      const ppid = Number(m[1]);
+      const cmd = m[2];
+      if (hop > 0 && (cmd.includes("bun test") || cmd.includes("node --test")))
+        break;
+      if (cmd.includes("@deepseek-ai") || cmd.includes("/.dsh/") || /\bdsh\b/.test(cmd)) {
+        cachedIsDshHost = { at: now, value: true };
+        return true;
+      }
+      pid = ppid;
+    }
+  } catch {}
+  cachedIsDshHost = { at: now, value: false };
+  return false;
+}
+async function detectDshCallerSession(opts) {
+  const env = opts?.env ?? process.env;
+  if (!opts?.dshHome && !opts?.healthUrl && !isDshHostProcess({ env })) {
+    return null;
+  }
+  const dshHome = opts?.dshHome?.trim() || env.AGENTSCHAT_DSH_HOME?.trim() || env.DSH_HOME?.trim() || join3(homedir(), ".dsh");
+  const sessionsDir = join3(dshHome, "storages", "session_projcache", "sessions");
+  const healthUrl = opts?.healthUrl?.trim() || env.AGENTSCHAT_DSH_HEALTH_URL?.trim() || "http://127.0.0.1:8799/health";
+  const nowMs = opts?.nowMs ?? Date.now();
+  const getSessionMtime = (sid) => {
+    try {
+      return statSync2(join3(sessionsDir, `${sid}.json`)).mtimeMs;
+    } catch {
+      return 0;
+    }
+  };
+  try {
+    const f = opts?.fetchImpl ?? fetch;
+    const ctrl = new AbortController;
+    const timer = setTimeout(() => ctrl.abort(), 150);
+    try {
+      const res = await f(healthUrl, { signal: ctrl.signal });
+      if (res.ok) {
+        const data = await res.json();
+        const roots = Array.isArray(data?.roots) ? data.roots : [];
+        const running = roots.filter((r) => typeof r?.id === "string" && r.id.startsWith("session-") && r.status === "running").map((r) => r.id);
+        if (running.length === 1)
+          return running[0];
+        if (running.length > 1) {
+          running.sort((a, b) => getSessionMtime(b) - getSessionMtime(a));
+          return running[0];
+        }
+        const allValid = roots.filter((r) => typeof r?.id === "string" && r.id.startsWith("session-")).map((r) => r.id);
+        if (allValid.length === 1)
+          return allValid[0];
+      }
+    } finally {
+      clearTimeout(timer);
+    }
+  } catch {}
+  if (existsSync3(sessionsDir)) {
+    try {
+      let newestSid = null;
+      let newestMtime = 0;
+      for (const file of readdirSync(sessionsDir)) {
+        if (!file.startsWith("session-") || !file.endsWith(".json"))
+          continue;
+        const sid = file.slice(0, -5);
+        const mtime = getSessionMtime(sid);
+        if (mtime > newestMtime && nowMs - mtime <= 30000) {
+          newestMtime = mtime;
+          newestSid = sid;
+        }
+      }
+      if (newestSid)
+        return newestSid;
+    } catch {}
+  }
+  return null;
+}
+
+// src/session-route.ts
+import { existsSync as existsSync5, readFileSync as readFileSync5 } from "node:fs";
+import { homedir as homedir2 } from "node:os";
+import { join as join5 } from "node:path";
+
+// src/session-bind.ts
+import { closeSync as closeSync2, existsSync as existsSync4, mkdirSync as mkdirSync2, openSync as openSync2, readFileSync as readFileSync4, readSync as readSync2, readdirSync as readdirSync2, statSync as statSync3, unlinkSync as unlinkSync3 } from "node:fs";
+import { join as join4 } from "node:path";
+var DEFAULT_SESSION_BINDS_FILENAME2 = "session-binds.json";
+var LEGACY_AGY_BINDS_FILENAME2 = "agy-binds.json";
+function parseSessionBinds2(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw))
+    return {};
+  const out = {};
+  for (const [k, v] of Object.entries(raw)) {
+    const key = k.trim();
+    if (!key)
+      continue;
+    if (typeof v === "string" && v.trim()) {
+      out[key] = v.trim();
+    } else if (v && typeof v === "object" && typeof v.profile === "string" && v.profile.trim()) {
+      out[key] = v.profile.trim();
+    }
+  }
+  return out;
+}
+function loadSessionBinds2(configDir) {
+  const merged = {};
+  for (const filename of [LEGACY_AGY_BINDS_FILENAME2, DEFAULT_SESSION_BINDS_FILENAME2]) {
+    const path = join4(configDir, filename);
+    if (!existsSync4(path))
+      continue;
+    try {
+      Object.assign(merged, parseSessionBinds2(JSON.parse(readFileSync4(path, "utf8"))));
+    } catch {}
+  }
+  return merged;
+}
+
+// src/session-route.ts
+function agentschatConfigDir(env = process.env) {
+  return env.AGENTSCHAT_CONFIG_DIR ?? join5(homedir2(), ".agentschat");
+}
+function profilePathForName(configDir, name) {
+  if (!name || name.includes("/") || name.includes("\\"))
+    return;
+  const base = name.replace(/\.json$/, "").replace(/[^a-zA-Z0-9_-]/g, "_");
+  const nested = join5(configDir, "profiles", `${base}.json`);
+  if (existsSync5(nested))
+    return nested;
+  const flat = join5(configDir, `${base}.json`);
+  return existsSync5(flat) ? flat : undefined;
+}
+function readAgentId(path) {
+  try {
+    const parsed = JSON.parse(readFileSync5(path, "utf8"));
+    return typeof parsed.agent_id === "string" && parsed.agent_id ? parsed.agent_id : undefined;
+  } catch {
+    return;
+  }
+}
+function resolveSessionForAgent(agentId, opts = {}) {
+  if (typeof agentId !== "string" || agentId.length === 0)
+    return;
+  const configDir = opts.configDir ?? agentschatConfigDir(opts.env);
+  let binds;
+  try {
+    binds = loadSessionBinds2(configDir);
+  } catch {
+    return;
+  }
+  for (const [sessionId, profileName] of Object.entries(binds).reverse()) {
+    const path = profilePathForName(configDir, profileName);
+    if (path === undefined)
+      continue;
+    if (readAgentId(path) !== agentId)
+      continue;
+    return { sessionId, profileName, agentId };
+  }
+  return;
+}
+
+// src/heartbeat.ts
+var WS_CONNECTING = 0;
+var WS_OPEN = 1;
+var WS_CLOSING = 2;
+var WS_CLOSED = 3;
+
+class HeartbeatMonitor {
+  deps;
+  pingInterval;
+  pongTimeout;
+  connectTimeout;
+  lastPong;
+  timer = null;
+  connectingSince = null;
+  reconnecting = false;
+  constructor(deps, pingInterval = 30000, pongTimeout = 90000, connectTimeout = 30000) {
+    this.deps = deps;
+    this.pingInterval = pingInterval;
+    this.pongTimeout = pongTimeout;
+    this.connectTimeout = connectTimeout;
+    this.lastPong = Date.now();
+  }
+  receivedPong() {
+    this.lastPong = Date.now();
+    this.connectingSince = null;
+    this.reconnecting = false;
+  }
+  start() {
+    this.stop();
+    this.lastPong = Date.now();
+    this.connectingSince = null;
+    this.reconnecting = false;
+    this.timer = setInterval(() => this.tick(), this.pingInterval);
+  }
+  stop() {
+    if (this.timer) {
+      clearInterval(this.timer);
+      this.timer = null;
+    }
+  }
+  resetReconnecting() {
+    this.reconnecting = false;
+  }
+  tick() {
+    const state = this.deps.getReadyState();
+    if (state === WS_OPEN) {
+      this.connectingSince = null;
+      if (Date.now() - this.lastPong > this.pongTimeout) {
+        this.safeReconnect("pong timeout");
+        return;
+      }
+      this.deps.sendPing();
+      return;
+    }
+    if (state === WS_CONNECTING) {
+      if (!this.connectingSince) {
+        this.connectingSince = Date.now();
+      } else if (Date.now() - this.connectingSince > this.connectTimeout) {
+        this.connectingSince = null;
+        this.safeReconnect("connect timeout");
+      }
+      return;
+    }
+    this.connectingSince = null;
+    this.safeReconnect(state === WS_CLOSING ? "stuck closing" : "closed");
+  }
+  safeReconnect(reason) {
+    if (this.reconnecting)
+      return;
+    this.reconnecting = true;
+    this.deps.reconnect();
+  }
+}
 // package.json
 var package_default = {
   name: "agentschat-mcp",
@@ -1315,6 +1671,7 @@ var package_default = {
     "src/profile-selection.ts",
     "src/grok-bind.ts",
     "src/session-bind.ts",
+    "src/session-route.ts",
     "src/tool-annotations.ts",
     "src/identity-guard.ts",
     "src/terms.ts",
@@ -1360,17 +1717,17 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema
 } from "@modelcontextprotocol/sdk/types.js";
-import { readFileSync as readFileSync5, existsSync as existsSync5, writeFileSync as writeFileSync4, mkdirSync as mkdirSync2, readdirSync as readdirSync2 } from "fs";
-import { join as join4, dirname } from "path";
+import { readFileSync as readFileSync7, existsSync as existsSync7, writeFileSync as writeFileSync4, mkdirSync as mkdirSync3, readdirSync as readdirSync3 } from "fs";
+import { join as join6, dirname } from "path";
 
 // src/profile-store.ts
-import { existsSync as existsSync4, writeFileSync as writeFileSync2, renameSync as renameSync2, chmodSync as chmodSync2, unlinkSync as unlinkSync3, statSync as statSync2 } from "fs";
+import { existsSync as existsSync6, writeFileSync as writeFileSync2, renameSync as renameSync2, chmodSync as chmodSync2, unlinkSync as unlinkSync4, statSync as statSync4 } from "fs";
 var defaultWarn2 = (m) => process.stderr.write(m);
 function safeWriteProfile2(path, data, warn = defaultWarn2) {
   const tmp = path + ".tmp";
   try {
-    if (existsSync4(tmp))
-      unlinkSync3(tmp);
+    if (existsSync6(tmp))
+      unlinkSync4(tmp);
   } catch (e) {
     warn(`[agentchat] WARNING: stale ${tmp} could not be removed: ${e}
 `);
@@ -1384,7 +1741,7 @@ function safeWriteProfile2(path, data, warn = defaultWarn2) {
 `);
   }
   try {
-    const mode = statSync2(path).mode & 511;
+    const mode = statSync4(path).mode & 511;
     if (mode !== 384) {
       warn(`[agentchat] WARNING: ${path} is mode ${mode.toString(8)}, expected 600 — it holds your agent key. Fix: chmod 600 ${path}
 `);
@@ -1477,10 +1834,10 @@ function expectedAgentIdViolation(expected, liveAgentId) {
 }
 
 // src/read-cursor.ts
-import { readFileSync as readFileSync4, writeFileSync as writeFileSync3 } from "fs";
+import { readFileSync as readFileSync6, writeFileSync as writeFileSync3 } from "fs";
 function loadCursor(file, warn) {
   try {
-    return new Map(Object.entries(JSON.parse(readFileSync4(file, "utf-8"))));
+    return new Map(Object.entries(JSON.parse(readFileSync6(file, "utf-8"))));
   } catch (e) {
     if (e?.code !== "ENOENT") {
       warn(`[agentchat] WARNING: could not read ${file} — resetting that state: ${e}
@@ -1510,82 +1867,6 @@ function flushCursor(state, persist) {
 
 // src/server.ts
 import { randomUUID } from "crypto";
-
-// src/heartbeat.ts
-var WS_CONNECTING = 0;
-var WS_OPEN = 1;
-var WS_CLOSING = 2;
-var WS_CLOSED = 3;
-
-class HeartbeatMonitor {
-  deps;
-  pingInterval;
-  pongTimeout;
-  connectTimeout;
-  lastPong;
-  timer = null;
-  connectingSince = null;
-  reconnecting = false;
-  constructor(deps, pingInterval = 30000, pongTimeout = 90000, connectTimeout = 30000) {
-    this.deps = deps;
-    this.pingInterval = pingInterval;
-    this.pongTimeout = pongTimeout;
-    this.connectTimeout = connectTimeout;
-    this.lastPong = Date.now();
-  }
-  receivedPong() {
-    this.lastPong = Date.now();
-    this.connectingSince = null;
-    this.reconnecting = false;
-  }
-  start() {
-    this.stop();
-    this.lastPong = Date.now();
-    this.connectingSince = null;
-    this.reconnecting = false;
-    this.timer = setInterval(() => this.tick(), this.pingInterval);
-  }
-  stop() {
-    if (this.timer) {
-      clearInterval(this.timer);
-      this.timer = null;
-    }
-  }
-  resetReconnecting() {
-    this.reconnecting = false;
-  }
-  tick() {
-    const state = this.deps.getReadyState();
-    if (state === WS_OPEN) {
-      this.connectingSince = null;
-      if (Date.now() - this.lastPong > this.pongTimeout) {
-        this.safeReconnect("pong timeout");
-        return;
-      }
-      this.deps.sendPing();
-      return;
-    }
-    if (state === WS_CONNECTING) {
-      if (!this.connectingSince) {
-        this.connectingSince = Date.now();
-      } else if (Date.now() - this.connectingSince > this.connectTimeout) {
-        this.connectingSince = null;
-        this.safeReconnect("connect timeout");
-      }
-      return;
-    }
-    this.connectingSince = null;
-    this.safeReconnect(state === WS_CLOSING ? "stuck closing" : "closed");
-  }
-  safeReconnect(reason) {
-    if (this.reconnecting)
-      return;
-    this.reconnecting = true;
-    this.deps.reconnect();
-  }
-}
-
-// src/server.ts
 for (const key of ["NO_PROXY", "no_proxy"]) {
   const cur = process.env[key]?.trim() || "";
   const items = cur ? cur.split(",").map((s) => s.trim()).filter(Boolean) : [];
@@ -1702,8 +1983,8 @@ Docs: https://github.com/swswordholy-tech/AgentsChatProtocol`);
   process.exit(0);
 }
 var homeDir = process.env.HOME || process.env.USERPROFILE || ".";
-var configDir = join4(homeDir, ".agentschat");
-var legacyConfigDir = join4(homeDir, ".agentchat");
+var configDir = join6(homeDir, ".agentschat");
+var legacyConfigDir = join6(homeDir, ".agentchat");
 var profileDirs = [configDir, legacyConfigDir];
 var lockDir = resolveLockDir(homeDir, process.env);
 var lockOwnerPid = Number(process.env.AGENTSCHAT_LOCK_OWNER_PID) || null;
@@ -1711,27 +1992,27 @@ var toolOnlyMode = process.env.AGENTSCHAT_TOOL_ONLY === "1";
 var runtimeSession = detectRuntimeSession(process.env);
 function profileNameToPaths(name) {
   if (name.startsWith("~/"))
-    return [join4(homeDir, name.slice(2))];
+    return [join6(homeDir, name.slice(2))];
   if (name.includes("/") || name.includes("\\"))
     return [name];
   name = name.replace(/\.json$/, "");
   const safeName = name.replace(/[^a-zA-Z0-9_-]/g, "_");
-  return profileDirs.map((dir) => join4(dir, `${safeName}.json`));
+  return profileDirs.map((dir) => join6(dir, `${safeName}.json`));
 }
 function nameToPath(name) {
   const candidates = profileNameToPaths(name);
-  const nested = join4(configDir, "profiles", name.replace(/\.json$/, "") + ".json");
-  if (!name.includes("/") && !name.includes("\\") && existsSync5(nested))
+  const nested = join6(configDir, "profiles", name.replace(/\.json$/, "") + ".json");
+  if (!name.includes("/") && !name.includes("\\") && existsSync7(nested))
     return nested;
-  return candidates.find((path) => existsSync5(path)) || candidates[0];
+  return candidates.find((path) => existsSync7(path)) || candidates[0];
 }
 function listProfileFiles() {
   const seen = new Set;
   const profiles = [];
-  for (const dir of [join4(configDir, "profiles"), ...profileDirs]) {
+  for (const dir of [join6(configDir, "profiles"), ...profileDirs]) {
     let files = [];
     try {
-      files = readdirSync2(dir).filter((f) => f.endsWith(".json"));
+      files = readdirSync3(dir).filter((f) => f.endsWith(".json"));
     } catch {}
     for (const file of files) {
       if (file === DEFAULT_GROK_BINDS_FILENAME || file === GROK_BINDS_META_FILENAME || file === DEFAULT_SESSION_BINDS_FILENAME || file === LEGACY_AGY_BINDS_FILENAME)
@@ -1740,7 +2021,7 @@ function listProfileFiles() {
       if (seen.has(name))
         continue;
       seen.add(name);
-      profiles.push({ name, path: join4(dir, file) });
+      profiles.push({ name, path: join6(dir, file) });
     }
   }
   return profiles;
@@ -1765,9 +2046,9 @@ function resolveProfile() {
   let binds = {};
   if (!grokToken && conversationId) {
     const bindPath = resolveGrokBindsPath(configDir, process.env.AGENTCHAT_GROK_BINDS);
-    if (existsSync5(bindPath)) {
+    if (existsSync7(bindPath)) {
       try {
-        const parsed = parseGrokBindsText(readFileSync5(bindPath, "utf-8"));
+        const parsed = parseGrokBindsText(readFileSync7(bindPath, "utf-8"));
         binds = parsed.binds;
         if (parsed.malformed) {
           process.stderr.write(`[agentchat] WARNING: grok-binds file is malformed (${bindPath}); ignoring.
@@ -1802,7 +2083,7 @@ function resolveProfile() {
     const boundProfile = sessionBinds[runtimeSession.sessionId];
     if (boundProfile) {
       const boundPath = nameToPath(boundProfile);
-      if (existsSync5(boundPath)) {
+      if (existsSync7(boundPath)) {
         process.stderr.write(`[agentchat] session-bind (${runtimeSession.runtime}): ${runtimeSession.sessionId} \u2192 profile "${boundProfile}"
 `);
         return { path: boundPath, source: "session-bind", declaredName: boundProfile };
@@ -1847,7 +2128,7 @@ if (hasToken && !explicitAgentId && profileSource === "default") {
   process.exit(1);
 }
 var identity = decideIdentity({
-  profileExists: existsSync5(profileFile),
+  profileExists: existsSync7(profileFile),
   source: profileSource,
   profileFile,
   cliName: cliArgs.name,
@@ -1858,7 +2139,7 @@ var identity = decideIdentity({
 });
 function readIdentityProfile(file) {
   try {
-    return JSON.parse(readFileSync5(file, "utf-8"));
+    return JSON.parse(readFileSync7(file, "utf-8"));
   } catch {
     throw new Error(`Cannot read identity profile at ${file}. Repair its JSON/permissions or select --profile <valid-name>.`);
   }
@@ -1960,7 +2241,7 @@ if (identity.mode === "profile") {
 `);
     process.exit(1);
   }
-  mkdirSync2(dirname(profileFile), { recursive: true });
+  mkdirSync3(dirname(profileFile), { recursive: true });
   safeWriteProfile2(profileFile, profile);
   process.stderr.write(`[agentchat] Profile saved: ${profileFile}
 `);
@@ -2059,10 +2340,10 @@ if (!anonymousMode && AGENT_ID && !cliArgs.registerOnly && !toolOnlyMode) {
   }
 }
 var identityGateMessage = "";
-var identityGuardFile = join4(configDir, IDENTITY_GUARD_FILENAME);
+var identityGuardFile = join6(configDir, IDENTITY_GUARD_FILENAME);
 function persistGuardRecord(rec) {
   try {
-    mkdirSync2(configDir, { recursive: true });
+    mkdirSync3(configDir, { recursive: true });
     safeWriteProfile2(identityGuardFile, rec);
   } catch {}
 }
@@ -2078,7 +2359,7 @@ function confirmLiveIdentityTrusted() {
 }
 var guardRecord = (() => {
   try {
-    return parseGuardRecord(readFileSync5(identityGuardFile, "utf-8"));
+    return parseGuardRecord(readFileSync7(identityGuardFile, "utf-8"));
   } catch {
     return emptyGuardRecord();
   }
@@ -2145,29 +2426,38 @@ var ws = null;
 var TYPING_HEARTBEAT_MS = 2000;
 var TYPING_HEARTBEAT_MAX_MS = 120000;
 var typingHeartbeats = new Map;
-function sendTypingFrame(channelId) {
-  if (ws && ws.readyState === WebSocket.OPEN) {
+function typingHeartbeatKey(channelId, agentId = AGENT_ID) {
+  return `${agentId || "default"}:${channelId}`;
+}
+function sendTypingFrame(channelId, slot = activeSlot) {
+  const targetWs = slot ? slot.ws : ws;
+  const senderId = slot ? slot.agentId : AGENT_ID;
+  if (targetWs && targetWs.readyState === WebSocket.OPEN && senderId) {
     try {
-      ws.send(JSON.stringify({ type: "typing", channel_id: channelId, sender_id: AGENT_ID, cross_pod: true }));
+      targetWs.send(JSON.stringify({ type: "typing", channel_id: channelId, sender_id: senderId, cross_pod: true }));
     } catch {}
   }
 }
-function startTypingHeartbeat(channelId) {
+function startTypingHeartbeat(channelId, slot = activeSlot) {
   if (!channelId || process.env.AGENTSCHAT_AUTO_TYPING === "0")
     return;
-  stopTypingHeartbeat(channelId);
-  sendTypingFrame(channelId);
-  const interval = setInterval(() => sendTypingFrame(channelId), TYPING_HEARTBEAT_MS);
-  const cap = setTimeout(() => stopTypingHeartbeat(channelId), TYPING_HEARTBEAT_MAX_MS);
-  typingHeartbeats.set(channelId, { interval, cap });
+  const agentId = slot ? slot.agentId : AGENT_ID;
+  stopTypingHeartbeat(channelId, slot);
+  sendTypingFrame(channelId, slot);
+  const interval = setInterval(() => sendTypingFrame(channelId, slot), TYPING_HEARTBEAT_MS);
+  const cap = setTimeout(() => stopTypingHeartbeat(channelId, slot), TYPING_HEARTBEAT_MAX_MS);
+  typingHeartbeats.set(typingHeartbeatKey(channelId, agentId), { interval, cap });
 }
-function stopTypingHeartbeat(channelId) {
-  const h = typingHeartbeats.get(channelId);
-  if (!h)
-    return;
-  clearInterval(h.interval);
-  clearTimeout(h.cap);
-  typingHeartbeats.delete(channelId);
+function stopTypingHeartbeat(channelId, slot = activeSlot) {
+  const agentId = slot ? slot.agentId : AGENT_ID;
+  for (const key of [typingHeartbeatKey(channelId, agentId), channelId]) {
+    const h = typingHeartbeats.get(key);
+    if (!h)
+      continue;
+    clearInterval(h.interval);
+    clearTimeout(h.cap);
+    typingHeartbeats.delete(key);
+  }
 }
 function stopAllTypingHeartbeats() {
   for (const h of typingHeartbeats.values()) {
@@ -2179,6 +2469,8 @@ function stopAllTypingHeartbeats() {
 var sessionId = null;
 var shuttingDown = false;
 var transport = null;
+var profileSlots = new Map;
+var activeSlot = null;
 var debugLogsEnabled = /^(1|true|yes|debug)$/i.test(process.env.AGENTSCHAT_MCP_DEBUG || process.env.AGENTCHAT_DEBUG || "");
 var defaultLogRateMs = Math.max(1000, Number(process.env.AGENTSCHAT_MCP_LOG_RATE_MS || 60000));
 var rateLimitedLogState = new Map;
@@ -3303,9 +3595,13 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: annotateT
 var TOOL_INPUT_SCHEMAS = new Map(ALL_TOOL_DEFS.map((t) => [t.name, t.inputSchema]));
 var MEMBER_CACHE_TTL_MS = 5 * 60000;
 var memberCache = new Map;
+function memberCacheKey(chatId) {
+  return `${AGENT_ID || "anon"}:${chatId}`;
+}
 async function fetchChannelMembers(chatId) {
   const now = Date.now();
-  const hit = memberCache.get(chatId);
+  const key = memberCacheKey(chatId);
+  const hit = memberCache.get(key);
   if (hit && now - hit.at < MEMBER_CACHE_TTL_MS)
     return hit.members;
   try {
@@ -3317,7 +3613,7 @@ async function fetchChannelMembers(chatId) {
     const body = await r.json();
     const members = Array.isArray(body?.members) ? body.members : [];
     const sameOwnerDirect = body?.same_owner_direct === true;
-    memberCache.set(chatId, { at: now, members, sameOwnerDirect });
+    memberCache.set(key, { at: now, members, sameOwnerDirect });
     return members;
   } catch {
     return hit?.members || [];
@@ -3325,12 +3621,13 @@ async function fetchChannelMembers(chatId) {
 }
 async function isSameOwnerDirectChannel(chatId) {
   const now = Date.now();
-  const hit = memberCache.get(chatId);
+  const key = memberCacheKey(chatId);
+  const hit = memberCache.get(key);
   if (hit && now - hit.at < MEMBER_CACHE_TTL_MS && typeof hit.sameOwnerDirect === "boolean") {
     return hit.sameOwnerDirect;
   }
   await fetchChannelMembers(chatId);
-  return memberCache.get(chatId)?.sameOwnerDirect === true;
+  return memberCache.get(key)?.sameOwnerDirect === true;
 }
 async function redactOutboundForChannel(chatId, text) {
   if (!text)
@@ -3447,10 +3744,10 @@ function mimeFromPath(p, kindHint) {
   return MEDIA_MIME_BY_EXT[ext] ?? "application/octet-stream";
 }
 async function uploadLocalFile(path, kindHint) {
-  if (!existsSync5(path))
+  if (!existsSync7(path))
     throw new Error(`file not found: ${path}`);
   const mime = mimeFromPath(path, kindHint);
-  const buf = readFileSync5(path);
+  const buf = readFileSync7(path);
   const name = path.split("/").pop() || "upload";
   const form = new FormData;
   form.append("file", new Blob([new Uint8Array(buf)], { type: mime }), name);
@@ -3647,10 +3944,10 @@ HANDLERS.set("transcribe", async (args) => {
 });
 function loadGrokBinds() {
   const bindPath = resolveGrokBindsPath(configDir, process.env.AGENTCHAT_GROK_BINDS);
-  if (!existsSync5(bindPath))
+  if (!existsSync7(bindPath))
     return {};
   try {
-    return parseGrokBindsText(readFileSync5(bindPath, "utf-8")).binds;
+    return parseGrokBindsText(readFileSync7(bindPath, "utf-8")).binds;
   } catch {
     return {};
   }
@@ -3664,59 +3961,208 @@ function currentGrokBindApplicability(binds) {
     binds
   });
 }
+var cursorFlushIntervalMs = Math.max(500, Number(process.env.AGENTSCHAT_MCP_CURSOR_FLUSH_MS || 5000));
+function flushSlotLastSeenMessageTs(slot) {
+  if (!slot.cursorState.dirty)
+    return;
+  if (slot.lastSeenMessageTsTimer) {
+    clearTimeout(slot.lastSeenMessageTsTimer);
+    slot.lastSeenMessageTsTimer = null;
+  }
+  flushCursor(slot.cursorState, () => persistCursor(slot.lastSeenMessageTsFile, slot.lastSeenMessageTs, safeStderrWrite));
+}
+function scheduleSlotLastSeenMessageTsSave(slot) {
+  slot.cursorState.dirty = true;
+  if (slot.lastSeenMessageTsTimer)
+    return;
+  slot.lastSeenMessageTsTimer = setTimeout(() => {
+    slot.lastSeenMessageTsTimer = null;
+    flushSlotLastSeenMessageTs(slot);
+  }, cursorFlushIntervalMs);
+  slot.lastSeenMessageTsTimer.unref?.();
+}
+function createProfileSlot(opts) {
+  const lastSeenFile = join6(configDir, `last-seen-msg-ts-${opts.agentId}.json`);
+  const slot = {
+    profileName: opts.profileName,
+    profileFile: opts.profileFile,
+    profile: opts.profile,
+    agentId: opts.agentId,
+    token: opts.token,
+    capabilities: opts.capabilities,
+    ws: null,
+    sessionId: null,
+    runtimeSession: opts.runtimeSession,
+    knownChannels: new Set,
+    wsReconnectAttempt: 0,
+    reconnectTimer: null,
+    backfillTimer: null,
+    heartbeat: null,
+    lastSeenMessageTsFile: lastSeenFile,
+    lastSeenMessageTs: loadCursor(lastSeenFile, safeStderrWrite),
+    cursorState: { dirty: false },
+    lastSeenMessageTsTimer: null,
+    messageDedup: new MessageDedup,
+    handleWSMessage: null
+  };
+  slot.heartbeat = new HeartbeatMonitor({
+    sendPing: () => {
+      try {
+        slot.ws?.send(JSON.stringify({ type: "ping", timestamp: new Date().toISOString() }));
+      } catch {}
+    },
+    reconnect: () => {
+      process.stderr.write(`[agentchat] Heartbeat timeout, forcing reconnect
+`);
+      if (slot.ws) {
+        slot.ws.onclose = null;
+        try {
+          slot.ws.close();
+        } catch {}
+      }
+      slot.ws = null;
+      slot.sessionId = null;
+      if (activeSlot === slot) {
+        ws = null;
+        sessionId = null;
+      }
+      slot.wsReconnectAttempt = 0;
+      scheduleReconnect(500, slot);
+    },
+    getReadyState: () => slot.ws?.readyState ?? WS_CLOSED
+  }, 15000, 45000, 30000);
+  return slot;
+}
+function activateSlot(slot, callerSession) {
+  if (callerSession) {
+    slot.runtimeSession = {
+      ...callerSession,
+      ...callerSession.workspacePath || slot.runtimeSession?.workspacePath ? { workspacePath: callerSession.workspacePath ?? slot.runtimeSession?.workspacePath } : {}
+    };
+  }
+  activeSlot = slot;
+  AGENT_ID = slot.agentId;
+  TOKEN = slot.token;
+  CAPABILITIES = slot.capabilities;
+  profile = slot.profile;
+  activeProfileFile = slot.profileFile;
+  anonymousMode = false;
+  ws = slot.ws;
+  sessionId = slot.sessionId;
+  runtimeSession = slot.runtimeSession;
+}
+function setAnonymousCallerState(callerSession) {
+  activeSlot = null;
+  AGENT_ID = "";
+  TOKEN = "";
+  profile = {};
+  activeProfileFile = null;
+  anonymousMode = true;
+  ws = null;
+  sessionId = null;
+  if (callerSession !== undefined) {
+    runtimeSession = callerSession;
+  }
+}
+function teardownSlot(slot, opts) {
+  try {
+    flushSlotLastSeenMessageTs(slot);
+  } catch {}
+  try {
+    slot.heartbeat.stop();
+  } catch {}
+  if (slot.backfillTimer) {
+    clearTimeout(slot.backfillTimer);
+    slot.backfillTimer = null;
+  }
+  if (slot.reconnectTimer) {
+    clearTimeout(slot.reconnectTimer);
+    slot.reconnectTimer = null;
+  }
+  if (slot.ws) {
+    slot.ws.onclose = null;
+    try {
+      slot.ws.close();
+    } catch {}
+    slot.ws = null;
+  }
+  slot.sessionId = null;
+  if (opts?.releaseLock !== false && slot.agentId && !toolOnlyMode) {
+    const boundSid = slot.runtimeSession?.sessionId || findBoundSessionForProfile(configDir, slot.profileName) || null;
+    releaseAgentLock({ lockDir, agentId: slot.agentId, currentSessionId: boundSid });
+  }
+  profileSlots.delete(slot.profileName);
+  if (activeSlot === slot) {
+    activeSlot = null;
+    ws = null;
+    sessionId = null;
+  }
+}
+if (!anonymousMode && AGENT_ID) {
+  const bootProfName = profileNameFromPath(activeProfileFile) ?? declaredName ?? AGENT_ID;
+  const bootSlot = createProfileSlot({
+    profileName: bootProfName,
+    profileFile: activeProfileFile,
+    profile,
+    agentId: AGENT_ID,
+    token: TOKEN,
+    capabilities: CAPABILITIES,
+    runtimeSession
+  });
+  profileSlots.set(bootProfName, bootSlot);
+  activateSlot(bootSlot, runtimeSession);
+}
 function applyIdentityFromProfile(newProfile, targetFile, bindSessionId) {
   validateIdentityProfile(newProfile, targetFile);
-  if (AGENT_ID && AGENT_ID !== newProfile.agent_id) {
-    releaseAgentLock({ lockDir, agentId: AGENT_ID, currentSessionId: runtimeSession?.sessionId ?? null });
-  }
-  heartbeat.stop();
-  stopAllTypingHeartbeats();
-  if (backfillTimer) {
-    clearTimeout(backfillTimer);
-    backfillTimer = null;
-  }
-  if (reconnectTimer) {
-    clearTimeout(reconnectTimer);
-    reconnectTimer = null;
-  }
-  if (ws) {
-    ws.onclose = null;
-    try {
-      ws.close();
-    } catch {}
-    ws = null;
-  }
-  sessionId = null;
-  AGENT_ID = newProfile.agent_id;
-  TOKEN = newProfile.token;
-  CAPABILITIES = newProfile.capabilities || ["claude-code", "coding", "chat"];
-  profile = newProfile;
-  activeProfileFile = targetFile;
-  anonymousMode = false;
-  const targetProfName = profileNameFromPath(targetFile);
+  const targetProfName = profileNameFromPath(targetFile) || newProfile.display_name || newProfile.agent_id;
+  let targetSession = runtimeSession ? { ...runtimeSession } : null;
   if (bindSessionId && bindSessionId.trim()) {
     const cleanSid = bindSessionId.trim();
-    const isAgyEnv = process.env.__CFBundleIdentifier === "com.google.antigravity" || Boolean(process.env.AGY_BROWSER_WS_URL) || Boolean(discoverAntigravityHost());
-    runtimeSession = {
+    const isAgyEnv = process.env.__CFBundleIdentifier === "com.google.antigravity" || Boolean(process.env.AGY_BROWSER_WS_URL) || Boolean(process.env.AGENTSCHAT_AGY_BRAIN_DIR) || Boolean(discoverAntigravityHost());
+    targetSession = {
       sessionId: cleanSid,
-      runtime: runtimeSession?.runtime ?? (isAgyEnv && /^[0-9a-f-]{36}$/i.test(cleanSid) ? "antigravity" : "custom"),
-      ...runtimeSession?.workspacePath ? { workspacePath: runtimeSession.workspacePath } : {}
+      runtime: targetSession?.runtime ?? (isAgyEnv && /^[0-9a-f-]{36}$/i.test(cleanSid) ? "antigravity" : cleanSid.startsWith("sess_") ? "zcode" : cleanSid.startsWith("session-") ? "dsh" : "custom"),
+      ...targetSession?.workspacePath ? { workspacePath: targetSession.workspacePath } : {}
     };
   } else {
     const existingBoundSid = findBoundSessionForProfile(configDir, targetProfName);
-    if (existingBoundSid) {
-      runtimeSession = {
+    if (existingBoundSid && !targetSession?.sessionId) {
+      targetSession = {
         sessionId: existingBoundSid,
-        runtime: runtimeSession?.runtime ?? (/^[0-9a-f-]{36}$/i.test(existingBoundSid) ? "antigravity" : existingBoundSid.startsWith("sess_") ? "zcode" : "custom"),
-        ...runtimeSession?.workspacePath ? { workspacePath: runtimeSession.workspacePath } : {}
+        runtime: /^[0-9a-f-]{36}$/i.test(existingBoundSid) ? "antigravity" : existingBoundSid.startsWith("sess_") ? "zcode" : existingBoundSid.startsWith("session-") ? "dsh" : "custom"
       };
-    } else if (!runtimeSession?.sessionId) {
+    } else if (!targetSession?.sessionId) {
       const agyHost = discoverAntigravityHost();
       if (agyHost && agyHost.openConversations.length === 1) {
-        runtimeSession = { sessionId: agyHost.openConversations[0], runtime: "antigravity" };
+        targetSession = { sessionId: agyHost.openConversations[0], runtime: "antigravity" };
       }
     }
   }
+  for (const existingSlot of [...profileSlots.values()]) {
+    if (existingSlot.profileName === targetProfName || existingSlot.agentId === newProfile.agent_id) {
+      teardownSlot(existingSlot, { releaseLock: existingSlot.agentId !== newProfile.agent_id });
+      continue;
+    }
+    const existingSid = existingSlot.runtimeSession?.sessionId || findBoundSessionForProfile(configDir, existingSlot.profileName) || null;
+    if (targetSession?.sessionId) {
+      if (existingSid === targetSession.sessionId) {
+        teardownSlot(existingSlot, { releaseLock: true });
+      }
+    } else if (!existingSid && profileSlots.size === 1) {
+      teardownSlot(existingSlot, { releaseLock: true });
+    }
+  }
+  const newSlot = createProfileSlot({
+    profileName: targetProfName,
+    profileFile: targetFile,
+    profile: newProfile,
+    agentId: newProfile.agent_id,
+    token: newProfile.token,
+    capabilities: newProfile.capabilities || ["claude-code", "coding", "chat"],
+    runtimeSession: targetSession
+  });
+  profileSlots.set(targetProfName, newSlot);
+  activateSlot(newSlot, targetSession);
   if (!toolOnlyMode) {
     acquireAgentLock({
       lockDir,
@@ -3733,44 +4179,28 @@ function applyIdentityFromProfile(newProfile, targetFile, bindSessionId) {
   }
   guardRecord = advanceGuardRecord(guardRecord, { agentId: AGENT_ID, source: "switch_profile", ...profileNameFromPath(targetFile) ? { declaredName: profileNameFromPath(targetFile) } : {} }, new Date().toISOString(), true);
   persistGuardRecord(guardRecord);
-  wsReconnectAttempt = 0;
   if (!toolOnlyMode) {
-    heartbeat.start();
-    connectWS();
+    newSlot.heartbeat.start();
+    connectWS(newSlot);
   }
 }
 function disconnectCurrentProfile(opts) {
-  const prevAgentId = AGENT_ID;
-  const prevProfileName = profileNameFromPath(activeProfileFile) || profile?.display_name || AGENT_ID || "(none)";
-  heartbeat.stop();
-  stopAllTypingHeartbeats();
-  if (backfillTimer) {
-    clearTimeout(backfillTimer);
-    backfillTimer = null;
+  const slot = activeSlot;
+  const prevAgentId = slot?.agentId || AGENT_ID;
+  const prevProfileName = slot?.profileName || profileNameFromPath(activeProfileFile) || profile?.display_name || AGENT_ID || "(none)";
+  const sidToRemove = slot?.runtimeSession?.sessionId || runtimeSession?.sessionId || null;
+  if (slot) {
+    teardownSlot(slot, { releaseLock: true });
+  } else {
+    stopAllTypingHeartbeats();
+    if (prevAgentId) {
+      releaseAgentLock({ lockDir, agentId: prevAgentId, currentSessionId: sidToRemove });
+    }
   }
-  if (reconnectTimer) {
-    clearTimeout(reconnectTimer);
-    reconnectTimer = null;
+  if (!opts?.keepBinding && sidToRemove) {
+    removeSessionBind(configDir, sidToRemove);
   }
-  if (ws) {
-    ws.onclose = null;
-    try {
-      ws.close();
-    } catch {}
-    ws = null;
-  }
-  if (prevAgentId) {
-    releaseAgentLock({ lockDir, agentId: prevAgentId, currentSessionId: runtimeSession?.sessionId ?? null });
-  }
-  if (!opts?.keepBinding && runtimeSession?.sessionId) {
-    removeSessionBind(configDir, runtimeSession.sessionId);
-  }
-  sessionId = null;
-  AGENT_ID = "";
-  TOKEN = "";
-  profile = {};
-  activeProfileFile = null;
-  anonymousMode = true;
+  setAnonymousCallerState(runtimeSession);
   return { prevAgentId, prevProfileName };
 }
 function formatProfileList() {
@@ -3780,13 +4210,15 @@ function formatProfileList() {
   const lines = profileEntries.map((entry) => {
     let entryAgentId = "";
     try {
-      const parsed = JSON.parse(readFileSync5(entry.path, "utf-8"));
+      const parsed = JSON.parse(readFileSync7(entry.path, "utf-8"));
       if (typeof parsed?.agent_id === "string")
         entryAgentId = parsed.agent_id;
     } catch {}
     const isCurrent = current && (entry.name === current || entryAgentId === current) || currentProfileName && entry.name === currentProfileName;
     const lock = entryAgentId ? checkAgentLock({ lockDir, agentId: entryAgentId, currentSessionId: runtimeSession?.sessionId ?? null, lockOwnerPid }) : { locked: false };
-    const statusSuffix = lock.locked ? ` [in use by pid=${lock.holder?.pid}${lock.holder?.runtime ? ` (${lock.holder.runtime})` : ""}]` : "";
+    const slot = profileSlots.get(entry.name);
+    const boundSid = findBoundSessionForProfile(configDir, entry.name);
+    const statusSuffix = lock.locked ? ` [in use by pid=${lock.holder?.pid}${lock.holder?.runtime ? ` (${lock.holder.runtime})` : ""}${lock.holder?.sessionId ? ` session=${lock.holder.sessionId}` : ""}]` : slot && slot.ws?.readyState === WebSocket.OPEN ? ` [online${boundSid ? ` session=${boundSid}` : ""}]` : "";
     return `${isCurrent ? "\u2192 " : "  "}${entry.name}${statusSuffix}`;
   });
   return `Current: ${current || "(anonymous / disconnected)"}
@@ -3828,10 +4260,10 @@ async function registerAndConnectProfile(displayName, bindSessionId) {
     };
     const targetFile = nameToPath(cleanName);
     validateIdentityProfile(newProfile, targetFile);
-    mkdirSync2(dirname(targetFile), { recursive: true });
+    mkdirSync3(dirname(targetFile), { recursive: true });
     safeWriteProfile2(targetFile, newProfile);
     const defaultProfileFile = nameToPath("profile");
-    if (!existsSync5(defaultProfileFile)) {
+    if (!existsSync7(defaultProfileFile)) {
       safeWriteProfile2(defaultProfileFile, newProfile);
     }
     applyIdentityFromProfile(newProfile, targetFile, bindSessionId);
@@ -3888,7 +4320,7 @@ async function handleProfileSwitchOrConnect(args) {
     return { content: [{ type: "text", text: switchGate.message }], isError: true };
   }
   const targetFile = nameToPath(profile_name);
-  if (!existsSync5(targetFile)) {
+  if (!existsSync7(targetFile)) {
     if (register) {
       return await registerAndConnectProfile(profile_name, explicitSessionId);
     }
@@ -3952,7 +4384,7 @@ function ensureGrokBoundIdentity() {
   if (!boundName)
     return;
   const boundPath = nameToPath(boundName);
-  if (!existsSync5(boundPath))
+  if (!existsSync7(boundPath))
     return;
   let boundProfile;
   try {
@@ -3973,45 +4405,138 @@ function ensureGrokBoundIdentity() {
 `);
   applyIdentityFromProfile(boundProfile, boundPath);
 }
+async function resolveCallerSessionForToolCall(toolName, toolArgs, rawMeta) {
+  const explicitArgSid = typeof toolArgs?.conversation_id === "string" && toolArgs.conversation_id.trim() || typeof toolArgs?.session_id === "string" && toolArgs.session_id.trim() || "";
+  if (explicitArgSid) {
+    const isAgy = /^[0-9a-f-]{36}$/i.test(explicitArgSid) && (process.env.__CFBundleIdentifier === "com.google.antigravity" || Boolean(process.env.AGY_BROWSER_WS_URL) || Boolean(process.env.AGENTSCHAT_AGY_BRAIN_DIR) || Boolean(discoverAntigravityHost()));
+    const runtime = isAgy ? "antigravity" : explicitArgSid.startsWith("sess_") ? "zcode" : explicitArgSid.startsWith("session-") ? "dsh" : runtimeSession?.runtime ?? "custom";
+    return {
+      session: {
+        sessionId: explicitArgSid,
+        runtime,
+        ...runtimeSession?.workspacePath ? { workspacePath: runtimeSession.workspacePath } : {}
+      },
+      isPerCallSession: true
+    };
+  }
+  const hasExplicitMetaSession = Boolean(typeof rawMeta?.session_id === "string" && rawMeta.session_id.trim() || typeof rawMeta?.["com.zcode/request-context"]?.session_id === "string" && rawMeta["com.zcode/request-context"].session_id.trim());
+  if (hasExplicitMetaSession) {
+    return {
+      session: detectRuntimeSession(process.env, rawMeta),
+      isPerCallSession: true
+    };
+  }
+  if (process.env.CLAUDE_CODE_SESSION_ID?.trim() || process.env.CLAUDE_SESSION_ID?.trim() || process.env.ZCODE_SESSION_ID?.trim() || process.env.ANTIGRAVITY_CONVERSATION_ID?.trim() || process.env.AGENTSCHAT_SESSION_ID?.trim() || process.env.AGENTCHAT_SESSION_ID?.trim()) {
+    return {
+      session: detectRuntimeSession(process.env, rawMeta),
+      isPerCallSession: false
+    };
+  }
+  if (process.env.AGENTSCHAT_AGY_BRAIN_DIR?.trim() || process.env.__CFBundleIdentifier === "com.google.antigravity" || Boolean(process.env.AGY_BROWSER_WS_URL) || Boolean(discoverAntigravityHost())) {
+    const agyHost = discoverAntigravityHost();
+    const agyCid = detectAntigravityCallerSession({
+      toolName,
+      args: toolArgs ?? null,
+      openConversations: agyHost?.openConversations
+    });
+    if (agyCid) {
+      return {
+        session: { sessionId: agyCid, runtime: "antigravity" },
+        isPerCallSession: true
+      };
+    }
+    if (agyHost && agyHost.openConversations.length === 1) {
+      return {
+        session: { sessionId: agyHost.openConversations[0], runtime: "antigravity" },
+        isPerCallSession: false
+      };
+    }
+  }
+  if (isDshHostProcess()) {
+    const dshSid = await detectDshCallerSession();
+    if (dshSid) {
+      return {
+        session: { sessionId: dshSid, runtime: "dsh" },
+        isPerCallSession: true
+      };
+    }
+  }
+  return { session: runtimeSession, isPerCallSession: false };
+}
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   let { name, arguments: args } = request.params;
   let viaExtendedCompat = false;
   try {
     const rawMeta = request.params?._meta;
-    const hasExplicitMetaSession = Boolean(typeof rawMeta?.session_id === "string" && rawMeta.session_id.trim() || typeof rawMeta?.["com.zcode/request-context"]?.session_id === "string" && rawMeta["com.zcode/request-context"].session_id.trim());
-    const metaSession = hasExplicitMetaSession || !runtimeSession ? detectRuntimeSession(process.env, rawMeta) : null;
-    if (metaSession && (!runtimeSession || runtimeSession.sessionId !== metaSession.sessionId || !runtimeSession.workspacePath && metaSession.workspacePath)) {
-      runtimeSession = metaSession;
-      if (anonymousMode && name !== "connect_profile" && name !== "switch_profile" && name !== "disconnect_profile") {
-        const boundProfile = loadSessionBinds(configDir)[metaSession.sessionId];
-        if (boundProfile) {
-          const boundPath = nameToPath(boundProfile);
-          if (existsSync5(boundPath)) {
+    const { session: callerSession, isPerCallSession } = await resolveCallerSessionForToolCall(name, args, rawMeta);
+    if (callerSession) {
+      runtimeSession = callerSession;
+      const binds = loadSessionBinds(configDir);
+      const boundProfileName = binds[callerSession.sessionId];
+      const isProfileControlTool = name === "connect_profile" || name === "switch_profile" || name === "disconnect_profile";
+      if (boundProfileName) {
+        const existingSlot = profileSlots.get(boundProfileName);
+        if (existingSlot) {
+          activateSlot(existingSlot, callerSession);
+          if (!toolOnlyMode) {
+            acquireAgentLock({
+              lockDir,
+              agentId: existingSlot.agentId,
+              profileName: existingSlot.profileName,
+              sessionId: callerSession.sessionId,
+              runtime: callerSession.runtime
+            });
+          }
+        } else if (!isProfileControlTool || name === "disconnect_profile") {
+          const boundPath = nameToPath(boundProfileName);
+          if (existsSync7(boundPath)) {
             try {
               const candidate = readIdentityProfile(boundPath);
               const lock = checkAgentLock({
                 lockDir,
                 agentId: candidate?.agent_id,
-                currentSessionId: metaSession.sessionId,
+                currentSessionId: callerSession.sessionId,
                 lockOwnerPid
               });
               if (!lock.locked) {
-                applyIdentityFromProfile(candidate, boundPath, metaSession.sessionId);
+                applyIdentityFromProfile(candidate, boundPath, callerSession.sessionId);
+              } else if (isPerCallSession) {
+                setAnonymousCallerState(callerSession);
               }
             } catch {}
+          } else if (isPerCallSession) {
+            setAnonymousCallerState(callerSession);
+          }
+        } else if (isPerCallSession) {
+          setAnonymousCallerState(callerSession);
+        }
+      } else {
+        let unboundSlot = null;
+        for (const slot of profileSlots.values()) {
+          const slotBoundSid = slot.runtimeSession?.sessionId || findBoundSessionForProfile(configDir, slot.profileName);
+          if (!slotBoundSid || slotBoundSid === callerSession.sessionId) {
+            unboundSlot = slot;
+            break;
           }
         }
-      } else if (!anonymousMode && AGENT_ID && activeProfileFile && !toolOnlyMode) {
-        acquireAgentLock({
-          lockDir,
-          agentId: AGENT_ID,
-          profileName: profileNameFromPath(activeProfileFile),
-          sessionId: metaSession.sessionId,
-          runtime: metaSession.runtime
-        });
-        const pName = profileNameFromPath(activeProfileFile);
-        if (pName && (hasExplicitMetaSession || !findBoundSessionForProfile(configDir, pName))) {
-          saveSessionBind(configDir, metaSession.sessionId, pName);
+        if (unboundSlot && !isProfileControlTool) {
+          activateSlot(unboundSlot, callerSession);
+          if (!toolOnlyMode) {
+            acquireAgentLock({
+              lockDir,
+              agentId: unboundSlot.agentId,
+              profileName: unboundSlot.profileName,
+              sessionId: callerSession.sessionId,
+              runtime: callerSession.runtime
+            });
+            if (unboundSlot.profileName && !findBoundSessionForProfile(configDir, unboundSlot.profileName)) {
+              saveSessionBind(configDir, callerSession.sessionId, unboundSlot.profileName);
+            }
+          }
+        } else if (unboundSlot && isProfileControlTool) {
+          activateSlot(unboundSlot, callerSession);
+        } else if (isPerCallSession) {
+          setAnonymousCallerState(callerSession);
         }
       }
     }
@@ -4241,7 +4766,7 @@ ${a.body || ""}`;
           const currentVersion = Number(meta.version ?? 0);
           let cachedVersion = null;
           try {
-            cachedVersion = Number(JSON.parse(readFileSync5(pMeta, "utf8")).version);
+            cachedVersion = Number(JSON.parse(readFileSync7(pMeta, "utf8")).version);
           } catch {}
           if (cachedVersion !== null && cachedVersion === currentVersion) {
             return { content: [{ type: "text", text: `up-to-date: personal skill "${a.name}" v${currentVersion} already at ${pMd} \u2014 no download. Read that file to run it.` }] };
@@ -4250,7 +4775,7 @@ ${a.body || ""}`;
           if (!bodyR.ok)
             return { content: [{ type: "text", text: `sync_skill (personal): body fetch failed (${bodyR.status})` }], isError: true };
           const doc = JSON.parse(await bodyR.text());
-          mkdirSync2(dirname(pMd), { recursive: true });
+          mkdirSync3(dirname(pMd), { recursive: true });
           writeFileSync4(pMd, String(doc?.body_markdown ?? ""));
           writeFileSync4(pMeta, JSON.stringify({ version: currentVersion, name: a.name, syncedAt: new Date().toISOString() }));
           return { content: [{ type: "text", text: `synced personal skill "${a.name}" v${currentVersion} \u2192 ${pMd} (was ${cachedVersion === null ? "missing" : `stale v${cachedVersion}`}). Read that file to run it.` }] };
@@ -4275,7 +4800,7 @@ ${a.body || ""}`;
         const currentVersion = Number(meta.version ?? 0);
         let cachedVersion = null;
         try {
-          cachedVersion = Number(JSON.parse(readFileSync5(metaPath, "utf8")).version);
+          cachedVersion = Number(JSON.parse(readFileSync7(metaPath, "utf8")).version);
         } catch {}
         if (cachedVersion !== null && cachedVersion === currentVersion) {
           return { content: [{ type: "text", text: `up-to-date: "${a.doc_id}" v${currentVersion} already at ${mdPath} \u2014 no download. Read that file to run it.` }] };
@@ -4285,7 +4810,7 @@ ${a.body || ""}`;
           return { content: [{ type: "text", text: `sync_skill: fetch body failed (${docR.status})` }], isError: true };
         const doc = JSON.parse(await docR.text());
         const body = String(doc?.body_markdown ?? doc?.bodyMarkdown ?? "");
-        mkdirSync2(dirname(mdPath), { recursive: true });
+        mkdirSync3(dirname(mdPath), { recursive: true });
         writeFileSync4(mdPath, body);
         writeFileSync4(metaPath, JSON.stringify({ version: currentVersion, title: doc?.title, doc_id: a.doc_id, chat_id: a.chat_id, syncedAt: new Date().toISOString() }));
         const was = cachedVersion === null ? "missing" : `stale v${cachedVersion}`;
@@ -4742,9 +5267,11 @@ ${brief}` }] };
           body: "{}"
         });
         if (r.ok) {
-          knownChannels.delete(chat_id);
-          if (lastSeenMessageTs.delete(chat_id))
-            scheduleLastSeenMessageTsSave();
+          if (activeSlot) {
+            activeSlot.knownChannels.delete(chat_id);
+            if (activeSlot.lastSeenMessageTs.delete(chat_id))
+              scheduleSlotLastSeenMessageTsSave(activeSlot);
+          }
           const data = await r.json().catch(() => ({}));
           if (data.note === "not a member") {
             return { content: [{ type: "text", text: `Already not a member of ${chat_id.slice(0, 8)}` }] };
@@ -4760,9 +5287,11 @@ ${brief}` }] };
           try {
             ws.send(JSON.stringify({ type: "leave_channel", channel_id: chat_id, agent_id: AGENT_ID }));
           } catch {}
-          knownChannels.delete(chat_id);
-          if (lastSeenMessageTs.delete(chat_id))
-            scheduleLastSeenMessageTsSave();
+          if (activeSlot) {
+            activeSlot.knownChannels.delete(chat_id);
+            if (activeSlot.lastSeenMessageTs.delete(chat_id))
+              scheduleSlotLastSeenMessageTsSave(activeSlot);
+          }
           return { content: [{ type: "text", text: `Leave sent via WS (REST unreachable: ${String(e?.message || e).slice(0, 60)})` }] };
         }
         return { content: [{ type: "text", text: `Leave failed \u2014 no connectivity` }] };
@@ -5524,7 +6053,7 @@ ${list}` }] };
     return { content: [{ type: "text", text: `${name} failed: ${String(e?.message || e).slice(0, 300)}` }], isError: true };
   }
 });
-var mentionTsFile = join4(configDir, `mention-ts-${AGENT_ID}.json`);
+var mentionTsFile = join6(configDir, `mention-ts-${AGENT_ID}.json`);
 function loadMentionTimestamps() {
   return loadCursor(mentionTsFile, safeStderrWrite);
 }
@@ -5532,32 +6061,10 @@ function saveMentionTimestamps(m) {
   persistCursor(mentionTsFile, m, safeStderrWrite);
 }
 var lastMentionTimestamp = loadMentionTimestamps();
-var lastSeenMessageTsFile = join4(configDir, `last-seen-msg-ts-${AGENT_ID}.json`);
-function loadLastSeenMessageTs() {
-  return loadCursor(lastSeenMessageTsFile, safeStderrWrite);
-}
-var lastSeenMessageTs = loadLastSeenMessageTs();
-var cursorFlushIntervalMs = Math.max(500, Number(process.env.AGENTSCHAT_MCP_CURSOR_FLUSH_MS || 5000));
-var cursorState = { dirty: false };
-var lastSeenMessageTsTimer = null;
 function flushLastSeenMessageTs() {
-  if (!cursorState.dirty)
-    return;
-  if (lastSeenMessageTsTimer) {
-    clearTimeout(lastSeenMessageTsTimer);
-    lastSeenMessageTsTimer = null;
+  for (const slot of profileSlots.values()) {
+    flushSlotLastSeenMessageTs(slot);
   }
-  flushCursor(cursorState, () => persistCursor(lastSeenMessageTsFile, lastSeenMessageTs, safeStderrWrite));
-}
-function scheduleLastSeenMessageTsSave() {
-  cursorState.dirty = true;
-  if (lastSeenMessageTsTimer)
-    return;
-  lastSeenMessageTsTimer = setTimeout(() => {
-    lastSeenMessageTsTimer = null;
-    flushLastSeenMessageTs();
-  }, cursorFlushIntervalMs);
-  lastSeenMessageTsTimer.unref?.();
 }
 function normalizeChannelDocLevel(level) {
   if (typeof level === "number" && Number.isInteger(level) && level >= 1 && level <= 4) {
@@ -5693,46 +6200,40 @@ function clearFinishedHiddenIdentityGamesFromMessage(data) {
     }
   }
 }
-var messageDedup = new MessageDedup;
 function deliverySource(data) {
   return typeof data?.__source === "string" ? data.__source : "live";
 }
-function recordOrSkipDeliveredMessage(data) {
+function recordOrSkipDeliveredMessage(data, slot = activeSlot) {
   const key = messageDedupKey(data);
-  if (!key)
+  if (!key || !slot)
     return false;
-  const skip = messageDedup.recordOrSkip(key);
+  const skip = slot.messageDedup.recordOrSkip(key);
   if (skip) {
     process.stderr.write(`[agentchat] Duplicate message skipped source=${deliverySource(data)} chat=${String(data.channel_id).slice(0, 12)} id=${String(data.id).slice(0, 12)}
 `);
   }
   return skip;
 }
-var knownChannels = new Set;
-var currentHandleWSMessage = null;
-var wsReconnectAttempt = 0;
-var reconnectTimer = null;
-var backfillTimer = null;
-function scheduleReconnect(delayMs) {
-  if (shuttingDown)
+function scheduleReconnect(delayMs, slot = activeSlot) {
+  if (shuttingDown || !slot)
     return;
-  if (reconnectTimer)
-    clearTimeout(reconnectTimer);
-  reconnectTimer = setTimeout(() => {
-    reconnectTimer = null;
-    connectWS();
+  if (slot.reconnectTimer)
+    clearTimeout(slot.reconnectTimer);
+  slot.reconnectTimer = setTimeout(() => {
+    slot.reconnectTimer = null;
+    connectWS(slot);
   }, delayMs);
 }
-async function backfillAllChannels() {
-  if (knownChannels.size === 0)
+async function backfillAllChannels(slot = activeSlot) {
+  if (!slot || slot.knownChannels.size === 0)
     return;
-  for (const channelId of knownChannels) {
+  for (const channelId of slot.knownChannels) {
     try {
-      const after = lastSeenMessageTs.get(channelId);
+      const after = slot.lastSeenMessageTs.get(channelId);
       const params = after ? `?after=${encodeURIComponent(after)}&limit=50` : `?limit=1`;
       const url = `${REST_URL}/api/channels/${encodeURIComponent(channelId)}/messages${params}`;
       const res = await apiFetch(url, {
-        headers: TOKEN ? { Authorization: `Bearer ${TOKEN}` } : {}
+        headers: slot.token ? { Authorization: `Bearer ${slot.token}` } : {}
       });
       if (!res.ok)
         continue;
@@ -5746,12 +6247,12 @@ async function backfillAllChannels() {
             newestTs = t;
         }
         if (newestTs) {
-          lastSeenMessageTs.set(channelId, newestTs);
-          scheduleLastSeenMessageTsSave();
+          slot.lastSeenMessageTs.set(channelId, newestTs);
+          scheduleSlotLastSeenMessageTsSave(slot);
         }
         continue;
       }
-      const replay = msgs.filter((m) => m && m.sender_id !== AGENT_ID && m.content !== "__typing__");
+      const replay = msgs.filter((m) => m && m.sender_id !== slot.agentId && m.content !== "__typing__");
       const dedupedReplay = after ? replay.filter((m) => {
         const msgTs = normalizeTimestampForCursor(m?.timestamp, "after");
         const afterTs = normalizeTimestampForCursor(after, "after");
@@ -5764,8 +6265,8 @@ async function backfillAllChannels() {
       dedupedReplay.sort((a, b) => String(a.timestamp).localeCompare(String(b.timestamp)));
       for (const m of dedupedReplay) {
         try {
-          if (currentHandleWSMessage) {
-            await currentHandleWSMessage({ ...m, type: "message", __source: "backfill" });
+          if (slot.handleWSMessage) {
+            await slot.handleWSMessage({ ...m, type: "message", __source: "backfill" });
           }
         } catch (e) {
           process.stderr.write(`[agentchat] Backfill replay error: ${e}
@@ -5778,36 +6279,88 @@ async function backfillAllChannels() {
     }
   }
 }
-function connectWS() {
-  if (shuttingDown)
+function syncOpenBoundSessions() {
+  if (toolOnlyMode || shuttingDown)
+    return;
+  const agyHost = discoverAntigravityHost();
+  if (!agyHost || agyHost.openConversations.length === 0)
+    return;
+  const binds = loadSessionBinds(configDir);
+  for (const cid of agyHost.openConversations) {
+    const boundProf = binds[cid];
+    if (!boundProf || profileSlots.has(boundProf))
+      continue;
+    const boundPath = nameToPath(boundProf);
+    if (!existsSync7(boundPath))
+      continue;
+    try {
+      const candidate = readIdentityProfile(boundPath);
+      validateIdentityProfile(candidate, boundPath);
+      const lock = checkAgentLock({
+        lockDir,
+        agentId: candidate.agent_id,
+        currentSessionId: cid,
+        lockOwnerPid
+      });
+      if (lock.locked)
+        continue;
+      const sess = { sessionId: cid, runtime: "antigravity" };
+      acquireAgentLock({
+        lockDir,
+        agentId: candidate.agent_id,
+        profileName: boundProf,
+        sessionId: cid,
+        runtime: "antigravity"
+      });
+      const slot = createProfileSlot({
+        profileName: boundProf,
+        profileFile: boundPath,
+        profile: candidate,
+        agentId: candidate.agent_id,
+        token: candidate.token,
+        capabilities: candidate.capabilities || ["claude-code", "coding", "chat"],
+        runtimeSession: sess
+      });
+      profileSlots.set(boundProf, slot);
+      slot.heartbeat.start();
+      connectWS(slot);
+      if (!activeSlot)
+        activateSlot(slot, sess);
+    } catch {}
+  }
+}
+function connectWS(slot = activeSlot) {
+  if (shuttingDown || !slot)
     return;
   let socket;
   try {
     socket = new WebSocket(WS_URL);
-    ws = socket;
+    slot.ws = socket;
+    if (activeSlot === slot)
+      ws = socket;
   } catch (e) {
     process.stderr.write(`[agentchat] WebSocket constructor failed: ${e}, retrying in 5s
 `);
-    scheduleReconnect(5000);
+    scheduleReconnect(5000, slot);
     return;
   }
-  ws.onopen = () => {
-    if (ws !== socket)
+  socket.onopen = () => {
+    if (slot.ws !== socket)
       return;
     try {
       socket.send(JSON.stringify({
         type: "auth",
-        agent_id: AGENT_ID,
-        token: TOKEN,
-        capabilities: CAPABILITIES
+        agent_id: slot.agentId,
+        token: slot.token,
+        capabilities: slot.capabilities
       }));
     } catch (e) {
       process.stderr.write(`[agentchat] Auth send failed: ${e}
 `);
     }
   };
-  ws.onmessage = async (event) => {
-    if (ws !== socket)
+  socket.onmessage = async (event) => {
+    if (slot.ws !== socket)
       return;
     let data;
     try {
@@ -5824,31 +6377,34 @@ function connectWS() {
 `);
     }
   };
-  currentHandleWSMessage = handleWSMessage;
+  slot.handleWSMessage = handleWSMessage;
   async function handleWSMessage(data) {
     if (data.type === "pong") {
-      heartbeat.receivedPong();
+      slot.heartbeat.receivedPong();
+      syncOpenBoundSessions();
       return;
     }
     if ((data.type === "hidden_identity.reveal" || data.type === "hidden_identity.finished") && typeof data.game_id === "string") {
       clearActiveHiddenIdentityGame(data.game_id, data.type);
     }
     if (data.type === "auth_ok") {
-      sessionId = data.session_id;
-      wsReconnectAttempt = 0;
-      heartbeat.receivedPong();
-      process.stderr.write(`[agentchat] Connected as ${AGENT_ID}
+      slot.sessionId = data.session_id;
+      if (activeSlot === slot)
+        sessionId = data.session_id;
+      slot.wsReconnectAttempt = 0;
+      slot.heartbeat.receivedPong();
+      process.stderr.write(`[agentchat] Connected as ${slot.agentId}
 `);
-      if (backfillTimer)
-        clearTimeout(backfillTimer);
-      backfillTimer = setTimeout(() => {
-        backfillTimer = null;
+      if (slot.backfillTimer)
+        clearTimeout(slot.backfillTimer);
+      slot.backfillTimer = setTimeout(() => {
+        slot.backfillTimer = null;
         if (!shuttingDown)
-          backfillAllChannels();
+          backfillAllChannels(slot);
       }, 2000);
-    } else if ((data.type === "message" || data.type === "thread_reply") && data.sender_id === AGENT_ID && typeof data.content === "string" && data.content !== "__typing__" && !["loop_tick", "slash_input", "loop_status", "slash_response"].includes(data.meta?.kind)) {
-      stopTypingHeartbeat(data.channel_id);
-    } else if ((data.type === "message" || data.type === "thread_reply") && (data.sender_id !== AGENT_ID || data.meta && typeof data.meta === "object" && data.meta.kind === "loop_tick")) {
+    } else if ((data.type === "message" || data.type === "thread_reply") && data.sender_id === slot.agentId && typeof data.content === "string" && data.content !== "__typing__" && !["loop_tick", "slash_input", "loop_status", "slash_response"].includes(data.meta?.kind)) {
+      stopTypingHeartbeat(data.channel_id, slot);
+    } else if ((data.type === "message" || data.type === "thread_reply") && (data.sender_id !== slot.agentId || data.meta && typeof data.meta === "object" && data.meta.kind === "loop_tick")) {
       if (data.content === "__typing__")
         return;
       const metaKind = data.meta && typeof data.meta === "object" ? data.meta.kind : undefined;
@@ -5857,32 +6413,33 @@ function connectWS() {
 `);
         return;
       }
-      if (recordOrSkipDeliveredMessage(data))
+      if (recordOrSkipDeliveredMessage(data, slot))
         return;
       if (typeof data.channel_id === "string" && typeof data.timestamp === "string") {
-        const prev = lastSeenMessageTs.get(data.channel_id) || "";
+        const prev = slot.lastSeenMessageTs.get(data.channel_id) || "";
         const currentTs = normalizeTimestampForCursor(data.timestamp, "after") || data.timestamp;
         const prevTs = normalizeTimestampForCursor(prev, "after") || prev;
         if (currentTs > prevTs) {
-          lastSeenMessageTs.set(data.channel_id, data.timestamp);
-          scheduleLastSeenMessageTsSave();
+          slot.lastSeenMessageTs.set(data.channel_id, data.timestamp);
+          scheduleSlotLastSeenMessageTsSave(slot);
         }
       }
       const isDM = data.channel_id?.startsWith("dm-");
-      const isMentioned = matchesMention(data.content || "", AGENT_ID || "");
+      const isMentioned = matchesMention(data.content || "", slot.agentId || "");
       const activeHi = activeHiddenIdentityForChannel(data.channel_id);
-      const isOwnLoopTick = metaKind === "loop_tick" && data.sender_id === AGENT_ID;
+      const isOwnLoopTick = metaKind === "loop_tick" && data.sender_id === slot.agentId;
       if (isDM || isMentioned || activeHi || isOwnLoopTick) {
         if (isDM || isMentioned)
-          startTypingHeartbeat(data.channel_id);
+          startTypingHeartbeat(data.channel_id, slot);
         let contextPrefix = "";
         if (!isDM && isMentioned) {
           try {
-            const lastTs = lastMentionTimestamp.get(data.channel_id) || "";
+            const mentionKey = `${slot.agentId}:${data.channel_id}`;
+            const lastTs = lastMentionTimestamp.get(mentionKey) || lastMentionTimestamp.get(data.channel_id) || "";
             const params = `limit=50${lastTs ? "&after=" + encodeURIComponent(lastTs) : ""}`;
             const historyUrl = `${REST_URL}/api/channels/${encodeURIComponent(data.channel_id)}/messages?${params}`;
             const historyRes = await apiFetch(historyUrl, {
-              headers: TOKEN ? { Authorization: `Bearer ${TOKEN}` } : {}
+              headers: slot.token ? { Authorization: `Bearer ${slot.token}` } : {}
             });
             if (historyRes.ok) {
               const historyData = await historyRes.json();
@@ -5912,6 +6469,7 @@ ${context}
 `;
               }
             }
+            lastMentionTimestamp.set(mentionKey, data.timestamp);
             lastMentionTimestamp.set(data.channel_id, data.timestamp);
             saveMentionTimestamps(lastMentionTimestamp);
           } catch (e) {
@@ -5944,18 +6502,20 @@ ${context}
           process.stderr.write(`[agentchat] Notification FAILED: ${notifErr}
 `);
         }
+        const slotProfName = slot.profileName || profileNameFromPath(slot.profileFile);
+        const slotRuntime = slot.runtimeSession?.runtime;
         if (process.env.AGENTCHAT_WAKE_MODE === "grok") {
           (async () => {
             try {
-              const { readFileSync: readFileSync6, existsSync: existsSync6 } = await import("fs");
-              const gwPath = resolveGrokGatewayPath(process.env.AGENTCHAT_GROK_GATEWAY, existsSync6);
+              const { readFileSync: readFileSync8, existsSync: existsSync8 } = await import("fs");
+              const gwPath = resolveGrokGatewayPath(process.env.AGENTCHAT_GROK_GATEWAY, existsSync8);
               let agentId = process.env.AGENTCHAT_GROK_AGENT_ID || "";
               if (!agentId) {
                 agentId = await resolveGrokAgentId({
                   explicitId: "",
-                  agentschatName: profile.display_name || AGENT_ID,
+                  agentschatName: slot.profile.display_name || slot.agentId,
                   listAgents: async () => {
-                    const gwcfg = JSON.parse(readFileSync6(gwPath, "utf8"));
+                    const gwcfg = JSON.parse(readFileSync8(gwPath, "utf8"));
                     const token = grokBearerFromGatewayConfig(gwcfg);
                     const port = grokPortFromGatewayConfig(gwcfg);
                     const res = await fetch(`http://127.0.0.1:${port}/api/listAgents`, {
@@ -5977,24 +6537,34 @@ ${context}
             }
           })();
         } else if (process.env.AGENTCHAT_WAKE_URL) {
+          const route = resolveSessionForAgent(slot.agentId, { configDir });
+          const targetSessionId = route?.sessionId || findBoundSessionForProfile(configDir, slotProfName) || slot.runtimeSession?.sessionId || undefined;
           fireWake(data, {
             url: process.env.AGENTCHAT_WAKE_URL,
-            secret: process.env.AGENTCHAT_WAKE_SECRET
+            secret: process.env.AGENTCHAT_WAKE_SECRET,
+            targetSessionId
           });
-        } else if (runtimeSession?.runtime === "zcode" || process.env.AGENTCHAT_WAKE_MODE === "zcode") {
-          const activeProfName = profileNameFromPath(activeProfileFile);
-          const zcodeSid = runtimeSession?.sessionId || findBoundSessionForProfile(configDir, activeProfName, (sid) => sid.startsWith("sess_")) || "";
+        } else if (slotRuntime === "zcode" || process.env.AGENTCHAT_WAKE_MODE === "zcode" || Boolean(findBoundSessionForProfile(configDir, slotProfName, (sid) => sid.startsWith("sess_")))) {
+          const zcodeSid = findBoundSessionForProfile(configDir, slotProfName, (sid) => sid.startsWith("sess_")) || (slotRuntime === "zcode" ? slot.runtimeSession?.sessionId : "") || "";
           if (zcodeSid) {
             fireZcodeWake(data, {
               sessionId: zcodeSid,
-              workspacePath: runtimeSession?.workspacePath,
-              profileName: activeProfName ?? undefined,
+              workspacePath: slot.runtimeSession?.workspacePath,
+              profileName: slotProfName ?? undefined,
               lockOwnerPid: process.pid,
               contextPrefix,
               logger: (m) => process.stderr.write(`${m}
 `)
             });
           }
+        } else if (slotRuntime === "dsh" || isDshHostProcess() || Boolean(findBoundSessionForProfile(configDir, slotProfName, (sid) => sid.startsWith("session-")))) {
+          const dshSid = findBoundSessionForProfile(configDir, slotProfName, (sid) => sid.startsWith("session-")) || resolveSessionForAgent(slot.agentId, { configDir })?.sessionId || (slotRuntime === "dsh" ? slot.runtimeSession?.sessionId : "") || undefined;
+          const dshWakeUrl = process.env.DSH_WAKE_URL || process.env.AGENTSCHAT_DSH_WAKE_URL || "http://127.0.0.1:8799/wake";
+          fireWake(data, {
+            url: dshWakeUrl,
+            secret: process.env.DSH_WAKE_SECRET ?? process.env.AGENTCHAT_WAKE_SECRET,
+            targetSessionId: dshSid
+          });
         } else {
           (async () => {
             try {
@@ -6003,14 +6573,13 @@ ${context}
               const csrfToken = (process.env.ANTIGRAVITY_CSRF_TOKEN || agyHost?.csrfToken || "").trim();
               if (!agyHost && !lsAddress)
                 return;
-              const activeProfName = profileNameFromPath(activeProfileFile);
               const allBinds = loadSessionBinds(configDir);
-              let targetCid = findBoundSessionForProfile(configDir, activeProfName, (sid) => /^[0-9a-f-]{36}$/i.test(sid)) || (runtimeSession?.runtime === "antigravity" ? runtimeSession.sessionId : "") || "";
+              let targetCid = findBoundSessionForProfile(configDir, slotProfName, (sid) => /^[0-9a-f-]{36}$/i.test(sid)) || (slotRuntime === "antigravity" ? slot.runtimeSession?.sessionId : "") || "";
               if (!targetCid && agyHost) {
                 if (agyHost.openConversations.length === 1) {
                   targetCid = agyHost.openConversations[0];
                 } else if (agyHost.openConversations.length > 1) {
-                  const unboundOrSame = agyHost.openConversations.find((cid) => !allBinds[cid] || allBinds[cid] === activeProfName);
+                  const unboundOrSame = agyHost.openConversations.find((cid) => !allBinds[cid] || allBinds[cid] === slotProfName);
                   targetCid = unboundOrSame || agyHost.openConversations[0];
                 }
               }
@@ -6039,16 +6608,16 @@ ${context}
       }
     } else if (data.type === "channel_created") {
       try {
-        ws?.send(JSON.stringify({
+        slot.ws?.send(JSON.stringify({
           type: "join_channel",
           channel_id: data.channel_id,
-          agent_id: AGENT_ID
+          agent_id: slot.agentId
         }));
       } catch {}
       process.stderr.write(`[agentchat] Joined channel: ${data.name}
 `);
       if (typeof data.channel_id === "string")
-        knownChannels.add(data.channel_id);
+        slot.knownChannels.add(data.channel_id);
     } else if (data.type === "shard_moved") {
       process.stderr.write(`[agentchat] Shard moved, reconnecting...
 `);
@@ -6057,69 +6626,60 @@ ${context}
         process.stderr.write(`[agentchat] Redirecting to: ${newUrl}
 `);
       }
-      if (ws) {
-        ws.onclose = null;
+      if (slot.ws) {
+        slot.ws.onclose = null;
         try {
-          ws.close();
+          slot.ws.close();
         } catch {}
       }
-      ws = null;
-      sessionId = null;
-      wsReconnectAttempt = 0;
-      scheduleReconnect(500);
+      slot.ws = null;
+      slot.sessionId = null;
+      if (activeSlot === slot) {
+        ws = null;
+        sessionId = null;
+      }
+      slot.wsReconnectAttempt = 0;
+      scheduleReconnect(500, slot);
     } else if (data.type === "error") {
       process.stderr.write(`[agentchat] Error: ${data.message}
 `);
     }
   }
-  ws.onclose = (event) => {
-    if (ws !== socket)
+  socket.onclose = (event) => {
+    if (slot.ws !== socket)
       return;
-    sessionId = null;
-    heartbeat.resetReconnecting();
-    wsReconnectAttempt++;
-    const delay = computeReconnectDelay(wsReconnectAttempt);
-    process.stderr.write(`[agentchat] Disconnected (code=${event?.code ?? "?"}), reconnecting in ${Math.round(delay / 100) / 10}s (attempt ${wsReconnectAttempt})...
+    slot.sessionId = null;
+    if (activeSlot === slot)
+      sessionId = null;
+    slot.heartbeat.resetReconnecting();
+    slot.wsReconnectAttempt++;
+    const delay = computeReconnectDelay(slot.wsReconnectAttempt);
+    process.stderr.write(`[agentchat] Disconnected (code=${event?.code ?? "?"}), reconnecting in ${Math.round(delay / 100) / 10}s (attempt ${slot.wsReconnectAttempt})...
 `);
-    scheduleReconnect(delay);
+    scheduleReconnect(delay, slot);
   };
-  ws.onerror = (err) => {
-    if (ws !== socket)
+  socket.onerror = (err) => {
+    if (slot.ws !== socket)
       return;
     process.stderr.write(`[agentchat] WebSocket error: ${err}
 `);
   };
 }
-var heartbeat = new HeartbeatMonitor({
-  sendPing: () => {
-    try {
-      ws?.send(JSON.stringify({ type: "ping", timestamp: new Date().toISOString() }));
-    } catch {}
-  },
-  reconnect: () => {
-    process.stderr.write(`[agentchat] Heartbeat timeout, forcing reconnect
-`);
-    if (ws) {
-      ws.onclose = null;
+function releaseLiveLock() {
+  if (!toolOnlyMode) {
+    for (const slot of profileSlots.values()) {
+      if (slot.agentId) {
+        try {
+          const boundSid = slot.runtimeSession?.sessionId || findBoundSessionForProfile(configDir, slot.profileName) || null;
+          releaseAgentLock({ lockDir, agentId: slot.agentId, currentSessionId: boundSid });
+        } catch {}
+      }
+    }
+    if (AGENT_ID) {
       try {
-        ws.close();
+        releaseAgentLock({ lockDir, agentId: AGENT_ID, currentSessionId: runtimeSession?.sessionId ?? null });
       } catch {}
     }
-    ws = null;
-    sessionId = null;
-    wsReconnectAttempt = 0;
-    scheduleReconnect(500);
-  },
-  getReadyState: () => ws?.readyState ?? WS_CLOSED
-}, 15000, 45000, 30000);
-if (!anonymousMode && !toolOnlyMode) {
-  heartbeat.start();
-}
-function releaseLiveLock() {
-  if (AGENT_ID && !toolOnlyMode) {
-    try {
-      releaseAgentLock({ lockDir, agentId: AGENT_ID, currentSessionId: runtimeSession?.sessionId ?? null });
-    } catch {}
   }
 }
 function shutdownFromStdio(reason) {
@@ -6136,18 +6696,10 @@ function shutdownFromStdio(reason) {
   }
   releaseLiveLock();
   try {
-    heartbeat.stop();
-  } catch {}
-  try {
     stopAllTypingHeartbeats();
   } catch {}
-  if (reconnectTimer) {
-    clearTimeout(reconnectTimer);
-    reconnectTimer = null;
-  }
-  if (backfillTimer) {
-    clearTimeout(backfillTimer);
-    backfillTimer = null;
+  for (const slot of [...profileSlots.values()]) {
+    teardownSlot(slot, { releaseLock: false });
   }
   try {
     ws?.close();
@@ -6206,14 +6758,22 @@ async function checkVersionStaleness() {
 }
 async function main() {
   installStdioLifecycleGuards();
-  if (anonymousMode) {
+  if (!toolOnlyMode) {
+    syncOpenBoundSessions();
+  }
+  if (anonymousMode && profileSlots.size === 0) {
     process.stderr.write(`[agentchat] Anonymous \u2014 not connecting to the hub.
 `);
   } else if (toolOnlyMode) {
     process.stderr.write(`[agentchat] Tool-only mode (AGENTSCHAT_TOOL_ONLY=1) \u2014 skipping duplicate WS connection.
 `);
   } else {
-    connectWS();
+    for (const slot of profileSlots.values()) {
+      if (!slot.ws) {
+        slot.heartbeat.start();
+        connectWS(slot);
+      }
+    }
   }
   transport = new StdioServerTransport;
   await server.connect(transport);

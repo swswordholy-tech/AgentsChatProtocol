@@ -294,7 +294,7 @@ ${text}`,
 
 // codex/run.ts
 import { readFileSync as readFileSync9 } from "node:fs";
-import { homedir as homedir4 } from "node:os";
+import { homedir as homedir5 } from "node:os";
 import { join as join10 } from "node:path";
 
 // codex/bots-config.ts
@@ -1647,7 +1647,7 @@ function isTeamLeadSkillInvocation(prompt) {
 }
 
 // codex/bridge.ts
-import { existsSync as existsSync5, mkdirSync as mkdirSync6, readFileSync as readFileSync7, renameSync as renameSync4, writeFileSync as writeFileSync4, openSync, closeSync, unlinkSync as unlinkSync3 } from "node:fs";
+import { existsSync as existsSync5, mkdirSync as mkdirSync6, readFileSync as readFileSync7, renameSync as renameSync4, writeFileSync as writeFileSync4, openSync as openSync2, closeSync as closeSync2, unlinkSync as unlinkSync3 } from "node:fs";
 import { join as join8 } from "node:path";
 
 // codex/thread-history.ts
@@ -1785,8 +1785,8 @@ async function verifyLoopTick(raw, config, owner, list) {
 
 // src/session-bind.ts
 import { createHash as createHash3 } from "node:crypto";
-import { existsSync as existsSync4, mkdirSync as mkdirSync5, readFileSync as readFileSync6, unlinkSync as unlinkSync2 } from "node:fs";
-import { tmpdir } from "node:os";
+import { closeSync, existsSync as existsSync4, mkdirSync as mkdirSync5, openSync, readFileSync as readFileSync6, readSync, readdirSync as readdirSync3, statSync as statSync3, unlinkSync as unlinkSync2 } from "node:fs";
+import { homedir as homedir4, tmpdir } from "node:os";
 import { join as join7 } from "node:path";
 
 // src/profile-store.ts
@@ -1958,9 +1958,9 @@ class Bridge {
       } catch {}
     }
     try {
-      const fd = openSync(this.lock, "wx", 384);
+      const fd = openSync2(this.lock, "wx", 384);
       writeFileSync4(fd, String(process.pid));
-      closeSync(fd);
+      closeSync2(fd);
     } catch {
       throw new Error(`Bridge already locked: ${this.lock}. If its process has exited, remove that lock manually.`);
     }
@@ -2631,7 +2631,7 @@ async function main() {
     return;
   }
   if (values["gui-thread"] || values["gui-message-file"] || values["gui-status"]) {
-    const channel = new GuiChannel(join10(homedir4(), ".agentschat/codex-gui-outbox"), values["gui-thread"] ? [values["gui-thread"]] : []);
+    const channel = new GuiChannel(join10(homedir5(), ".agentschat/codex-gui-outbox"), values["gui-thread"] ? [values["gui-thread"]] : []);
     if (values["gui-status"]) {
       console.log(JSON.stringify(channel.list().map(({ prompt: prompt2, ...receipt2 }) => receipt2)));
       return;

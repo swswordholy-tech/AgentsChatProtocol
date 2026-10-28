@@ -89,8 +89,13 @@ import {
   findBoundSessionForProfile,
   detectRuntimeSession,
   discoverAntigravityHost,
+  detectAntigravityCallerSession,
+  detectDshCallerSession,
+  isDshHostProcess,
   type DetectedSession,
 } from "./session-bind.ts";
+import { resolveSessionForAgent } from "./session-route.ts";
+import { HeartbeatMonitor, WS_OPEN, WS_CLOSED, WS_CONNECTING, WS_CLOSING } from "./heartbeat.ts";
 import pkg from "../package.json";
 import {
   CallToolRequestSchema,
@@ -753,27 +758,36 @@ let ws: WebSocket | null = null;
 const TYPING_HEARTBEAT_MS = 2_000;
 const TYPING_HEARTBEAT_MAX_MS = 120_000;
 const typingHeartbeats = new Map<string, { interval: ReturnType<typeof setInterval>; cap: ReturnType<typeof setTimeout> }>();
-function sendTypingFrame(channelId: string) {
-  if (ws && ws.readyState === WebSocket.OPEN) {
+function typingHeartbeatKey(channelId: string, agentId: string = AGENT_ID): string {
+  return `${agentId || "default"}:${channelId}`;
+}
+function sendTypingFrame(channelId: string, slot: ProfileSlot | null = activeSlot) {
+  const targetWs = slot ? slot.ws : ws;
+  const senderId = slot ? slot.agentId : AGENT_ID;
+  if (targetWs && targetWs.readyState === WebSocket.OPEN && senderId) {
     try {
-      ws.send(JSON.stringify({ type: "typing", channel_id: channelId, sender_id: AGENT_ID, cross_pod: true }));
+      targetWs.send(JSON.stringify({ type: "typing", channel_id: channelId, sender_id: senderId, cross_pod: true }));
     } catch {}
   }
 }
-function startTypingHeartbeat(channelId: string) {
+function startTypingHeartbeat(channelId: string, slot: ProfileSlot | null = activeSlot) {
   if (!channelId || process.env.AGENTSCHAT_AUTO_TYPING === "0") return;
-  stopTypingHeartbeat(channelId); // reset if one is already running for this channel
-  sendTypingFrame(channelId); // immediate first pulse
-  const interval = setInterval(() => sendTypingFrame(channelId), TYPING_HEARTBEAT_MS);
-  const cap = setTimeout(() => stopTypingHeartbeat(channelId), TYPING_HEARTBEAT_MAX_MS);
-  typingHeartbeats.set(channelId, { interval, cap });
+  const agentId = slot ? slot.agentId : AGENT_ID;
+  stopTypingHeartbeat(channelId, slot); // reset if one is already running for this channel
+  sendTypingFrame(channelId, slot); // immediate first pulse
+  const interval = setInterval(() => sendTypingFrame(channelId, slot), TYPING_HEARTBEAT_MS);
+  const cap = setTimeout(() => stopTypingHeartbeat(channelId, slot), TYPING_HEARTBEAT_MAX_MS);
+  typingHeartbeats.set(typingHeartbeatKey(channelId, agentId), { interval, cap });
 }
-function stopTypingHeartbeat(channelId: string) {
-  const h = typingHeartbeats.get(channelId);
-  if (!h) return;
-  clearInterval(h.interval);
-  clearTimeout(h.cap);
-  typingHeartbeats.delete(channelId);
+function stopTypingHeartbeat(channelId: string, slot: ProfileSlot | null = activeSlot) {
+  const agentId = slot ? slot.agentId : AGENT_ID;
+  for (const key of [typingHeartbeatKey(channelId, agentId), channelId]) {
+    const h = typingHeartbeats.get(key);
+    if (!h) continue;
+    clearInterval(h.interval);
+    clearTimeout(h.cap);
+    typingHeartbeats.delete(key);
+  }
 }
 function stopAllTypingHeartbeats() {
   for (const h of typingHeartbeats.values()) {
@@ -785,6 +799,32 @@ function stopAllTypingHeartbeats() {
 let sessionId: string | null = null;
 let shuttingDown = false;
 let transport: StdioServerTransport | null = null;
+
+interface ProfileSlot {
+  profileName: string;
+  profileFile: string | null;
+  profile: any;
+  agentId: string;
+  token: string;
+  capabilities: string[];
+  ws: WebSocket | null;
+  sessionId: string | null;
+  runtimeSession: DetectedSession | null;
+  knownChannels: Set<string>;
+  wsReconnectAttempt: number;
+  reconnectTimer: ReturnType<typeof setTimeout> | null;
+  backfillTimer: ReturnType<typeof setTimeout> | null;
+  heartbeat: HeartbeatMonitor;
+  lastSeenMessageTsFile: string;
+  lastSeenMessageTs: Map<string, string>;
+  cursorState: { dirty: boolean };
+  lastSeenMessageTsTimer: ReturnType<typeof setTimeout> | null;
+  messageDedup: MessageDedup;
+  handleWSMessage: ((data: any) => Promise<void>) | null;
+}
+
+const profileSlots = new Map<string, ProfileSlot>();
+let activeSlot: ProfileSlot | null = null;
 
 const debugLogsEnabled = /^(1|true|yes|debug)$/i.test(
   process.env.AGENTSCHAT_MCP_DEBUG || process.env.AGENTCHAT_DEBUG || "",
@@ -1958,9 +1998,14 @@ const TOOL_INPUT_SCHEMAS: Map<string, any> = new Map(
 const MEMBER_CACHE_TTL_MS = 5 * 60_000;
 const memberCache = new Map<string, { at: number; members: { agent_id: string; display_name?: string }[]; sameOwnerDirect?: boolean }>();
 
+function memberCacheKey(chatId: string): string {
+  return `${AGENT_ID || "anon"}:${chatId}`;
+}
+
 async function fetchChannelMembers(chatId: string): Promise<{ agent_id: string; display_name?: string }[]> {
   const now = Date.now();
-  const hit = memberCache.get(chatId);
+  const key = memberCacheKey(chatId);
+  const hit = memberCache.get(key);
   if (hit && now - hit.at < MEMBER_CACHE_TTL_MS) return hit.members;
   try {
     const r = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(chatId)}/members`, {
@@ -1970,7 +2015,7 @@ async function fetchChannelMembers(chatId: string): Promise<{ agent_id: string; 
     const body = await r.json() as any;
     const members = Array.isArray(body?.members) ? body.members : [];
     const sameOwnerDirect = body?.same_owner_direct === true;
-    memberCache.set(chatId, { at: now, members, sameOwnerDirect });
+    memberCache.set(key, { at: now, members, sameOwnerDirect });
     return members;
   } catch {
     return hit?.members || [];
@@ -1979,12 +2024,13 @@ async function fetchChannelMembers(chatId: string): Promise<{ agent_id: string; 
 
 async function isSameOwnerDirectChannel(chatId: string): Promise<boolean> {
   const now = Date.now();
-  const hit = memberCache.get(chatId);
+  const key = memberCacheKey(chatId);
+  const hit = memberCache.get(key);
   if (hit && now - hit.at < MEMBER_CACHE_TTL_MS && typeof hit.sameOwnerDirect === "boolean") {
     return hit.sameOwnerDirect;
   }
   await fetchChannelMembers(chatId);
-  return memberCache.get(chatId)?.sameOwnerDirect === true;
+  return memberCache.get(key)?.sameOwnerDirect === true;
 }
 
 async function redactOutboundForChannel(chatId: string, text: string): Promise<string> {
@@ -2326,61 +2372,241 @@ function currentGrokBindApplicability(binds: Record<string, string>) {
   });
 }
 
+const cursorFlushIntervalMs = Math.max(
+  500,
+  Number(process.env.AGENTSCHAT_MCP_CURSOR_FLUSH_MS || 5000),
+);
+
+function flushSlotLastSeenMessageTs(slot: ProfileSlot) {
+  if (!slot.cursorState.dirty) return;
+  if (slot.lastSeenMessageTsTimer) {
+    clearTimeout(slot.lastSeenMessageTsTimer);
+    slot.lastSeenMessageTsTimer = null;
+  }
+  flushCursor(slot.cursorState, () => persistCursor(slot.lastSeenMessageTsFile, slot.lastSeenMessageTs, safeStderrWrite));
+}
+
+function scheduleSlotLastSeenMessageTsSave(slot: ProfileSlot) {
+  slot.cursorState.dirty = true;
+  if (slot.lastSeenMessageTsTimer) return;
+  slot.lastSeenMessageTsTimer = setTimeout(() => {
+    slot.lastSeenMessageTsTimer = null;
+    flushSlotLastSeenMessageTs(slot);
+  }, cursorFlushIntervalMs);
+  (slot.lastSeenMessageTsTimer as any).unref?.();
+}
+
+function createProfileSlot(opts: {
+  profileName: string;
+  profileFile: string | null;
+  profile: any;
+  agentId: string;
+  token: string;
+  capabilities: string[];
+  runtimeSession: DetectedSession | null;
+}): ProfileSlot {
+  const lastSeenFile = join(configDir, `last-seen-msg-ts-${opts.agentId}.json`);
+  const slot: ProfileSlot = {
+    profileName: opts.profileName,
+    profileFile: opts.profileFile,
+    profile: opts.profile,
+    agentId: opts.agentId,
+    token: opts.token,
+    capabilities: opts.capabilities,
+    ws: null,
+    sessionId: null,
+    runtimeSession: opts.runtimeSession,
+    knownChannels: new Set<string>(),
+    wsReconnectAttempt: 0,
+    reconnectTimer: null,
+    backfillTimer: null,
+    heartbeat: null as any,
+    lastSeenMessageTsFile: lastSeenFile,
+    lastSeenMessageTs: loadCursor(lastSeenFile, safeStderrWrite),
+    cursorState: { dirty: false },
+    lastSeenMessageTsTimer: null,
+    messageDedup: new MessageDedup(),
+    handleWSMessage: null,
+  };
+  slot.heartbeat = new HeartbeatMonitor({
+    sendPing: () => {
+      try { slot.ws?.send(JSON.stringify({ type: "ping", timestamp: new Date().toISOString() })); } catch {}
+    },
+    reconnect: () => {
+      process.stderr.write("[agentchat] Heartbeat timeout, forcing reconnect\n");
+      if (slot.ws) { slot.ws.onclose = null; try { slot.ws.close(); } catch {} }
+      slot.ws = null;
+      slot.sessionId = null;
+      if (activeSlot === slot) {
+        ws = null;
+        sessionId = null;
+      }
+      slot.wsReconnectAttempt = 0;
+      scheduleReconnect(500, slot);
+    },
+    getReadyState: () => slot.ws?.readyState ?? WS_CLOSED,
+  }, 15_000, 45_000, 30_000);
+  return slot;
+}
+
+function activateSlot(slot: ProfileSlot, callerSession?: DetectedSession | null): void {
+  if (callerSession) {
+    slot.runtimeSession = {
+      ...callerSession,
+      ...(callerSession.workspacePath || slot.runtimeSession?.workspacePath
+        ? { workspacePath: callerSession.workspacePath ?? slot.runtimeSession?.workspacePath }
+        : {}),
+    };
+  }
+  activeSlot = slot;
+  AGENT_ID = slot.agentId;
+  TOKEN = slot.token;
+  CAPABILITIES = slot.capabilities;
+  profile = slot.profile;
+  activeProfileFile = slot.profileFile;
+  anonymousMode = false;
+  ws = slot.ws;
+  sessionId = slot.sessionId;
+  runtimeSession = slot.runtimeSession;
+}
+
+function setAnonymousCallerState(callerSession?: DetectedSession | null): void {
+  activeSlot = null;
+  AGENT_ID = "";
+  TOKEN = "";
+  profile = {};
+  activeProfileFile = null;
+  anonymousMode = true;
+  ws = null;
+  sessionId = null;
+  if (callerSession !== undefined) {
+    runtimeSession = callerSession;
+  }
+}
+
+function teardownSlot(slot: ProfileSlot, opts?: { releaseLock?: boolean }): void {
+  try { flushSlotLastSeenMessageTs(slot); } catch {}
+  try { slot.heartbeat.stop(); } catch {}
+  if (slot.backfillTimer) { clearTimeout(slot.backfillTimer); slot.backfillTimer = null; }
+  if (slot.reconnectTimer) { clearTimeout(slot.reconnectTimer); slot.reconnectTimer = null; }
+  if (slot.ws) {
+    slot.ws.onclose = null;
+    try { slot.ws.close(); } catch {}
+    slot.ws = null;
+  }
+  slot.sessionId = null;
+  if (opts?.releaseLock !== false && slot.agentId && !toolOnlyMode) {
+    const boundSid = slot.runtimeSession?.sessionId || findBoundSessionForProfile(configDir, slot.profileName) || null;
+    releaseAgentLock({ lockDir, agentId: slot.agentId, currentSessionId: boundSid });
+  }
+  profileSlots.delete(slot.profileName);
+  if (activeSlot === slot) {
+    activeSlot = null;
+    ws = null;
+    sessionId = null;
+  }
+}
+
+if (!anonymousMode && AGENT_ID) {
+  const bootProfName = profileNameFromPath(activeProfileFile) ?? declaredName ?? AGENT_ID;
+  const bootSlot = createProfileSlot({
+    profileName: bootProfName,
+    profileFile: activeProfileFile,
+    profile,
+    agentId: AGENT_ID,
+    token: TOKEN,
+    capabilities: CAPABILITIES,
+    runtimeSession,
+  });
+  profileSlots.set(bootProfName, bootSlot);
+  activateSlot(bootSlot, runtimeSession);
+}
+
 /**
  * Apply a profile file as the live identity and reconnect WS.
  * Shared by `switch_profile`, `connect_profile`, and grok-bind heal.
+ * Supports single-process multi-agent multiplexing: when called by a different
+ * session (`bindSessionId` / `runtimeSession.sessionId`), other sessions'
+ * connected `ProfileSlot`s remain alive and online.
  */
 function applyIdentityFromProfile(newProfile: any, targetFile: string, bindSessionId?: string | null): void {
   validateIdentityProfile(newProfile, targetFile);
-  if (AGENT_ID && AGENT_ID !== newProfile.agent_id) {
-    releaseAgentLock({ lockDir, agentId: AGENT_ID, currentSessionId: runtimeSession?.sessionId ?? null });
-  }
-  heartbeat.stop();
-  stopAllTypingHeartbeats();
-  if (backfillTimer) { clearTimeout(backfillTimer); backfillTimer = null; }
-  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
-  if (ws) {
-    ws.onclose = null;
-    try { ws.close(); } catch {}
-    ws = null;
-  }
-  sessionId = null;
-  AGENT_ID = newProfile.agent_id;
-  TOKEN = newProfile.token;
-  CAPABILITIES = newProfile.capabilities || ["claude-code", "coding", "chat"];
-  profile = newProfile;
-  activeProfileFile = targetFile;
-  anonymousMode = false;
+  const targetProfName = profileNameFromPath(targetFile) || newProfile.display_name || newProfile.agent_id;
 
-  const targetProfName = profileNameFromPath(targetFile);
+  let targetSession: DetectedSession | null = runtimeSession ? { ...runtimeSession } : null;
   if (bindSessionId && bindSessionId.trim()) {
     const cleanSid = bindSessionId.trim();
     const isAgyEnv =
       process.env.__CFBundleIdentifier === "com.google.antigravity" ||
       Boolean(process.env.AGY_BROWSER_WS_URL) ||
+      Boolean(process.env.AGENTSCHAT_AGY_BRAIN_DIR) ||
       Boolean(discoverAntigravityHost());
-    runtimeSession = {
+    targetSession = {
       sessionId: cleanSid,
-      runtime: runtimeSession?.runtime ?? (isAgyEnv && /^[0-9a-f-]{36}$/i.test(cleanSid) ? "antigravity" : "custom"),
-      ...(runtimeSession?.workspacePath ? { workspacePath: runtimeSession.workspacePath } : {}),
+      runtime:
+        targetSession?.runtime ??
+        (isAgyEnv && /^[0-9a-f-]{36}$/i.test(cleanSid)
+          ? "antigravity"
+          : cleanSid.startsWith("sess_")
+            ? "zcode"
+            : cleanSid.startsWith("session-")
+              ? "dsh"
+              : "custom"),
+      ...(targetSession?.workspacePath ? { workspacePath: targetSession.workspacePath } : {}),
     };
   } else {
     const existingBoundSid = findBoundSessionForProfile(configDir, targetProfName);
-    if (existingBoundSid) {
-      runtimeSession = {
+    if (existingBoundSid && !targetSession?.sessionId) {
+      targetSession = {
         sessionId: existingBoundSid,
         runtime:
-          runtimeSession?.runtime ??
-          (/^[0-9a-f-]{36}$/i.test(existingBoundSid) ? "antigravity" : existingBoundSid.startsWith("sess_") ? "zcode" : "custom"),
-        ...(runtimeSession?.workspacePath ? { workspacePath: runtimeSession.workspacePath } : {}),
+          /^[0-9a-f-]{36}$/i.test(existingBoundSid)
+            ? "antigravity"
+            : existingBoundSid.startsWith("sess_")
+              ? "zcode"
+              : existingBoundSid.startsWith("session-")
+                ? "dsh"
+                : "custom",
       };
-    } else if (!runtimeSession?.sessionId) {
+    } else if (!targetSession?.sessionId) {
       const agyHost = discoverAntigravityHost();
       if (agyHost && agyHost.openConversations.length === 1) {
-        runtimeSession = { sessionId: agyHost.openConversations[0]!, runtime: "antigravity" };
+        targetSession = { sessionId: agyHost.openConversations[0]!, runtime: "antigravity" };
       }
     }
   }
+
+  // Only tear down existing slot(s) that belong to THIS session (or the same profile),
+  // preserving other sessions' connected slots in profileSlots.
+  for (const existingSlot of [...profileSlots.values()]) {
+    if (existingSlot.profileName === targetProfName || existingSlot.agentId === newProfile.agent_id) {
+      teardownSlot(existingSlot, { releaseLock: existingSlot.agentId !== newProfile.agent_id });
+      continue;
+    }
+    const existingSid =
+      existingSlot.runtimeSession?.sessionId ||
+      findBoundSessionForProfile(configDir, existingSlot.profileName) ||
+      null;
+    if (targetSession?.sessionId) {
+      if (existingSid === targetSession.sessionId) {
+        teardownSlot(existingSlot, { releaseLock: true });
+      }
+    } else if (!existingSid && profileSlots.size === 1) {
+      teardownSlot(existingSlot, { releaseLock: true });
+    }
+  }
+
+  const newSlot = createProfileSlot({
+    profileName: targetProfName,
+    profileFile: targetFile,
+    profile: newProfile,
+    agentId: newProfile.agent_id,
+    token: newProfile.token,
+    capabilities: newProfile.capabilities || ["claude-code", "coding", "chat"],
+    runtimeSession: targetSession,
+  });
+  profileSlots.set(targetProfName, newSlot);
+  activateSlot(newSlot, targetSession);
 
   if (!toolOnlyMode) {
     acquireAgentLock({
@@ -2405,37 +2631,34 @@ function applyIdentityFromProfile(newProfile: any, targetFile: string, bindSessi
     true,
   );
   persistGuardRecord(guardRecord);
-  wsReconnectAttempt = 0;
   if (!toolOnlyMode) {
-    heartbeat.start();
-    connectWS();
+    newSlot.heartbeat.start();
+    connectWS(newSlot);
   }
 }
 
 function disconnectCurrentProfile(opts?: { keepBinding?: boolean }): { prevAgentId: string; prevProfileName: string } {
-  const prevAgentId = AGENT_ID;
-  const prevProfileName = profileNameFromPath(activeProfileFile) || profile?.display_name || AGENT_ID || "(none)";
-  heartbeat.stop();
-  stopAllTypingHeartbeats();
-  if (backfillTimer) { clearTimeout(backfillTimer); backfillTimer = null; }
-  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
-  if (ws) {
-    ws.onclose = null;
-    try { ws.close(); } catch {}
-    ws = null;
+  const slot = activeSlot;
+  const prevAgentId = slot?.agentId || AGENT_ID;
+  const prevProfileName =
+    slot?.profileName ||
+    profileNameFromPath(activeProfileFile) ||
+    profile?.display_name ||
+    AGENT_ID ||
+    "(none)";
+  const sidToRemove = slot?.runtimeSession?.sessionId || runtimeSession?.sessionId || null;
+  if (slot) {
+    teardownSlot(slot, { releaseLock: true });
+  } else {
+    stopAllTypingHeartbeats();
+    if (prevAgentId) {
+      releaseAgentLock({ lockDir, agentId: prevAgentId, currentSessionId: sidToRemove });
+    }
   }
-  if (prevAgentId) {
-    releaseAgentLock({ lockDir, agentId: prevAgentId, currentSessionId: runtimeSession?.sessionId ?? null });
+  if (!opts?.keepBinding && sidToRemove) {
+    removeSessionBind(configDir, sidToRemove);
   }
-  if (!opts?.keepBinding && runtimeSession?.sessionId) {
-    removeSessionBind(configDir, runtimeSession.sessionId);
-  }
-  sessionId = null;
-  AGENT_ID = "";
-  TOKEN = "";
-  profile = {};
-  activeProfileFile = null;
-  anonymousMode = true;
+  setAnonymousCallerState(runtimeSession);
   return { prevAgentId, prevProfileName };
 }
 
@@ -2453,9 +2676,13 @@ function formatProfileList(): string {
     const lock = entryAgentId
       ? checkAgentLock({ lockDir, agentId: entryAgentId, currentSessionId: runtimeSession?.sessionId ?? null, lockOwnerPid })
       : { locked: false };
+    const slot = profileSlots.get(entry.name);
+    const boundSid = findBoundSessionForProfile(configDir, entry.name);
     const statusSuffix = lock.locked
-      ? ` [in use by pid=${lock.holder?.pid}${lock.holder?.runtime ? ` (${lock.holder.runtime})` : ""}]`
-      : "";
+      ? ` [in use by pid=${lock.holder?.pid}${lock.holder?.runtime ? ` (${lock.holder.runtime})` : ""}${lock.holder?.sessionId ? ` session=${lock.holder.sessionId}` : ""}]`
+      : slot && slot.ws?.readyState === WebSocket.OPEN
+        ? ` [online${boundSid ? ` session=${boundSid}` : ""}]`
+        : "";
     return `${isCurrent ? "→ " : "  "}${entry.name}${statusSuffix}`;
   });
   return `Current: ${current || "(anonymous / disconnected)"}\nAvailable profiles:\n${lines.join("\n")}`;
@@ -2683,6 +2910,109 @@ function ensureGrokBoundIdentity(): void {
 }
 
 
+async function resolveCallerSessionForToolCall(
+  toolName: string,
+  toolArgs: Record<string, any> | undefined,
+  rawMeta: Record<string, any> | undefined,
+): Promise<{ session: DetectedSession | null; isPerCallSession: boolean }> {
+  // 1. Explicit conversation_id / session_id in tool arguments
+  const explicitArgSid =
+    (typeof toolArgs?.conversation_id === "string" && toolArgs.conversation_id.trim()) ||
+    (typeof toolArgs?.session_id === "string" && toolArgs.session_id.trim()) ||
+    "";
+  if (explicitArgSid) {
+    const isAgy =
+      /^[0-9a-f-]{36}$/i.test(explicitArgSid) &&
+      (process.env.__CFBundleIdentifier === "com.google.antigravity" ||
+        Boolean(process.env.AGY_BROWSER_WS_URL) ||
+        Boolean(process.env.AGENTSCHAT_AGY_BRAIN_DIR) ||
+        Boolean(discoverAntigravityHost()));
+    const runtime = isAgy
+      ? "antigravity"
+      : explicitArgSid.startsWith("sess_")
+        ? "zcode"
+        : explicitArgSid.startsWith("session-")
+          ? "dsh"
+          : runtimeSession?.runtime ?? "custom";
+    return {
+      session: {
+        sessionId: explicitArgSid,
+        runtime,
+        ...(runtimeSession?.workspacePath ? { workspacePath: runtimeSession.workspacePath } : {}),
+      },
+      isPerCallSession: true,
+    };
+  }
+
+  // 2. ZCode per-request _meta.session_id
+  const hasExplicitMetaSession = Boolean(
+    (typeof rawMeta?.session_id === "string" && rawMeta.session_id.trim()) ||
+      (typeof rawMeta?.["com.zcode/request-context"]?.session_id === "string" &&
+        rawMeta["com.zcode/request-context"].session_id.trim()),
+  );
+  if (hasExplicitMetaSession) {
+    return {
+      session: detectRuntimeSession(process.env, rawMeta),
+      isPerCallSession: true,
+    };
+  }
+
+  // 3. Process-pinned session env vars (Claude Code, ZCode wake child, explicit env)
+  if (
+    process.env.CLAUDE_CODE_SESSION_ID?.trim() ||
+    process.env.CLAUDE_SESSION_ID?.trim() ||
+    process.env.ZCODE_SESSION_ID?.trim() ||
+    process.env.ANTIGRAVITY_CONVERSATION_ID?.trim() ||
+    process.env.AGENTSCHAT_SESSION_ID?.trim() ||
+    process.env.AGENTCHAT_SESSION_ID?.trim()
+  ) {
+    return {
+      session: detectRuntimeSession(process.env, rawMeta),
+      isPerCallSession: false,
+    };
+  }
+
+  // 4. Antigravity multi-conversation caller detection via transcript.jsonl
+  if (
+    process.env.AGENTSCHAT_AGY_BRAIN_DIR?.trim() ||
+    process.env.__CFBundleIdentifier === "com.google.antigravity" ||
+    Boolean(process.env.AGY_BROWSER_WS_URL) ||
+    Boolean(discoverAntigravityHost())
+  ) {
+    const agyHost = discoverAntigravityHost();
+    const agyCid = detectAntigravityCallerSession({
+      toolName,
+      args: toolArgs ?? null,
+      openConversations: agyHost?.openConversations,
+    });
+    if (agyCid) {
+      return {
+        session: { sessionId: agyCid, runtime: "antigravity" },
+        isPerCallSession: true,
+      };
+    }
+    if (agyHost && agyHost.openConversations.length === 1) {
+      return {
+        session: { sessionId: agyHost.openConversations[0]!, runtime: "antigravity" },
+        isPerCallSession: false,
+      };
+    }
+  }
+
+  // 5. DeepSeek Harness (DSH) caller session detection
+  if (isDshHostProcess()) {
+    const dshSid = await detectDshCallerSession();
+    if (dshSid) {
+      return {
+        session: { sessionId: dshSid, runtime: "dsh" },
+        isPerCallSession: true,
+      };
+    }
+  }
+
+  return { session: runtimeSession, isPerCallSession: false };
+}
+
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   let { name, arguments: args } = request.params;
   let viaExtendedCompat = false;
@@ -2691,52 +3021,85 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   // SDK error, so the calling agent always learns the call failed. Explicit
   // error returns below carry isError:true individually.
   try {
-    // Capture session metadata injected by hosts on tools/call (e.g. ZCode's
-    // _meta.session_id and _meta.workspace_path). Never allow Antigravity's
-    // currently-focused window heuristic (`discoverAntigravityHost`) to overwrite
-    // an already-bound `runtimeSession` when another tab calls a tool.
+    // Resolve the calling session/conversation and automatically route to its
+    // bound ProfileSlot in profileSlots (`session_id -> profile -> agent_id`).
     const rawMeta = (request.params as any)?._meta;
-    const hasExplicitMetaSession = Boolean(
-      (typeof rawMeta?.session_id === "string" && rawMeta.session_id.trim()) ||
-      (typeof rawMeta?.["com.zcode/request-context"]?.session_id === "string" &&
-        rawMeta["com.zcode/request-context"].session_id.trim()),
+    const { session: callerSession, isPerCallSession } = await resolveCallerSessionForToolCall(
+      name,
+      args as Record<string, any> | undefined,
+      rawMeta,
     );
-    const metaSession =
-      hasExplicitMetaSession || !runtimeSession
-        ? detectRuntimeSession(process.env, rawMeta)
-        : null;
-    if (metaSession && (!runtimeSession || runtimeSession.sessionId !== metaSession.sessionId || (!runtimeSession.workspacePath && metaSession.workspacePath))) {
-      runtimeSession = metaSession;
-      if (anonymousMode && name !== "connect_profile" && name !== "switch_profile" && name !== "disconnect_profile") {
-        const boundProfile = loadSessionBinds(configDir)[metaSession.sessionId];
-        if (boundProfile) {
-          const boundPath = nameToPath(boundProfile);
+    if (callerSession) {
+      runtimeSession = callerSession;
+      const binds = loadSessionBinds(configDir);
+      const boundProfileName = binds[callerSession.sessionId];
+      const isProfileControlTool =
+        name === "connect_profile" || name === "switch_profile" || name === "disconnect_profile";
+
+      if (boundProfileName) {
+        const existingSlot = profileSlots.get(boundProfileName);
+        if (existingSlot) {
+          activateSlot(existingSlot, callerSession);
+          if (!toolOnlyMode) {
+            acquireAgentLock({
+              lockDir,
+              agentId: existingSlot.agentId,
+              profileName: existingSlot.profileName,
+              sessionId: callerSession.sessionId,
+              runtime: callerSession.runtime,
+            });
+          }
+        } else if (!isProfileControlTool || name === "disconnect_profile") {
+          const boundPath = nameToPath(boundProfileName);
           if (existsSync(boundPath)) {
             try {
               const candidate = readIdentityProfile(boundPath);
               const lock = checkAgentLock({
                 lockDir,
                 agentId: candidate?.agent_id,
-                currentSessionId: metaSession.sessionId,
+                currentSessionId: callerSession.sessionId,
                 lockOwnerPid,
               });
               if (!lock.locked) {
-                applyIdentityFromProfile(candidate, boundPath, metaSession.sessionId);
+                applyIdentityFromProfile(candidate, boundPath, callerSession.sessionId);
+              } else if (isPerCallSession) {
+                setAnonymousCallerState(callerSession);
               }
             } catch {}
+          } else if (isPerCallSession) {
+            setAnonymousCallerState(callerSession);
+          }
+        } else if (isPerCallSession) {
+          setAnonymousCallerState(callerSession);
+        }
+      } else {
+        let unboundSlot: ProfileSlot | null = null;
+        for (const slot of profileSlots.values()) {
+          const slotBoundSid =
+            slot.runtimeSession?.sessionId || findBoundSessionForProfile(configDir, slot.profileName);
+          if (!slotBoundSid || slotBoundSid === callerSession.sessionId) {
+            unboundSlot = slot;
+            break;
           }
         }
-      } else if (!anonymousMode && AGENT_ID && activeProfileFile && !toolOnlyMode) {
-        acquireAgentLock({
-          lockDir,
-          agentId: AGENT_ID,
-          profileName: profileNameFromPath(activeProfileFile),
-          sessionId: metaSession.sessionId,
-          runtime: metaSession.runtime,
-        });
-        const pName = profileNameFromPath(activeProfileFile);
-        if (pName && (hasExplicitMetaSession || !findBoundSessionForProfile(configDir, pName))) {
-          saveSessionBind(configDir, metaSession.sessionId, pName);
+        if (unboundSlot && !isProfileControlTool) {
+          activateSlot(unboundSlot, callerSession);
+          if (!toolOnlyMode) {
+            acquireAgentLock({
+              lockDir,
+              agentId: unboundSlot.agentId,
+              profileName: unboundSlot.profileName,
+              sessionId: callerSession.sessionId,
+              runtime: callerSession.runtime,
+            });
+            if (unboundSlot.profileName && !findBoundSessionForProfile(configDir, unboundSlot.profileName)) {
+              saveSessionBind(configDir, callerSession.sessionId, unboundSlot.profileName);
+            }
+          }
+        } else if (unboundSlot && isProfileControlTool) {
+          activateSlot(unboundSlot, callerSession);
+        } else if (isPerCallSession) {
+          setAnonymousCallerState(callerSession);
         }
       }
     }
@@ -3484,8 +3847,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         // Prune so knownChannels / lastSeenMessageTs don't grow unbounded and
         // turn every reconnect backfill into a serial REST fetch over channels
         // we've already left.
-        knownChannels.delete(chat_id);
-        if (lastSeenMessageTs.delete(chat_id)) scheduleLastSeenMessageTsSave();
+        if (activeSlot) {
+          activeSlot.knownChannels.delete(chat_id);
+          if (activeSlot.lastSeenMessageTs.delete(chat_id)) scheduleSlotLastSeenMessageTsSave(activeSlot);
+        }
         const data = await r.json().catch(() => ({})) as any;
         if (data.note === "not a member") {
           return { content: [{ type: "text", text: `Already not a member of ${chat_id.slice(0, 8)}` }] };
@@ -3500,8 +3865,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       // REST unreachable — fall back to WS leave so at least in-memory state updates
       if (ws && ws.readyState === WebSocket.OPEN) {
         try { ws.send(JSON.stringify({ type: "leave_channel", channel_id: chat_id, agent_id: AGENT_ID })); } catch {}
-        knownChannels.delete(chat_id);
-        if (lastSeenMessageTs.delete(chat_id)) scheduleLastSeenMessageTsSave();
+        if (activeSlot) {
+          activeSlot.knownChannels.delete(chat_id);
+          if (activeSlot.lastSeenMessageTs.delete(chat_id)) scheduleSlotLastSeenMessageTsSave(activeSlot);
+        }
         return { content: [{ type: "text", text: `Leave sent via WS (REST unreachable: ${String(e?.message || e).slice(0, 60)})` }] };
       }
       return { content: [{ type: "text", text: `Leave failed — no connectivity` }] };
@@ -4302,37 +4669,10 @@ const lastMentionTimestamp = loadMentionTimestamps();
 // disconnect event — so the "reconnect" trigger alone doesn't
 // cover this class. Backfill runs on every auth_ok whether first
 // connect or reconnect; if we missed anything, we find it.
-const lastSeenMessageTsFile = join(configDir, `last-seen-msg-ts-${AGENT_ID}.json`);
-function loadLastSeenMessageTs(): Map<string, string> {
-  return loadCursor(lastSeenMessageTsFile, safeStderrWrite);
-}
-const lastSeenMessageTs = loadLastSeenMessageTs();
-const cursorFlushIntervalMs = Math.max(
-  500,
-  Number(process.env.AGENTSCHAT_MCP_CURSOR_FLUSH_MS || 5000),
-);
-/** Dirty flag lives in an object so flushCursor can clear it only on a landed write. */
-const cursorState = { dirty: false };
-let lastSeenMessageTsTimer: ReturnType<typeof setTimeout> | null = null;
-
 function flushLastSeenMessageTs() {
-  if (!cursorState.dirty) return;
-  if (lastSeenMessageTsTimer) {
-    clearTimeout(lastSeenMessageTsTimer);
-    lastSeenMessageTsTimer = null;
+  for (const slot of profileSlots.values()) {
+    flushSlotLastSeenMessageTs(slot);
   }
-  // Stays dirty if the write fails, so the shutdown fallback flush actually retries.
-  flushCursor(cursorState, () => persistCursor(lastSeenMessageTsFile, lastSeenMessageTs, safeStderrWrite));
-}
-
-function scheduleLastSeenMessageTsSave() {
-  cursorState.dirty = true;
-  if (lastSeenMessageTsTimer) return;
-  lastSeenMessageTsTimer = setTimeout(() => {
-    lastSeenMessageTsTimer = null;
-    flushLastSeenMessageTs();
-  }, cursorFlushIntervalMs);
-  (lastSeenMessageTsTimer as any).unref?.();
 }
 
 // normalizeTimestampForCursor now lives in ./timestamps.ts (imported above),
@@ -4483,14 +4823,13 @@ function clearFinishedHiddenIdentityGamesFromMessage(data: any) {
 // duplicate or drop older out-of-order messages that were never processed.
 // Dedup core (key derivation + bounded set) lives in ./dedup.ts; this file
 // keeps the thin logging wrapper so call sites and stderr output are unchanged.
-const messageDedup = new MessageDedup();
 function deliverySource(data: any): string {
   return typeof data?.__source === "string" ? data.__source : "live";
 }
-function recordOrSkipDeliveredMessage(data: any): boolean {
+function recordOrSkipDeliveredMessage(data: any, slot: ProfileSlot | null = activeSlot): boolean {
   const key = messageDedupKey(data);
-  if (!key) return false;
-  const skip = messageDedup.recordOrSkip(key);
+  if (!key || !slot) return false;
+  const skip = slot.messageDedup.recordOrSkip(key);
   if (skip) {
     process.stderr.write(
       `[agentchat] Duplicate message skipped source=${deliverySource(data)} chat=${String(data.channel_id).slice(0, 12)} id=${String(data.id).slice(0, 12)}\n`,
@@ -4498,24 +4837,13 @@ function recordOrSkipDeliveredMessage(data: any): boolean {
   }
   return skip;
 }
-// Channels we believe we're a member of. Populated from
-// `channel_created` events on auth_ok. Used as the backfill target set.
-const knownChannels = new Set<string>();
-// Task #119: exposed handler reference so backfillAllChannels (module-
-// scope) can reuse connectWS's handleWSMessage closure without
-// duplicating the mention/notification gate logic.
-let currentHandleWSMessage: ((data: any) => Promise<void>) | null = null;
-let wsReconnectAttempt = 0;
-let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-// Tracked so shutdown / switchIdentity can cancel a pending auth_ok backfill.
-let backfillTimer: ReturnType<typeof setTimeout> | null = null;
 
-function scheduleReconnect(delayMs: number) {
-  if (shuttingDown) return; // don't resurrect the socket after shutdown
-  if (reconnectTimer) clearTimeout(reconnectTimer);
-  reconnectTimer = setTimeout(() => {
-    reconnectTimer = null;
-    connectWS();
+function scheduleReconnect(delayMs: number, slot: ProfileSlot | null = activeSlot) {
+  if (shuttingDown || !slot) return; // don't resurrect the socket after shutdown
+  if (slot.reconnectTimer) clearTimeout(slot.reconnectTimer);
+  slot.reconnectTimer = setTimeout(() => {
+    slot.reconnectTimer = null;
+    connectWS(slot);
   }, delayMs);
 }
 
@@ -4524,37 +4852,20 @@ function scheduleReconnect(delayMs: number) {
  * was unreliable or down. Invoked 2s after every auth_ok — covers
  * both cold start (empty cursors = no backfill) and reconnect
  * (cursor points to last-seen, REST returns the gap).
- *
- * Iterates channels we believe we're in (populated from the
- * channel_created events that follow auth_ok). For each, GETs
- * /api/channels/:id/messages?after=<lastSeenTs> and re-injects
- * every message through handleWSMessage — same code path as live
- * delivery, so @mention detection + notification emission go
- * through the same gate. Self-messages are filtered by the handler
- * (sender_id !== AGENT_ID).
- *
- * Deduplication is by message id in handleWSMessage. Timestamp cursors
- * decide what backfill requests should ask for, but they are not a safe
- * identity check under live/backfill races or out-of-order delivery.
  */
-async function backfillAllChannels(): Promise<void> {
-  if (knownChannels.size === 0) return;
-  for (const channelId of knownChannels) {
+async function backfillAllChannels(slot: ProfileSlot | null = activeSlot): Promise<void> {
+  if (!slot || slot.knownChannels.size === 0) return;
+  for (const channelId of slot.knownChannels) {
     try {
-      const after = lastSeenMessageTs.get(channelId);
+      const after = slot.lastSeenMessageTs.get(channelId);
       const params = after ? `?after=${encodeURIComponent(after)}&limit=50` : `?limit=1`;
       const url = `${REST_URL}/api/channels/${encodeURIComponent(channelId)}/messages${params}`;
       const res = await apiFetch(url, {
-        headers: TOKEN ? { "Authorization": `Bearer ${TOKEN}` } : {},
+        headers: slot.token ? { "Authorization": `Bearer ${slot.token}` } : {},
       });
       if (!res.ok) continue;
       const data = await res.json() as { messages?: any[] };
       const msgs = data.messages || [];
-      // No cursor yet (cold start / freshly joined channel): DON'T replay —
-      // seed the cursor from the newest message so later backfills fetch only
-      // genuinely new messages. Replaying here would surface a possibly
-      // hours-old DM/@mention as a live notification (contract: empty cursor
-      // = no backfill).
       if (!after) {
         let newestTs = "";
         for (const m of msgs) {
@@ -4562,16 +4873,13 @@ async function backfillAllChannels(): Promise<void> {
           if (t > newestTs) newestTs = t;
         }
         if (newestTs) {
-          lastSeenMessageTs.set(channelId, newestTs);
-          scheduleLastSeenMessageTsSave();
+          slot.lastSeenMessageTs.set(channelId, newestTs);
+          scheduleSlotLastSeenMessageTsSave(slot);
         }
         continue;
       }
-      // Filter out self-messages upfront (faster than re-entering the
-      // handler just to bail) and typing placeholders (plugin ignores
-      // them anyway).
       const replay = msgs.filter((m: any) =>
-        m && m.sender_id !== AGENT_ID && m.content !== "__typing__");
+        m && m.sender_id !== slot.agentId && m.content !== "__typing__");
       const dedupedReplay = after
         ? replay.filter((m: any) => {
             const msgTs = normalizeTimestampForCursor(m?.timestamp, "after");
@@ -4581,14 +4889,11 @@ async function backfillAllChannels(): Promise<void> {
         : replay;
       if (dedupedReplay.length === 0) continue;
       process.stderr.write(`[agentchat] Backfill ${channelId.slice(0, 12)}: ${dedupedReplay.length} missed msg(s)\n`);
-      // Sort ascending so replay order matches live chronology —
-      // lastSeenMessageTs advances monotonically.
       dedupedReplay.sort((a: any, b: any) => String(a.timestamp).localeCompare(String(b.timestamp)));
       for (const m of dedupedReplay) {
         try {
-          // Wrap as a `message` envelope to match ws.onmessage shape.
-          if (currentHandleWSMessage) {
-            await currentHandleWSMessage({ ...m, type: "message", __source: "backfill" });
+          if (slot.handleWSMessage) {
+            await slot.handleWSMessage({ ...m, type: "message", __source: "backfill" });
           }
         } catch (e) {
           process.stderr.write(`[agentchat] Backfill replay error: ${e}\n`);
@@ -4600,42 +4905,85 @@ async function backfillAllChannels(): Promise<void> {
   }
 }
 
-function connectWS() {
-  // Don't spin up a new socket after stdio shutdown — a stray reconnect
-  // timer must never resurrect the connection.
-  if (shuttingDown) return;
+/**
+ * Automatically connect any additional unlocked profiles in `session-binds.json`
+ * that are bound to currently open Antigravity conversations.
+ */
+function syncOpenBoundSessions(): void {
+  if (toolOnlyMode || shuttingDown) return;
+  const agyHost = discoverAntigravityHost();
+  if (!agyHost || agyHost.openConversations.length === 0) return;
+  const binds = loadSessionBinds(configDir);
+  for (const cid of agyHost.openConversations) {
+    const boundProf = binds[cid];
+    if (!boundProf || profileSlots.has(boundProf)) continue;
+    const boundPath = nameToPath(boundProf);
+    if (!existsSync(boundPath)) continue;
+    try {
+      const candidate = readIdentityProfile(boundPath);
+      validateIdentityProfile(candidate, boundPath);
+      const lock = checkAgentLock({
+        lockDir,
+        agentId: candidate.agent_id,
+        currentSessionId: cid,
+        lockOwnerPid,
+      });
+      if (lock.locked) continue;
+      const sess: DetectedSession = { sessionId: cid, runtime: "antigravity" };
+      acquireAgentLock({
+        lockDir,
+        agentId: candidate.agent_id,
+        profileName: boundProf,
+        sessionId: cid,
+        runtime: "antigravity",
+      });
+      const slot = createProfileSlot({
+        profileName: boundProf,
+        profileFile: boundPath,
+        profile: candidate,
+        agentId: candidate.agent_id,
+        token: candidate.token,
+        capabilities: candidate.capabilities || ["claude-code", "coding", "chat"],
+        runtimeSession: sess,
+      });
+      profileSlots.set(boundProf, slot);
+      slot.heartbeat.start();
+      connectWS(slot);
+      if (!activeSlot) activateSlot(slot, sess);
+    } catch {}
+  }
+}
 
-  // Capture THIS socket locally. Every handler below guards on
-  // `ws !== socket`, so a superseded socket (e.g. a dead-TCP connection
-  // whose close event is delayed past the point a replacement is already
-  // live) can never clobber the current session or schedule a duplicate
-  // reconnect — the root cause of the orphan/double-connection race.
+function connectWS(slot: ProfileSlot | null = activeSlot) {
+  if (shuttingDown || !slot) return;
+
   let socket: WebSocket;
   try {
     socket = new WebSocket(WS_URL);
-    ws = socket;
+    slot.ws = socket;
+    if (activeSlot === slot) ws = socket;
   } catch (e) {
     process.stderr.write(`[agentchat] WebSocket constructor failed: ${e}, retrying in 5s\n`);
-    scheduleReconnect(5000); // route through the single tracked timer
+    scheduleReconnect(5000, slot);
     return;
   }
 
-  ws.onopen = () => {
-    if (ws !== socket) return; // superseded by a newer socket
+  socket.onopen = () => {
+    if (slot.ws !== socket) return;
     try {
       socket.send(JSON.stringify({
         type: "auth",
-        agent_id: AGENT_ID,
-        token: TOKEN,
-        capabilities: CAPABILITIES,
+        agent_id: slot.agentId,
+        token: slot.token,
+        capabilities: slot.capabilities,
       }));
     } catch (e) {
       process.stderr.write(`[agentchat] Auth send failed: ${e}\n`);
     }
   };
 
-  ws.onmessage = async (event) => {
-    if (ws !== socket) return; // ignore late frames from a superseded socket
+  socket.onmessage = async (event) => {
+    if (slot.ws !== socket) return;
     let data: any;
     try { data = JSON.parse(String(event.data)); } catch { return; }
     if (data && typeof data === "object" && !data.__source) data.__source = "live";
@@ -4644,11 +4992,11 @@ function connectWS() {
     }
   };
 
-  currentHandleWSMessage = handleWSMessage;
+  slot.handleWSMessage = handleWSMessage;
   async function handleWSMessage(data: any) {
-
     if (data.type === "pong") {
-      heartbeat.receivedPong();
+      slot!.heartbeat.receivedPong();
+      syncOpenBoundSessions();
       return;
     }
     if ((data.type === "hidden_identity.reveal" || data.type === "hidden_identity.finished") && typeof data.game_id === "string") {
@@ -4656,58 +5004,29 @@ function connectWS() {
     }
 
     if (data.type === "auth_ok") {
-      sessionId = data.session_id;
-      wsReconnectAttempt = 0; // reset backoff on successful auth
-      heartbeat.receivedPong(); // treat auth_ok as alive signal
-      process.stderr.write(`[agentchat] Connected as ${AGENT_ID}\n`);
-      // Task #119: fire a backfill 2s after auth_ok to pick up any
-      // messages that arrived while the WS was down or that the Redis
-      // ac:ch:* subscribe happened to miss. Delay gives the server
-      // time to emit channel_created for each joined channel so
-      // knownChannels is populated. backfillAllChannels does the
-      // per-channel REST fetch and re-injects each missed message
-      // through handleWSMessage so @mention detection + notification
-      // path is identical to live delivery — no divergent code paths.
-      if (backfillTimer) clearTimeout(backfillTimer);
-      backfillTimer = setTimeout(() => {
-        backfillTimer = null;
-        if (!shuttingDown) void backfillAllChannels();
+      slot!.sessionId = data.session_id;
+      if (activeSlot === slot) sessionId = data.session_id;
+      slot!.wsReconnectAttempt = 0;
+      slot!.heartbeat.receivedPong();
+      process.stderr.write(`[agentchat] Connected as ${slot!.agentId}\n`);
+      if (slot!.backfillTimer) clearTimeout(slot!.backfillTimer);
+      slot!.backfillTimer = setTimeout(() => {
+        slot!.backfillTimer = null;
+        if (!shuttingDown) void backfillAllChannels(slot!);
       }, 2000);
     } else if ((data.type === "message" || data.type === "thread_reply") &&
-      data.sender_id === AGENT_ID && typeof data.content === "string" && data.content !== "__typing__" &&
+      data.sender_id === slot!.agentId && typeof data.content === "string" && data.content !== "__typing__" &&
       !["loop_tick", "slash_input", "loop_status", "slash_response"].includes(data.meta?.kind)) {
-      // A separate connection of this identity may have produced the reply.
-      stopTypingHeartbeat(data.channel_id);
+      stopTypingHeartbeat(data.channel_id, slot!);
     } else if (
-      // thread_reply is a bidirectional protocol frame (Server -> Client too).
-      // Route it through the same @mention / notification / cursor path as a
-      // plain message, otherwise thread @mentions are silently invisible.
       (data.type === "message" || data.type === "thread_reply") &&
-      // Loop ticks are server-fired with sender_id=loop.agent_id, which
-      // equals AGENT_ID when the loop owner is THIS plugin. Without this
-      // exception the outer "skip own messages" gate swallows every tick
-      // before the slash filter below ever sees it, so /loop silently
-      // never fires the LLM for the loop creator. Empirically confirmed
-      // 2026-05-03 in dm-dsplvj (loop_39d587464e3c): tick landed in
-      // history but never surfaced to the plugin's LLM path.
-      (data.sender_id !== AGENT_ID ||
+      (data.sender_id !== slot!.agentId ||
         (data.meta &&
           typeof data.meta === "object" &&
           (data.meta as { kind?: unknown }).kind === "loop_tick"))
     ) {
-      // 跳过 typing 状态消息
       if (data.content === "__typing__") return;
 
-      // Slash side-channel skip (boss directive 2026-05-03 msg:caf95079).
-      // /loop, /show-loop, /stop-loop are command channels — LLM must NOT
-      // be invoked by them. Server tags envelopes server-authoritatively:
-      //   • meta.kind="slash_input"  — user's literal slash text (hub.ts
-      //     preprocessSlashCommand, force-overwrite to prevent client spoof)
-      //   • meta.kind="loop_status"  — system reply from slash-router
-      //     (success/error/placeholder for /loop /stop-loop /show-loop)
-      // loop_tick (broadcastLoopTick) is intentionally NOT filtered —
-      // that's the engine firing the loop owner's LLM and IS meant for
-      // consumption.
       const metaKind = (data.meta && typeof data.meta === "object")
         ? (data.meta as { kind?: unknown }).kind
         : undefined;
@@ -4719,70 +5038,40 @@ function connectWS() {
         return;
       }
 
-      if (recordOrSkipDeliveredMessage(data)) return;
+      if (recordOrSkipDeliveredMessage(data, slot!)) return;
 
-      // Task #119: record the timestamp so a future auth_ok backfill
-      // knows where to resume. Only advance forward (defensive against
-      // out-of-order delivery from Redis subscribe vs REST backfill replay).
-      // Persist on a short debounce so busy public channels do not turn
-      // every silent message into a synchronous disk write.
       if (typeof data.channel_id === "string" && typeof data.timestamp === "string") {
-        const prev = lastSeenMessageTs.get(data.channel_id) || "";
+        const prev = slot!.lastSeenMessageTs.get(data.channel_id) || "";
         const currentTs = normalizeTimestampForCursor(data.timestamp, "after") || data.timestamp;
         const prevTs = normalizeTimestampForCursor(prev, "after") || prev;
         if (currentTs > prevTs) {
-          lastSeenMessageTs.set(data.channel_id, data.timestamp);
-          scheduleLastSeenMessageTsSave();
+          slot!.lastSeenMessageTs.set(data.channel_id, data.timestamp);
+          scheduleSlotLastSeenMessageTsSave(slot!);
         }
       }
 
       const isDM = data.channel_id?.startsWith("dm-");
-      // Match `@<agentId>` and `@<displayName>(<agentId>)`; see matchesMention
-      // (mentions.ts) for why the second clause must not fire on incidental
-      // `(<id>)` substrings like "User joined: name (acc_xyz)".
-      const isMentioned = matchesMention(data.content || "", AGENT_ID || "");
+      const isMentioned = matchesMention(data.content || "", slot!.agentId || "");
       const activeHi = activeHiddenIdentityForChannel(data.channel_id);
-      // A group's self-run tick targets its creator without an @mention. Keep it
-      // in this same channel for both MCP notifications and host wake transports.
-      // Another bot's tick does not grant this exception.
-      const isOwnLoopTick = metaKind === "loop_tick" && data.sender_id === AGENT_ID;
+      const isOwnLoopTick = metaKind === "loop_tick" && data.sender_id === slot!.agentId;
 
       if (isDM || isMentioned || activeHi || isOwnLoopTick) {
-        // DM or @mention → respond. Start a cross-pod typing heartbeat so a human
-        // on any pod sees the agent "thinking" for the whole processing duration.
-        // The hub now cross-pod-broadcasts agent typing frames (cross_pod:true)
-        // and never persists them, so this is ephemeral + zero-write. Stops when
-        // we reply to the channel (reply handler), at the 120s cap, or on shutdown.
-        if (isDM || isMentioned) startTypingHeartbeat(data.channel_id);
+        if (isDM || isMentioned) startTypingHeartbeat(data.channel_id, slot!);
 
-        // For @mention in channels, fetch context since last mention
         let contextPrefix = "";
         if (!isDM && isMentioned) {
           try {
-            const lastTs = lastMentionTimestamp.get(data.channel_id) || "";
-            // Cap the request size: 50 messages max, plus client-side byte
-            // and per-message-content trimming below. Boss msg:fc8b9b1a —
-            // long-silent agents would pull a 200-message backlog on first
-            // @mention, blowing up small-context models. 50 + 15KB +
-            // per-msg 2KB matches "recent conversation" without overshoot.
+            const mentionKey = `${slot!.agentId}:${data.channel_id}`;
+            const lastTs = lastMentionTimestamp.get(mentionKey) || lastMentionTimestamp.get(data.channel_id) || "";
             const params = `limit=50${lastTs ? '&after=' + encodeURIComponent(lastTs) : ''}`;
             const historyUrl = `${REST_URL}/api/channels/${encodeURIComponent(data.channel_id)}/messages?${params}`;
-            // Channel reads are auth-gated (login for public channels,
-            // membership for private). Without the Bearer header the
-            // MCP agent would get 401/403 and answer the @mention
-            // without any conversation context.
             const historyRes = await apiFetch(historyUrl, {
-              headers: TOKEN ? { "Authorization": `Bearer ${TOKEN}` } : {},
+              headers: slot!.token ? { "Authorization": `Bearer ${slot!.token}` } : {},
             });
             if (historyRes.ok) {
               const historyData = await historyRes.json() as any;
               let msgs = (historyData.messages || [])
                 .filter((m: any) => m.id !== data.id && m.content !== "__typing__");
-              // Cumulative byte cap (newest-first walk so we keep the most
-              // recent messages when total exceeds the budget). Per-message
-              // content also clipped to 2KB to defang occasional copy-paste
-              // walls of text — a single mega-message no longer eats the
-              // whole budget alone.
               let totalBytes = 0;
               const maxBytes = 15_000;
               const maxPerMsg = 2_000;
@@ -4792,7 +5081,7 @@ function connectWS() {
                 const clipped = raw.length > maxPerMsg
                   ? raw.slice(0, maxPerMsg) + " …[truncated]"
                   : raw;
-                const size = Buffer.byteLength(clipped, "utf8"); // real UTF-8 bytes (CJK is 3B/char, not 1)
+                const size = Buffer.byteLength(clipped, "utf8");
                 if (totalBytes + size > maxBytes) break;
                 totalBytes += size;
                 trimmed.unshift({ ...msgs[i], content: clipped });
@@ -4808,7 +5097,7 @@ function connectWS() {
                 contextPrefix = `${note}\n${context}\n\n[你被 @mention 了，请回复]\n`;
               }
             }
-            // Record this mention timestamp for next time
+            lastMentionTimestamp.set(mentionKey, data.timestamp);
             lastMentionTimestamp.set(data.channel_id, data.timestamp);
             saveMentionTimestamps(lastMentionTimestamp);
           } catch (e) {
@@ -4821,7 +5110,6 @@ function connectWS() {
 
         process.stderr.write(`[agentchat] ${isDM ? 'DM' : isMentioned ? '@mention' : isOwnLoopTick ? 'loop-tick' : 'HI-active'} from ${String(data.sender_id ?? "?").slice(0, 8)}: ${String(data.content ?? "").slice(0, 50)}\n`);
 
-        // 推送给 Claude Code
         try {
           const notifAtt = formatWakeAttachments(data.attachments);
           await server.notification({
@@ -4839,30 +5127,20 @@ function connectWS() {
         } catch (notifErr) {
           process.stderr.write(`[agentchat] Notification FAILED: ${notifErr}\n`);
         }
-        // Wake-webhook (host-agnostic): hosts without an MCP channel-notification
-        // surface (Grok Bot, generic MCP clients) are woken by an outbound POST to
-        // AGENTCHAT_WAKE_URL instead. Best-effort — never blocks the notification
-        // path above. The ac_ token stays local; the body carries message metadata
-        // + an HMAC signature (AGENTCHAT_WAKE_SECRET) so the receiver can verify.
-        // Grok mode (AGENTCHAT_WAKE_MODE=grok): a same-machine Grok gateway expects
-        // loopback /api/sendPrompt with its own Bearer (read from gateway.json) and
-        // a {agentId, prompt} body — a different transport, same trigger.
+
+        const slotProfName = slot!.profileName || profileNameFromPath(slot!.profileFile);
+        const slotRuntime = slot!.runtimeSession?.runtime;
+
         if (process.env.AGENTCHAT_WAKE_MODE === "grok") {
-          // 1:1 mapping: this plugin instance (one AgentsChat agent) wakes ONE Grok
-          // agent. Explicit AGENTCHAT_GROK_AGENT_ID wins; else resolve by matching
-          // the AgentsChat display name against the gateway's listAgents (warns);
-          // else fail closed (no wake). The gateway token/port come from gateway.json.
           void (async () => {
             try {
               const { readFileSync, existsSync } = await import("node:fs");
-              // env override wins; else first existing candidate (~/.grok default,
-              // production GrokBot /home/box/sand-data) — never guess a path blindly.
               const gwPath = resolveGrokGatewayPath(process.env.AGENTCHAT_GROK_GATEWAY, existsSync);
               let agentId = process.env.AGENTCHAT_GROK_AGENT_ID || "";
               if (!agentId) {
                 agentId = (await resolveGrokAgentId({
                   explicitId: "",
-                  agentschatName: profile.display_name || AGENT_ID,
+                  agentschatName: slot!.profile.display_name || slot!.agentId,
                   listAgents: async () => {
                     const gwcfg = JSON.parse(readFileSync(gwPath, "utf8"));
                     const token = grokBearerFromGatewayConfig(gwcfg);
@@ -4884,26 +5162,55 @@ function connectWS() {
             }
           })();
         } else if (process.env.AGENTCHAT_WAKE_URL) {
+          const route = resolveSessionForAgent(slot!.agentId, { configDir });
+          const targetSessionId =
+            route?.sessionId ||
+            findBoundSessionForProfile(configDir, slotProfName) ||
+            slot!.runtimeSession?.sessionId ||
+            undefined;
           void fireWake(data, {
             url: process.env.AGENTCHAT_WAKE_URL,
             secret: process.env.AGENTCHAT_WAKE_SECRET,
+            targetSessionId,
           });
-        } else if (runtimeSession?.runtime === "zcode" || process.env.AGENTCHAT_WAKE_MODE === "zcode") {
-          const activeProfName = profileNameFromPath(activeProfileFile);
+        } else if (
+          slotRuntime === "zcode" ||
+          process.env.AGENTCHAT_WAKE_MODE === "zcode" ||
+          Boolean(findBoundSessionForProfile(configDir, slotProfName, (sid) => sid.startsWith("sess_")))
+        ) {
           const zcodeSid =
-            runtimeSession?.sessionId ||
-            findBoundSessionForProfile(configDir, activeProfName, (sid) => sid.startsWith("sess_")) ||
+            findBoundSessionForProfile(configDir, slotProfName, (sid) => sid.startsWith("sess_")) ||
+            (slotRuntime === "zcode" ? slot!.runtimeSession?.sessionId : "") ||
             "";
           if (zcodeSid) {
             void fireZcodeWake(data, {
               sessionId: zcodeSid,
-              workspacePath: runtimeSession?.workspacePath,
-              profileName: activeProfName ?? undefined,
+              workspacePath: slot!.runtimeSession?.workspacePath,
+              profileName: slotProfName ?? undefined,
               lockOwnerPid: process.pid,
               contextPrefix,
               logger: (m) => process.stderr.write(`${m}\n`),
             });
           }
+        } else if (
+          slotRuntime === "dsh" ||
+          isDshHostProcess() ||
+          Boolean(findBoundSessionForProfile(configDir, slotProfName, (sid) => sid.startsWith("session-")))
+        ) {
+          const dshSid =
+            findBoundSessionForProfile(configDir, slotProfName, (sid) => sid.startsWith("session-")) ||
+            resolveSessionForAgent(slot!.agentId, { configDir })?.sessionId ||
+            (slotRuntime === "dsh" ? slot!.runtimeSession?.sessionId : "") ||
+            undefined;
+          const dshWakeUrl =
+            process.env.DSH_WAKE_URL ||
+            process.env.AGENTSCHAT_DSH_WAKE_URL ||
+            "http://127.0.0.1:8799/wake";
+          void fireWake(data, {
+            url: dshWakeUrl,
+            secret: process.env.DSH_WAKE_SECRET ?? process.env.AGENTCHAT_WAKE_SECRET,
+            targetSessionId: dshSid,
+          });
         } else {
           // Native Antigravity (agy) Connect-RPC wake when running under language_server
           void (async () => {
@@ -4912,18 +5219,17 @@ function connectWS() {
               const lsAddress = process.env.ANTIGRAVITY_LS_ADDRESS?.trim() || "";
               const csrfToken = (process.env.ANTIGRAVITY_CSRF_TOKEN || agyHost?.csrfToken || "").trim();
               if (!agyHost && !lsAddress) return;
-              const activeProfName = profileNameFromPath(activeProfileFile);
               const allBinds = loadSessionBinds(configDir);
               let targetCid =
-                findBoundSessionForProfile(configDir, activeProfName, (sid) => /^[0-9a-f-]{36}$/i.test(sid)) ||
-                (runtimeSession?.runtime === "antigravity" ? runtimeSession.sessionId : "") ||
+                findBoundSessionForProfile(configDir, slotProfName, (sid) => /^[0-9a-f-]{36}$/i.test(sid)) ||
+                (slotRuntime === "antigravity" ? slot!.runtimeSession?.sessionId : "") ||
                 "";
               if (!targetCid && agyHost) {
                 if (agyHost.openConversations.length === 1) {
                   targetCid = agyHost.openConversations[0]!;
                 } else if (agyHost.openConversations.length > 1) {
                   const unboundOrSame = agyHost.openConversations.find(
-                    (cid) => !allBinds[cid] || allBinds[cid] === activeProfName,
+                    (cid) => !allBinds[cid] || allBinds[cid] === slotProfName,
                   );
                   targetCid = unboundOrSame || agyHost.openConversations[0]!;
                 }
@@ -4945,94 +5251,70 @@ function connectWS() {
         }
         if (activeHi) clearFinishedHiddenIdentityGamesFromMessage(data);
       } else {
-        // Channel message without @mention → silent (just log)
         rateLimitedLog(
           "silent-channel-message",
           `[agentchat] [silent] ${String(data.sender_id ?? "?").slice(0, 8)} in ${String(data.channel_id ?? "?").slice(0, 12)}: ${String(data.content ?? "").slice(0, 30)}\n`,
         );
       }
     } else if (data.type === "channel_created") {
-      // 自动加入新频道
       try {
-        ws?.send(JSON.stringify({
+        slot!.ws?.send(JSON.stringify({
           type: "join_channel",
           channel_id: data.channel_id,
-          agent_id: AGENT_ID,
+          agent_id: slot!.agentId,
         }));
       } catch {}
       process.stderr.write(`[agentchat] Joined channel: ${data.name}\n`);
-      // Task #119: track channel id for reconnect backfill target set.
-      if (typeof data.channel_id === "string") knownChannels.add(data.channel_id);
+      if (typeof data.channel_id === "string") slot!.knownChannels.add(data.channel_id);
     } else if (data.type === "shard_moved") {
-      // Server instance shutting down or channel moved — a PLANNED hop.
-      // Detach the socket's onclose so it can't also run the unplanned
-      // backoff path, reset the backoff counter, and fast-reconnect. This
-      // keeps a rolling deploy (several pods closing in sequence) from
-      // pushing each successive reconnect 2s, 4s, 6s ... further out.
       process.stderr.write(`[agentchat] Shard moved, reconnecting...\n`);
       if (data.redirect_url) {
         const newUrl = data.redirect_url.replace(/^https/, "wss").replace(/^http/, "ws") + "/ws";
         process.stderr.write(`[agentchat] Redirecting to: ${newUrl}\n`);
-        // Note: for simplicity we reconnect to original URL and let /api/shard handle routing
       }
-      if (ws) { ws.onclose = null; try { ws.close(); } catch {} }
-      ws = null;
-      sessionId = null;
-      wsReconnectAttempt = 0;
-      scheduleReconnect(500);
+      if (slot!.ws) { slot!.ws.onclose = null; try { slot!.ws.close(); } catch {} }
+      slot!.ws = null;
+      slot!.sessionId = null;
+      if (activeSlot === slot) { ws = null; sessionId = null; }
+      slot!.wsReconnectAttempt = 0;
+      scheduleReconnect(500, slot!);
     } else if (data.type === "error") {
       process.stderr.write(`[agentchat] Error: ${data.message}\n`);
     }
   }
 
-  ws.onclose = (event) => {
-    if (ws !== socket) return; // a superseded socket's delayed close — leave live state alone
-    sessionId = null;
-    heartbeat.resetReconnecting(); // allow heartbeat to reconnect again if needed
-    // Only genuine UNPLANNED drops reach here now. Planned paths
-    // (shard_moved / heartbeat.reconnect / switchIdentity) detach this
-    // handler and self-schedule a fast reconnect, so there is no
-    // isPlannedReconnect flag to consume and no fast/slow ambiguity.
-    wsReconnectAttempt++;
-    const delay = computeReconnectDelay(wsReconnectAttempt);
-    process.stderr.write(`[agentchat] Disconnected (code=${(event as any)?.code ?? "?"}), reconnecting in ${Math.round(delay/100)/10}s (attempt ${wsReconnectAttempt})...\n`);
-    scheduleReconnect(delay);
+  socket.onclose = (event) => {
+    if (slot.ws !== socket) return;
+    slot.sessionId = null;
+    if (activeSlot === slot) sessionId = null;
+    slot.heartbeat.resetReconnecting();
+    slot.wsReconnectAttempt++;
+    const delay = computeReconnectDelay(slot.wsReconnectAttempt);
+    process.stderr.write(`[agentchat] Disconnected (code=${(event as any)?.code ?? "?"}), reconnecting in ${Math.round(delay/100)/10}s (attempt ${slot.wsReconnectAttempt})...\n`);
+    scheduleReconnect(delay, slot);
   };
 
-  ws.onerror = (err) => {
-    if (ws !== socket) return;
+  socket.onerror = (err) => {
+    if (slot.ws !== socket) return;
     process.stderr.write(`[agentchat] WebSocket error: ${err}\n`);
   };
 }
 
-// Heartbeat with dead-connection detection (15s ping, 45s timeout for faster recovery)
-import { HeartbeatMonitor, WS_OPEN, WS_CLOSED, WS_CONNECTING, WS_CLOSING } from "./heartbeat.ts";
-
-const heartbeat = new HeartbeatMonitor({
-  sendPing: () => {
-    try { ws?.send(JSON.stringify({ type: "ping", timestamp: new Date().toISOString() })); } catch {}
-  },
-  reconnect: () => {
-    process.stderr.write("[agentchat] Heartbeat timeout, forcing reconnect\n");
-    // Detach onclose so the forced close doesn't also run the unplanned
-    // backoff path and downgrade this fast 500ms recovery to 2-5s.
-    if (ws) { ws.onclose = null; try { ws.close(); } catch {} }
-    ws = null;
-    sessionId = null;
-    wsReconnectAttempt = 0; // reset backoff for heartbeat-triggered reconnect
-    scheduleReconnect(500); // short delay to avoid tight loop
-  },
-  getReadyState: () => ws?.readyState ?? WS_CLOSED,
-}, 15_000, 45_000, 30_000); // 15s ping, 45s pong timeout, 30s connect timeout
-if (!anonymousMode && !toolOnlyMode) {
-  heartbeat.start();
-}
-
 function releaseLiveLock() {
-  if (AGENT_ID && !toolOnlyMode) {
-    try {
-      releaseAgentLock({ lockDir, agentId: AGENT_ID, currentSessionId: runtimeSession?.sessionId ?? null });
-    } catch {}
+  if (!toolOnlyMode) {
+    for (const slot of profileSlots.values()) {
+      if (slot.agentId) {
+        try {
+          const boundSid = slot.runtimeSession?.sessionId || findBoundSessionForProfile(configDir, slot.profileName) || null;
+          releaseAgentLock({ lockDir, agentId: slot.agentId, currentSessionId: boundSid });
+        } catch {}
+      }
+    }
+    if (AGENT_ID) {
+      try {
+        releaseAgentLock({ lockDir, agentId: AGENT_ID, currentSessionId: runtimeSession?.sessionId ?? null });
+      } catch {}
+    }
   }
 }
 
@@ -5040,18 +5322,11 @@ function shutdownFromStdio(reason: string) {
   if (shuttingDown) return;
   shuttingDown = true;
   safeStderrWrite(`[agentchat] Stdio closed (${reason}), shutting down\n`);
-  // Persisting the read cursor is a state change, not teardown: report, never swallow.
   try { flushLastSeenMessageTs(); } catch (e) { safeStderrWrite(`[agentchat] WARNING: read-cursor flush failed on shutdown: ${e}\n`); }
   releaseLiveLock();
-  try { heartbeat.stop(); } catch {}
   try { stopAllTypingHeartbeats(); } catch {}
-  if (reconnectTimer) {
-    clearTimeout(reconnectTimer);
-    reconnectTimer = null;
-  }
-  if (backfillTimer) {
-    clearTimeout(backfillTimer);
-    backfillTimer = null;
+  for (const slot of [...profileSlots.values()]) {
+    teardownSlot(slot, { releaseLock: false });
   }
   try { ws?.close(); } catch {}
   ws = null;
@@ -5116,14 +5391,22 @@ async function checkVersionStaleness(): Promise<void> {
 // --- Start ---
 async function main() {
   installStdioLifecycleGuards();
+  if (!toolOnlyMode) {
+    syncOpenBoundSessions();
+  }
   // Anonymous = no credentials to present. Connecting would just fail auth in a
   // reconnect loop; stdio (initialize/tools/list) is served either way.
-  if (anonymousMode) {
+  if (anonymousMode && profileSlots.size === 0) {
     process.stderr.write(`[agentchat] Anonymous — not connecting to the hub.\n`);
   } else if (toolOnlyMode) {
     process.stderr.write(`[agentchat] Tool-only mode (AGENTSCHAT_TOOL_ONLY=1) — skipping duplicate WS connection.\n`);
   } else {
-    connectWS();
+    for (const slot of profileSlots.values()) {
+      if (!slot.ws) {
+        slot.heartbeat.start();
+        connectWS(slot);
+      }
+    }
   }
 
   // Stdio is the only supported transport. The --port HTTP SSE path was

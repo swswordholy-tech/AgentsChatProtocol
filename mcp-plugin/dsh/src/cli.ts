@@ -20,7 +20,8 @@ import { redact } from "../../muse/src/config.ts";
 import { shouldDispatch } from "../../muse/src/policy.ts";
 import { TypingHeartbeat } from "../../muse/src/typing.ts";
 import { appendWakeQueue, buildWakePayload, fireWake } from "../../muse/src/wake.ts";
-import { resolveSessionForAgent } from "../../src/session-route.ts";
+import { agentschatConfigDir, resolveSessionForAgent } from "../../src/session-route.ts";
+import { loadSessionBinds } from "../../src/session-bind.ts";
 import { applyDshCordisPatchFile } from "./patch.ts";
 
 export const DSH_PROFILE_PATH = join(homedir(), ".agentschat", "dsh.json");
@@ -219,39 +220,92 @@ DeepSeek Harness (dsh) integration for AgentsChat:
       process.env.DSH_WAKE_QUEUE ?? join(homedir(), ".agentschat", "dsh-wake-queue.jsonl");
     const wakeUrl = process.env.DSH_WAKE_URL ?? process.env.AGENTCHAT_WAKE_URL;
     const wakeSecret = process.env.DSH_WAKE_SECRET ?? process.env.AGENTCHAT_WAKE_SECRET;
-    const typing = new TypingHeartbeat((channelId) => client.sendTyping(channelId));
-    process.on("SIGINT", () => typing.stopAll());
-    client.onMessage((m) => {
-      if (m.sender_id === config.agentId) {
-        typing.stop(m.channel_id);
-        return;
-      }
-      const kind = m.channel_id.startsWith("dm-") ? "direct" : "group";
-      if (!shouldDispatch(m, { agentId: config.agentId, displayName: config.displayName, channelKind: kind })) return;
-      typing.start(m.channel_id);
-      // Route the wake to the harness Session this identity is bound to
-      // (`session-binds.json`), so the receiver stops guessing "the newest idle
-      // Session" — a guess that lands in an unrelated conversation whenever an
-      // older Session happens to be idle. No bind → no target, and the receiver
-      // keeps its own fallback policy.
-      const route = resolveSessionForAgent(config.agentId);
-      const payload = buildWakePayload({ ...m, type: "message" }, { targetSessionId: route?.sessionId });
-      const queued = appendWakeQueue(queueFile, payload);
-      void fireWake(
-        { ...m, type: "message" },
-        { url: wakeUrl, secret: wakeSecret, logger: console.error, targetSessionId: route?.sessionId },
-      );
-      console.log(
-        `[dsh-wake] ${m.channel_id} ${m.sender_id} ${m.id} queued=${queued} target=${route?.sessionId ?? "unbound"}`,
-      );
+
+    const connectedAgentIds = new Set<string>();
+    const activeTyping: TypingHeartbeat[] = [];
+    process.on("SIGINT", () => {
+      for (const t of activeTyping) t.stopAll();
     });
-    client.onReconnect = () => {
-      for (const c of wakeChannels) client.joinChannel(c);
+
+    const attachWakeForClient = (
+      botClient: MuseAgentChatClient,
+      botIdentity: { agentId: string; displayName?: string },
+    ) => {
+      const typing = new TypingHeartbeat((channelId) => botClient.sendTyping(channelId));
+      activeTyping.push(typing);
+      botClient.onMessage((m) => {
+        if (m.sender_id === botIdentity.agentId) {
+          typing.stop(m.channel_id);
+          return;
+        }
+        const kind = m.channel_id.startsWith("dm-") ? "direct" : "group";
+        if (!shouldDispatch(m, { agentId: botIdentity.agentId, displayName: botIdentity.displayName, channelKind: kind })) return;
+        typing.start(m.channel_id);
+        // Route the wake to the harness Session this identity is bound to
+        // (`session-binds.json`), so the receiver stops guessing "the newest idle
+        // Session" — a guess that lands in an unrelated conversation whenever an
+        // older Session happens to be idle. No bind → no target, and the receiver
+        // keeps its own fallback policy.
+        const route = resolveSessionForAgent(botIdentity.agentId);
+        const payload = buildWakePayload({ ...m, type: "message" }, { targetSessionId: route?.sessionId });
+        const queued = appendWakeQueue(queueFile, payload);
+        void fireWake(
+          { ...m, type: "message" },
+          { url: wakeUrl, secret: wakeSecret, logger: console.error, targetSessionId: route?.sessionId },
+        );
+        console.log(
+          `[dsh-wake] ${m.channel_id} ${m.sender_id} ${m.id} agent=${botIdentity.agentId} queued=${queued} target=${route?.sessionId ?? "unbound"}`,
+        );
+      });
+      botClient.onReconnect = () => {
+        for (const c of wakeChannels) botClient.joinChannel(c);
+      };
     };
+
+    connectedAgentIds.add(config.agentId);
+    attachWakeForClient(client, { agentId: config.agentId, displayName: config.displayName });
     await client.connect();
     for (const c of wakeChannels) client.joinChannel(c);
+
+    // Also multiplex any additional DSH sessions (`session-*`) bound in `session-binds.json`
+    const syncBoundDshClients = async () => {
+      try {
+        const cfgDir = agentschatConfigDir();
+        const binds = loadSessionBinds(cfgDir);
+        for (const [sid, profName] of Object.entries(binds)) {
+          if (!sid.startsWith("session-") || !profName) continue;
+          const base = profName.replace(/\.json$/, "").replace(/[^a-zA-Z0-9_-]/g, "_");
+          const candidates = [join(cfgDir, "profiles", `${base}.json`), join(cfgDir, `${base}.json`)];
+          const profPath = candidates.find((p) => existsSync(p));
+          if (!profPath) continue;
+          const raw = JSON.parse(readFileSync(profPath, "utf8")) as Record<string, any>;
+          const botAgentId = typeof raw.agent_id === "string" ? raw.agent_id : typeof raw.agentId === "string" ? raw.agentId : "";
+          const botToken = typeof raw.token === "string" ? raw.token : "";
+          if (!botAgentId || !botToken || botToken === "dev-token" || connectedAgentIds.has(botAgentId)) continue;
+          connectedAgentIds.add(botAgentId);
+          const extraClient = new MuseAgentChatClient({
+            url: config.wsUrl,
+            agentId: botAgentId,
+            token: botToken,
+            capabilities: ["chat"],
+          });
+          attachWakeForClient(extraClient, {
+            agentId: botAgentId,
+            displayName: typeof raw.display_name === "string" ? raw.display_name : undefined,
+          });
+          await extraClient.connect();
+          for (const c of wakeChannels) extraClient.joinChannel(c);
+          console.log(`[dsh-wake] Connected bound session ${sid} -> ${profName} (${botAgentId})`);
+        }
+      } catch {}
+    };
+    await syncBoundDshClients();
+    const bindTimer = setInterval(() => void syncBoundDshClients(), 5_000);
+    (bindTimer as any).unref?.();
+
     console.log(`DSH wake daemon listening on ${wakeChannels.join(", ") || "(no channels — pass --channel <id>)"}, queue=${queueFile}.`);
     await client.waitUntilClosed();
+    clearInterval(bindTimer);
     return;
   }
 
