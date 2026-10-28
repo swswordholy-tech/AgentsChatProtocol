@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 
 // dsh/src/cli.ts
-import { existsSync as existsSync3, mkdirSync as mkdirSync2, readFileSync as readFileSync3, writeFileSync as writeFileSync2 } from "node:fs";
+import { existsSync as existsSync5, mkdirSync as mkdirSync3, readFileSync as readFileSync5, writeFileSync as writeFileSync2 } from "node:fs";
 import { spawn } from "node:child_process";
-import { dirname as dirname2, join as join3 } from "node:path";
-import { homedir as homedir3 } from "node:os";
+import { dirname as dirname2, join as join5 } from "node:path";
+import { homedir as homedir4 } from "node:os";
 
 // muse/src/policy.ts
 var MAX_HISTORY_MESSAGES = 50;
@@ -376,8 +376,9 @@ var WAKE_CONTENT_MAX = 500;
 function redactSecrets(text) {
   return text.replace(/ac_[A-Za-z0-9_-]+/g, "[redacted]").replace(/eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "[redacted]");
 }
-function buildWakePayload(msg) {
+function buildWakePayload(msg, opts = {}) {
   const content = typeof msg.content === "string" ? redactSecrets(msg.content.slice(0, WAKE_CONTENT_MAX)) : undefined;
+  const targetSessionId = typeof opts.targetSessionId === "string" && opts.targetSessionId.length > 0 ? opts.targetSessionId : undefined;
   return {
     type: typeof msg.type === "string" ? msg.type : "message",
     channel_id: msg.channel_id,
@@ -385,7 +386,8 @@ function buildWakePayload(msg) {
     sender_id: msg.sender_id,
     content,
     mentioned_ids: Array.isArray(msg.mentioned_ids) ? msg.mentioned_ids.filter((x) => typeof x === "string") : undefined,
-    timestamp: typeof msg.timestamp === "string" ? msg.timestamp : undefined
+    timestamp: typeof msg.timestamp === "string" ? msg.timestamp : undefined,
+    ...targetSessionId ? { target_session_id: targetSessionId } : {}
   };
 }
 function signWakeBody(body, secret) {
@@ -396,7 +398,7 @@ async function fireWake(msg, cfg) {
   const url = (cfg.url ?? "").trim();
   if (!url)
     return;
-  const body = JSON.stringify(buildWakePayload(msg));
+  const body = JSON.stringify(buildWakePayload(msg, { targetSessionId: cfg.targetSessionId }));
   const headers = { "Content-Type": "application/json" };
   if (cfg.secret)
     headers[WAKE_SIG_HEADER] = signWakeBody(body, cfg.secret);
@@ -442,16 +444,98 @@ function appendWakeQueue(queueFile, payload) {
   return true;
 }
 
-// dsh/src/patch.ts
-import { existsSync as existsSync2, mkdirSync, readFileSync as readFileSync2, writeFileSync } from "node:fs";
-import { dirname, join as join2 } from "node:path";
+// src/session-route.ts
+import { existsSync as existsSync3, readFileSync as readFileSync3 } from "node:fs";
 import { homedir as homedir2 } from "node:os";
-function resolveDshPatchPath(opts = {}) {
-  const home = opts.dshHome ?? process.env.DSH_HOME ?? join2(homedir2(), ".dsh");
-  if (opts.dshProfile) {
-    return join2(home, "profiles", opts.dshProfile, "cordis.patch.yml");
+import { join as join3 } from "node:path";
+
+// src/session-bind.ts
+import { existsSync as existsSync2, mkdirSync, readFileSync as readFileSync2, unlinkSync } from "node:fs";
+import { join as join2 } from "node:path";
+var DEFAULT_SESSION_BINDS_FILENAME = "session-binds.json";
+var LEGACY_AGY_BINDS_FILENAME = "agy-binds.json";
+function parseSessionBinds(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw))
+    return {};
+  const out = {};
+  for (const [k, v] of Object.entries(raw)) {
+    const key = k.trim();
+    if (!key)
+      continue;
+    if (typeof v === "string" && v.trim()) {
+      out[key] = v.trim();
+    } else if (v && typeof v === "object" && typeof v.profile === "string" && v.profile.trim()) {
+      out[key] = v.profile.trim();
+    }
   }
-  return join2(home, "cordis.patch.yml");
+  return out;
+}
+function loadSessionBinds(configDir) {
+  const merged = {};
+  for (const filename of [LEGACY_AGY_BINDS_FILENAME, DEFAULT_SESSION_BINDS_FILENAME]) {
+    const path = join2(configDir, filename);
+    if (!existsSync2(path))
+      continue;
+    try {
+      Object.assign(merged, parseSessionBinds(JSON.parse(readFileSync2(path, "utf8"))));
+    } catch {}
+  }
+  return merged;
+}
+
+// src/session-route.ts
+function agentschatConfigDir(env = process.env) {
+  return env.AGENTSCHAT_CONFIG_DIR ?? join3(homedir2(), ".agentschat");
+}
+function profilePathForName(configDir, name) {
+  if (!name || name.includes("/") || name.includes("\\"))
+    return;
+  const base = name.replace(/\.json$/, "").replace(/[^a-zA-Z0-9_-]/g, "_");
+  const nested = join3(configDir, "profiles", `${base}.json`);
+  if (existsSync3(nested))
+    return nested;
+  const flat = join3(configDir, `${base}.json`);
+  return existsSync3(flat) ? flat : undefined;
+}
+function readAgentId(path) {
+  try {
+    const parsed = JSON.parse(readFileSync3(path, "utf8"));
+    return typeof parsed.agent_id === "string" && parsed.agent_id ? parsed.agent_id : undefined;
+  } catch {
+    return;
+  }
+}
+function resolveSessionForAgent(agentId, opts = {}) {
+  if (typeof agentId !== "string" || agentId.length === 0)
+    return;
+  const configDir = opts.configDir ?? agentschatConfigDir(opts.env);
+  let binds;
+  try {
+    binds = loadSessionBinds(configDir);
+  } catch {
+    return;
+  }
+  for (const [sessionId, profileName] of Object.entries(binds).reverse()) {
+    const path = profilePathForName(configDir, profileName);
+    if (path === undefined)
+      continue;
+    if (readAgentId(path) !== agentId)
+      continue;
+    return { sessionId, profileName, agentId };
+  }
+  return;
+}
+
+// dsh/src/patch.ts
+import { existsSync as existsSync4, mkdirSync as mkdirSync2, readFileSync as readFileSync4, writeFileSync } from "node:fs";
+import { dirname, join as join4 } from "node:path";
+import { homedir as homedir3 } from "node:os";
+function resolveDshPatchPath(opts = {}) {
+  const home = opts.dshHome ?? process.env.DSH_HOME ?? join4(homedir3(), ".dsh");
+  if (opts.dshProfile) {
+    return join4(home, "profiles", opts.dshProfile, "cordis.patch.yml");
+  }
+  return join4(home, "cordis.patch.yml");
 }
 function buildMcpAgentsChatArgs(opts = {}) {
   const pkg = opts.packageSpec ?? "agentschat-mcp@latest";
@@ -526,17 +610,17 @@ ${renderMcpAgentsChatEntry("    ", opts)}
 }
 function applyDshCordisPatchFile(opts = {}) {
   const patchPath = resolveDshPatchPath(opts);
-  const existing = existsSync2(patchPath) ? readFileSync2(patchPath, "utf8") : "";
+  const existing = existsSync4(patchPath) ? readFileSync4(patchPath, "utf8") : "";
   const { content, changed } = mergeDshCordisPatch(existing, opts);
   if (changed) {
-    mkdirSync(dirname(patchPath), { recursive: true });
+    mkdirSync2(dirname(patchPath), { recursive: true });
     writeFileSync(patchPath, content, "utf8");
   }
   return { patchPath, changed };
 }
 
 // dsh/src/cli.ts
-var DSH_PROFILE_PATH = join3(homedir3(), ".agentschat", "dsh.json");
+var DSH_PROFILE_PATH = join5(homedir4(), ".agentschat", "dsh.json");
 var DEFAULT_WS_URL = "wss://agents-chat.com/ws";
 var DEFAULT_REST_URL = "https://agents-chat.com";
 function arg(name, argv) {
@@ -549,8 +633,8 @@ function has(name, argv) {
 function loadDshConfig(env = process.env, profilePath = DSH_PROFILE_PATH) {
   let profile = {};
   try {
-    if (existsSync3(profilePath)) {
-      profile = JSON.parse(readFileSync3(profilePath, "utf8"));
+    if (existsSync5(profilePath)) {
+      profile = JSON.parse(readFileSync5(profilePath, "utf8"));
     }
   } catch {
     profile = {};
@@ -593,7 +677,7 @@ async function registerOnly(name, restUrl, profilePath = DSH_PROFILE_PATH) {
   const token = data.agentKey ?? data.token ?? data.key;
   if (!agentId || !token)
     throw new Error("Registration response did not include an agent id/token");
-  mkdirSync2(dirname2(profilePath), { recursive: true });
+  mkdirSync3(dirname2(profilePath), { recursive: true });
   writeFileSync2(profilePath, JSON.stringify({ agentId, token }, null, 2), { mode: 384 });
   console.log(`Registered DSH agent '${name}' as ${agentId}. Identity saved to ${profilePath} (token not printed).`);
 }
@@ -692,7 +776,7 @@ DeepSeek Harness (dsh) integration for AgentsChat:
     }
     if (config.defaultChannelId)
       wakeChannels.push(config.defaultChannelId);
-    const queueFile = process.env.DSH_WAKE_QUEUE ?? join3(homedir3(), ".agentschat", "dsh-wake-queue.jsonl");
+    const queueFile = process.env.DSH_WAKE_QUEUE ?? join5(homedir4(), ".agentschat", "dsh-wake-queue.jsonl");
     const wakeUrl = process.env.DSH_WAKE_URL ?? process.env.AGENTCHAT_WAKE_URL;
     const wakeSecret = process.env.DSH_WAKE_SECRET ?? process.env.AGENTCHAT_WAKE_SECRET;
     const typing = new TypingHeartbeat((channelId) => client.sendTyping(channelId));
@@ -706,10 +790,11 @@ DeepSeek Harness (dsh) integration for AgentsChat:
       if (!shouldDispatch(m, { agentId: config.agentId, displayName: config.displayName, channelKind: kind }))
         return;
       typing.start(m.channel_id);
-      const payload = buildWakePayload({ ...m, type: "message" });
+      const route = resolveSessionForAgent(config.agentId);
+      const payload = buildWakePayload({ ...m, type: "message" }, { targetSessionId: route?.sessionId });
       const queued = appendWakeQueue(queueFile, payload);
-      fireWake({ ...m, type: "message" }, { url: wakeUrl, secret: wakeSecret, logger: console.error });
-      console.log(`[dsh-wake] ${m.channel_id} ${m.sender_id} ${m.id} queued=${queued}`);
+      fireWake({ ...m, type: "message" }, { url: wakeUrl, secret: wakeSecret, logger: console.error, targetSessionId: route?.sessionId });
+      console.log(`[dsh-wake] ${m.channel_id} ${m.sender_id} ${m.id} queued=${queued} target=${route?.sessionId ?? "unbound"}`);
     });
     client.onReconnect = () => {
       for (const c of wakeChannels)

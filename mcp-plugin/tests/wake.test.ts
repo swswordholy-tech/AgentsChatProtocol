@@ -107,3 +107,23 @@ describe("signWakeBody / verifyWakeSignature — HMAC over the raw body", () => 
     expect(WAKE_SIG_HEADER).toBe("x-agentschat-signature");
   });
 });
+
+describe("buildWakePayload — session routing", () => {
+  test("carries target_session_id when the bridge knows the bound session", () => {
+    const payload = buildWakePayload(
+      { id: "m1", channel_id: "dm-x", sender_id: "user" },
+      { targetSessionId: "session-1" },
+    );
+    expect(payload.target_session_id).toBe("session-1");
+  });
+
+  test("omits target_session_id entirely when unbound (receivers keep their fallback)", () => {
+    const payload = buildWakePayload({ id: "m1", channel_id: "dm-x", sender_id: "user" });
+    expect("target_session_id" in payload).toBe(false);
+  });
+
+  test("an empty target is treated as unbound, not as an empty session id", () => {
+    const payload = buildWakePayload({ id: "m1", channel_id: "dm-x" }, { targetSessionId: "" });
+    expect("target_session_id" in payload).toBe(false);
+  });
+});

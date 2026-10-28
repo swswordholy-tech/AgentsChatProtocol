@@ -49,6 +49,11 @@ export interface WakePayload {
   content?: string;
   mentioned_ids?: string[];
   timestamp?: string;
+  /**
+   * Harness session this wake belongs to, resolved from `session-binds.json`.
+   * Absent means "not bound" — receivers must then use their own fallback.
+   */
+  target_session_id?: string;
 }
 
 export function redactSecrets(text: string): string {
@@ -57,9 +62,14 @@ export function redactSecrets(text: string): string {
     .replace(/eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "[redacted]");
 }
 
-export function buildWakePayload(msg: WakeMessage): WakePayload {
+export function buildWakePayload(
+  msg: WakeMessage,
+  opts: { targetSessionId?: string } = {},
+): WakePayload {
   const content =
     typeof msg.content === "string" ? redactSecrets(msg.content.slice(0, WAKE_CONTENT_MAX)) : undefined;
+  const targetSessionId =
+    typeof opts.targetSessionId === "string" && opts.targetSessionId.length > 0 ? opts.targetSessionId : undefined;
   return {
     type: typeof msg.type === "string" ? msg.type : "message",
     channel_id: msg.channel_id,
@@ -68,6 +78,7 @@ export function buildWakePayload(msg: WakeMessage): WakePayload {
     content,
     mentioned_ids: Array.isArray(msg.mentioned_ids) ? msg.mentioned_ids.filter((x) => typeof x === "string") : undefined,
     timestamp: typeof msg.timestamp === "string" ? msg.timestamp : undefined,
+    ...(targetSessionId ? { target_session_id: targetSessionId } : {}),
   };
 }
 
@@ -108,6 +119,8 @@ export interface WakeConfig {
   timeoutMs?: number;
   fetchImpl?: typeof fetch;
   logger?: (msg: string) => void;
+  /** Harness session the wake belongs to (see buildWakePayload). */
+  targetSessionId?: string;
 }
 
 /** POST a wake event. Best-effort: resolves void whether it succeeded or not. */
@@ -115,7 +128,7 @@ export async function fireWake(msg: WakeMessage, cfg: WakeConfig): Promise<void>
   const log = cfg.logger ?? (() => {});
   const url = (cfg.url ?? "").trim();
   if (!url) return;
-  const body = JSON.stringify(buildWakePayload(msg));
+  const body = JSON.stringify(buildWakePayload(msg, { targetSessionId: cfg.targetSessionId }));
   const headers: Record<string, string> = { "Content-Type": "application/json" };
   if (cfg.secret) headers[WAKE_SIG_HEADER] = signWakeBody(body, cfg.secret);
   const doPost = async (): Promise<void> => {

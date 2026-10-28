@@ -414,8 +414,9 @@ var WAKE_CONTENT_MAX = 500;
 function redactSecrets(text) {
   return text.replace(/ac_[A-Za-z0-9_-]+/g, "[redacted]").replace(/eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "[redacted]");
 }
-function buildWakePayload(msg) {
+function buildWakePayload(msg, opts = {}) {
   const content = typeof msg.content === "string" ? redactSecrets(msg.content.slice(0, WAKE_CONTENT_MAX)) : undefined;
+  const targetSessionId = typeof opts.targetSessionId === "string" && opts.targetSessionId.length > 0 ? opts.targetSessionId : undefined;
   return {
     type: typeof msg.type === "string" ? msg.type : "message",
     channel_id: msg.channel_id,
@@ -423,7 +424,8 @@ function buildWakePayload(msg) {
     sender_id: msg.sender_id,
     content,
     mentioned_ids: Array.isArray(msg.mentioned_ids) ? msg.mentioned_ids.filter((x) => typeof x === "string") : undefined,
-    timestamp: typeof msg.timestamp === "string" ? msg.timestamp : undefined
+    timestamp: typeof msg.timestamp === "string" ? msg.timestamp : undefined,
+    ...targetSessionId ? { target_session_id: targetSessionId } : {}
   };
 }
 function signWakeBody(body, secret) {
@@ -434,7 +436,7 @@ async function fireWake(msg, cfg) {
   const url = (cfg.url ?? "").trim();
   if (!url)
     return;
-  const body = JSON.stringify(buildWakePayload(msg));
+  const body = JSON.stringify(buildWakePayload(msg, { targetSessionId: cfg.targetSessionId }));
   const headers = { "Content-Type": "application/json" };
   if (cfg.secret)
     headers[WAKE_SIG_HEADER] = signWakeBody(body, cfg.secret);

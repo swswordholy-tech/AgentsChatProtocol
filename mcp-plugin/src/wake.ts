@@ -70,6 +70,11 @@ export interface WakePayload {
   attachments?: WakeAttachment[];
   mentioned_ids?: string[];
   timestamp?: string;
+  /**
+   * Harness session this wake belongs to, resolved from `session-binds.json`.
+   * Absent means "not bound" — receivers must then use their own fallback.
+   */
+  target_session_id?: string;
 }
 
 export function formatWakeAttachments(attachments: unknown): string {
@@ -96,7 +101,7 @@ export function formatWakeAttachments(attachments: unknown): string {
  * Build the wake body: the fields the receiver needs to wake + decide + optionally
  * skip a history fetch. Credential-shaped fields are never carried across.
  */
-export function buildWakePayload(msg: WakeMessage): WakePayload {
+export function buildWakePayload(msg: WakeMessage, opts: { targetSessionId?: string } = {}): WakePayload {
   // The content excerpt crosses the wire to the wake receiver, so it goes through
   // the same redactSecrets every other outbound content path uses (reply/edit/
   // caption/status) — a message with an ac_ key or JWT pasted into it must not leak
@@ -117,6 +122,8 @@ export function buildWakePayload(msg: WakeMessage): WakePayload {
           transcript: typeof a.transcript === "string" ? redactSecrets(a.transcript.slice(0, 300), redactOpts) : undefined,
         }))
     : undefined;
+  const targetSessionId =
+    typeof opts.targetSessionId === "string" && opts.targetSessionId.length > 0 ? opts.targetSessionId : undefined;
   return {
     type: typeof msg.type === "string" ? msg.type : "message",
     channel_id: msg.channel_id,
@@ -126,6 +133,7 @@ export function buildWakePayload(msg: WakeMessage): WakePayload {
     ...(attachments && attachments.length > 0 ? { attachments } : {}),
     mentioned_ids: Array.isArray(msg.mentioned_ids) ? msg.mentioned_ids.filter((x) => typeof x === "string") : undefined,
     timestamp: typeof msg.timestamp === "string" ? msg.timestamp : undefined,
+    ...(targetSessionId ? { target_session_id: targetSessionId } : {}),
   };
 }
 
@@ -162,6 +170,8 @@ export interface WakeConfig {
   /** Extra fetch impl for tests. */
   fetchImpl?: typeof fetch;
   logger?: (msg: string) => void;
+  /** Harness session the wake belongs to (see buildWakePayload). */
+  targetSessionId?: string;
 }
 
 /**
@@ -173,7 +183,7 @@ export async function fireWake(msg: WakeMessage, cfg: WakeConfig): Promise<void>
   const url = (cfg.url ?? "").trim();
   if (!url) return; // not configured — the wake path is opt-in
 
-  const payload = buildWakePayload(msg);
+  const payload = buildWakePayload(msg, { targetSessionId: cfg.targetSessionId });
   const body = JSON.stringify(payload);
   const headers: Record<string, string> = { "Content-Type": "application/json" };
   if (cfg.secret) headers[WAKE_SIG_HEADER] = signWakeBody(body, cfg.secret);

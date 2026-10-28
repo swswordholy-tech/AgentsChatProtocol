@@ -539,7 +539,7 @@ function formatWakeAttachments(attachments) {
   }
   return lines.length > 0 ? ` [附件: ${lines.join("; ")}]` : "";
 }
-function buildWakePayload(msg) {
+function buildWakePayload(msg, opts = {}) {
   const redactOpts = msg.same_owner_direct === true ? { preserveAcKeys: true } : undefined;
   const content = typeof msg.content === "string" ? redactSecrets2(msg.content.slice(0, WAKE_CONTENT_MAX), redactOpts) : undefined;
   const attachments = Array.isArray(msg.attachments) && msg.attachments.length > 0 ? msg.attachments.filter((a) => a && typeof a === "object" && typeof a.url === "string").map((a) => ({
@@ -552,6 +552,7 @@ function buildWakePayload(msg) {
     duration_ms: typeof a.duration_ms === "number" ? a.duration_ms : undefined,
     transcript: typeof a.transcript === "string" ? redactSecrets2(a.transcript.slice(0, 300), redactOpts) : undefined
   })) : undefined;
+  const targetSessionId = typeof opts.targetSessionId === "string" && opts.targetSessionId.length > 0 ? opts.targetSessionId : undefined;
   return {
     type: typeof msg.type === "string" ? msg.type : "message",
     channel_id: msg.channel_id,
@@ -560,7 +561,8 @@ function buildWakePayload(msg) {
     content,
     ...attachments && attachments.length > 0 ? { attachments } : {},
     mentioned_ids: Array.isArray(msg.mentioned_ids) ? msg.mentioned_ids.filter((x) => typeof x === "string") : undefined,
-    timestamp: typeof msg.timestamp === "string" ? msg.timestamp : undefined
+    timestamp: typeof msg.timestamp === "string" ? msg.timestamp : undefined,
+    ...targetSessionId ? { target_session_id: targetSessionId } : {}
   };
 }
 function signWakeBody(body, secret) {
@@ -571,7 +573,7 @@ async function fireWake(msg, cfg) {
   const url = (cfg.url ?? "").trim();
   if (!url)
     return;
-  const payload = buildWakePayload(msg);
+  const payload = buildWakePayload(msg, { targetSessionId: cfg.targetSessionId });
   const body = JSON.stringify(payload);
   const headers = { "Content-Type": "application/json" };
   if (cfg.secret)
