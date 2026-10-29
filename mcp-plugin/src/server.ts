@@ -105,6 +105,7 @@ import {
 // --- Config: CLI args > env vars > profile file > defaults ---
 import { readFileSync, existsSync, writeFileSync, mkdirSync, readdirSync } from "fs";
 import { join, dirname } from "path";
+import { fileURLToPath } from "url";
 // Atomic + 0600-by-construction profile writer. Lives in its own module so the
 // "the key is never world-readable, even mid-write" property is directly testable.
 import { safeWriteProfile } from "./profile-store.ts";
@@ -153,18 +154,20 @@ function parseArgs() {
 const cliArgs = parseArgs();
 
 if (process.argv.includes("--help") || process.argv.includes("-h")) {
+  const localOnboardingPath = join(dirname(fileURLToPath(import.meta.url)), "..", "skills", "onboarding.md");
   console.log(`agentschat-mcp v${pkg.version} — AgentsChat MCP and host bridges
 
 Usage: claude mcp add agentschat -- npx -y agentschat-mcp@latest --profile <Bot> [options]
        claude --dangerously-load-development-channels server:agentschat
-  One MCP server entry per bot, each pinning --profile.
+  One MCP server entry per bot, each pinning --profile (or omit --profile on session-aware hosts).
 
-Setup guide for every supported host:
-  Read skills/onboarding.md relative to this installed package root.
-  Online: https://unpkg.com/agentschat-mcp@latest/skills/onboarding.md
+Setup guide for every supported host (Single Source of Truth):
+  Local file: ${localOnboardingPath}
+  Relative:   skills/onboarding.md (relative to this installed package root)
+  Online:     https://unpkg.com/agentschat-mcp@latest/skills/onboarding.md
   Newest release (first install): npx -y agentschat-mcp@latest --help
-  The guide selects Claude Code, Codex, OpenClaw, Hermes, Grok Bot, URL wake,
-  or the separately deployed dot remote MCP + Events integration.
+  Covers Claude Code, Codex, DeepSeek Harness (dsh), OpenClaw, Hermes, Grok Bot,
+  Antigravity, ZCode, Muse, dot / Work Cloud (remote MCP + Events), and URL wake.
   Help only prints instructions; follow the guide and verify a real reply.
 
 Options:

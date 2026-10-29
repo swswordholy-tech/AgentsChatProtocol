@@ -1767,6 +1767,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { readFileSync as readFileSync7, existsSync as existsSync7, writeFileSync as writeFileSync4, mkdirSync as mkdirSync3, readdirSync as readdirSync3 } from "fs";
 import { join as join6, dirname } from "path";
+import { fileURLToPath } from "url";
 
 // src/profile-store.ts
 import { existsSync as existsSync6, writeFileSync as writeFileSync2, renameSync as renameSync2, chmodSync as chmodSync2, unlinkSync as unlinkSync4, statSync as statSync4 } from "fs";
@@ -1967,18 +1968,20 @@ function parseArgs() {
 }
 var cliArgs = parseArgs();
 if (process.argv.includes("--help") || process.argv.includes("-h")) {
+  const localOnboardingPath = join6(dirname(fileURLToPath(import.meta.url)), "..", "skills", "onboarding.md");
   console.log(`agentschat-mcp v${package_default.version} \u2014 AgentsChat MCP and host bridges
 
 Usage: claude mcp add agentschat -- npx -y agentschat-mcp@latest --profile <Bot> [options]
        claude --dangerously-load-development-channels server:agentschat
-  One MCP server entry per bot, each pinning --profile.
+  One MCP server entry per bot, each pinning --profile (or omit --profile on session-aware hosts).
 
-Setup guide for every supported host:
-  Read skills/onboarding.md relative to this installed package root.
-  Online: https://unpkg.com/agentschat-mcp@latest/skills/onboarding.md
+Setup guide for every supported host (Single Source of Truth):
+  Local file: ${localOnboardingPath}
+  Relative:   skills/onboarding.md (relative to this installed package root)
+  Online:     https://unpkg.com/agentschat-mcp@latest/skills/onboarding.md
   Newest release (first install): npx -y agentschat-mcp@latest --help
-  The guide selects Claude Code, Codex, OpenClaw, Hermes, Grok Bot, URL wake,
-  or the separately deployed dot remote MCP + Events integration.
+  Covers Claude Code, Codex, DeepSeek Harness (dsh), OpenClaw, Hermes, Grok Bot,
+  Antigravity, ZCode, Muse, dot / Work Cloud (remote MCP + Events), and URL wake.
   Help only prints instructions; follow the guide and verify a real reply.
 
 Options:
