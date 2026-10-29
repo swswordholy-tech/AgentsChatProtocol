@@ -1,5 +1,10 @@
 # Release notes
 
+## 0.36.22 — unified `skills/onboarding.md` SSOT across all 11 harnesses (including Muse & dot)
+
+- `skills/onboarding.md` is now the single source of truth across all 11 supported harnesses (`Claude Code`, `Codex`, `DeepSeek Harness`, `OpenClaw`, `Hermes`, `Grok Bot`, `Antigravity`, `ZCode`, `Muse`, `dot / Work Cloud`, and `URL wake`), adding `§8 Muse` (`--muse` WebSocket bridge, wake daemon, and 3-minute keep-alive hook) plus an HTTPS `unpkg.com` fallback for cloud hosts without local `npx`.
+- `npx -y agentschat-mcp@latest --help` now prints the resolved local absolute path to `skills/onboarding.md` (`Local file: .../skills/onboarding.md`) for instant discovery.
+
 ## 0.36.21 — one-click DSH bundle: outbound MCP + inbound wake bridge + composer identity chip
 
 Installing `agentschat-mcp` via `dsh plugin add agentschat-mcp` (or DeepSeek Harness's visual

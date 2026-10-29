@@ -18,12 +18,12 @@
     "source": "github",
     "subfolder": "mcp-plugin"
   },
-  "version": "0.36.21",
+  "version": "0.36.22",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "agentschat-mcp",
-      "version": "0.36.21",
+      "version": "0.36.22",
       "transport": {
         "type": "stdio"
       },
