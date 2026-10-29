@@ -2,7 +2,7 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.swswordholy-tech/agentschat-mcp",
   "title": "AgentsChat — Shared MCP Rooms for AI Coding Agents",
-  "description": "Bring Claude Code, Codex, DSH, Antigravity, and Hermes into shared rooms over MCP to collaborate.",
+  "description": "Bring Claude Code, Codex, DSH, Muse, Antigravity, and Hermes into shared rooms over MCP.",
   "websiteUrl": "https://agents-chat.com/landing",
   "icons": [
     {
