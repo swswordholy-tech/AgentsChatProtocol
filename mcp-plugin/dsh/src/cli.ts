@@ -201,21 +201,21 @@ DeepSeek Harness (dsh) integration for AgentsChat:
     return;
   }
 
-  const config = loadDshConfig();
-  console.log("DSH AgentsChat:", JSON.stringify(safeDshConfig(config)));
-  const client = new MuseAgentChatClient({
-    url: config.wsUrl,
-    agentId: config.agentId,
-    token: config.token,
-    capabilities: ["chat"],
-  });
-
   if (has("--wake", argv)) {
+    let primaryConfig: DshBridgeConfig | null = null;
+    try {
+      primaryConfig = loadDshConfig();
+      console.log("DSH AgentsChat:", JSON.stringify(safeDshConfig(primaryConfig)));
+    } catch {
+      console.log("[dsh-wake] No global dsh.json identity; watching session-binds.json for bound DSH sessions.");
+    }
+    const defaultWsUrl = primaryConfig?.wsUrl ?? process.env.AGENTCHAT_WS_URL ?? DEFAULT_WS_URL;
+
     const wakeChannels: string[] = [];
     for (let i = 0; i < argv.length; i++) {
       if (argv[i] === "--channel" && argv[i + 1]) wakeChannels.push(argv[i + 1]);
     }
-    if (config.defaultChannelId) wakeChannels.push(config.defaultChannelId);
+    if (primaryConfig?.defaultChannelId) wakeChannels.push(primaryConfig.defaultChannelId);
     const queueFile =
       process.env.DSH_WAKE_QUEUE ?? join(homedir(), ".agentschat", "dsh-wake-queue.jsonl");
     const wakeUrl = process.env.DSH_WAKE_URL ?? process.env.AGENTCHAT_WAKE_URL;
@@ -223,14 +223,13 @@ DeepSeek Harness (dsh) integration for AgentsChat:
 
     const connectedAgentIds = new Set<string>();
     const activeTyping: TypingHeartbeat[] = [];
-    process.on("SIGINT", () => {
-      for (const t of activeTyping) t.stopAll();
-    });
+    const activeClients: MuseAgentChatClient[] = [];
 
     const attachWakeForClient = (
       botClient: MuseAgentChatClient,
       botIdentity: { agentId: string; displayName?: string },
     ) => {
+      activeClients.push(botClient);
       const typing = new TypingHeartbeat((channelId) => botClient.sendTyping(channelId));
       activeTyping.push(typing);
       botClient.onMessage((m) => {
@@ -241,11 +240,6 @@ DeepSeek Harness (dsh) integration for AgentsChat:
         const kind = m.channel_id.startsWith("dm-") ? "direct" : "group";
         if (!shouldDispatch(m, { agentId: botIdentity.agentId, displayName: botIdentity.displayName, channelKind: kind })) return;
         typing.start(m.channel_id);
-        // Route the wake to the harness Session this identity is bound to
-        // (`session-binds.json`), so the receiver stops guessing "the newest idle
-        // Session" — a guess that lands in an unrelated conversation whenever an
-        // older Session happens to be idle. No bind → no target, and the receiver
-        // keeps its own fallback policy.
         const route = resolveSessionForAgent(botIdentity.agentId);
         const payload = buildWakePayload({ ...m, type: "message" }, { targetSessionId: route?.sessionId });
         const queued = appendWakeQueue(queueFile, payload);
@@ -262,12 +256,24 @@ DeepSeek Harness (dsh) integration for AgentsChat:
       };
     };
 
-    connectedAgentIds.add(config.agentId);
-    attachWakeForClient(client, { agentId: config.agentId, displayName: config.displayName });
-    await client.connect();
-    for (const c of wakeChannels) client.joinChannel(c);
+    let primaryClient: MuseAgentChatClient | null = null;
+    if (primaryConfig) {
+      primaryClient = new MuseAgentChatClient({
+        url: primaryConfig.wsUrl,
+        agentId: primaryConfig.agentId,
+        token: primaryConfig.token,
+        capabilities: ["chat"],
+      });
+      connectedAgentIds.add(primaryConfig.agentId);
+      attachWakeForClient(primaryClient, {
+        agentId: primaryConfig.agentId,
+        displayName: primaryConfig.displayName,
+      });
+      await primaryClient.connect();
+      for (const c of wakeChannels) primaryClient.joinChannel(c);
+    }
 
-    // Also multiplex any additional DSH sessions (`session-*`) bound in `session-binds.json`
+    // Multiplex any DSH sessions (`session-*`) bound in `session-binds.json`
     const syncBoundDshClients = async () => {
       try {
         const cfgDir = agentschatConfigDir();
@@ -281,10 +287,11 @@ DeepSeek Harness (dsh) integration for AgentsChat:
           const raw = JSON.parse(readFileSync(profPath, "utf8")) as Record<string, any>;
           const botAgentId = typeof raw.agent_id === "string" ? raw.agent_id : typeof raw.agentId === "string" ? raw.agentId : "";
           const botToken = typeof raw.token === "string" ? raw.token : "";
+          const botWsUrl = typeof raw.server === "string" && /^wss?:\/\//i.test(raw.server) ? raw.server : defaultWsUrl;
           if (!botAgentId || !botToken || botToken === "dev-token" || connectedAgentIds.has(botAgentId)) continue;
           connectedAgentIds.add(botAgentId);
           const extraClient = new MuseAgentChatClient({
-            url: config.wsUrl,
+            url: botWsUrl,
             agentId: botAgentId,
             token: botToken,
             capabilities: ["chat"],
@@ -300,14 +307,37 @@ DeepSeek Harness (dsh) integration for AgentsChat:
       } catch {}
     };
     await syncBoundDshClients();
-    const bindTimer = setInterval(() => void syncBoundDshClients(), 5_000);
-    (bindTimer as any).unref?.();
+    const bindTimer = setInterval(() => void syncBoundDshClients(), 3_000);
 
     console.log(`DSH wake daemon listening on ${wakeChannels.join(", ") || "(no channels — pass --channel <id>)"}, queue=${queueFile}.`);
-    await client.waitUntilClosed();
+    await new Promise<void>((resolve) => {
+      const shutdown = () => {
+        for (const t of activeTyping) t.stopAll();
+        for (const c of activeClients) {
+          try {
+            c.disconnect();
+          } catch {}
+        }
+        resolve();
+      };
+      process.once("SIGINT", shutdown);
+      process.once("SIGTERM", shutdown);
+      if (primaryClient) {
+        void primaryClient.waitUntilClosed().then(resolve);
+      }
+    });
     clearInterval(bindTimer);
     return;
   }
+
+  const config = loadDshConfig();
+  console.log("DSH AgentsChat:", JSON.stringify(safeDshConfig(config)));
+  const client = new MuseAgentChatClient({
+    url: config.wsUrl,
+    agentId: config.agentId,
+    token: config.token,
+    capabilities: ["chat"],
+  });
 
   if (has("--send", argv)) {
     const channelId = arg("--send", argv);

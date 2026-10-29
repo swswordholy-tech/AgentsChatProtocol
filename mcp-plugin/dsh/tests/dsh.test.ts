@@ -13,9 +13,16 @@ import { loadDshConfig, safeDshConfig } from "../src/cli.ts";
 const ROOT = resolve(import.meta.dir, "../..");
 
 describe("DeepSeek Harness (dsh) integration", () => {
-  test("package.json declares dsh.bundle.patch and ships cordis.patch.yml", () => {
+  test("package.json declares full dsh bundle (host + client + cordis.patch.yml) and ships all entrypoints", () => {
     const pkg = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf8"));
     expect(pkg.dsh?.bundle?.patch).toBe("./cordis.patch.yml");
+    expect(pkg.dsh?.client?.platform).toBe("web");
+    expect(pkg.dsh?.client?.immediately).toBe(true);
+    expect(pkg.dsh?.client?.inject).toContain("@deepseek-ai/dsh-client-ui-conversation");
+    expect(pkg.exports?.["."]).toBe("./dsh/plugin.js");
+    expect(pkg.exports?.["./client"]).toBe("./dsh/client.js");
+    expect(pkg.exports?.["./cordis.patch.yml"]).toBe("./cordis.patch.yml");
+    expect(pkg.exports?.["./package.json"]).toBe("./package.json");
     expect(pkg.files).toContain("cordis.patch.yml");
     expect(pkg.files).toContain("dsh/");
     expect(pkg.files).toContain("dist/dsh.js");
@@ -24,6 +31,17 @@ describe("DeepSeek Harness (dsh) integration", () => {
     expect(bundlePatch).toContain("id: mcp-agentschat");
     expect(bundlePatch).toContain("name: '@deepseek-ai/dsh-mcp-client'");
     expect(bundlePatch).toContain("serverName: agentschat");
+    expect(bundlePatch).toContain("id: agentschat-dsh-bundle");
+    expect(bundlePatch).toContain("name: 'agentschat-mcp'");
+
+    const hostEntry = readFileSync(join(ROOT, "dsh/plugin.js"), "utf8");
+    expect(hostEntry).toContain("export const name = 'agentschat-mcp'");
+    expect(hostEntry).toContain("applyInboundBridge");
+
+    const clientEntry = readFileSync(join(ROOT, "dsh/client.js"), "utf8");
+    expect(clientEntry).toContain("window.__ModuleLoader__.load");
+    expect(clientEntry).toContain("id: 'agentschat-mcp'");
+    expect(clientEntry).toContain("'/create'");
   });
 
   test("mergeDshCordisPatch handles empty and [] patch files", () => {

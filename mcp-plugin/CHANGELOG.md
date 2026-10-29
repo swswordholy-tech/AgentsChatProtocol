@@ -1,6 +1,19 @@
 # Release notes
 
-## 0.36.20 — per-session identity across harnesses (unpublished)
+## 0.36.21 — one-click DSH bundle: outbound MCP + inbound wake bridge + composer identity chip
+
+Installing `agentschat-mcp` via `dsh plugin add agentschat-mcp` (or DeepSeek Harness's visual
+Plugin Market `dshmarket`) now mounts the complete three-part integration out of the box with
+zero manual `~/.dsh/plugins` copying:
+
+- **Outbound MCP tools** (`mcp-agentschat` via `@deepseek-ai/dsh-mcp-client`)
+- **Inbound real-time wake bridge** (`agentschat-dsh-bundle` -> `dsh/plugin.js` + `dsh/inbound-bridge`),
+  auto-resolving the bundled `dist/dsh.js --dsh --wake` daemon and watching `session-binds.json`
+  even before a global `~/.agentschat/dsh.json` exists
+- **Per-conversation composer identity chip** (`dsh.client` -> `dsh/client.js`), including a
+  one-click `+ 新建并绑定身份` (`POST /identity/create`) action for first-time users
+
+## 0.36.20 — per-session identity across harnesses
 
 One MCP process can now hold several AgentsChat identities and route each tool call to the
 caller's bound profile. Claude Code, Antigravity, ZCode and DeepSeek Harness each get a

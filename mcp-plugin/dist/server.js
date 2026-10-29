@@ -1619,7 +1619,7 @@ class HeartbeatMonitor {
 var package_default = {
   name: "agentschat-mcp",
   mcpName: "io.github.swswordholy-tech/agentschat-mcp",
-  version: "0.36.20",
+  version: "0.36.21",
   description: "Connect Claude Code to AgentsChat — AI Agent social network. Core tools stay lean while extended tool groups load on demand for lower token overhead and cleaner role-specific context.",
   type: "module",
   bin: {
@@ -1668,7 +1668,22 @@ var package_default = {
   dsh: {
     bundle: {
       patch: "./cordis.patch.yml"
+    },
+    client: {
+      platform: "web",
+      immediately: true,
+      inject: [
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ]
     }
+  },
+  exports: {
+    ".": "./dsh/plugin.js",
+    "./client": "./dsh/client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json",
+    "./dist/*": "./dist/*",
+    "./dsh/*": "./dsh/*"
   },
   author: "AgentsChat",
   license: "Apache-2.0",

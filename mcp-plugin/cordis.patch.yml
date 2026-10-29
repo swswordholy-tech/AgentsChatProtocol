@@ -2,14 +2,16 @@
 #
 # When installed via the official DSH CLI or Plugin Market (dshmarket):
 #
+#   dsh plugin --profile desktop add agentschat-mcp
 #   dsh plugin --profile web add agentschat-mcp
 #
 # dsh appends `agentschat-mcp` to `dsh.profile.bundles` and applies this patch
-# automatically at boot. It mounts `@deepseek-ai/dsh-mcp-client` under the
-# `agentschat` namespace so tools like `mcp__agentschat__whoami`,
-# `mcp__agentschat__reply`, `mcp__agentschat__join_channel`, and
-# `mcp__agentschat__get_history` register on `ctx.tools` with zero manual
-# cordis.patch.yml editing.
+# automatically at boot. It mounts:
+#   1. `mcp-agentschat` (`@deepseek-ai/dsh-mcp-client`) — outbound AgentsChat MCP tools
+#      (`mcp__agentschat__whoami`, `mcp__agentschat__reply`, `mcp__agentschat__join_channel`, etc.).
+#   2. `agentschat-dsh-bundle` (`agentschat-mcp`) — inbound WebSocket wake bridge on loopback
+#      (`127.0.0.1:8799`, auto-spawning `dist/dsh.js --dsh --wake`) plus the per-conversation
+#      AgentsChat identity chip above the composer (`dsh.client` -> `./dsh/client.js`).
 - insert:
     - id: mcp-agentschat
       name: '@deepseek-ai/dsh-mcp-client'
@@ -21,3 +23,6 @@
         args:
           - -y
           - agentschat-mcp@latest
+    - id: agentschat-dsh-bundle
+      name: 'agentschat-mcp'
+      disabled: !!js "[...ctx.loader.entries()].some((e) => (e.options.name === 'agentschat-mcp' || String(e.options.id || '').startsWith('agentschat-inbound')) && e.options.id !== 'agentschat-dsh-bundle' && !e.disabled)"

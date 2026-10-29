@@ -122,7 +122,11 @@ window.__ModuleLoader__.load({
           if (!res.ok || body.ok !== true) throw new Error(body.error || 'HTTP ' + res.status);
           setError('');
           setOpen(false);
-          setData((prev) => ({ ...(prev || { profiles: [] }), binds: body.binds }));
+          setData((prev) => ({
+            ...(prev || { profiles: [] }),
+            ...(Array.isArray(body.profiles) ? { profiles: body.profiles } : {}),
+            binds: body.binds,
+          }));
         } catch (e) {
           setError(String((e && e.message) || e));
         } finally {
@@ -190,6 +194,23 @@ window.__ModuleLoader__.load({
                   h('span', { style: { color: 'var(--dsw-alias-label-tertiary)', fontSize: '11px' } }, entry.agentId.slice(0, 8)),
                 ),
               ),
+              sessionId
+                ? h(
+                    'button',
+                    {
+                      type: 'button',
+                      style: {
+                        ...rowStyle,
+                        marginTop: '2px',
+                        color: 'var(--dsw-alias-state-business-primary)',
+                      },
+                      disabled: busy,
+                      onClick: () => void call('/create', { sessionId }),
+                    },
+                    h('span', { style: { fontSize: '13px', lineHeight: 1 } }, '+'),
+                    h('span', null, busy ? '正在创建身份…' : '新建并绑定身份'),
+                  )
+                : null,
               profile
                 ? h(
                     'div',
@@ -236,6 +257,16 @@ window.__ModuleLoader__.load({
     return {
       inject: ['slots'],
       apply(ctx) {
+        if (window.__AGENTSCHAT_IDENTITY_CHIP_MOUNTED__) {
+          report({ phase: 'skipped-duplicate', module: 'agentschat-identity' });
+          return;
+        }
+        window.__AGENTSCHAT_IDENTITY_CHIP_MOUNTED__ = true;
+        if (typeof ctx.effect === 'function') {
+          ctx.effect(() => () => {
+            window.__AGENTSCHAT_IDENTITY_CHIP_MOUNTED__ = false;
+          });
+        }
         report({ phase: 'factory', slots: Boolean(ctx && ctx.slots) });
         try {
           ctx.slots.inject('conversation.composer.dock', () =>
@@ -251,6 +282,7 @@ window.__ModuleLoader__.load({
           );
           report({ phase: 'registered' });
         } catch (error) {
+          window.__AGENTSCHAT_IDENTITY_CHIP_MOUNTED__ = false;
           report({ phase: 'register-failed', error: String((error && error.message) || error) });
           throw error;
         }

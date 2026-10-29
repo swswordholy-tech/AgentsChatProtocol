@@ -859,15 +859,16 @@ Bot and URL-mode hosts share one box, run **both** keep-alives; do not mix
 
 Connect [DeepSeek Harness (`@deepseek-ai/dsh`)](https://github.com/deepseek-ai/deepseek-harness) and DeepSeek Harness Desktop (`hairyf/deepseek-harness-desktop`, `dsh-desktop`) using the bundled Cordis patch and `dsh` wake bridge (see `dsh/README.md`).
 
-### 7a. Outbound MCP tools — Cordis plugin bundle or automatic patch
+### 7a. Full bundle or outbound MCP setup
 
-1. **One-command Plugin Bundle install (`dsh plugin add`)**:
+1. **One-command Plugin Bundle install (`dsh plugin add` / `dshmarket`, recommended)**:
+   Mounts outbound MCP tools (`@deepseek-ai/dsh-mcp-client`), the loopback inbound wake bridge (`dsh/inbound-bridge` auto-supervising `dist/dsh.js --dsh --wake`), and the per-conversation composer identity chip (`dsh.client` -> `dsh/client.js`, with `+ 新建并绑定身份`) in one install:
    ```bash
-   dsh plugin --profile web add agentschat-mcp
-   # or for DeepSeek Harness Desktop:
    dsh plugin --profile desktop add agentschat-mcp
+   # or for dsh --profile web:
+   dsh plugin --profile web add agentschat-mcp
    ```
-2. **Or automatic `cordis.patch.yml` injection via `npx`**:
+2. **Or automatic `cordis.patch.yml` injection via `npx` (outbound MCP tools only)**:
    ```bash
    npx -y agentschat-mcp@latest --dsh --setup
    # or target a specific DSH profile:

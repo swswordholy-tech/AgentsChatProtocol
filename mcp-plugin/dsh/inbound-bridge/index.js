@@ -55,6 +55,7 @@ import {
 } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
+import { fileURLToPath } from 'node:url';
 import { createHmac, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { createServer } from 'node:http';
@@ -85,7 +86,7 @@ const WAKE_PATH = '/agentschat/wake';
  * is no way to tell which version is live from the outside, which is how a
  * "fixed" build once delivered into a busy Session. `/health` reports it.
  */
-const BUILD = 'inbound/2026-10-29.14-config-bin';
+const BUILD = 'inbound/2026-10-29.21-bundled';
 /** Producer-owned source kind; a bare `plugin` wrapper is refused by session format v4. */
 const SOURCE_KIND = 'plugin:agentschat-inbound';
 /** Poll interval while wakes wait for a root agent to finish its turn. */
@@ -205,10 +206,18 @@ function forgetDelivery(payload) {
 
 export function apply(ctx, config = {}) {
   const port = Number(config.port ?? 8799);
-  // The wake daemon is a separate process; its entry point is deployment-specific,
-  // so it comes from config/env rather than a hardcoded checkout path. Without it
-  // the HTTP side (wakes in, identity API out) still works.
-  const mcpBin = config.mcpBin ?? process.env.AGENTSCHAT_DSH_BRIDGE_BIN;
+  // When installed as the published `agentschat-mcp` DSH bundle, `../../dist/dsh.js`
+  // sits right inside the package so the wake daemon starts zero-config. Machine-local
+  // copies (`~/.dsh/plugins/...`) lack `../../dist/dsh.js` and fall back to config/env.
+  const defaultBundledMcpBin = (() => {
+    try {
+      const candidate = fileURLToPath(new URL('../../dist/dsh.js', import.meta.url));
+      return existsSync(candidate) ? candidate : undefined;
+    } catch {
+      return undefined;
+    }
+  })();
+  const mcpBin = config.mcpBin ?? process.env.AGENTSCHAT_DSH_BRIDGE_BIN ?? defaultBundledMcpBin;
   const nodeBin = config.nodeBin ?? process.env.DSH_NODE_BIN ?? 'node';
   const channels = Array.isArray(config.channels) && config.channels.length > 0 ? config.channels : ['welcome'];
   const retryMs = Number(config.retryMs ?? DEFAULT_RETRY_MS);
@@ -537,6 +546,82 @@ export function apply(ctx, config = {}) {
       readJsonBody(req, res, (body) => {
         log(`client-alive ${JSON.stringify(body)}`);
         sendJson(res, 200, { ok: true, build: BUILD });
+      });
+      return;
+    }
+    if (req.method === 'POST' && req.url === '/identity/create') {
+      readJsonBody(req, res, async (body) => {
+        const sessionId = typeof body?.sessionId === 'string' ? body.sessionId.trim() : '';
+        const rawName = typeof body?.name === 'string' && body.name.trim()
+          ? body.name.trim().slice(0, 48)
+          : `DSH_${sessionId ? sessionId.replace(/^session-/, '').slice(0, 6) : randomBytes(3).toString('hex')}`;
+        const baseName = rawName.replace(/[^a-zA-Z0-9_-]/g, '_').replace(/^_+|_+$/g, '') || `DSH_${randomBytes(3).toString('hex')}`;
+        let profileName = baseName;
+        let suffix = 2;
+        mkdirSync(PROFILES_DIR, { recursive: true });
+        while (existsSync(join(PROFILES_DIR, `${profileName}.json`)) || existsSync(join(AGENTSCHAT_DIR, `${profileName}.json`))) {
+          profileName = `${baseName}_${suffix++}`;
+        }
+        const restBase = (
+          config.apiUrl ??
+          process.env.AGENTCHAT_REST_URL ??
+          process.env.AGENTSCHAT_API_URL ??
+          'https://agents-chat.com'
+        ).replace(/\/+$/, '');
+        const wsUrl =
+          process.env.AGENTCHAT_WS_URL ??
+          `${restBase.replace(/^https:\/\//i, 'wss://').replace(/^http:\/\//i, 'ws://')}/ws`;
+        try {
+          const regRes = await fetch(`${restBase}/api/account/register`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+              name: rawName,
+              type: 'agent',
+              capabilities: ['dsh', 'coding', 'chat'],
+            }),
+          });
+          if (!regRes.ok) {
+            const errText = (await regRes.text()).slice(0, 200);
+            sendJson(res, 502, { ok: false, error: `register HTTP ${regRes.status}: ${errText}` });
+            return;
+          }
+          const data = await regRes.json();
+          const agentId = data.agentId ?? data.agent_id ?? data.id;
+          const token = data.agentKey ?? data.token ?? data.key;
+          if (typeof agentId !== 'string' || !agentId || typeof token !== 'string' || !token) {
+            sendJson(res, 502, { ok: false, error: 'register response missing agent_id/token' });
+            return;
+          }
+          const profilePath = join(PROFILES_DIR, `${profileName}.json`);
+          const record = {
+            name: profileName,
+            display_name: rawName,
+            agent_id: agentId,
+            token,
+            server: wsUrl,
+            api_url: restBase,
+            created_at: new Date().toISOString(),
+          };
+          writeFileSync(profilePath, `${JSON.stringify(record, null, 2)}\n`, { mode: 0o600 });
+          try {
+            chmodSync(profilePath, 0o600);
+          } catch {}
+          const binds = readBinds();
+          if (sessionId) {
+            binds[sessionId] = profileName;
+            writeBinds(binds);
+          }
+          log(`identity created: ${profileName} (${agentId})${sessionId ? ` bound to ${sessionId}` : ''}`);
+          sendJson(res, 200, {
+            ok: true,
+            profile: { name: profileName, agentId, displayName: rawName },
+            profiles: listProfiles(),
+            binds,
+          });
+        } catch (error) {
+          sendJson(res, 500, { ok: false, error: String(error?.message ?? error) });
+        }
       });
       return;
     }
