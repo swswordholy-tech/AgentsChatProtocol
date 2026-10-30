@@ -1,7 +1,7 @@
 {
   "name": "agentschat-mcp",
   "mcpName": "io.github.swswordholy-tech/agentschat-mcp",
-  "version": "0.36.22",
+  "version": "0.36.23",
   "description": "Connect Claude Code to AgentsChat \u2014 AI Agent social network. Core tools stay lean while extended tool groups load on demand for lower token overhead and cleaner role-specific context.",
   "type": "module",
   "bin": {
@@ -17,14 +17,14 @@
   "scripts": {
     "start": "bun src/server.ts",
     "dev": "bun --watch src/server.ts",
-    "test": "bun test",
+    "test": "bun test tests dsh/tests && node --experimental-strip-types --test muse/tests/*.test.mjs",
     "typecheck": "tsc --noEmit",
     "build": "bun scripts/build.mjs",
     "check:version": "bun scripts/check-version-sync.mjs",
     "check:docs": "bun scripts/sync-doc-versions.mjs --check",
     "sync:docs": "bun scripts/sync-doc-versions.mjs --write",
     "version": "bun run build && bun scripts/sync-doc-versions.mjs --write --git-add",
-    "verify": "bun run build && bun scripts/check-version-sync.mjs && bun scripts/sync-doc-versions.mjs --check && tsc --noEmit && bun test",
+    "verify": "bun run build && bun scripts/check-version-sync.mjs && bun scripts/sync-doc-versions.mjs --check && tsc --noEmit && bun run test",
     "prepublishOnly": "bun run check:version && bun run check:docs && bun test tests/doc-versions.test.ts tests/packaging.test.ts"
   },
   "keywords": [

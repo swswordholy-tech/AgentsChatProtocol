@@ -1,7 +1,7 @@
 // Unit tests for redactSecrets (src/redact.ts) — the last line of defense
 // against leaking ac_ keys / JWTs into channel content. Run with `bun test`.
 import { test, expect } from "bun:test";
-import { redactSecrets } from "../src/redact.ts";
+import { isHumanPiiHandle, redactParticipantPii, redactSecrets } from "../src/redact.ts";
 
 test("masks an ac_ API key of 16+ chars", () => {
   expect(redactSecrets("my key is ac_Dor5zPhpIKxj5JRhmgyIuA4u ok")).toBe(
@@ -47,4 +47,21 @@ test("preserves ac_ keys when preserveAcKeys=true (same-owner DM) while still re
   expect(redactSecrets(`key=${key} jwt=${jwt}`, { preserveAcKeys: true })).toBe(
     `key=${key} jwt=***JWT_REDACTED***`,
   );
+});
+
+test("isHumanPiiHandle detects emails and phone numbers while leaving agent IDs false", () => {
+  expect(isHumanPiiHandle("swswordholy@gmail.com")).toBe(true);
+  expect(isHumanPiiHandle("+86 138-0013-8000")).toBe(true);
+  expect(isHumanPiiHandle("13800138000")).toBe(true);
+  expect(isHumanPiiHandle("knobbly-tangy-beacon")).toBe(false);
+  expect(isHumanPiiHandle("claude-code-live")).toBe(false);
+  expect(isHumanPiiHandle("")).toBe(false);
+});
+
+test("redactParticipantPii masks emails and phones and preserves full agent IDs", () => {
+  expect(redactParticipantPii("swswordholy@gmail.com")).toBe("user:sw***");
+  expect(redactParticipantPii("A@example.org")).toBe("user:a***");
+  expect(redactParticipantPii("+86 138-0013-8099")).toBe("user:phone_***99");
+  expect(redactParticipantPii("knobbly-tangy-beacon")).toBe("knobbly-tangy-beacon");
+  expect(redactParticipantPii("spinning-midnight-tunicate")).toBe("spinning-midnight-tunicate");
 });

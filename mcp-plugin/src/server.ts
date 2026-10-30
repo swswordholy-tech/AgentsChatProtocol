@@ -41,7 +41,7 @@ if (process.env.AGENTCHAT_NO_PROXY === "1" && process.env.NODE_USE_ENV_PROXY !==
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { redactSecrets } from "./redact.ts";
+import { isHumanPiiHandle, redactParticipantPii, redactSecrets } from "./redact.ts";
 import { matchesMention } from "./mentions.ts";
 import { messageDedupKey, MessageDedup } from "./dedup.ts";
 import { computeReconnectDelay } from "./reconnect.ts";
@@ -1651,7 +1651,7 @@ const ALL_TOOL_DEFS = [
     },
     {
       name: "channel_brief",
-      description: "Capability synopsis of a channel: who's here (and ONLINE right now), linked OKR objectives with open-task counts, available channel skills, loadable extended tool groups (with load state), recent docs, and what you can do. Call after joining or when entering an unfamiliar room.",
+      description: "Capability synopsis of a channel: who's here (and ONLINE right now, with human emails/phones masked), active agent_peers with their specialty capabilities, linked OKR objectives with open-task counts, available channel skills, loadable extended tool groups (with load state), recent docs, and what you can do. Call after joining or when entering an unfamiliar room.",
       inputSchema: {
         type: "object" as const,
         properties: { chat_id: { type: "string", description: "The channel_id" } },
@@ -1660,7 +1660,7 @@ const ALL_TOOL_DEFS = [
     },
     {
       name: "list_members",
-      description: "List members in a channel.",
+      description: "List members in a channel with full @agent_id handles, online status, and peer capability tags (human login emails/phones masked).",
       inputSchema: {
         type: "object" as const,
         properties: {
@@ -3738,7 +3738,7 @@ const handleToolCall = async (request: any): Promise<any> => {
       const data = await r.json() as any;
       if (data.messages?.length > 0) {
         const results = data.messages.map((m: any) =>
-          `[${m.sender_id?.slice(0, 8)}] ${m.content?.slice(0, 80)}`
+          `[${redactParticipantPii(m.sender_id || "?")}] ${m.content?.slice(0, 80)}`
         ).join("\n");
         return { content: [{ type: "text", text: `Found ${data.messages.length} results:\n${results}` }] };
       }
@@ -3779,9 +3779,51 @@ const handleToolCall = async (request: any): Promise<any> => {
     return { content: [{ type: "text", text: "Not connected" }] };
   }
 
+  async function fetchMcpChannelContext(chatId: string): Promise<{
+    channel?: { id?: string; name?: string; type?: string; topic?: string; member_count?: number };
+    agents?: Array<{ id: string; name?: string; capabilities?: string[]; online?: boolean; is_self?: boolean }>;
+  } | null> {
+    if (!chatId || !TOKEN) return null;
+    try {
+      const r = await apiFetch(
+        `${REST_URL}/mcp`,
+        {
+          method: "POST",
+          headers: {
+            "Authorization": `Bearer ${TOKEN}`,
+            "Content-Type": "application/json",
+            ...(AGENT_ID ? { "X-Agent-Id": AGENT_ID } : {}),
+          },
+          body: JSON.stringify({
+            jsonrpc: "2.0",
+            id: 1,
+            method: "tools/call",
+            params: {
+              name: "agentschat_get_channel_context",
+              arguments: { channel_id: chatId },
+            },
+          }),
+        },
+        2500,
+      );
+      if (!r.ok) return null;
+      const rpc = await r.json() as any;
+      if (rpc?.error || rpc?.result?.isError) return null;
+      const structured = rpc?.result?.structuredContent;
+      if (structured && typeof structured === "object") return structured;
+      const textPayload = rpc?.result?.content?.[0]?.text;
+      if (typeof textPayload === "string" && textPayload.trim().startsWith("{")) {
+        return JSON.parse(textPayload);
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
   // P3 capability synopsis (kr_mq66wu4u): everything an agent can DO in a
-  // channel, composed from existing REST reads. Sections fail soft (null)
-  // so a single flaky fetch never blanks the brief.
+  // channel, composed from existing REST reads + /mcp agentschat_get_channel_context.
+  // Sections fail soft (null) so a single flaky fetch never blanks the brief.
   async function channelBrief(chatId: string): Promise<string> {
     const get = async (path: string) => {
       try {
@@ -3789,10 +3831,11 @@ const handleToolCall = async (request: any): Promise<any> => {
         return r.ok ? await r.json() as any : null;
       } catch { return null; }
     };
-    const [membersData, docsData, okrData] = await Promise.all([
+    const [membersData, docsData, okrData, mcpCtx] = await Promise.all([
       get(`/api/channels/${encodeURIComponent(chatId)}/members`),
       get(`/api/channels/${encodeURIComponent(chatId)}/docs`),
       get(`/api/channels/${encodeURIComponent(chatId)}/okr_snapshot`),
+      fetchMcpChannelContext(chatId),
     ]);
     // membersData === null means the /members read FAILED (most often a 403 because
     // you are not a member of this channel, or the channel does not exist) — NOT an
@@ -3800,20 +3843,52 @@ const handleToolCall = async (request: any): Promise<any> => {
     // truth was "you cannot see this channel's roster", corrupting their self-model.
     const membersReadable = membersData !== null;
     const memberIds: string[] = (membersData?.members || []).map((m: any) => m?.agent_id).filter(Boolean);
+    const memberIdSet = new Set<string>(memberIds);
+    const rawOnlineSet = new Set<string>();
     let online: string[] = [];
     if (memberIds.length > 0) {
       // Batch the presence query in chunks of 50 so channels with >50 members
       // report accurately (was: memberIds.slice(0,50) — silently wrong past 50).
-      const onlineSet = new Set<string>();
       for (let i = 0; i < memberIds.length; i += 50) {
         const batch = memberIds.slice(i, i + 50);
         const pres = await get(`/api/presence?ids=${encodeURIComponent(batch.join(","))}`);
         for (const [k, v] of Object.entries(pres?.presence || {})) {
-          if (v === "online") onlineSet.add(k);
+          if (v === "online" && memberIdSet.has(k)) rawOnlineSet.add(k);
         }
       }
-      online = [...onlineSet];
+      const maskedOnlineSet = new Set<string>();
+      for (const id of rawOnlineSet) {
+        maskedOnlineSet.add(redactParticipantPii(id));
+      }
+      online = [...maskedOnlineSet];
     }
+    const agentPeers = Array.isArray(mcpCtx?.agents)
+      ? mcpCtx.agents
+          .filter((a: any) => a?.id && !isHumanPiiHandle(a.id))
+          .map((a: any) => ({
+            id: String(a.id),
+            ...(a.name && !isHumanPiiHandle(a.name) ? { name: String(a.name) } : {}),
+            capabilities: Array.isArray(a.capabilities) ? a.capabilities.map(String) : [],
+            ...(typeof a.online === "boolean"
+              ? { online: a.online }
+              : memberIds.length > 0
+                ? { online: rawOnlineSet.has(String(a.id)) }
+                : {}),
+            is_self: typeof a.is_self === "boolean" ? a.is_self : String(a.id) === AGENT_ID,
+          }))
+      : (membersData?.members || [])
+          .filter((m: any) => m?.agent_id && !isHumanPiiHandle(m.agent_id) && m.type !== "user")
+          .map((m: any) => ({
+            id: String(m.agent_id),
+            ...(m.display_name && !isHumanPiiHandle(m.display_name) ? { name: String(m.display_name) } : {}),
+            capabilities: Array.isArray(m.capabilities) ? m.capabilities.map(String) : [],
+            ...(typeof m.online === "boolean"
+              ? { online: m.online }
+              : memberIds.length > 0
+                ? { online: rawOnlineSet.has(String(m.agent_id)) }
+                : {}),
+            is_self: String(m.agent_id) === AGENT_ID,
+          }));
     const allDocs = docsData ? extractChannelDocsPayload(docsData) : [];
     const skills = allDocs.filter(isSkillDoc).map((d: any) => ({ doc_id: d.id, title: d.title }));
     const docs = allDocs.filter((d: any) => !isSkillDoc(d)).slice(0, 10).map((d: any) => ({ doc_id: d.id, title: d.title, kind: d.kind }));
@@ -3834,9 +3909,12 @@ const handleToolCall = async (request: any): Promise<any> => {
     }));
     return JSON.stringify({
       channel: chatId,
+      ...(mcpCtx?.channel?.name && mcpCtx.channel.name !== chatId ? { channel_name: String(mcpCtx.channel.name) } : {}),
+      ...(mcpCtx?.channel?.topic ? { topic: String(mcpCtx.channel.topic) } : {}),
       members: membersReadable
         ? { total: memberIds.length, online }
         : { total: null, note: "roster unreadable — you are likely not a member of this channel (or it does not exist)" },
+      ...(membersReadable ? { agent_peers: agentPeers } : {}),
       okr_objectives: objectives,
       skills,
       docs,
@@ -4212,13 +4290,43 @@ const handleToolCall = async (request: any): Promise<any> => {
   if (name === "list_members") {
     const { chat_id } = args as any;
     try {
-      const r = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(chat_id)}/members`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
+      const [r, mcpCtx] = await Promise.all([
+        apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(chat_id)}/members`, { headers: { "Authorization": `Bearer ${TOKEN}` } }),
+        fetchMcpChannelContext(chat_id),
+      ]);
       if (r.ok) {
         const data = await r.json() as any;
         const members = data.members || [];
         if (members.length === 0) return { content: [{ type: "text", text: "No members found." }] };
-        const list = members.map((m: any) => `• ${m.display_name || m.agent_id} (${m.agent_id.slice(0, 12)})${m.role ? ` [${m.role}]` : ""}`).join("\n");
-        return { content: [{ type: "text", text: `${members.length} members in ${chat_id.slice(0, 8)}:\n${list}` }] };
+        const peerById = new Map<string, { name?: string; capabilities?: string[]; online?: boolean }>();
+        for (const a of Array.isArray(mcpCtx?.agents) ? mcpCtx!.agents! : []) {
+          if (a?.id && !isHumanPiiHandle(a.id)) {
+            peerById.set(String(a.id), a);
+          }
+        }
+        const list = members
+          .map((m: any) => {
+            const rawId = String(m?.agent_id ?? "");
+            const isHuman = isHumanPiiHandle(rawId) || m?.type === "user";
+            const safeId = redactParticipantPii(rawId);
+            const peer = !isHuman ? peerById.get(rawId) : undefined;
+            const rawDisplay = m?.display_name ? String(m.display_name).trim() : (peer?.name ? String(peer.name).trim() : "");
+            const safeDisplay = rawDisplay && !isHumanPiiHandle(rawDisplay) ? rawDisplay : safeId;
+            const handleBadge = isHuman ? `(${safeId})` : `(@${safeId})`;
+            const roleBadge = m?.role ? ` [${m.role}]` : "";
+            const onlineVal = typeof m?.online === "boolean" ? m.online : peer?.online;
+            const onlineBadge = typeof onlineVal === "boolean" ? ` (${onlineVal ? "online" : "offline"})` : "";
+            const caps =
+              Array.isArray(peer?.capabilities) && peer!.capabilities!.length > 0
+                ? peer!.capabilities!
+                : Array.isArray(m?.capabilities)
+                  ? m.capabilities
+                  : [];
+            const capsBadge = caps.length > 0 ? ` {capabilities: ${caps.join(", ")}}` : "";
+            return `• ${safeDisplay} ${handleBadge}${roleBadge}${onlineBadge}${capsBadge}`;
+          })
+          .join("\n");
+        return { content: [{ type: "text", text: `${members.length} members in ${chat_id}:\n${list}` }] };
       }
       return { content: [{ type: "text", text: `Failed to list members (${r.status})` }] };
     } catch (e) {
@@ -4237,7 +4345,7 @@ const handleToolCall = async (request: any): Promise<any> => {
         full || rawContent.length <= MAX_HISTORY_MESSAGE_CHARS
           ? rawContent
           : `${rawContent.slice(0, MAX_HISTORY_MESSAGE_CHARS)}… [truncated ${rawContent.length - MAX_HISTORY_MESSAGE_CHARS} chars; pass message_id="${m.id || ""}" to get_history for full text]`;
-      let line = `[${time}] ${m.sender_id?.slice(0, 12)}: ${body}`;
+      let line = `[${time}] ${redactParticipantPii(m.sender_id || "?")}: ${body}`;
       // Surface media attachments so an agent can perceive voice/image messages,
       // not just their text caption. Audio: show any server transcript inline
       // (agent reads it directly); otherwise point at transcribe(url).
@@ -5135,7 +5243,7 @@ function connectWS(slot: ProfileSlot | null = activeSlot) {
               const truncatedMsgs = trimmed.length < msgs.length;
               if (trimmed.length > 0) {
                 const context = trimmed
-                  .map((m: any) => `${m.sender_id}: ${m.content}${formatWakeAttachments(m.attachments)}`)
+                  .map((m: any) => `${redactParticipantPii(m.sender_id || "?")}: ${m.content}${formatWakeAttachments(m.attachments)}`)
                   .join("\n");
                 const note = truncatedMsgs
                   ? `[频道上下文 - 最近 ${trimmed.length} 条消息（更早的已截断保护上下文窗口）]`

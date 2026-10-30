@@ -60,6 +60,32 @@ function redactSecrets(text, opts) {
   const step = opts?.preserveAcKeys ? text : text.replace(/ac_[A-Za-z0-9_-]{16,}/g, "ac_***REDACTED***");
   return step.replace(/eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "***JWT_REDACTED***");
 }
+var PHONE_PII_RE = /^\+?\d[\d\s()-]{5,}$/;
+function isHumanPiiHandle(rawId) {
+  const s = String(rawId ?? "").trim();
+  if (!s)
+    return false;
+  if (s.includes("@"))
+    return true;
+  if (PHONE_PII_RE.test(s))
+    return true;
+  return false;
+}
+function redactParticipantPii(rawId) {
+  const s = String(rawId ?? "").trim();
+  if (!s)
+    return "unknown";
+  const atIdx = s.indexOf("@");
+  if (atIdx >= 0) {
+    const local = s.slice(0, atIdx).replace(/[^a-zA-Z0-9]/g, "");
+    return `user:${(local.slice(0, 2) || "u").toLowerCase()}***`;
+  }
+  if (PHONE_PII_RE.test(s)) {
+    const digits = s.replace(/\D/g, "");
+    return `user:phone_***${digits.slice(-2) || "00"}`;
+  }
+  return s;
+}
 
 // src/mentions.ts
 function matchesMention(content, agentId) {
@@ -1619,7 +1645,7 @@ class HeartbeatMonitor {
 var package_default = {
   name: "agentschat-mcp",
   mcpName: "io.github.swswordholy-tech/agentschat-mcp",
-  version: "0.36.22",
+  version: "0.36.23",
   description: "Connect Claude Code to AgentsChat — AI Agent social network. Core tools stay lean while extended tool groups load on demand for lower token overhead and cleaner role-specific context.",
   type: "module",
   bin: {
@@ -1635,14 +1661,14 @@ var package_default = {
   scripts: {
     start: "bun src/server.ts",
     dev: "bun --watch src/server.ts",
-    test: "bun test",
+    test: "bun test tests dsh/tests && node --experimental-strip-types --test muse/tests/*.test.mjs",
     typecheck: "tsc --noEmit",
     build: "bun scripts/build.mjs",
     "check:version": "bun scripts/check-version-sync.mjs",
     "check:docs": "bun scripts/sync-doc-versions.mjs --check",
     "sync:docs": "bun scripts/sync-doc-versions.mjs --write",
     version: "bun run build && bun scripts/sync-doc-versions.mjs --write --git-add",
-    verify: "bun run build && bun scripts/check-version-sync.mjs && bun scripts/sync-doc-versions.mjs --check && tsc --noEmit && bun test",
+    verify: "bun run build && bun scripts/check-version-sync.mjs && bun scripts/sync-doc-versions.mjs --check && tsc --noEmit && bun run test",
     prepublishOnly: "bun run check:version && bun run check:docs && bun test tests/doc-versions.test.ts tests/packaging.test.ts"
   },
   keywords: [
@@ -3309,7 +3335,7 @@ var ALL_TOOL_DEFS = [
   },
   {
     name: "channel_brief",
-    description: "Capability synopsis of a channel: who's here (and ONLINE right now), linked OKR objectives with open-task counts, available channel skills, loadable extended tool groups (with load state), recent docs, and what you can do. Call after joining or when entering an unfamiliar room.",
+    description: "Capability synopsis of a channel: who's here (and ONLINE right now, with human emails/phones masked), active agent_peers with their specialty capabilities, linked OKR objectives with open-task counts, available channel skills, loadable extended tool groups (with load state), recent docs, and what you can do. Call after joining or when entering an unfamiliar room.",
     inputSchema: {
       type: "object",
       properties: { chat_id: { type: "string", description: "The channel_id" } },
@@ -3318,7 +3344,7 @@ var ALL_TOOL_DEFS = [
   },
   {
     name: "list_members",
-    description: "List members in a channel.",
+    description: "List members in a channel with full @agent_id handles, online status, and peer capability tags (human login emails/phones masked).",
     inputSchema: {
       type: "object",
       properties: {
@@ -5196,7 +5222,7 @@ ${a.body || ""}`;
         }
         const data = await r.json();
         if (data.messages?.length > 0) {
-          const results = data.messages.map((m) => `[${m.sender_id?.slice(0, 8)}] ${m.content?.slice(0, 80)}`).join(`
+          const results = data.messages.map((m) => `[${redactParticipantPii(m.sender_id || "?")}] ${m.content?.slice(0, 80)}`).join(`
 `);
           return { content: [{ type: "text", text: `Found ${data.messages.length} results:
 ${results}` }] };
@@ -5244,6 +5270,44 @@ ${results}` }] };
       }
       return { content: [{ type: "text", text: "Not connected" }] };
     }
+    async function fetchMcpChannelContext(chatId) {
+      if (!chatId || !TOKEN)
+        return null;
+      try {
+        const r = await apiFetch(`${REST_URL}/mcp`, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${TOKEN}`,
+            "Content-Type": "application/json",
+            ...AGENT_ID ? { "X-Agent-Id": AGENT_ID } : {}
+          },
+          body: JSON.stringify({
+            jsonrpc: "2.0",
+            id: 1,
+            method: "tools/call",
+            params: {
+              name: "agentschat_get_channel_context",
+              arguments: { channel_id: chatId }
+            }
+          })
+        }, 2500);
+        if (!r.ok)
+          return null;
+        const rpc = await r.json();
+        if (rpc?.error || rpc?.result?.isError)
+          return null;
+        const structured = rpc?.result?.structuredContent;
+        if (structured && typeof structured === "object")
+          return structured;
+        const textPayload = rpc?.result?.content?.[0]?.text;
+        if (typeof textPayload === "string" && textPayload.trim().startsWith("{")) {
+          return JSON.parse(textPayload);
+        }
+        return null;
+      } catch {
+        return null;
+      }
+    }
     async function channelBrief(chatId) {
       const get = async (path) => {
         try {
@@ -5253,26 +5317,45 @@ ${results}` }] };
           return null;
         }
       };
-      const [membersData, docsData, okrData] = await Promise.all([
+      const [membersData, docsData, okrData, mcpCtx] = await Promise.all([
         get(`/api/channels/${encodeURIComponent(chatId)}/members`),
         get(`/api/channels/${encodeURIComponent(chatId)}/docs`),
-        get(`/api/channels/${encodeURIComponent(chatId)}/okr_snapshot`)
+        get(`/api/channels/${encodeURIComponent(chatId)}/okr_snapshot`),
+        fetchMcpChannelContext(chatId)
       ]);
       const membersReadable = membersData !== null;
       const memberIds = (membersData?.members || []).map((m) => m?.agent_id).filter(Boolean);
+      const memberIdSet = new Set(memberIds);
+      const rawOnlineSet = new Set;
       let online = [];
       if (memberIds.length > 0) {
-        const onlineSet = new Set;
         for (let i = 0;i < memberIds.length; i += 50) {
           const batch = memberIds.slice(i, i + 50);
           const pres = await get(`/api/presence?ids=${encodeURIComponent(batch.join(","))}`);
           for (const [k, v] of Object.entries(pres?.presence || {})) {
-            if (v === "online")
-              onlineSet.add(k);
+            if (v === "online" && memberIdSet.has(k))
+              rawOnlineSet.add(k);
           }
         }
-        online = [...onlineSet];
+        const maskedOnlineSet = new Set;
+        for (const id of rawOnlineSet) {
+          maskedOnlineSet.add(redactParticipantPii(id));
+        }
+        online = [...maskedOnlineSet];
       }
+      const agentPeers = Array.isArray(mcpCtx?.agents) ? mcpCtx.agents.filter((a) => a?.id && !isHumanPiiHandle(a.id)).map((a) => ({
+        id: String(a.id),
+        ...a.name && !isHumanPiiHandle(a.name) ? { name: String(a.name) } : {},
+        capabilities: Array.isArray(a.capabilities) ? a.capabilities.map(String) : [],
+        ...typeof a.online === "boolean" ? { online: a.online } : memberIds.length > 0 ? { online: rawOnlineSet.has(String(a.id)) } : {},
+        is_self: typeof a.is_self === "boolean" ? a.is_self : String(a.id) === AGENT_ID
+      })) : (membersData?.members || []).filter((m) => m?.agent_id && !isHumanPiiHandle(m.agent_id) && m.type !== "user").map((m) => ({
+        id: String(m.agent_id),
+        ...m.display_name && !isHumanPiiHandle(m.display_name) ? { name: String(m.display_name) } : {},
+        capabilities: Array.isArray(m.capabilities) ? m.capabilities.map(String) : [],
+        ...typeof m.online === "boolean" ? { online: m.online } : memberIds.length > 0 ? { online: rawOnlineSet.has(String(m.agent_id)) } : {},
+        is_self: String(m.agent_id) === AGENT_ID
+      }));
       const allDocs = docsData ? extractChannelDocsPayload(docsData) : [];
       const skills = allDocs.filter(isSkillDoc).map((d) => ({ doc_id: d.id, title: d.title }));
       const docs = allDocs.filter((d) => !isSkillDoc(d)).slice(0, 10).map((d) => ({ doc_id: d.id, title: d.title, kind: d.kind }));
@@ -5288,7 +5371,10 @@ ${results}` }] };
       }));
       return JSON.stringify({
         channel: chatId,
+        ...mcpCtx?.channel?.name && mcpCtx.channel.name !== chatId ? { channel_name: String(mcpCtx.channel.name) } : {},
+        ...mcpCtx?.channel?.topic ? { topic: String(mcpCtx.channel.topic) } : {},
         members: membersReadable ? { total: memberIds.length, online } : { total: null, note: "roster unreadable \u2014 you are likely not a member of this channel (or it does not exist)" },
+        ...membersReadable ? { agent_peers: agentPeers } : {},
         okr_objectives: objectives,
         skills,
         docs,
@@ -5658,15 +5744,38 @@ ${lines}` }] };
     if (name === "list_members") {
       const { chat_id } = args;
       try {
-        const r = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(chat_id)}/members`, { headers: { Authorization: `Bearer ${TOKEN}` } });
+        const [r, mcpCtx] = await Promise.all([
+          apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(chat_id)}/members`, { headers: { Authorization: `Bearer ${TOKEN}` } }),
+          fetchMcpChannelContext(chat_id)
+        ]);
         if (r.ok) {
           const data = await r.json();
           const members = data.members || [];
           if (members.length === 0)
             return { content: [{ type: "text", text: "No members found." }] };
-          const list = members.map((m) => `\u2022 ${m.display_name || m.agent_id} (${m.agent_id.slice(0, 12)})${m.role ? ` [${m.role}]` : ""}`).join(`
+          const peerById = new Map;
+          for (const a of Array.isArray(mcpCtx?.agents) ? mcpCtx.agents : []) {
+            if (a?.id && !isHumanPiiHandle(a.id)) {
+              peerById.set(String(a.id), a);
+            }
+          }
+          const list = members.map((m) => {
+            const rawId = String(m?.agent_id ?? "");
+            const isHuman = isHumanPiiHandle(rawId) || m?.type === "user";
+            const safeId = redactParticipantPii(rawId);
+            const peer = !isHuman ? peerById.get(rawId) : undefined;
+            const rawDisplay = m?.display_name ? String(m.display_name).trim() : peer?.name ? String(peer.name).trim() : "";
+            const safeDisplay = rawDisplay && !isHumanPiiHandle(rawDisplay) ? rawDisplay : safeId;
+            const handleBadge = isHuman ? `(${safeId})` : `(@${safeId})`;
+            const roleBadge = m?.role ? ` [${m.role}]` : "";
+            const onlineVal = typeof m?.online === "boolean" ? m.online : peer?.online;
+            const onlineBadge = typeof onlineVal === "boolean" ? ` (${onlineVal ? "online" : "offline"})` : "";
+            const caps = Array.isArray(peer?.capabilities) && peer.capabilities.length > 0 ? peer.capabilities : Array.isArray(m?.capabilities) ? m.capabilities : [];
+            const capsBadge = caps.length > 0 ? ` {capabilities: ${caps.join(", ")}}` : "";
+            return `\u2022 ${safeDisplay} ${handleBadge}${roleBadge}${onlineBadge}${capsBadge}`;
+          }).join(`
 `);
-          return { content: [{ type: "text", text: `${members.length} members in ${chat_id.slice(0, 8)}:
+          return { content: [{ type: "text", text: `${members.length} members in ${chat_id}:
 ${list}` }] };
         }
         return { content: [{ type: "text", text: `Failed to list members (${r.status})` }] };
@@ -5682,7 +5791,7 @@ ${list}` }] };
         const time = m.timestamp ? new Date(m.timestamp).toLocaleString() : "?";
         const rawContent = String(m.content ?? "");
         const body = full || rawContent.length <= MAX_HISTORY_MESSAGE_CHARS ? rawContent : `${rawContent.slice(0, MAX_HISTORY_MESSAGE_CHARS)}\u2026 [truncated ${rawContent.length - MAX_HISTORY_MESSAGE_CHARS} chars; pass message_id="${m.id || ""}" to get_history for full text]`;
-        let line = `[${time}] ${m.sender_id?.slice(0, 12)}: ${body}`;
+        let line = `[${time}] ${redactParticipantPii(m.sender_id || "?")}: ${body}`;
         const atts = Array.isArray(m.attachments) ? m.attachments : [];
         for (const a of atts) {
           if (!a?.url)
@@ -6527,7 +6636,7 @@ function connectWS(slot = activeSlot) {
               }
               const truncatedMsgs = trimmed.length < msgs.length;
               if (trimmed.length > 0) {
-                const context = trimmed.map((m) => `${m.sender_id}: ${m.content}${formatWakeAttachments(m.attachments)}`).join(`
+                const context = trimmed.map((m) => `${redactParticipantPii(m.sender_id || "?")}: ${m.content}${formatWakeAttachments(m.attachments)}`).join(`
 `);
                 const note = truncatedMsgs ? `[\u9891\u9053\u4E0A\u4E0B\u6587 - \u6700\u8FD1 ${trimmed.length} \u6761\u6D88\u606F\uFF08\u66F4\u65E9\u7684\u5DF2\u622A\u65AD\u4FDD\u62A4\u4E0A\u4E0B\u6587\u7A97\u53E3\uFF09]` : `[\u9891\u9053\u4E0A\u4E0B\u6587 - \u81EA\u4E0A\u6B21 @mention \u4EE5\u6765 ${trimmed.length} \u6761\u6D88\u606F]`;
                 contextPrefix = `${note}
