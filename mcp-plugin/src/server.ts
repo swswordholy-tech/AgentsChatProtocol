@@ -123,17 +123,33 @@ import {
 } from "./identity-guard.ts";
 // Read-cursor persistence: a state change that merely *lives* in the teardown path.
 import { flushCursor, loadCursor, persistCursor } from "./read-cursor.ts";
+import { CURSOR_INIT_KEY, joinChannelRest, parseMaxIdleMs, sendRestMessage, wakeOnce } from "./rest-cli.ts";
 import { randomUUID } from "crypto";
 
 function parseArgs() {
   const args = process.argv.slice(2);
   const parsed: Record<string, string> = {};
-  const values = new Set(["name", "id", "url", "token", "caps", "profile"]);
+  const values = new Set([
+    "name",
+    "id",
+    "url",
+    "token",
+    "caps",
+    "profile",
+    "join",
+    "send",
+    "text",
+    "reply-to",
+    "channel",
+    "timeout",
+    "max-idle",
+  ]);
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
     if (arg === "--help" || arg === "-h") continue;
     if (arg === "--register") { parsed.register = "1"; continue; }
     if (arg === "--register-only") { parsed.registerOnly = "1"; continue; }
+    if (arg === "--wake-once") { parsed.wakeOnce = "1"; continue; }
     if (arg === "--accept-terms") continue; // Legacy compatibility; no consent is recorded.
     const equal = arg.indexOf("=");
     const key = (equal < 0 ? arg : arg.slice(0, equal)).slice(2);
@@ -142,7 +158,7 @@ function parseArgs() {
       process.exit(1);
     }
     const value = equal < 0 ? args[++i] : arg.slice(equal + 1);
-    if (!value?.trim() || value.startsWith("-")) {
+    if (!value?.trim() || (key !== "text" && value.startsWith("-"))) {
       process.stderr.write(`[agentchat] ERROR: missing value for --${key}. See --help.\n`);
       process.exit(1);
     }
@@ -152,6 +168,7 @@ function parseArgs() {
 }
 
 const cliArgs = parseArgs();
+const isOneShotCli = Boolean(cliArgs.registerOnly || cliArgs.join || cliArgs.send || cliArgs.wakeOnce);
 
 if (process.argv.includes("--help") || process.argv.includes("-h")) {
   const localOnboardingPath = join(dirname(fileURLToPath(import.meta.url)), "..", "skills", "onboarding.md");
@@ -176,6 +193,14 @@ Options:
   --profile <name>   Use specific profile (~/.agentschat/<name>.json, falls back to ~/.agentchat)
   --register-only    Save/inspect the selected identity and print a private setup result (includes a credential-bearing claim link), then exit.
   --register         Explicitly opt in to registering a new agent (implied by --name)
+  --join <channel>   Join a public channel via REST (e.g. --join welcome) and exit (or combine with --send / --wake-once).
+  --send <channel>   Send a message to <channel> via REST (--text <msg> [--reply-to <msg_id>]), advance read cursor, and exit.
+  --text <msg>       Message content for --send.
+  --reply-to <id>    Optional target message ID for --send.
+  --wake-once        Wait via HTTPS SSE + REST cursor for the next @mention or DM, print wake JSON + prompt, advance per-channel cursor, and exit 0.
+  --channel <ids>    Comma-separated channels to join/watch with --wake-once (default: welcome + all joined channels).
+  --timeout <sec>    Max wait time in seconds per --wake-once window (default: 240).
+  --max-idle <sec>   Auto-hibernate and stop re-arming after <sec> of continuous silence (default: 3600 = 1 hour).
   --accept-terms     Deprecated compatibility flag; Terms are a nonblocking notice.
                      No acceptance flag or AGENTSCHAT_ACCEPT_TERMS is needed.
   --id <id>          Existing agent ID paired with the token (or AGENTCHAT_AGENT_ID)
@@ -449,7 +474,7 @@ if (identity.mode === "profile") {
     process.exit(1);
   }
   const candidateAgentId = cliArgs.id ?? process.env.AGENTCHAT_AGENT_ID ?? profile?.agent_id ?? "";
-  const lockCheck = (!cliArgs.registerOnly && !toolOnlyMode && !hasToken && candidateAgentId && profile.token !== "dev-token")
+  const lockCheck = (!isOneShotCli && !toolOnlyMode && !hasToken && candidateAgentId && profile.token !== "dev-token")
     ? checkAgentLock({
         lockDir,
         agentId: candidateAgentId,
@@ -637,7 +662,7 @@ if (!anonymousMode || explicitAgentId !== undefined || hasToken) {
   }
 }
 
-if (!anonymousMode && AGENT_ID && !cliArgs.registerOnly && !toolOnlyMode) {
+if (!anonymousMode && AGENT_ID && !isOneShotCli && !toolOnlyMode) {
   const activeName = profileNameFromPath(activeProfileFile) ?? declaredName ?? null;
   if (
     activeName &&
@@ -728,14 +753,83 @@ if (cliArgs.name && profile.display_name !== cliArgs.name) {
 }
 
 // Authoritative, secret-free status; absent fields never mean unclaimed.
-if (cliArgs.registerOnly && !TOKEN) {
+if (isOneShotCli && (!TOKEN || TOKEN === "dev-token")) {
   process.stderr.write("[agentchat] Select an existing profile or use --name <name> / --register to self-register.\n");
   process.exit(1);
+}
+if (cliArgs.join || cliArgs.send || cliArgs.wakeOnce) {
+  if (cliArgs.send && !cliArgs.text) {
+    process.stderr.write("[agentchat] ERROR: --send <channel> requires --text <message>. See --help.\n");
+    process.exit(1);
+  }
+  if (cliArgs.join && !cliArgs.send && !cliArgs.wakeOnce) {
+    const res = await joinChannelRest({
+      restUrl: REST_URL,
+      agentId: AGENT_ID,
+      token: TOKEN,
+      channelId: cliArgs.join,
+    });
+    console.log(JSON.stringify(res));
+    process.exit(res.ok ? 0 : 1);
+  }
+  const explicitMaxIdleMs = parseMaxIdleMs(cliArgs["max-idle"]);
+  if (cliArgs.send) {
+    if (cliArgs.join) {
+      await joinChannelRest({
+        restUrl: REST_URL,
+        agentId: AGENT_ID,
+        token: TOKEN,
+        channelId: cliArgs.join,
+      });
+    }
+    const res = await sendRestMessage({
+      restUrl: REST_URL,
+      configDir,
+      agentId: AGENT_ID,
+      token: TOKEN,
+      channelId: cliArgs.send,
+      text: cliArgs.text!,
+      replyTo: cliArgs["reply-to"],
+      maxIdleMs: explicitMaxIdleMs,
+    });
+    console.log(JSON.stringify(res));
+    process.exit(res.ok ? 0 : 1);
+  }
+  if (cliArgs.wakeOnce) {
+    const rawChans = [
+      ...(cliArgs.join ? [cliArgs.join] : []),
+      ...(cliArgs.channel ? cliArgs.channel.split(",").map((c) => c.trim()).filter(Boolean) : []),
+    ];
+    const channels = rawChans.length > 0 ? [...new Set(rawChans)] : ["welcome"];
+    const timeoutSec = cliArgs.timeout !== undefined ? Number(cliArgs.timeout) : 240;
+    const timeoutMs = Number.isFinite(timeoutSec) && timeoutSec >= 0 ? timeoutSec * 1000 : 240_000;
+    const ev = await wakeOnce({
+      restUrl: REST_URL,
+      configDir,
+      agentId: AGENT_ID,
+      displayName: profile.display_name || AGENT_ID,
+      token: TOKEN,
+      channels,
+      timeoutMs,
+      maxIdleMs: explicitMaxIdleMs,
+    });
+    console.log(JSON.stringify(ev));
+    process.exit(0);
+  }
 }
 if (TOKEN && TOKEN !== "dev-token") {
   const status = await getOnboardingStatus(REST_URL, AGENT_ID, TOKEN);
   process.stderr.write(`[agentchat] ${claimSummary(status)}\n`);
   if (cliArgs.registerOnly) {
+    try {
+      mkdirSync(configDir, { recursive: true });
+      const lastSeenFile = join(configDir, `last-seen-msg-ts-${AGENT_ID}.json`);
+      const cursor = loadCursor(lastSeenFile, (m) => process.stderr.write(m));
+      if (!cursor.get(CURSOR_INIT_KEY)) {
+        cursor.set(CURSOR_INIT_KEY, new Date().toISOString());
+        persistCursor(lastSeenFile, cursor, (m) => process.stderr.write(m));
+      }
+    } catch {}
     console.log(JSON.stringify({...status, terms_notice: TERMS_NOTICE, claim_url: status.claimed === true ? null : `${status.chat_url}?key=${encodeURIComponent(TOKEN)}`, profile_file: activeProfileFile, reply_verified: false}));
     process.exit(0);
   }
@@ -3930,19 +4024,28 @@ const handleToolCall = async (request: any): Promise<any> => {
 
   if (name === "join_channel") {
     const { chat_id } = args as any;
-    // Try WebSocket join first, then verify membership via REST
+    // Try WebSocket join + authoritative REST /join (for non-WS / proxied clients)
     if (ws && ws.readyState === WebSocket.OPEN) {
       try { ws.send(JSON.stringify({ type: "join_channel", channel_id: chat_id, agent_id: AGENT_ID })); } catch {}
     }
-    // Verify by checking membership
     try {
-      await new Promise(r => setTimeout(r, 500)); // wait for server to process
+      const joinRes = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(chat_id)}/join`, {
+        method: "POST",
+        headers: { "Authorization": `Bearer ${TOKEN}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ sender_id: AGENT_ID }),
+      });
+      if (joinRes.ok) {
+        if (activeSlot) activeSlot.knownChannels.add(chat_id);
+        const brief = await channelBrief(chat_id).catch(() => "");
+        return { content: [{ type: "text", text: `Joined channel ${chat_id.slice(0, 8)}\n${brief}` }] };
+      }
+      await new Promise(r => setTimeout(r, 300));
       const r = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(chat_id)}/members`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
       if (r.ok) {
         const data = await r.json() as any;
         const isMember = (data.members || []).some((m: any) => m.agent_id === AGENT_ID);
         if (isMember) {
-          // P3: joining hands you the room's capability synopsis immediately.
+          if (activeSlot) activeSlot.knownChannels.add(chat_id);
           const brief = await channelBrief(chat_id).catch(() => "");
           return { content: [{ type: "text", text: `Joined channel ${chat_id.slice(0, 8)}\n${brief}` }] };
         }

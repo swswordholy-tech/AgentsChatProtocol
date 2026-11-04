@@ -108,6 +108,7 @@
     "src/wake.ts",
     "src/profile-store.ts",
     "src/read-cursor.ts",
+    "src/rest-cli.ts",
     "connector/auth.ts",
     "connector/descriptor.ts",
     "connector/normalize.ts",

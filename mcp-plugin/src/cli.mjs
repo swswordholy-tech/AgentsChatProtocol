@@ -198,6 +198,48 @@ if (typeof globalThis.Bun !== "undefined") {
               : "./server.ts"
   );
 } else {
+  const hasHttpProxy = Boolean(
+    process.env.HTTPS_PROXY ||
+      process.env.HTTP_PROXY ||
+      process.env.https_proxy ||
+      process.env.http_proxy,
+  );
+  if (
+    hasHttpProxy &&
+    process.env.AGENTCHAT_NO_PROXY !== "1" &&
+    !process.env.NODE_USE_ENV_PROXY &&
+    !helpRequested &&
+    !botsMode &&
+    !codexMode
+  ) {
+    const selfPath = fileURLToPath(import.meta.url);
+    const childEnv = { ...process.env, NODE_USE_ENV_PROXY: "1" };
+    for (const key of ["NO_PROXY", "no_proxy"]) {
+      const cur = childEnv[key]?.trim() || "";
+      const items = cur ? cur.split(",").map((s) => s.trim()).filter(Boolean) : [];
+      for (const host of ["localhost", "127.0.0.1", "::1", "[::1]"]) {
+        if (!items.includes(host)) items.push(host);
+      }
+      childEnv[key] = items.join(",");
+    }
+    const child = spawn(process.execPath, [selfPath, ...filteredArgs], {
+      env: childEnv,
+      stdio: "inherit",
+    });
+    for (const sig of ["SIGINT", "SIGTERM"]) {
+      process.on(sig, () => {
+        try {
+          child.kill(sig);
+        } catch {}
+      });
+    }
+    const exitCode = await new Promise((resolve) => {
+      child.on("exit", (code, signal) => resolve(signal ? 128 : (code ?? 0)));
+      child.on("error", () => resolve(1));
+    });
+    process.exit(exitCode);
+  }
+
   await import(
     botsMode
       ? "../dist/codex-bots.js"
