@@ -247,6 +247,25 @@ Docs: https://github.com/swswordholy-tech/AgentsChatProtocol`);
 
 // Explicit CLI selection > project binding > runtime binding > environment > default.
 // Onboarding resolves ambiguous unbound candidates with the user; never scan-and-pick.
+// A dedicated Codex bridge is the identity authority for all inherited MCP entries.
+// No credentials in this envelope; read the existing private profile.
+const codexIdentity = process.env.AGENTSCHAT_CODEX_IDENTITY
+  ? JSON.parse(process.env.AGENTSCHAT_CODEX_IDENTITY) as { profileFile: string; agentId: string; apiUrl: string; wsUrl: string }
+  : undefined;
+if (codexIdentity) {
+  if (process.env.AGENTSCHAT_TOOL_ONLY !== "1" ||
+      [codexIdentity.profileFile, codexIdentity.agentId, codexIdentity.apiUrl, codexIdentity.wsUrl].some(v => typeof v !== "string" || !v.trim())) {
+    throw new Error("Invalid Codex tool identity");
+  }
+  // Override inherited CLI/project/env selectors; they may belong to another bot.
+  cliArgs.profile = codexIdentity.profileFile;
+  cliArgs.id = codexIdentity.agentId;
+  cliArgs.url = codexIdentity.apiUrl;
+  delete cliArgs.token;
+  delete cliArgs.name;
+  delete process.env.AGENTCHAT_TOKEN;
+  process.env.AGENTSCHAT_EXPECT_AGENT_ID = codexIdentity.agentId;
+}
 const homeDir = process.env.HOME || process.env.USERPROFILE || ".";
 const configDir = join(homeDir, ".agentschat");
 const legacyConfigDir = join(homeDir, ".agentchat");
@@ -460,6 +479,9 @@ function readIdentityProfile(file: string): any {
 if (identity.mode === "profile") {
   try {
     profile = readIdentityProfile(profileFile);
+    if (codexIdentity && profile.agent_id !== codexIdentity.agentId) {
+      throw new Error("Codex tool profile identity mismatch");
+    }
     if (projectAgentId !== undefined && projectAgentId !== (cliArgs.id ?? process.env.AGENTCHAT_AGENT_ID ?? profile?.agent_id)) {
       throw new Error("Project agent_id does not match selected profile");
     }
@@ -3158,6 +3180,10 @@ const handleToolCall = async (request: any): Promise<any> => {
   // SDK error, so the calling agent always learns the call failed. Explicit
   // error returns below carry isError:true individually.
   try {
+    if (codexIdentity && (AGENT_ID !== codexIdentity.agentId ||
+        ["connect_profile", "switch_profile", "disconnect_profile"].includes(name))) {
+      return { content: [{ type: "text", text: "Codex bridge owns this tool identity; change the bot configuration and restart to change identity." }], isError: true };
+    }
     // Resolve the calling session/conversation and automatically route to its
     // bound ProfileSlot in profileSlots (`session_id -> profile -> agent_id`).
     const rawMeta = (request.params as any)?._meta;
@@ -3166,7 +3192,7 @@ const handleToolCall = async (request: any): Promise<any> => {
       args as Record<string, any> | undefined,
       rawMeta,
     );
-    if (callerSession) {
+    if (callerSession && !codexIdentity) {
       runtimeSession = callerSession;
       const binds = loadSessionBinds(configDir);
       const boundProfileName = binds[callerSession.sessionId];
@@ -3251,7 +3277,7 @@ const handleToolCall = async (request: any): Promise<any> => {
 
     // Shared Cursor MCP: heal back to grok-bind identity if another agent
     // stole the live profile via switch_profile. No-op when unbound.
-    ensureGrokBoundIdentity();
+    if (!codexIdentity) ensureGrokBoundIdentity();
 
     // Identity guard (task_muk0154j_pstaosfn): after a suspect fallback (explicit
     // identity lost on respawn → default profile), WRITE tools refuse until the
@@ -4524,7 +4550,7 @@ const handleToolCall = async (request: any): Promise<any> => {
         const list = msgs.map((m: any) => formatHistoryMessage(m, false)).join("\n");
         return { content: [{ type: "text", text: `${msgs.length} messages:\n${list}` }] };
       }
-      return { content: [{ type: "text", text: `Failed to get history (${r.status})` }] };
+      return { content: [{ type: "text", text: `Failed to get history (${r.status})` }], isError: true };
     } catch (e) {
       return { content: [{ type: "text", text: `Error: ${e}` }] };
     }
@@ -5647,6 +5673,10 @@ async function checkVersionStaleness(): Promise<void> {
 
 // --- Start ---
 async function main() {
+  if (codexIdentity) {
+    const status = await getOnboardingStatus(REST_URL, AGENT_ID, TOKEN);
+    if (status.authentication !== "ok") throw new Error("Codex tool authentication failed; bridge transport alone is not tool readiness");
+  }
   installStdioLifecycleGuards();
   if (!toolOnlyMode) {
     syncOpenBoundSessions();

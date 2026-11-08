@@ -5,6 +5,7 @@ import {spawnSync} from "node:child_process";
 import {join} from "node:path";
 import {tmpdir} from "node:os";
 import {prepareRuntimeHome} from "../codex/runtime-home.ts";
+import {parse} from "smol-toml";
 import {AppServer} from "../codex/app-server.ts";
 const roots:string[]=[];
 afterEach(()=>{for(const p of roots.splice(0))rmSync(p,{recursive:true,force:true});});
@@ -78,6 +79,8 @@ test("independent modes reject mutable-state symlinks including nested paths",()
 test("isolated CLI check reports missing login without generating or exposing account data",()=>{
  const {root}=fixture();const profile=join(root,"profile.json"),fake=join(root,"fake-codex");
  writeFileSync(profile,JSON.stringify({agent_id:"synthetic-bot",token:"ac_test_only"}),{mode:0o600});
+ mkdirSync(join(root,".agentschat"));
+ writeFileSync(join(root,".agentschat/config.json"), JSON.stringify({permissions:"read-only"}));
  writeFileSync(fake,`#!/usr/bin/env node\nrequire('readline').createInterface({input:process.stdin}).on('line',l=>{const m=JSON.parse(l);if(m.id)console.log(JSON.stringify({id:m.id,result:m.method==='account/read'?{account:null,requiresOpenaiAuth:true}:{}}));});\n`);chmodSync(fake,0o700);
  const result=spawnSync(process.execPath,[join(import.meta.dir,"../codex/run.ts"),"--codex-bridge","--cwd",root,"--profile",profile,"--codex-bin",fake,"--state-root",join(root,"state"),"--codex-home-mode","isolated","--check"],{encoding:"utf8",env:{PATH:process.env.PATH,HOME:root,CODEX_HOME:join(root,"nonexistent-source")},timeout:10000});
  expect(result.status).toBe(0);
@@ -115,4 +118,29 @@ test("sandbox startup rejection exposes only safe actionable diagnostics",async(
   let message="";try { await app.request("test/reject",{}); } catch(e) { message=(e as Error).message; }
   expect(message).toContain("Host sandbox rejected");expect(message).toContain("Model execution is not verified");expect(message).not.toContain("private-source-value");
  } finally {app.close();}
+});
+
+// Parent environment inheritance is not enough: Codex filters MCP child env.
+// Pin the actual config entry, without putting bearer credentials in argv.
+test("bridge config pins tool identity even with inherited MCP selectors", async () => {
+ const {root,source}=fixture(), runtime=prepareRuntimeHome(join(root,"bot"),source);
+ const fake=join(root,"codex");
+ writeFileSync(fake, `#!/usr/bin/env node
+require('readline').createInterface({input:process.stdin}).on('line',l=>{const m=JSON.parse(l);if(m.id)console.log(JSON.stringify({id:m.id,result:m.method==='test/argv'?process.argv.slice(2):{}}));});
+`);chmodSync(fake,0o700);
+ const identity={profileFile:join(root,"selected.json"),agentId:"selected-bot",apiUrl:"https://example.test",wsUrl:"wss://example.test/ws"};
+ const app=new AppServer(fake,undefined,undefined,"full-access",runtime,undefined,undefined,identity);
+ try {
+  await app.start();
+  const args=await app.request("test/argv",{});
+  const override=args.find((v:string)=>v.startsWith("mcp_servers.agentschat="));
+  const config=parse(override) as any;
+  const entry=config.mcp_servers.agentschat;
+  expect(entry.enabled).toBe(true);
+  expect(entry.env.AGENTSCHAT_TOOL_ONLY).toBe("1");
+  expect(entry.env.AGENTSCHAT_EXPECT_AGENT_ID).toBe("selected-bot");
+  expect(JSON.parse(entry.env.AGENTSCHAT_CODEX_IDENTITY)).toEqual(identity);
+  expect(entry.args[0]).toContain("src/cli.mjs");
+  expect(entry.url).toBeUndefined();
+ } finally { app.close(); }
 });

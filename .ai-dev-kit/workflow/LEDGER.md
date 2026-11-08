@@ -542,3 +542,10 @@ include IPC config snapshots, disconnect shutdown and process-group cleanup.
 - Self-service evidence: docs/working/self-service-onboarding/verification.md; Protocol506/4skip/0fail, Server2786/0fail, Web108/0fail, SDK25+29pass and actual local Node→MCP→backend chat acceptance. No deployment or publication.
 
 - Version preparation: 0.36.14; final full506/4skip/0fail, focused21/0 and prepublish14/0 with unchanged tracked hashes. Registry 0.36.13 is now published from prior11444af and retains its Terms gate; 0.36.14 is absent. Guides require the new capability. PR #14 pairs with IOSDev PR #1; no publish/deploy.
+
+## Codex tool identity repair (fix/codex-tool-identity)
+- [x] Isolated worktree preserves ongoing main-worktree conflicts.
+- [x] Pin selected profile and service in the actual Codex MCP entry; fail closed on profile/token mismatch.
+- [x] Test subprocess MCP authentication and conflicting inherited selectors.
+- [x] Diagnose welcome mention delivery without replaying historical tasks.
+- [x] Build, validate and document the branch; commit/push delivery is verified by the Git remote receipt.

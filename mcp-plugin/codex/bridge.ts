@@ -82,6 +82,8 @@ export class Bridge {
     // Only retain the wire fields used by this bridge; no protocol instructions.
     const tick = raw.meta?.kind === "loop_tick" ? raw.meta : undefined;
     const message: ChatMessage = { id: raw.id, channel_id: raw.channel_id, sender_id: raw.sender_id,
+      ...(Array.isArray(raw.mentioned_ids) ? { mentioned_ids: raw.mentioned_ids.filter((id: unknown) => typeof id === "string") } : {}),
+      ...(Array.isArray(raw.mentions) ? { mentions: raw.mentions.filter((id: unknown) => typeof id === "string") } : {}),
       content: tick ? "Authorized scheduled loop" : this.redact(raw.content),
       ...(tick ? { meta: { kind: "loop_tick", loop_id: tick.loop_id, interval_ms: tick.interval_ms,
         next_tick_ms: tick.next_tick_ms, prompt: tick.prompt } as LoopTick } : {}) };

@@ -1,4 +1,5 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { createInterface } from "node:readline";
 import type { ThreadHistory } from "./thread-history.ts";
 import type { PermissionMode, ReasoningEffort } from "./config.ts";
@@ -22,15 +23,40 @@ export class AppServer {
   private diagnosticTail = "";
   private disabledMcp: Record<string, { enabled: boolean }> = {};
   // Keep the legacy positional argument for callers; turns have no time limit.
-  constructor(private bin = "codex", private args = ["app-server", "--listen", "stdio://"], _legacyTurnTimeoutMs?: number, private permissions: PermissionMode = "full-access", private runtime?: {home: string; legacyHome?: string}, private effort?: ReasoningEffort, private model?: string) {}
+  constructor(private bin = "codex", private args = ["app-server", "--listen", "stdio://"], _legacyTurnTimeoutMs?: number, private permissions: PermissionMode = "full-access", private runtime?: {home: string; legacyHome?: string}, private effort?: ReasoningEffort, private model?: string, private toolIdentity?: { profileFile: string; agentId: string; apiUrl: string; wsUrl: string }) {}
   get namespace() { return this.runtime?.home; }
   async start() {
     const env = Object.fromEntries(Object.entries(process.env).filter(([k]) => !/^AGENTS?CHAT_|^RELAY_/.test(k)));
     env.AGENTSCHAT_LOCK_OWNER_PID = String(process.pid);
     env.AGENTSCHAT_TOOL_ONLY = "1";
+    if (this.toolIdentity) {
+      env.AGENTSCHAT_CODEX_IDENTITY = JSON.stringify(this.toolIdentity);
+      env.AGENTSCHAT_EXPECT_AGENT_ID = this.toolIdentity.agentId;
+    }
     if (this.runtime) { env.CODEX_HOME = this.runtime.home; env.CODEX_SQLITE_HOME = this.runtime.home; }
     const args = this.runtime && this.args[0] === "app-server"
-      ? [...this.args, "-c", `sqlite_home=${JSON.stringify(this.runtime.home)}`] : this.args;
+      ? [...this.args, "-c", `sqlite_home=${JSON.stringify(this.runtime.home)}`] : [...this.args];
+    if (this.toolIdentity && this.args[0] === "app-server") {
+      // Codex filters child environment variables. Supply an explicit MCP entry
+      // instead of depending on parent env inheritance or a global plugin version.
+      const entry = {
+        command: process.execPath,
+        args: [fileURLToPath(new URL("../src/cli.mjs", import.meta.url))],
+        enabled: this.permissions !== "read-only",
+        env: {
+          AGENTSCHAT_CODEX_IDENTITY: JSON.stringify(this.toolIdentity),
+          AGENTSCHAT_EXPECT_AGENT_ID: this.toolIdentity.agentId,
+          AGENTSCHAT_TOOL_ONLY: "1",
+          AGENTSCHAT_LOCK_OWNER_PID: String(process.pid),
+        },
+      };
+      // Replace the complete entry, including stale url/bearer/env fields from
+      // operator config. JSON objects are not TOML inline tables.
+      const encode = (value: unknown): string => value && typeof value === "object" && !Array.isArray(value)
+        ? `{ ${Object.entries(value).map(([k, v]) => `${JSON.stringify(k)} = ${encode(v)}`).join(", ")} }`
+        : JSON.stringify(value);
+      args.push("-c", `mcp_servers.agentschat=${encode(entry)}`);
+    }
     this.child = spawn(this.bin, args, { env, stdio: "pipe" });
     // Child diagnostics may contain account or MCP credentials; never relay raw stderr.
     this.child.stderr.on("data", (chunk: Buffer) => {

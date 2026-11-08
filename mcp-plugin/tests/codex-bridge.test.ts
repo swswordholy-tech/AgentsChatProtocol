@@ -571,3 +571,16 @@ test("writable state root preserves identity isolation and explicit home mode",(
  expect(resolveConfig({cwd:f.cwd,profile:"override"},{},f.root).stateDir).not.toBe(c.stateDir);
  expect(()=>resolveConfig({cwd:f.cwd,codexHomeMode:"unknown"},{},f.root)).toThrow("codex_home_mode");
 });
+
+test("server-resolved mentions survive durable inbox and reach the model", async () => {
+ const f=fixture(); let prompt="";
+ const generator={thread:async()=>"t-mention",generate:async (_:string,p:string)=>{prompt=p;return "ok";}};
+ const bridge=ownedBridge(f.c,generator,async()=>{},()=>{});
+ try {
+  bridge.accept({...message("resolved-mention","welcome"),content:"@DisplayName hi",mentioned_ids:["project"]});
+  await bridge.drain();
+  const state=JSON.parse(readFileSync(join(f.c.stateDir,"state.json"),"utf8"));
+  expect(state.entries[0].message.mentioned_ids).toEqual(["project"]);
+  expect(prompt).toContain('"mentioned_ids":["project"]');
+ } finally {await bridge.stop();}
+});

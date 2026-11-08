@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 // @bun
+import { createRequire } from "node:module";
+var __require = /* @__PURE__ */ createRequire(import.meta.url);
 
 // src/onboarding-status.ts
 async function getOnboardingStatus(base, agentId, token, request = fetch) {
@@ -711,8 +713,8 @@ async function fireGrokWake(msg, cfg) {
   }
   let gwcfg;
   try {
-    const { readFileSync } = await import("node:fs");
-    gwcfg = JSON.parse(readFileSync(cfg.gatewayConfigPath, "utf8"));
+    const { readFileSync: readFileSync3 } = await import("node:fs");
+    gwcfg = JSON.parse(readFileSync3(cfg.gatewayConfigPath, "utf8"));
   } catch (e) {
     log(`[agentchat] grok wake: cannot read ${cfg.gatewayConfigPath}: ${e}`);
     return;
@@ -839,8 +841,8 @@ async function resolveZcodeCommand(explicitBin) {
   }
   const macAppBundleCjs = "/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs";
   try {
-    const { existsSync } = await import("node:fs");
-    if (existsSync(macAppBundleCjs)) {
+    const { existsSync: existsSync2 } = await import("node:fs");
+    if (existsSync2(macAppBundleCjs)) {
       return { cmd: "node", prefixArgs: [macAppBundleCjs] };
     }
   } catch {}
@@ -880,7 +882,7 @@ function fireZcodeWake(msg, cfg) {
         return;
       }
       const { spawn } = await import("node:child_process");
-      await new Promise((resolve) => {
+      await new Promise((resolve2) => {
         const child = spawn(cmd, args, {
           cwd: cfg.workspacePath || process.cwd(),
           env,
@@ -899,7 +901,7 @@ function fireZcodeWake(msg, cfg) {
         child.on("error", (err) => {
           clearTimeout(timer);
           log(`[agentchat] zcode wake spawn error (${sessionId}): ${err}`);
-          resolve();
+          resolve2();
         });
         child.on("close", (code) => {
           clearTimeout(timer);
@@ -907,7 +909,7 @@ function fireZcodeWake(msg, cfg) {
           if (!succeeded) {
             log(`[agentchat] zcode wake (${sessionId}) exited code=${code}${stderr ? `: ${stderr.trim().slice(0, 200)}` : ""}`);
           }
-          resolve();
+          resolve2();
         });
       });
     } catch (e) {
@@ -2823,6 +2825,19 @@ Profiles stored in: ~/.agentschat/ (legacy fallback: ~/.agentchat/)
 Docs: https://github.com/swswordholy-tech/AgentsChatProtocol`);
   process.exit(0);
 }
+var codexIdentity = process.env.AGENTSCHAT_CODEX_IDENTITY ? JSON.parse(process.env.AGENTSCHAT_CODEX_IDENTITY) : undefined;
+if (codexIdentity) {
+  if (process.env.AGENTSCHAT_TOOL_ONLY !== "1" || [codexIdentity.profileFile, codexIdentity.agentId, codexIdentity.apiUrl, codexIdentity.wsUrl].some((v) => typeof v !== "string" || !v.trim())) {
+    throw new Error("Invalid Codex tool identity");
+  }
+  cliArgs.profile = codexIdentity.profileFile;
+  cliArgs.id = codexIdentity.agentId;
+  cliArgs.url = codexIdentity.apiUrl;
+  delete cliArgs.token;
+  delete cliArgs.name;
+  delete process.env.AGENTCHAT_TOKEN;
+  process.env.AGENTSCHAT_EXPECT_AGENT_ID = codexIdentity.agentId;
+}
 var homeDir = process.env.HOME || process.env.USERPROFILE || ".";
 var configDir = join7(homeDir, ".agentschat");
 var legacyConfigDir = join7(homeDir, ".agentchat");
@@ -2989,6 +3004,9 @@ function readIdentityProfile(file) {
 if (identity.mode === "profile") {
   try {
     profile = readIdentityProfile(profileFile);
+    if (codexIdentity && profile.agent_id !== codexIdentity.agentId) {
+      throw new Error("Codex tool profile identity mismatch");
+    }
     if (projectAgentId !== undefined && projectAgentId !== (cliArgs.id ?? process.env.AGENTCHAT_AGENT_ID ?? profile?.agent_id)) {
       throw new Error("Project agent_id does not match selected profile");
     }
@@ -4696,18 +4714,18 @@ async function sendMediaMessage(kind, args) {
     let ttsDuration;
     if (text) {
       const voice = typeof args.voice === "string" && args.voice ? args.voice : undefined;
-      const r = await apiFetch(`${REST_URL}/api/tts`, {
+      const r2 = await apiFetch(`${REST_URL}/api/tts`, {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${TOKEN}` },
         body: JSON.stringify({ text, ...voice ? { voice } : {} })
       });
-      const t = await r.text();
-      if (r.status === 429 && /MEDIA_BUDGET_EXCEEDED/i.test(t))
+      const t = await r2.text();
+      if (r2.status === 429 && /MEDIA_BUDGET_EXCEEDED/i.test(t))
         return { content: [{ type: "text", text: "Voice budget exhausted for today (MEDIA_BUDGET_EXCEEDED) \u2014 try again tomorrow, or send a recorded clip via path/url." }], isError: true };
-      if (r.status === 400 && /INVALID_VOICE/i.test(t))
+      if (r2.status === 400 && /INVALID_VOICE/i.test(t))
         return { content: [{ type: "text", text: "Invalid voice for TTS. Call list_voices for valid names, or omit `voice` to use your configured one." }], isError: true };
-      if (!r.ok)
-        return { content: [{ type: "text", text: `TTS failed (${r.status}): ${t.slice(0, 140)}` }], isError: true };
+      if (!r2.ok)
+        return { content: [{ type: "text", text: `TTS failed (${r2.status}): ${t.slice(0, 140)}` }], isError: true };
       let d;
       try {
         d = JSON.parse(t);
@@ -5394,9 +5412,12 @@ var handleToolCall = async (request) => {
   let { name, arguments: args } = request.params;
   let viaExtendedCompat = false;
   try {
+    if (codexIdentity && (AGENT_ID !== codexIdentity.agentId || ["connect_profile", "switch_profile", "disconnect_profile"].includes(name))) {
+      return { content: [{ type: "text", text: "Codex bridge owns this tool identity; change the bot configuration and restart to change identity." }], isError: true };
+    }
     const rawMeta = request.params?._meta;
     const { session: callerSession, isPerCallSession } = await resolveCallerSessionForToolCall(name, args, rawMeta);
-    if (callerSession) {
+    if (callerSession && !codexIdentity) {
       runtimeSession = callerSession;
       const binds = loadSessionBinds(configDir);
       const boundProfileName = binds[callerSession.sessionId];
@@ -5472,7 +5493,8 @@ var handleToolCall = async (request) => {
       if (argErr)
         return { content: [{ type: "text", text: `${name}: ${argErr}` }], isError: true };
     }
-    ensureGrokBoundIdentity();
+    if (!codexIdentity)
+      ensureGrokBoundIdentity();
     if (identityGateMessage && name !== "whoami" && TOOL_ANNOTATIONS[name]?.readOnlyHint !== true) {
       return { content: [{ type: "text", text: `\uD83D\uDEA8 ${identityGateMessage}` }], isError: true };
     }
@@ -6241,7 +6263,7 @@ ${results}` }] };
           return { content: [{ type: "text", text: `Joined channel ${chat_id.slice(0, 8)}
 ${brief}` }] };
         }
-        await new Promise((r) => setTimeout(r, 300));
+        await new Promise((r2) => setTimeout(r2, 300));
         const r = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(chat_id)}/members`, { headers: { Authorization: `Bearer ${TOKEN}` } });
         if (r.ok) {
           const data = await r.json();
@@ -6722,7 +6744,7 @@ ${formatHistoryMessage(exact, true)}` }] };
           return { content: [{ type: "text", text: `${msgs.length} messages:
 ${list}` }] };
         }
-        return { content: [{ type: "text", text: `Failed to get history (${r.status})` }] };
+        return { content: [{ type: "text", text: `Failed to get history (${r.status})` }], isError: true };
       } catch (e) {
         return { content: [{ type: "text", text: `Error: ${e}` }] };
       }
@@ -7532,15 +7554,15 @@ ${context}
         if (process.env.AGENTCHAT_WAKE_MODE === "grok") {
           (async () => {
             try {
-              const { readFileSync, existsSync } = await import("fs");
-              const gwPath = resolveGrokGatewayPath(process.env.AGENTCHAT_GROK_GATEWAY, existsSync);
+              const { readFileSync: readFileSync10, existsSync: existsSync9 } = await import("fs");
+              const gwPath = resolveGrokGatewayPath(process.env.AGENTCHAT_GROK_GATEWAY, existsSync9);
               let agentId = process.env.AGENTCHAT_GROK_AGENT_ID || "";
               if (!agentId) {
                 agentId = await resolveGrokAgentId({
                   explicitId: "",
                   agentschatName: slot.profile.display_name || slot.agentId,
                   listAgents: async () => {
-                    const gwcfg = JSON.parse(readFileSync(gwPath, "utf8"));
+                    const gwcfg = JSON.parse(readFileSync10(gwPath, "utf8"));
                     const token = grokBearerFromGatewayConfig(gwcfg);
                     const port = grokPortFromGatewayConfig(gwcfg);
                     const res = await fetch(`http://127.0.0.1:${port}/api/listAgents`, {
@@ -7782,6 +7804,11 @@ async function checkVersionStaleness() {
   }
 }
 async function main() {
+  if (codexIdentity) {
+    const status = await getOnboardingStatus(REST_URL, AGENT_ID, TOKEN);
+    if (status.authentication !== "ok")
+      throw new Error("Codex tool authentication failed; bridge transport alone is not tool readiness");
+  }
   installStdioLifecycleGuards();
   if (!toolOnlyMode) {
     syncOpenBoundSessions();

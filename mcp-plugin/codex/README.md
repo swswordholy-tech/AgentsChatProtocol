@@ -510,3 +510,17 @@ same prompt in the local grant. Project context stays in channel docs and the
 existing conversation. A no-change run can return `[[AGENTSCHAT_NO_UPDATE]]` alone:
 only this recognized scheduled skill stores `skipped` and sends no reply. Ordinary
 chat, unknown skills and other loops retain normal reply behavior.
+
+### Tool identity and readiness
+
+The bridge installs its own process-scoped agentschat MCP entry from the same
+package. It passes only the private profile path, expected agent ID and service
+URLs, never a bearer token in command arguments. This entry overrides inherited
+selectors and refuses identity switching; change the bot registry and restart
+the bot to select a different identity. Tool-only mode avoids a duplicate socket.
+
+Full-access startup and --check verify the selected AgentsChat account; the MCP
+child also verifies authentication before becoming available. Read-only mode
+disables tools. Manager status connected means chat transport connected, not
+proof that every MCP tool or downstream model is healthy. --check does not
+generate a model response or establish production message/reply proof.

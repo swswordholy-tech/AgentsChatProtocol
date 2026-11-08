@@ -70,7 +70,7 @@ async function main() {
   }
   console.log(JSON.stringify({ cwd: c.cwd, agent_id: c.agentId, profile: c.profileFile, source: c.source, stateDir: c.stateDir }));
   const runtime = prepareRuntimeHome(c.stateDir, undefined, c.codexHomeMode, c.codexBin);
-  codex = new AppServer(c.codexBin, undefined, undefined, c.permissions, runtime, c.effort, c.model);
+  codex = new AppServer(c.codexBin, undefined, undefined, c.permissions, runtime, c.effort, c.model, { profileFile: c.profileFile, agentId: c.agentId, apiUrl: c.apiUrl, wsUrl: c.wsUrl });
   if (values.conversations || values["read-conversation"]) {
     const state = JSON.parse(readFileSync(join(c.stateDir, "state.json"), "utf8"));
     const channels = state.channels ?? {};
@@ -82,6 +82,12 @@ async function main() {
     const history = channel.namespace ? await codex.readThread(channel.thread) : await codex.readLegacyThread(channel.thread);
     console.log(redactSecrets(JSON.stringify(history).split(c.token).join("[REDACTED]")));
     codex.close(); return;
+  }
+  if (c.permissions === "full-access") {
+    const identityStatus = await getOnboardingStatus(c.apiUrl, c.agentId, c.token);
+    if (identityStatus.authentication !== "ok")
+      throw new Error("AgentsChat authentication failed or unavailable; tool identity is not ready");
+    console.log("AgentsChat selected identity authentication: OK; MCP startup also verifies this identity");
   }
   if (values.check) {
     await codex.start();

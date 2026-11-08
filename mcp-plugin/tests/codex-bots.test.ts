@@ -84,7 +84,7 @@ test("manager snapshot survives broken registry; parent death cleans workers", a
  const { WebSocketServer } = await import("ws");
  const home=realpathSync(mkdtempSync(join(tmpdir(),"bots-lifecycle-")));
  const profiles=join(home,".agentschat/profiles"); mkdirSync(profiles,{recursive:true});
- const hub = Bun.serve({port:0,fetch:()=>Response.json({channels:[]})});
+ const hub = Bun.serve({port:0,fetch:(req)=>new URL(req.url).pathname==="/api/account/onboarding" ? Response.json({agent_id:"test-bot",claimed:true}) : Response.json({channels:[]})});
  const ws = new WebSocketServer({port:0}); await new Promise<void>(r=>ws.once("listening",r));
  ws.on("connection",socket=>socket.on("message",raw=>{if(JSON.parse(String(raw)).type==="auth")socket.send(JSON.stringify({type:"auth_ok"}));}));
  const fake=join(home,"fake-codex");
