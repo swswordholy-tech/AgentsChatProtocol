@@ -928,13 +928,13 @@ function fireZcodeWake(msg, cfg) {
 
 // src/session-bind.ts
 import { createHash } from "node:crypto";
-import { closeSync, existsSync as existsSync3, mkdirSync, openSync, readFileSync as readFileSync3, readSync, readdirSync, statSync as statSync2, unlinkSync as unlinkSync2 } from "node:fs";
+import { closeSync, existsSync as existsSync3, mkdirSync, openSync, readFileSync as readFileSync4, readSync, readdirSync as readdirSync2, statSync as statSync2, unlinkSync as unlinkSync2 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join as join3 } from "node:path";
 import { spawnSync } from "node:child_process";
 
 // src/profile-store.ts
-import { existsSync as existsSync2, writeFileSync, renameSync, chmodSync, unlinkSync, statSync } from "fs";
+import { existsSync as existsSync2, writeFileSync, renameSync, chmodSync, unlinkSync, statSync, readdirSync, readFileSync as readFileSync3 } from "fs";
 var defaultWarn = (m) => process.stderr.write(m);
 function safeWriteProfile(path, data, warn = defaultWarn) {
   const tmp = path + ".tmp";
@@ -964,6 +964,16 @@ function safeWriteProfile(path, data, warn = defaultWarn) {
 `);
   }
 }
+var NON_PROFILE_JSON_FILES = new Set([
+  "session-binds.json",
+  "agy-binds.json",
+  "grok-binds.json",
+  "grok-binds-meta.json",
+  "grok-binds.meta.json",
+  "identity-guard.json",
+  "dsh.json",
+  "config.json"
+]);
 
 // src/session-bind.ts
 var DEFAULT_SESSION_BINDS_FILENAME = "session-binds.json";
@@ -999,7 +1009,7 @@ function readAgentLock(lockDir, agentId) {
   if (!existsSync3(file))
     return null;
   try {
-    const raw = JSON.parse(readFileSync3(file, "utf8"));
+    const raw = JSON.parse(readFileSync4(file, "utf8"));
     if (!raw || typeof raw !== "object" || typeof raw.pid !== "number" || typeof raw.agentId !== "string") {
       return null;
     }
@@ -1096,25 +1106,49 @@ function loadSessionBinds(configDir) {
     if (!existsSync3(path))
       continue;
     try {
-      Object.assign(merged, parseSessionBinds(JSON.parse(readFileSync3(path, "utf8"))));
+      Object.assign(merged, parseSessionBinds(JSON.parse(readFileSync4(path, "utf8"))));
     } catch {}
   }
   return merged;
+}
+function resolveAgentIdForProfileName(configDir, name) {
+  if (!name || name.includes("/") || name.includes("\\"))
+    return null;
+  const base = name.replace(/\.json$/, "").replace(/[^a-zA-Z0-9_-]/g, "_");
+  for (const candidate of [join3(configDir, "profiles", `${base}.json`), join3(configDir, `${base}.json`)]) {
+    if (!existsSync3(candidate))
+      continue;
+    try {
+      const parsed = JSON.parse(readFileSync4(candidate, "utf8"));
+      if (typeof parsed?.agent_id === "string" && parsed.agent_id.trim()) {
+        return parsed.agent_id.trim();
+      }
+    } catch {}
+  }
+  return null;
 }
 function saveSessionBind(configDir, sessionId, profileName) {
   const sid = sessionId.trim();
   const prof = profileName.trim();
   if (!sid || !prof)
     return;
+  const targetAgentId = resolveAgentIdForProfileName(configDir, prof);
+  const isSameProfileOrAgent = (existingProf) => {
+    if (existingProf === prof)
+      return true;
+    if (!targetAgentId)
+      return false;
+    return resolveAgentIdForProfileName(configDir, existingProf) === targetAgentId;
+  };
   const path = join3(configDir, DEFAULT_SESSION_BINDS_FILENAME);
   let current = {};
   if (existsSync3(path)) {
     try {
-      current = parseSessionBinds(JSON.parse(readFileSync3(path, "utf8")));
+      current = parseSessionBinds(JSON.parse(readFileSync4(path, "utf8")));
     } catch {}
   }
   for (const [existingSid, existingProf] of Object.entries(current)) {
-    if (existingProf === prof && existingSid !== sid) {
+    if (existingSid !== sid && isSameProfileOrAgent(existingProf)) {
       delete current[existingSid];
     }
   }
@@ -1125,10 +1159,10 @@ function saveSessionBind(configDir, sessionId, profileName) {
   const legacyPath = join3(configDir, LEGACY_AGY_BINDS_FILENAME);
   if (existsSync3(legacyPath)) {
     try {
-      const legacy = parseSessionBinds(JSON.parse(readFileSync3(legacyPath, "utf8")));
+      const legacy = parseSessionBinds(JSON.parse(readFileSync4(legacyPath, "utf8")));
       let changed = false;
       for (const [existingSid, existingProf] of Object.entries(legacy)) {
-        if (existingProf === prof && existingSid !== sid) {
+        if (existingSid !== sid && isSameProfileOrAgent(existingProf)) {
           delete legacy[existingSid];
           changed = true;
         }
@@ -1148,7 +1182,7 @@ function removeSessionBind(configDir, sessionId) {
     if (!existsSync3(path))
       continue;
     try {
-      const current = parseSessionBinds(JSON.parse(readFileSync3(path, "utf8")));
+      const current = parseSessionBinds(JSON.parse(readFileSync4(path, "utf8")));
       if (sid in current) {
         delete current[sid];
         safeWriteProfile(path, current);
@@ -1197,7 +1231,9 @@ function detectRuntimeSession(env = process.env, meta) {
   if (explicitSid) {
     return { sessionId: explicitSid, runtime: "custom" };
   }
-  if (env === process.env || env.__CFBundleIdentifier === "com.google.antigravity" || Boolean(env.AGY_BROWSER_WS_URL)) {
+  const hasExplicitAgyEnv = env.__CFBundleIdentifier === "com.google.antigravity" || Boolean(env.AGY_BROWSER_WS_URL) || Boolean(env.ANTIGRAVITY_LS_ADDRESS) || Boolean(env.ANTIGRAVITY_CSRF_TOKEN);
+  const isMockHubSubprocess = !hasExplicitAgyEnv && typeof env.AGENTCHAT_REST_URL === "string" && /^http:\/\/127\.0\.0\.1:\d+/.test(env.AGENTCHAT_REST_URL);
+  if (!isMockHubSubprocess && (env === process.env || hasExplicitAgyEnv)) {
     const agyHost = discoverAntigravityHost();
     if (agyHost && agyHost.openConversations.length === 1) {
       return { sessionId: agyHost.openConversations[0], runtime: "antigravity" };
@@ -1206,7 +1242,57 @@ function detectRuntimeSession(env = process.env, meta) {
   return null;
 }
 var cachedAgyHost = null;
+function parseAntigravityLsofOutput(stdout, appDataDir = "antigravity") {
+  const ports = [];
+  const presenceConversations = [];
+  const dbConversations = [];
+  const cleanAppDir = (appDataDir || "antigravity").trim().replace(/^\/+|\/+$/g, "");
+  const isCliTarget = cleanAppDir === "antigravity-cli";
+  for (const line of (stdout || "").split(/\r?\n/)) {
+    const portMatch = line.match(/127\.0\.0\.1:(\d+)\s+\(LISTEN\)/);
+    if (portMatch) {
+      const p = Number(portMatch[1]);
+      if (p > 0 && !ports.includes(p))
+        ports.push(p);
+    }
+    if (!isCliTarget && line.includes("/antigravity-cli/"))
+      continue;
+    const presMatch = line.match(/\/presence\/([0-9a-fA-F-]{36})\.lock$/);
+    if (presMatch) {
+      const cid = presMatch[1];
+      if (!presenceConversations.includes(cid))
+        presenceConversations.push(cid);
+      continue;
+    }
+    const dbMatch = line.match(/\/conversations\/([0-9a-fA-F-]{36})\.db$/);
+    if (dbMatch) {
+      if (cleanAppDir && line.includes("/.gemini/") && !line.includes(`/${cleanAppDir}/conversations/`)) {
+        continue;
+      }
+      const cid = dbMatch[1];
+      if (!dbConversations.includes(cid))
+        dbConversations.push(cid);
+    }
+  }
+  ports.sort((a, b) => b - a);
+  const openConversations = presenceConversations.length > 0 ? presenceConversations : dbConversations;
+  return { ports, openConversations };
+}
 function discoverAntigravityHost(opts) {
+  if (!opts?.currentPid) {
+    const envAddr = process.env.ANTIGRAVITY_LS_ADDRESS?.trim() || "";
+    const envCsrf = process.env.ANTIGRAVITY_CSRF_TOKEN?.trim() || "";
+    if (envAddr && envCsrf) {
+      const portMatch = envAddr.match(/:(\d+)$/);
+      const ports = portMatch ? [Number(portMatch[1])] : [];
+      const openConversations = (process.env.ANTIGRAVITY_OPEN_CONVERSATIONS || "").split(",").map((s) => s.trim()).filter((s) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s));
+      return { lsPid: process.ppid, csrfToken: envCsrf, ports, openConversations };
+    }
+    const hasExplicitAgyEnv = process.env.__CFBundleIdentifier === "com.google.antigravity" || Boolean(process.env.AGY_BROWSER_WS_URL);
+    if (!hasExplicitAgyEnv && typeof process.env.AGENTCHAT_REST_URL === "string" && /^http:\/\/127\.0\.0\.1:\d+/.test(process.env.AGENTCHAT_REST_URL)) {
+      return null;
+    }
+  }
   const now = Date.now();
   const cacheMs = opts?.cacheMs ?? 5000;
   if (cachedAgyHost && now - cachedAgyHost.at < cacheMs)
@@ -1244,26 +1330,10 @@ function discoverAntigravityHost(opts) {
       cachedAgyHost = { at: now, info: null };
       return null;
     }
+    const appDirMatch = lsCmd.match(/--app_data_dir[=\s]+([^\s]+)/);
+    const appDataDir = appDirMatch?.[1]?.trim() || "antigravity";
     const lsof = spawnSync("lsof", ["-Pan", "-p", String(lsPid)], { encoding: "utf8", timeout: 1500 });
-    const ports = [];
-    const openConversations = [];
-    if (lsof.status === 0 && lsof.stdout) {
-      for (const line of lsof.stdout.split(/\r?\n/)) {
-        const portMatch = line.match(/127\.0\.0\.1:(\d+)\s+\(LISTEN\)/);
-        if (portMatch) {
-          const p = Number(portMatch[1]);
-          if (p > 0 && !ports.includes(p))
-            ports.push(p);
-        }
-        const presMatch = line.match(/\/presence\/([0-9a-fA-F-]{36})\.lock$/) || line.match(/\/conversations\/([0-9a-fA-F-]{36})\.db$/);
-        if (presMatch) {
-          const cid = presMatch[1];
-          if (!openConversations.includes(cid))
-            openConversations.push(cid);
-        }
-      }
-    }
-    ports.sort((a, b) => b - a);
+    const { ports, openConversations } = lsof.status === 0 && lsof.stdout ? parseAntigravityLsofOutput(lsof.stdout, appDataDir) : { ports: [], openConversations: [] };
     const info = { lsPid, csrfToken, ports, openConversations };
     cachedAgyHost = { at: now, info };
     return info;
@@ -1285,7 +1355,7 @@ function detectAntigravityCallerSession(opts) {
       candidateSet.add(cid);
   }
   try {
-    for (const entry of readdirSync(brainDir)) {
+    for (const entry of readdirSync2(brainDir)) {
       if (uuidRe.test(entry))
         candidateSet.add(entry);
     }
@@ -1422,7 +1492,7 @@ function sessionDirMtime(dir) {
 function sessionLogMtime(dshHome, sid) {
   let projects;
   try {
-    projects = readdirSync(join3(dshHome, "sessions"));
+    projects = readdirSync2(join3(dshHome, "sessions"));
   } catch {
     return 0;
   }
@@ -1438,7 +1508,7 @@ function newestSessionLog(dshHome, nowMs, maxAgeMs) {
   const root = join3(dshHome, "sessions");
   let projects;
   try {
-    projects = readdirSync(root);
+    projects = readdirSync2(root);
   } catch {
     return null;
   }
@@ -1446,7 +1516,7 @@ function newestSessionLog(dshHome, nowMs, maxAgeMs) {
   for (const project of projects) {
     let entries;
     try {
-      entries = readdirSync(join3(root, project));
+      entries = readdirSync2(join3(root, project));
     } catch {
       continue;
     }
@@ -1503,12 +1573,12 @@ async function detectDshCallerSession(opts) {
 }
 
 // src/session-route.ts
-import { existsSync as existsSync5, readFileSync as readFileSync5 } from "node:fs";
+import { existsSync as existsSync5, readFileSync as readFileSync6 } from "node:fs";
 import { homedir as homedir2 } from "node:os";
 import { join as join5 } from "node:path";
 
 // src/session-bind.ts
-import { closeSync as closeSync2, existsSync as existsSync4, mkdirSync as mkdirSync2, openSync as openSync2, readFileSync as readFileSync4, readSync as readSync2, readdirSync as readdirSync2, statSync as statSync3, unlinkSync as unlinkSync3 } from "node:fs";
+import { closeSync as closeSync2, existsSync as existsSync4, mkdirSync as mkdirSync2, openSync as openSync2, readFileSync as readFileSync5, readSync as readSync2, readdirSync as readdirSync3, statSync as statSync3, unlinkSync as unlinkSync3 } from "node:fs";
 import { join as join4 } from "node:path";
 var DEFAULT_SESSION_BINDS_FILENAME2 = "session-binds.json";
 var LEGACY_AGY_BINDS_FILENAME2 = "agy-binds.json";
@@ -1535,7 +1605,7 @@ function loadSessionBinds2(configDir) {
     if (!existsSync4(path))
       continue;
     try {
-      Object.assign(merged, parseSessionBinds2(JSON.parse(readFileSync4(path, "utf8"))));
+      Object.assign(merged, parseSessionBinds2(JSON.parse(readFileSync5(path, "utf8"))));
     } catch {}
   }
   return merged;
@@ -1557,7 +1627,7 @@ function profilePathForName(configDir, name) {
 }
 function readAgentId(path) {
   try {
-    const parsed = JSON.parse(readFileSync5(path, "utf8"));
+    const parsed = JSON.parse(readFileSync6(path, "utf8"));
     return typeof parsed.agent_id === "string" && parsed.agent_id ? parsed.agent_id : undefined;
   } catch {
     return;
@@ -1574,6 +1644,8 @@ function resolveSessionForAgent(agentId, opts = {}) {
     return;
   }
   for (const [sessionId, profileName] of Object.entries(binds).reverse()) {
+    if (opts.filter && !opts.filter(sessionId))
+      continue;
     const path = profilePathForName(configDir, profileName);
     if (path === undefined)
       continue;
@@ -1661,7 +1733,7 @@ class HeartbeatMonitor {
 var package_default = {
   name: "agentschat-mcp",
   mcpName: "io.github.swswordholy-tech/agentschat-mcp",
-  version: "0.36.23",
+  version: "0.36.24",
   description: "Connect Claude Code to AgentsChat — AI Agent social network. Core tools stay lean while extended tool groups load on demand for lower token overhead and cleaner role-specific context.",
   type: "module",
   bin: {
@@ -1808,12 +1880,13 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema
 } from "@modelcontextprotocol/sdk/types.js";
-import { readFileSync as readFileSync9, existsSync as existsSync8, writeFileSync as writeFileSync6, mkdirSync as mkdirSync4, readdirSync as readdirSync3 } from "fs";
-import { join as join7, dirname as dirname2 } from "path";
+import { readFileSync as readFileSync11, existsSync as existsSync8, writeFileSync as writeFileSync6, mkdirSync as mkdirSync4, readdirSync as readdirSync5 } from "fs";
+import { join as join8, dirname as dirname2 } from "path";
 import { fileURLToPath } from "url";
 
 // src/profile-store.ts
-import { existsSync as existsSync6, writeFileSync as writeFileSync2, renameSync as renameSync2, chmodSync as chmodSync2, unlinkSync as unlinkSync4, statSync as statSync4 } from "fs";
+import { existsSync as existsSync6, writeFileSync as writeFileSync2, renameSync as renameSync2, chmodSync as chmodSync2, unlinkSync as unlinkSync4, statSync as statSync4, readdirSync as readdirSync4, readFileSync as readFileSync7 } from "fs";
+import { join as join6, resolve as resolve2 } from "path";
 var defaultWarn2 = (m) => process.stderr.write(m);
 function safeWriteProfile2(path, data, warn = defaultWarn2) {
   const tmp = path + ".tmp";
@@ -1842,6 +1915,73 @@ function safeWriteProfile2(path, data, warn = defaultWarn2) {
     warn(`[agentchat] WARNING: could not verify permissions of ${path}: ${e}
 `);
   }
+}
+var NON_PROFILE_JSON_FILES2 = new Set([
+  "session-binds.json",
+  "agy-binds.json",
+  "grok-binds.json",
+  "grok-binds-meta.json",
+  "grok-binds.meta.json",
+  "identity-guard.json",
+  "dsh.json",
+  "config.json"
+]);
+function findDefaultProfileCollision(configDir, defaultProfilePath) {
+  if (!defaultProfilePath || !existsSync6(defaultProfilePath))
+    return null;
+  let defParsed;
+  try {
+    defParsed = JSON.parse(readFileSync7(defaultProfilePath, "utf8"));
+  } catch {
+    return null;
+  }
+  if (!defParsed || typeof defParsed !== "object" || Array.isArray(defParsed))
+    return null;
+  const defAgentId = typeof defParsed.agent_id === "string" ? defParsed.agent_id.trim() : "";
+  const defDisplayName = typeof defParsed.display_name === "string" ? defParsed.display_name.trim().toLowerCase() : "";
+  if (!defAgentId && !defDisplayName)
+    return null;
+  const resolvedDefault = resolve2(defaultProfilePath);
+  for (const dir of [join6(configDir, "profiles"), configDir]) {
+    if (!existsSync6(dir))
+      continue;
+    let files = [];
+    try {
+      files = readdirSync4(dir).filter((f) => f.endsWith(".json"));
+    } catch {
+      continue;
+    }
+    for (const file of files) {
+      if (NON_PROFILE_JSON_FILES2.has(file))
+        continue;
+      const candidatePath = join6(dir, file);
+      if (resolve2(candidatePath) === resolvedDefault)
+        continue;
+      const baseName = file.replace(/\.json$/, "");
+      if (baseName.toLowerCase() === "profile")
+        continue;
+      let candidate;
+      try {
+        candidate = JSON.parse(readFileSync7(candidatePath, "utf8"));
+      } catch {
+        continue;
+      }
+      if (!candidate || typeof candidate !== "object" || Array.isArray(candidate))
+        continue;
+      const candAgentId = typeof candidate.agent_id === "string" ? candidate.agent_id.trim() : "";
+      const candToken = typeof candidate.token === "string" ? candidate.token.trim() : "";
+      if (!candAgentId || !candToken)
+        continue;
+      if (defAgentId && candAgentId === defAgentId) {
+        return { collidingName: baseName, collidingPath: candidatePath, reason: "agent_id" };
+      }
+      const candDisplayName = typeof candidate.display_name === "string" ? candidate.display_name.trim().toLowerCase() : "";
+      if (defDisplayName && (candDisplayName === defDisplayName || baseName.toLowerCase() === defDisplayName)) {
+        return { collidingName: baseName, collidingPath: candidatePath, reason: "display_name" };
+      }
+    }
+  }
+  return null;
 }
 
 // src/identity-guard.ts
@@ -1926,10 +2066,10 @@ function expectedAgentIdViolation(expected, liveAgentId) {
 }
 
 // src/read-cursor.ts
-import { readFileSync as readFileSync6, writeFileSync as writeFileSync3 } from "fs";
+import { readFileSync as readFileSync8, writeFileSync as writeFileSync3 } from "fs";
 function loadCursor(file, warn) {
   try {
-    return new Map(Object.entries(JSON.parse(readFileSync6(file, "utf-8"))));
+    return new Map(Object.entries(JSON.parse(readFileSync8(file, "utf-8"))));
   } catch (e) {
     if (e?.code !== "ENOENT") {
       warn(`[agentchat] WARNING: could not read ${file} — resetting that state: ${e}
@@ -1958,8 +2098,8 @@ function flushCursor(state, persist) {
 }
 
 // src/rest-cli.ts
-import { existsSync as existsSync7, mkdirSync as mkdirSync3, readFileSync as readFileSync8, writeFileSync as writeFileSync5 } from "node:fs";
-import { dirname, join as join6 } from "node:path";
+import { existsSync as existsSync7, mkdirSync as mkdirSync3, readFileSync as readFileSync10, writeFileSync as writeFileSync5 } from "node:fs";
+import { dirname, join as join7 } from "node:path";
 
 // src/mentions.ts
 function matchesMention2(content, agentId) {
@@ -1973,10 +2113,10 @@ function matchesMention2(content, agentId) {
 }
 
 // src/read-cursor.ts
-import { readFileSync as readFileSync7, writeFileSync as writeFileSync4 } from "fs";
+import { readFileSync as readFileSync9, writeFileSync as writeFileSync4 } from "fs";
 function loadCursor2(file, warn) {
   try {
-    return new Map(Object.entries(JSON.parse(readFileSync7(file, "utf-8"))));
+    return new Map(Object.entries(JSON.parse(readFileSync9(file, "utf-8"))));
   } catch (e) {
     if (e?.code !== "ENOENT") {
       warn(`[agentchat] WARNING: could not read ${file} — resetting that state: ${e}
@@ -2105,7 +2245,7 @@ function loadSeenIds(file) {
   if (!existsSync7(file))
     return [];
   try {
-    const parsed = JSON.parse(readFileSync8(file, "utf8"));
+    const parsed = JSON.parse(readFileSync10(file, "utf8"));
     return Array.isArray(parsed) ? parsed.filter((x) => typeof x === "string") : [];
   } catch {
     return [];
@@ -2122,7 +2262,7 @@ function loadJsonMap(file) {
   if (!existsSync7(file))
     return {};
   try {
-    const raw = JSON.parse(readFileSync8(file, "utf8"));
+    const raw = JSON.parse(readFileSync10(file, "utf8"));
     if (!raw || typeof raw !== "object" || Array.isArray(raw))
       return {};
     return raw;
@@ -2142,7 +2282,7 @@ function advanceChannelReadCursor(opts) {
     return;
   const warn = opts.warn ?? ((m) => process.stderr.write(m));
   mkdirSync3(configDir, { recursive: true });
-  const lastSeenFile = join6(configDir, `last-seen-msg-ts-${agentId}.json`);
+  const lastSeenFile = join7(configDir, `last-seen-msg-ts-${agentId}.json`);
   const cursor = loadCursor2(lastSeenFile, warn);
   const prev = cursor.get(channelId) || "";
   const nextNorm = normalizeTimestampForCursor2(timestamp, "after") || timestamp;
@@ -2155,7 +2295,7 @@ function advanceChannelReadCursor(opts) {
     cursor.set(channelId, timestamp);
   }
   persistCursor2(lastSeenFile, cursor, warn);
-  const readCursorsFile = join6(configDir, "read-cursors.json");
+  const readCursorsFile = join7(configDir, "read-cursors.json");
   const readCursors = loadJsonMap(readCursorsFile);
   const scopedKey = `${agentId}:${channelId}`;
   const prevRead = readCursors[scopedKey] || readCursors[channelId] || "";
@@ -2298,14 +2438,14 @@ async function wakeOnce(opts) {
   const pollIntervalMs = opts.pollIntervalMs ?? 15000;
   const enableSse = opts.enableSse ?? true;
   mkdirSync3(configDir, { recursive: true });
-  const lastSeenFile = join6(configDir, `last-seen-msg-ts-${agentId}.json`);
-  const seenIdsFile = join6(configDir, `wake-seen-ids-${agentId}.json`);
-  const mentionTsFile = join6(configDir, "mention-timestamps.json");
-  const wakePidFile = join6(configDir, `wake-once-${agentId}.pid`);
+  const lastSeenFile = join7(configDir, `last-seen-msg-ts-${agentId}.json`);
+  const seenIdsFile = join7(configDir, `wake-seen-ids-${agentId}.json`);
+  const mentionTsFile = join7(configDir, "mention-timestamps.json");
+  const wakePidFile = join7(configDir, `wake-once-${agentId}.pid`);
   if (!opts.fetchImpl) {
     try {
       if (existsSync7(wakePidFile)) {
-        const oldPid = parseInt(readFileSync8(wakePidFile, "utf-8").trim(), 10);
+        const oldPid = parseInt(readFileSync10(wakePidFile, "utf-8").trim(), 10);
         if (Number.isFinite(oldPid) && oldPid > 1 && oldPid !== process.pid) {
           try {
             process.kill(oldPid, "SIGTERM");
@@ -2752,7 +2892,7 @@ function parseArgs() {
 var cliArgs = parseArgs();
 var isOneShotCli = Boolean(cliArgs.registerOnly || cliArgs.join || cliArgs.send || cliArgs.wakeOnce);
 if (process.argv.includes("--help") || process.argv.includes("-h")) {
-  const localOnboardingPath = join7(dirname2(fileURLToPath(import.meta.url)), "..", "skills", "onboarding.md");
+  const localOnboardingPath = join8(dirname2(fileURLToPath(import.meta.url)), "..", "skills", "onboarding.md");
   console.log(`agentschat-mcp v${package_default.version} \u2014 AgentsChat MCP and host bridges
 
 Usage: claude mcp add agentschat -- npx -y agentschat-mcp@latest --profile <Bot> [options]
@@ -2839,26 +2979,34 @@ if (codexIdentity) {
   process.env.AGENTSCHAT_EXPECT_AGENT_ID = codexIdentity.agentId;
 }
 var homeDir = process.env.HOME || process.env.USERPROFILE || ".";
-var configDir = join7(homeDir, ".agentschat");
-var legacyConfigDir = join7(homeDir, ".agentchat");
+var configDir = join8(homeDir, ".agentschat");
+var legacyConfigDir = join8(homeDir, ".agentchat");
 var profileDirs = [configDir, legacyConfigDir];
 var lockDir = resolveLockDir(homeDir, process.env);
 var lockOwnerPid = Number(process.env.AGENTSCHAT_LOCK_OWNER_PID) || null;
 var toolOnlyMode = process.env.AGENTSCHAT_TOOL_ONLY === "1";
-var runtimeSession = detectRuntimeSession(process.env);
+var runtimeSessionComputed = false;
+var runtimeSession = null;
+function ensureRuntimeSession() {
+  if (!runtimeSessionComputed) {
+    runtimeSessionComputed = true;
+    runtimeSession = detectRuntimeSession(process.env);
+  }
+  return runtimeSession;
+}
 var dshRouteWarned = false;
 function profileNameToPaths(name) {
   if (name.startsWith("~/"))
-    return [join7(homeDir, name.slice(2))];
+    return [join8(homeDir, name.slice(2))];
   if (name.includes("/") || name.includes("\\"))
     return [name];
   name = name.replace(/\.json$/, "");
   const safeName = name.replace(/[^a-zA-Z0-9_-]/g, "_");
-  return profileDirs.map((dir) => join7(dir, `${safeName}.json`));
+  return profileDirs.map((dir) => join8(dir, `${safeName}.json`));
 }
 function nameToPath(name) {
   const candidates = profileNameToPaths(name);
-  const nested = join7(configDir, "profiles", name.replace(/\.json$/, "") + ".json");
+  const nested = join8(configDir, "profiles", name.replace(/\.json$/, "") + ".json");
   if (!name.includes("/") && !name.includes("\\") && existsSync8(nested))
     return nested;
   return candidates.find((path) => existsSync8(path)) || candidates[0];
@@ -2866,10 +3014,10 @@ function nameToPath(name) {
 function listProfileFiles() {
   const seen = new Set;
   const profiles = [];
-  for (const dir of [join7(configDir, "profiles"), ...profileDirs]) {
+  for (const dir of [join8(configDir, "profiles"), ...profileDirs]) {
     let files = [];
     try {
-      files = readdirSync3(dir).filter((f) => f.endsWith(".json"));
+      files = readdirSync5(dir).filter((f) => f.endsWith(".json"));
     } catch {}
     for (const file of files) {
       if (file === DEFAULT_GROK_BINDS_FILENAME || file === GROK_BINDS_META_FILENAME || file === DEFAULT_SESSION_BINDS_FILENAME || file === LEGACY_AGY_BINDS_FILENAME)
@@ -2878,7 +3026,7 @@ function listProfileFiles() {
       if (seen.has(name))
         continue;
       seen.add(name);
-      profiles.push({ name, path: join7(dir, file) });
+      profiles.push({ name, path: join8(dir, file) });
     }
   }
   return profiles;
@@ -2905,7 +3053,7 @@ function resolveProfile() {
     const bindPath = resolveGrokBindsPath(configDir, process.env.AGENTCHAT_GROK_BINDS);
     if (existsSync8(bindPath)) {
       try {
-        const parsed = parseGrokBindsText(readFileSync9(bindPath, "utf-8"));
+        const parsed = parseGrokBindsText(readFileSync11(bindPath, "utf-8"));
         binds = parsed.binds;
         if (parsed.malformed) {
           process.stderr.write(`[agentchat] WARNING: grok-binds file is malformed (${bindPath}); ignoring.
@@ -2935,13 +3083,14 @@ function resolveProfile() {
     return { path: nameToPath(process.env.AGENTSCHAT_PROFILE), source: "env", declaredName: process.env.AGENTSCHAT_PROFILE };
   if (process.env.AGENTCHAT_PROFILE)
     return { path: nameToPath(process.env.AGENTCHAT_PROFILE), source: "legacy-env", declaredName: process.env.AGENTCHAT_PROFILE };
-  if (!grokToken && runtimeSession?.sessionId) {
+  const bootSession = !grokToken ? ensureRuntimeSession() : null;
+  if (!grokToken && bootSession?.sessionId) {
     const sessionBinds = loadSessionBinds(configDir);
-    const boundProfile = sessionBinds[runtimeSession.sessionId];
+    const boundProfile = sessionBinds[bootSession.sessionId];
     if (boundProfile) {
       const boundPath = nameToPath(boundProfile);
       if (existsSync8(boundPath)) {
-        process.stderr.write(`[agentchat] session-bind (${runtimeSession.runtime}): ${runtimeSession.sessionId} \u2192 profile "${boundProfile}"
+        process.stderr.write(`[agentchat] session-bind (${bootSession.runtime}): ${bootSession.sessionId} \u2192 profile "${boundProfile}"
 `);
         return { path: boundPath, source: "session-bind", declaredName: boundProfile };
       }
@@ -2996,49 +3145,68 @@ var identity = decideIdentity({
 });
 function readIdentityProfile(file) {
   try {
-    return JSON.parse(readFileSync9(file, "utf-8"));
+    return JSON.parse(readFileSync11(file, "utf-8"));
   } catch {
     throw new Error(`Cannot read identity profile at ${file}. Repair its JSON/permissions or select --profile <valid-name>.`);
   }
 }
 if (identity.mode === "profile") {
-  try {
-    profile = readIdentityProfile(profileFile);
-    if (codexIdentity && profile.agent_id !== codexIdentity.agentId) {
-      throw new Error("Codex tool profile identity mismatch");
-    }
-    if (projectAgentId !== undefined && projectAgentId !== (cliArgs.id ?? process.env.AGENTCHAT_AGENT_ID ?? profile?.agent_id)) {
-      throw new Error("Project agent_id does not match selected profile");
-    }
-    validateIdentityProfile(profile && !Array.isArray(profile) ? {
-      ...profile,
-      agent_id: cliArgs.id ?? process.env.AGENTCHAT_AGENT_ID ?? profile.agent_id,
-      token: cliArgs.token ?? process.env.AGENTCHAT_TOKEN ?? profile.token,
-      capabilities: cliArgs.caps?.split(",") ?? profile.capabilities
-    } : profile, profileFile, !hasToken);
-  } catch (e) {
-    process.stderr.write(`[agentchat] ERROR: ${e.message}
+  const isDefaultProfileFile = profileSource === "default" || profileNameFromPath(profileFile)?.toLowerCase() === "profile";
+  const defaultCollision = isDefaultProfileFile ? findDefaultProfileCollision(configDir, profileFile) : null;
+  if (defaultCollision) {
+    if (profileSource !== "default") {
+      process.stderr.write(`[agentchat] ERROR: Refusing to load duplicate profile.json (${profileFile}): it collides (${defaultCollision.reason}) with named profile "${defaultCollision.collidingName}" (${defaultCollision.collidingPath}).
+` + `  Delete ${profileFile} and use --profile ${defaultCollision.collidingName} instead.
 `);
-    process.exit(1);
-  }
-  const candidateAgentId = cliArgs.id ?? process.env.AGENTCHAT_AGENT_ID ?? profile?.agent_id ?? "";
-  const lockCheck = !isOneShotCli && !toolOnlyMode && !hasToken && candidateAgentId && profile.token !== "dev-token" ? checkAgentLock({
-    lockDir,
-    agentId: candidateAgentId,
-    currentSessionId: runtimeSession?.sessionId ?? null,
-    lockOwnerPid
-  }) : { locked: false };
-  if (lockCheck.locked) {
+      process.exit(1);
+    }
     anonymousMode = true;
     activeProfileFile = null;
     profile = {};
-    process.stderr.write(`[agentchat] Profile "${declaredName ?? profileNameFromPath(profileFile) ?? "profile"}" (${lockCheck.holder?.agentId}) is already in use by active process pid=${lockCheck.holder?.pid}` + `${lockCheck.holder?.runtime ? ` (${lockCheck.holder.runtime})` : ""}` + `${lockCheck.holder?.sessionId ? ` session=${lockCheck.holder.sessionId}` : ""}.
+    process.stderr.write(`[agentchat] Ignoring duplicate default profile.json (${profileFile}): it collides (${defaultCollision.reason}) with named profile "${defaultCollision.collidingName}" (${defaultCollision.collidingPath}).
+` + `  Starting in ANONYMOUS mode instead of shadowing "${defaultCollision.collidingName}". Delete ${profileFile} or bind this session via connect_profile(profile_name="${defaultCollision.collidingName}").
+`);
+  } else {
+    try {
+      profile = readIdentityProfile(profileFile);
+      if (codexIdentity && profile.agent_id !== codexIdentity.agentId) {
+        throw new Error("Codex tool profile identity mismatch");
+      }
+      if (projectAgentId !== undefined && projectAgentId !== (cliArgs.id ?? process.env.AGENTCHAT_AGENT_ID ?? profile?.agent_id)) {
+        throw new Error("Project agent_id does not match selected profile");
+      }
+      validateIdentityProfile(profile && !Array.isArray(profile) ? {
+        ...profile,
+        agent_id: cliArgs.id ?? process.env.AGENTCHAT_AGENT_ID ?? profile.agent_id,
+        token: cliArgs.token ?? process.env.AGENTCHAT_TOKEN ?? profile.token,
+        capabilities: cliArgs.caps?.split(",") ?? profile.capabilities
+      } : profile, profileFile, !hasToken);
+    } catch (e) {
+      process.stderr.write(`[agentchat] ERROR: ${e.message}
+`);
+      process.exit(1);
+    }
+    const candidateAgentId = cliArgs.id ?? process.env.AGENTCHAT_AGENT_ID ?? profile?.agent_id ?? "";
+    if (!isOneShotCli && !toolOnlyMode)
+      ensureRuntimeSession();
+    const lockCheck = !isOneShotCli && !toolOnlyMode && !hasToken && candidateAgentId && profile.token !== "dev-token" ? checkAgentLock({
+      lockDir,
+      agentId: candidateAgentId,
+      currentSessionId: runtimeSession?.sessionId ?? null,
+      lockOwnerPid
+    }) : { locked: false };
+    if (lockCheck.locked) {
+      anonymousMode = true;
+      activeProfileFile = null;
+      profile = {};
+      process.stderr.write(`[agentchat] Profile "${declaredName ?? profileNameFromPath(profileFile) ?? "profile"}" (${lockCheck.holder?.agentId}) is already in use by active process pid=${lockCheck.holder?.pid}` + `${lockCheck.holder?.runtime ? ` (${lockCheck.holder.runtime})` : ""}` + `${lockCheck.holder?.sessionId ? ` session=${lockCheck.holder.sessionId}` : ""}.
 ` + `  Starting in ANONYMOUS (disconnected) mode so this window does not collide with the active session.
 ` + `  Use connect_profile or switch_profile to connect an idle profile or register a new agent for this window.
 `);
-  } else {
-    process.stderr.write(`[agentchat] Profile loaded: ${profileFile}
+    } else {
+      process.stderr.write(`[agentchat] Profile loaded: ${profileFile}
 `);
+    }
   }
 } else if (identity.mode === "env-creds") {
   activeProfileFile = null;
@@ -3181,11 +3349,22 @@ if (!anonymousMode || explicitAgentId !== undefined || hasToken) {
   }
 }
 if (!anonymousMode && AGENT_ID && !isOneShotCli && !toolOnlyMode) {
-  const activeName = profileNameFromPath(activeProfileFile) ?? declaredName ?? null;
-  if (activeName && runtimeSession?.runtime === "antigravity" && !process.env.ANTIGRAVITY_CONVERSATION_ID?.trim()) {
-    const existingBoundSid = findBoundSessionForProfile(configDir, activeName, (sid) => /^[0-9a-f-]{36}$/i.test(sid));
-    if (existingBoundSid) {
-      runtimeSession = { sessionId: existingBoundSid, runtime: "antigravity" };
+  let activeName = profileNameFromPath(activeProfileFile) ?? declaredName ?? null;
+  const isAgyUuid = (sid) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(sid);
+  const isImplicitAgyBoot = (runtimeSession?.runtime === "antigravity" || !runtimeSession && Boolean(discoverAntigravityHost())) && !process.env.ANTIGRAVITY_CONVERSATION_ID?.trim();
+  if (activeName && isImplicitAgyBoot) {
+    const existingBoundSid = findBoundSessionForProfile(configDir, activeName, isAgyUuid);
+    const existingAgentRoute = resolveSessionForAgent(AGENT_ID, { configDir, filter: isAgyUuid });
+    const resolvedSid = existingBoundSid || existingAgentRoute?.sessionId || "";
+    if (resolvedSid) {
+      runtimeSession = { sessionId: resolvedSid, runtime: "antigravity" };
+      if (profileSource === "default" && existingAgentRoute?.profileName && existingAgentRoute.profileName !== activeName) {
+        const aliasPath = nameToPath(existingAgentRoute.profileName);
+        if (existsSync8(aliasPath)) {
+          activeProfileFile = aliasPath;
+          activeName = existingAgentRoute.profileName;
+        }
+      }
     }
   }
   acquireAgentLock({
@@ -3196,11 +3375,14 @@ if (!anonymousMode && AGENT_ID && !isOneShotCli && !toolOnlyMode) {
     runtime: runtimeSession?.runtime ?? "mcp"
   });
   if (runtimeSession?.sessionId && activeName) {
-    saveSessionBind(configDir, runtimeSession.sessionId, activeName);
+    const existingBinds = loadSessionBinds(configDir);
+    if (!isImplicitAgyBoot || existingBinds[runtimeSession.sessionId] === activeName) {
+      saveSessionBind(configDir, runtimeSession.sessionId, activeName);
+    }
   }
 }
 var identityGateMessage = "";
-var identityGuardFile = join7(configDir, IDENTITY_GUARD_FILENAME);
+var identityGuardFile = join8(configDir, IDENTITY_GUARD_FILENAME);
 function persistGuardRecord(rec) {
   try {
     mkdirSync4(configDir, { recursive: true });
@@ -3219,7 +3401,7 @@ function confirmLiveIdentityTrusted() {
 }
 var guardRecord = (() => {
   try {
-    return parseGuardRecord(readFileSync9(identityGuardFile, "utf-8"));
+    return parseGuardRecord(readFileSync11(identityGuardFile, "utf-8"));
   } catch {
     return emptyGuardRecord();
   }
@@ -3332,7 +3514,7 @@ if (TOKEN && TOKEN !== "dev-token") {
   if (cliArgs.registerOnly) {
     try {
       mkdirSync4(configDir, { recursive: true });
-      const lastSeenFile = join7(configDir, `last-seen-msg-ts-${AGENT_ID}.json`);
+      const lastSeenFile = join8(configDir, `last-seen-msg-ts-${AGENT_ID}.json`);
       const cursor = loadCursor(lastSeenFile, (m) => process.stderr.write(m));
       if (!cursor.get(CURSOR_INIT_KEY)) {
         cursor.set(CURSOR_INIT_KEY, new Date().toISOString());
@@ -4677,7 +4859,7 @@ async function uploadLocalFile(path, kindHint) {
   if (!existsSync8(path))
     throw new Error(`file not found: ${path}`);
   const mime = mimeFromPath(path, kindHint);
-  const buf = readFileSync9(path);
+  const buf = readFileSync11(path);
   const name = path.split("/").pop() || "upload";
   const form = new FormData;
   form.append("file", new Blob([new Uint8Array(buf)], { type: mime }), name);
@@ -4877,7 +5059,7 @@ function loadGrokBinds() {
   if (!existsSync8(bindPath))
     return {};
   try {
-    return parseGrokBindsText(readFileSync9(bindPath, "utf-8")).binds;
+    return parseGrokBindsText(readFileSync11(bindPath, "utf-8")).binds;
   } catch {
     return {};
   }
@@ -4912,7 +5094,7 @@ function scheduleSlotLastSeenMessageTsSave(slot) {
   slot.lastSeenMessageTsTimer.unref?.();
 }
 function createProfileSlot(opts) {
-  const lastSeenFile = join7(configDir, `last-seen-msg-ts-${opts.agentId}.json`);
+  const lastSeenFile = join8(configDir, `last-seen-msg-ts-${opts.agentId}.json`);
   const slot = {
     profileName: opts.profileName,
     profileFile: opts.profileFile,
@@ -4992,6 +5174,28 @@ function setAnonymousCallerState(callerSession) {
   sessionId = null;
   if (callerSession !== undefined) {
     runtimeSession = callerSession;
+  }
+}
+function findSlotByAgentId(agentId) {
+  if (!agentId)
+    return;
+  for (const s of profileSlots.values()) {
+    if (s.agentId === agentId)
+      return s;
+  }
+  return;
+}
+function upgradeAliasSlotInPlace(slot, newProfileName, newProfileFile, newProfile, sess) {
+  if (slot.profileName !== newProfileName) {
+    profileSlots.delete(slot.profileName);
+    slot.profileName = newProfileName;
+    profileSlots.set(newProfileName, slot);
+  }
+  slot.profileFile = newProfileFile;
+  slot.profile = newProfile;
+  slot.runtimeSession = sess;
+  if (activeSlot === slot) {
+    activateSlot(slot, sess);
   }
 }
 function teardownSlot(slot, opts) {
@@ -5140,7 +5344,7 @@ function formatProfileList() {
   const lines = profileEntries.map((entry) => {
     let entryAgentId = "";
     try {
-      const parsed = JSON.parse(readFileSync9(entry.path, "utf-8"));
+      const parsed = JSON.parse(readFileSync11(entry.path, "utf-8"));
       if (typeof parsed?.agent_id === "string")
         entryAgentId = parsed.agent_id;
     } catch {}
@@ -5148,7 +5352,8 @@ function formatProfileList() {
     const lock = entryAgentId ? checkAgentLock({ lockDir, agentId: entryAgentId, currentSessionId: runtimeSession?.sessionId ?? null, lockOwnerPid }) : { locked: false };
     const slot = profileSlots.get(entry.name);
     const boundSid = findBoundSessionForProfile(configDir, entry.name);
-    const statusSuffix = lock.locked ? ` [in use by pid=${lock.holder?.pid}${lock.holder?.runtime ? ` (${lock.holder.runtime})` : ""}${lock.holder?.sessionId ? ` session=${lock.holder.sessionId}` : ""}]` : slot && slot.ws?.readyState === WebSocket.OPEN ? ` [online${boundSid ? ` session=${boundSid}` : ""}]` : "";
+    const dupCollision = entry.name.toLowerCase() === "profile" ? findDefaultProfileCollision(configDir, entry.path) : null;
+    const statusSuffix = dupCollision ? ` [duplicate of ${dupCollision.collidingName} \u2014 disallowed; delete profile.json]` : lock.locked ? ` [in use by pid=${lock.holder?.pid}${lock.holder?.runtime ? ` (${lock.holder.runtime})` : ""}${lock.holder?.sessionId ? ` session=${lock.holder.sessionId}` : ""}]` : slot && slot.ws?.readyState === WebSocket.OPEN ? ` [online${boundSid ? ` session=${boundSid}` : ""}]` : "";
     return `${isCurrent ? "\u2192 " : "  "}${entry.name}${statusSuffix}`;
   });
   return `Current: ${current || "(anonymous / disconnected)"}
@@ -5160,6 +5365,42 @@ async function registerAndConnectProfile(displayName, bindSessionId) {
   const cleanName = displayName.trim();
   if (!cleanName) {
     return { content: [{ type: "text", text: "Error: register_name / profile_name must be a non-empty string." }], isError: true };
+  }
+  const safeBase = cleanName.replace(/\.json$/, "").replace(/[^a-zA-Z0-9_-]/g, "_");
+  if (safeBase.toLowerCase() === "profile") {
+    return {
+      content: [{
+        type: "text",
+        text: 'Error: "profile" (profile.json) is reserved and cannot be registered as a named agent profile. Choose a distinct profile name (e.g. "Antigravity", "Claude_Work", "Codex_Dev").'
+      }],
+      isError: true
+    };
+  }
+  const existingTargetFile = nameToPath(cleanName);
+  if (existsSync8(existingTargetFile)) {
+    return {
+      content: [{
+        type: "text",
+        text: `Error: Profile "${cleanName}" already exists at ${existingTargetFile}. Pass profile_name="${cleanName}" to connect to it, or choose a different register_name.`
+      }],
+      isError: true
+    };
+  }
+  const existingDefaultPath = nameToPath("profile");
+  if (existsSync8(existingDefaultPath)) {
+    try {
+      const defParsed = JSON.parse(readFileSync11(existingDefaultPath, "utf-8"));
+      const defDisplay = typeof defParsed?.display_name === "string" ? defParsed.display_name.trim().toLowerCase() : "";
+      if (defDisplay && defDisplay === cleanName.toLowerCase()) {
+        return {
+          content: [{
+            type: "text",
+            text: `Error: Default profile.json already uses display_name "${defParsed.display_name}". Delete ${existingDefaultPath} or choose a distinct name so profile.json never collides with a named profile.`
+          }],
+          isError: true
+        };
+      }
+    } catch {}
   }
   const caps = ["claude-code", "coding", "chat"];
   try {
@@ -5192,10 +5433,6 @@ async function registerAndConnectProfile(displayName, bindSessionId) {
     validateIdentityProfile(newProfile, targetFile);
     mkdirSync4(dirname2(targetFile), { recursive: true });
     safeWriteProfile2(targetFile, newProfile);
-    const defaultProfileFile = nameToPath("profile");
-    if (!existsSync8(defaultProfileFile)) {
-      safeWriteProfile2(defaultProfileFile, newProfile);
-    }
     applyIdentityFromProfile(newProfile, targetFile, bindSessionId);
     const claimEntry = `${REST_URL}/chat/${encodeURIComponent(data.id)}?claim=1`;
     return {
@@ -5262,6 +5499,18 @@ async function handleProfileSwitchOrConnect(args) {
       }],
       isError: true
     };
+  }
+  if (profileNameFromPath(targetFile)?.toLowerCase() === "profile") {
+    const dupCollision = findDefaultProfileCollision(configDir, targetFile);
+    if (dupCollision) {
+      return {
+        content: [{
+          type: "text",
+          text: `Refusing to connect "profile" (${targetFile}): profile.json collides (${dupCollision.reason}) with named profile "${dupCollision.collidingName}" (${dupCollision.collidingPath}). ` + `Delete ${targetFile} and connect via profile_name="${dupCollision.collidingName}" instead.`
+        }],
+        isError: true
+      };
+    }
   }
   const newProfile = readIdentityProfile(targetFile);
   validateIdentityProfile(newProfile, targetFile);
@@ -5440,16 +5689,32 @@ var handleToolCall = async (request) => {
           if (existsSync8(boundPath)) {
             try {
               const candidate = readIdentityProfile(boundPath);
-              const lock = checkAgentLock({
-                lockDir,
-                agentId: candidate?.agent_id,
-                currentSessionId: callerSession.sessionId,
-                lockOwnerPid
-              });
-              if (!lock.locked) {
-                applyIdentityFromProfile(candidate, boundPath, callerSession.sessionId);
-              } else if (isPerCallSession) {
-                setAnonymousCallerState(callerSession);
+              const aliasSlot = candidate?.agent_id ? findSlotByAgentId(candidate.agent_id) : undefined;
+              const aliasSid = aliasSlot ? aliasSlot.runtimeSession?.sessionId || findBoundSessionForProfile(configDir, aliasSlot.profileName) || resolveSessionForAgent(aliasSlot.agentId, { configDir })?.sessionId || null : null;
+              if (aliasSlot && (!aliasSid || aliasSid === callerSession.sessionId)) {
+                upgradeAliasSlotInPlace(aliasSlot, boundProfileName, boundPath, candidate, callerSession);
+                activateSlot(aliasSlot, callerSession);
+                if (!toolOnlyMode) {
+                  acquireAgentLock({
+                    lockDir,
+                    agentId: aliasSlot.agentId,
+                    profileName: boundProfileName,
+                    sessionId: callerSession.sessionId,
+                    runtime: callerSession.runtime
+                  });
+                }
+              } else {
+                const lock = checkAgentLock({
+                  lockDir,
+                  agentId: candidate?.agent_id,
+                  currentSessionId: callerSession.sessionId,
+                  lockOwnerPid
+                });
+                if (!lock.locked) {
+                  applyIdentityFromProfile(candidate, boundPath, callerSession.sessionId);
+                } else if (isPerCallSession) {
+                  setAnonymousCallerState(callerSession);
+                }
               }
             } catch {}
           } else if (isPerCallSession) {
@@ -5461,7 +5726,7 @@ var handleToolCall = async (request) => {
       } else {
         let unboundSlot = null;
         for (const slot of profileSlots.values()) {
-          const slotBoundSid = slot.runtimeSession?.sessionId || findBoundSessionForProfile(configDir, slot.profileName);
+          const slotBoundSid = slot.runtimeSession?.sessionId || findBoundSessionForProfile(configDir, slot.profileName) || resolveSessionForAgent(slot.agentId, { configDir })?.sessionId;
           if (!slotBoundSid || slotBoundSid === callerSession.sessionId) {
             unboundSlot = slot;
             break;
@@ -5715,7 +5980,7 @@ ${a.body || ""}`;
           const currentVersion = Number(meta.version ?? 0);
           let cachedVersion = null;
           try {
-            cachedVersion = Number(JSON.parse(readFileSync9(pMeta, "utf8")).version);
+            cachedVersion = Number(JSON.parse(readFileSync11(pMeta, "utf8")).version);
           } catch {}
           if (cachedVersion !== null && cachedVersion === currentVersion) {
             return { content: [{ type: "text", text: `up-to-date: personal skill "${a.name}" v${currentVersion} already at ${pMd} \u2014 no download. Read that file to run it.` }] };
@@ -5749,7 +6014,7 @@ ${a.body || ""}`;
         const currentVersion = Number(meta.version ?? 0);
         let cachedVersion = null;
         try {
-          cachedVersion = Number(JSON.parse(readFileSync9(metaPath, "utf8")).version);
+          cachedVersion = Number(JSON.parse(readFileSync11(metaPath, "utf8")).version);
         } catch {}
         if (cachedVersion !== null && cachedVersion === currentVersion) {
           return { content: [{ type: "text", text: `up-to-date: "${a.doc_id}" v${currentVersion} already at ${mdPath} \u2014 no download. Read that file to run it.` }] };
@@ -7100,7 +7365,7 @@ ${list}` }] };
   }
 };
 server.setRequestHandler(CallToolRequestSchema, (request) => serializeCall(() => handleToolCall(request)));
-var mentionTsFile = join7(configDir, `mention-ts-${AGENT_ID}.json`);
+var mentionTsFile = join8(configDir, `mention-ts-${AGENT_ID}.json`);
 function loadMentionTimestamps() {
   return loadCursor(mentionTsFile, safeStderrWrite);
 }
@@ -7247,6 +7512,7 @@ function clearFinishedHiddenIdentityGamesFromMessage(data) {
     }
   }
 }
+var processAgentMessageDedup = new MessageDedup;
 function deliverySource(data) {
   return typeof data?.__source === "string" ? data.__source : "live";
 }
@@ -7254,7 +7520,9 @@ function recordOrSkipDeliveredMessage(data, slot = activeSlot) {
   const key = messageDedupKey(data);
   if (!key || !slot)
     return false;
-  const skip = slot.messageDedup.recordOrSkip(key);
+  const slotSkip = slot.messageDedup.recordOrSkip(key);
+  const agentSkip = slot.agentId ? processAgentMessageDedup.recordOrSkip(`${slot.agentId}:${key}`) : false;
+  const skip = slotSkip || agentSkip;
   if (skip) {
     process.stderr.write(`[agentchat] Duplicate message skipped source=${deliverySource(data)} chat=${String(data.channel_id).slice(0, 12)} id=${String(data.id).slice(0, 12)}
 `);
@@ -7343,6 +7611,22 @@ function syncOpenBoundSessions() {
     try {
       const candidate = readIdentityProfile(boundPath);
       validateIdentityProfile(candidate, boundPath);
+      const sess = { sessionId: cid, runtime: "antigravity" };
+      const existingByAgent = findSlotByAgentId(candidate.agent_id);
+      if (existingByAgent) {
+        const existingSid = existingByAgent.runtimeSession?.sessionId || findBoundSessionForProfile(configDir, existingByAgent.profileName);
+        if (!existingSid || existingSid === cid) {
+          upgradeAliasSlotInPlace(existingByAgent, boundProf, boundPath, candidate, sess);
+          acquireAgentLock({
+            lockDir,
+            agentId: existingByAgent.agentId,
+            profileName: boundProf,
+            sessionId: cid,
+            runtime: "antigravity"
+          });
+        }
+        continue;
+      }
       const lock = checkAgentLock({
         lockDir,
         agentId: candidate.agent_id,
@@ -7351,7 +7635,6 @@ function syncOpenBoundSessions() {
       });
       if (lock.locked)
         continue;
-      const sess = { sessionId: cid, runtime: "antigravity" };
       acquireAgentLock({
         lockDir,
         agentId: candidate.agent_id,
@@ -7554,7 +7837,7 @@ ${context}
         if (process.env.AGENTCHAT_WAKE_MODE === "grok") {
           (async () => {
             try {
-              const { readFileSync: readFileSync10, existsSync: existsSync9 } = await import("fs");
+              const { readFileSync: readFileSync12, existsSync: existsSync9 } = await import("fs");
               const gwPath = resolveGrokGatewayPath(process.env.AGENTCHAT_GROK_GATEWAY, existsSync9);
               let agentId = process.env.AGENTCHAT_GROK_AGENT_ID || "";
               if (!agentId) {
@@ -7562,7 +7845,7 @@ ${context}
                   explicitId: "",
                   agentschatName: slot.profile.display_name || slot.agentId,
                   listAgents: async () => {
-                    const gwcfg = JSON.parse(readFileSync10(gwPath, "utf8"));
+                    const gwcfg = JSON.parse(readFileSync12(gwPath, "utf8"));
                     const token = grokBearerFromGatewayConfig(gwcfg);
                     const port = grokPortFromGatewayConfig(gwcfg);
                     const res = await fetch(`http://127.0.0.1:${port}/api/listAgents`, {
@@ -7592,7 +7875,8 @@ ${context}
             targetSessionId
           });
         } else if (slotRuntime === "zcode" || process.env.AGENTCHAT_WAKE_MODE === "zcode" || Boolean(findBoundSessionForProfile(configDir, slotProfName, (sid) => sid.startsWith("sess_")))) {
-          const zcodeSid = findBoundSessionForProfile(configDir, slotProfName, (sid) => sid.startsWith("sess_")) || (slotRuntime === "zcode" ? slot.runtimeSession?.sessionId : "") || "";
+          const isZcodeSid = (sid) => sid.startsWith("sess_");
+          const zcodeSid = findBoundSessionForProfile(configDir, slotProfName, isZcodeSid) || resolveSessionForAgent(slot.agentId, { configDir, filter: isZcodeSid })?.sessionId || (slotRuntime === "zcode" ? slot.runtimeSession?.sessionId : "") || "";
           if (zcodeSid) {
             fireZcodeWake(data, {
               sessionId: zcodeSid,
@@ -7605,7 +7889,8 @@ ${context}
             });
           }
         } else if (slotRuntime === "dsh" || isDshHostProcess() || Boolean(findBoundSessionForProfile(configDir, slotProfName, (sid) => sid.startsWith("session-")))) {
-          const dshSid = findBoundSessionForProfile(configDir, slotProfName, (sid) => sid.startsWith("session-")) || resolveSessionForAgent(slot.agentId, { configDir })?.sessionId || (slotRuntime === "dsh" ? slot.runtimeSession?.sessionId : "") || undefined;
+          const isDshSid = (sid) => sid.startsWith("session-");
+          const dshSid = findBoundSessionForProfile(configDir, slotProfName, isDshSid) || resolveSessionForAgent(slot.agentId, { configDir, filter: isDshSid })?.sessionId || (slotRuntime === "dsh" ? slot.runtimeSession?.sessionId : "") || undefined;
           const dshWakeUrl = process.env.DSH_WAKE_URL || process.env.AGENTSCHAT_DSH_WAKE_URL || "http://127.0.0.1:8799/wake";
           fireWake(data, {
             url: dshWakeUrl,
@@ -7620,14 +7905,28 @@ ${context}
               const csrfToken = (process.env.ANTIGRAVITY_CSRF_TOKEN || agyHost?.csrfToken || "").trim();
               if (!agyHost && !lsAddress)
                 return;
+              const isAgyUuid = (sid) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(sid);
               const allBinds = loadSessionBinds(configDir);
-              let targetCid = findBoundSessionForProfile(configDir, slotProfName, (sid) => /^[0-9a-f-]{36}$/i.test(sid)) || (slotRuntime === "antigravity" ? slot.runtimeSession?.sessionId : "") || "";
+              let targetCid = findBoundSessionForProfile(configDir, slotProfName, isAgyUuid) || resolveSessionForAgent(slot.agentId, { configDir, filter: isAgyUuid })?.sessionId || (slotRuntime === "antigravity" && slot.runtimeSession?.sessionId && isAgyUuid(slot.runtimeSession.sessionId) ? slot.runtimeSession.sessionId : "") || "";
               if (!targetCid && agyHost) {
                 if (agyHost.openConversations.length === 1) {
-                  targetCid = agyHost.openConversations[0];
+                  const soleCid = agyHost.openConversations[0];
+                  const soleBoundProf = allBinds[soleCid];
+                  let soleMatchesAgent = false;
+                  if (soleBoundProf) {
+                    const p = nameToPath(soleBoundProf);
+                    if (existsSync8(p)) {
+                      try {
+                        soleMatchesAgent = readIdentityProfile(p)?.agent_id === slot.agentId;
+                      } catch {}
+                    }
+                  }
+                  if (!soleBoundProf || soleBoundProf === slotProfName || soleMatchesAgent) {
+                    targetCid = soleCid;
+                  }
                 } else if (agyHost.openConversations.length > 1) {
-                  const unboundOrSame = agyHost.openConversations.find((cid) => !allBinds[cid] || allBinds[cid] === slotProfName);
-                  targetCid = unboundOrSame || agyHost.openConversations[0];
+                  rateLimitedLog(`agy-wake-unbound:${slot.agentId}`, `[agentchat] Skipping ambiguous Antigravity wake for ${slot.agentId}: ${agyHost.openConversations.length} conversations are open and none is bound to this agent (call whoami or connect_profile in the target conversation to bind it).
+`);
                 }
               }
               if (targetCid && csrfToken) {
@@ -7812,6 +8111,13 @@ async function main() {
   installStdioLifecycleGuards();
   if (!toolOnlyMode) {
     syncOpenBoundSessions();
+    if (process.env.__CFBundleIdentifier === "com.google.antigravity" || Boolean(process.env.AGY_BROWSER_WS_URL) || Boolean(process.env.ANTIGRAVITY_LS_ADDRESS) || Boolean(discoverAntigravityHost())) {
+      const agySyncTimer = setInterval(() => {
+        if (!shuttingDown)
+          syncOpenBoundSessions();
+      }, 15000);
+      agySyncTimer.unref?.();
+    }
   }
   if (anonymousMode && profileSlots.size === 0) {
     process.stderr.write(`[agentchat] Anonymous \u2014 not connecting to the hub.

@@ -108,7 +108,7 @@ import { join, dirname } from "path";
 import { fileURLToPath } from "url";
 // Atomic + 0600-by-construction profile writer. Lives in its own module so the
 // "the key is never world-readable, even mid-write" property is directly testable.
-import { safeWriteProfile } from "./profile-store.ts";
+import { safeWriteProfile, findDefaultProfileCollision } from "./profile-store.ts";
 import {
   decideIdentityGuard,
   advanceGuardRecord,
@@ -273,7 +273,15 @@ const profileDirs = [configDir, legacyConfigDir];
 const lockDir = resolveLockDir(homeDir, process.env);
 const lockOwnerPid = Number(process.env.AGENTSCHAT_LOCK_OWNER_PID) || null;
 const toolOnlyMode = process.env.AGENTSCHAT_TOOL_ONLY === "1";
-let runtimeSession: DetectedSession | null = detectRuntimeSession(process.env);
+let runtimeSessionComputed = false;
+let runtimeSession: DetectedSession | null = null;
+function ensureRuntimeSession(): DetectedSession | null {
+  if (!runtimeSessionComputed) {
+    runtimeSessionComputed = true;
+    runtimeSession = detectRuntimeSession(process.env);
+  }
+  return runtimeSession;
+}
 /** One-shot notice when DSH is detected but no session can be resolved (see the DSH branch). */
 let dshRouteWarned = false;
 
@@ -375,13 +383,14 @@ function resolveProfile(): { path: string; source: ProfileSource; declaredName?:
 
   // Unified session-bind (`~/.agentschat/session-binds.json` / `agy-binds.json`):
   // maps CLAUDE_CODE_SESSION_ID / ANTIGRAVITY_CONVERSATION_ID / ZCODE_SESSION_ID to a profile.
-  if (!grokToken && runtimeSession?.sessionId) {
+  const bootSession = !grokToken ? ensureRuntimeSession() : null;
+  if (!grokToken && bootSession?.sessionId) {
     const sessionBinds = loadSessionBinds(configDir);
-    const boundProfile = sessionBinds[runtimeSession.sessionId];
+    const boundProfile = sessionBinds[bootSession.sessionId];
     if (boundProfile) {
       const boundPath = nameToPath(boundProfile);
       if (existsSync(boundPath)) {
-        process.stderr.write(`[agentchat] session-bind (${runtimeSession.runtime}): ${runtimeSession.sessionId} → profile "${boundProfile}"\n`);
+        process.stderr.write(`[agentchat] session-bind (${bootSession.runtime}): ${bootSession.sessionId} → profile "${boundProfile}"\n`);
         return { path: boundPath, source: "session-bind", declaredName: boundProfile };
       }
     }
@@ -477,46 +486,67 @@ function readIdentityProfile(file: string): any {
 }
 
 if (identity.mode === "profile") {
-  try {
-    profile = readIdentityProfile(profileFile);
-    if (codexIdentity && profile.agent_id !== codexIdentity.agentId) {
-      throw new Error("Codex tool profile identity mismatch");
+  const isDefaultProfileFile =
+    profileSource === "default" || profileNameFromPath(profileFile)?.toLowerCase() === "profile";
+  const defaultCollision = isDefaultProfileFile ? findDefaultProfileCollision(configDir, profileFile) : null;
+  if (defaultCollision) {
+    if (profileSource !== "default") {
+      process.stderr.write(
+        `[agentchat] ERROR: Refusing to load duplicate profile.json (${profileFile}): it collides (${defaultCollision.reason}) with named profile "${defaultCollision.collidingName}" (${defaultCollision.collidingPath}).\n` +
+          `  Delete ${profileFile} and use --profile ${defaultCollision.collidingName} instead.\n`,
+      );
+      process.exit(1);
     }
-    if (projectAgentId !== undefined && projectAgentId !== (cliArgs.id ?? process.env.AGENTCHAT_AGENT_ID ?? profile?.agent_id)) {
-      throw new Error("Project agent_id does not match selected profile");
-    }
-    validateIdentityProfile(profile && !Array.isArray(profile) ? {
-      ...profile,
-      agent_id: cliArgs.id ?? process.env.AGENTCHAT_AGENT_ID ?? profile.agent_id,
-      token: cliArgs.token ?? process.env.AGENTCHAT_TOKEN ?? profile.token,
-      capabilities: cliArgs.caps?.split(",") ?? profile.capabilities,
-    } : profile, profileFile, !hasToken);
-  } catch (e) {
-    process.stderr.write(`[agentchat] ERROR: ${(e as Error).message}\n`);
-    process.exit(1);
-  }
-  const candidateAgentId = cliArgs.id ?? process.env.AGENTCHAT_AGENT_ID ?? profile?.agent_id ?? "";
-  const lockCheck = (!isOneShotCli && !toolOnlyMode && !hasToken && candidateAgentId && profile.token !== "dev-token")
-    ? checkAgentLock({
-        lockDir,
-        agentId: candidateAgentId,
-        currentSessionId: runtimeSession?.sessionId ?? null,
-        lockOwnerPid,
-      })
-    : { locked: false };
-  if (lockCheck.locked) {
     anonymousMode = true;
     activeProfileFile = null;
     profile = {};
     process.stderr.write(
-      `[agentchat] Profile "${declaredName ?? profileNameFromPath(profileFile) ?? "profile"}" (${lockCheck.holder?.agentId}) is already in use by active process pid=${lockCheck.holder?.pid}` +
-        `${lockCheck.holder?.runtime ? ` (${lockCheck.holder.runtime})` : ""}` +
-        `${lockCheck.holder?.sessionId ? ` session=${lockCheck.holder.sessionId}` : ""}.\n` +
-        `  Starting in ANONYMOUS (disconnected) mode so this window does not collide with the active session.\n` +
-        `  Use connect_profile or switch_profile to connect an idle profile or register a new agent for this window.\n`,
+      `[agentchat] Ignoring duplicate default profile.json (${profileFile}): it collides (${defaultCollision.reason}) with named profile "${defaultCollision.collidingName}" (${defaultCollision.collidingPath}).\n` +
+        `  Starting in ANONYMOUS mode instead of shadowing "${defaultCollision.collidingName}". Delete ${profileFile} or bind this session via connect_profile(profile_name="${defaultCollision.collidingName}").\n`,
     );
   } else {
-    process.stderr.write(`[agentchat] Profile loaded: ${profileFile}\n`);
+    try {
+      profile = readIdentityProfile(profileFile);
+      if (codexIdentity && profile.agent_id !== codexIdentity.agentId) {
+        throw new Error("Codex tool profile identity mismatch");
+      }
+      if (projectAgentId !== undefined && projectAgentId !== (cliArgs.id ?? process.env.AGENTCHAT_AGENT_ID ?? profile?.agent_id)) {
+        throw new Error("Project agent_id does not match selected profile");
+      }
+      validateIdentityProfile(profile && !Array.isArray(profile) ? {
+        ...profile,
+        agent_id: cliArgs.id ?? process.env.AGENTCHAT_AGENT_ID ?? profile.agent_id,
+        token: cliArgs.token ?? process.env.AGENTCHAT_TOKEN ?? profile.token,
+        capabilities: cliArgs.caps?.split(",") ?? profile.capabilities,
+      } : profile, profileFile, !hasToken);
+    } catch (e) {
+      process.stderr.write(`[agentchat] ERROR: ${(e as Error).message}\n`);
+      process.exit(1);
+    }
+    const candidateAgentId = cliArgs.id ?? process.env.AGENTCHAT_AGENT_ID ?? profile?.agent_id ?? "";
+    if (!isOneShotCli && !toolOnlyMode) ensureRuntimeSession();
+    const lockCheck = (!isOneShotCli && !toolOnlyMode && !hasToken && candidateAgentId && profile.token !== "dev-token")
+      ? checkAgentLock({
+          lockDir,
+          agentId: candidateAgentId,
+          currentSessionId: runtimeSession?.sessionId ?? null,
+          lockOwnerPid,
+        })
+      : { locked: false };
+    if (lockCheck.locked) {
+      anonymousMode = true;
+      activeProfileFile = null;
+      profile = {};
+      process.stderr.write(
+        `[agentchat] Profile "${declaredName ?? profileNameFromPath(profileFile) ?? "profile"}" (${lockCheck.holder?.agentId}) is already in use by active process pid=${lockCheck.holder?.pid}` +
+          `${lockCheck.holder?.runtime ? ` (${lockCheck.holder.runtime})` : ""}` +
+          `${lockCheck.holder?.sessionId ? ` session=${lockCheck.holder.sessionId}` : ""}.\n` +
+          `  Starting in ANONYMOUS (disconnected) mode so this window does not collide with the active session.\n` +
+          `  Use connect_profile or switch_profile to connect an idle profile or register a new agent for this window.\n`,
+      );
+    } else {
+      process.stderr.write(`[agentchat] Profile loaded: ${profileFile}\n`);
+    }
   }
 } else if (identity.mode === "env-creds") {
   // Token handed to us directly — authenticate with it, register nothing, write nothing.
@@ -685,19 +715,28 @@ if (!anonymousMode || explicitAgentId !== undefined || hasToken) {
 }
 
 if (!anonymousMode && AGENT_ID && !isOneShotCli && !toolOnlyMode) {
-  const activeName = profileNameFromPath(activeProfileFile) ?? declaredName ?? null;
-  if (
-    activeName &&
-    runtimeSession?.runtime === "antigravity" &&
-    !process.env.ANTIGRAVITY_CONVERSATION_ID?.trim()
-  ) {
-    const existingBoundSid = findBoundSessionForProfile(
-      configDir,
-      activeName,
-      (sid) => /^[0-9a-f-]{36}$/i.test(sid),
-    );
-    if (existingBoundSid) {
-      runtimeSession = { sessionId: existingBoundSid, runtime: "antigravity" };
+  let activeName = profileNameFromPath(activeProfileFile) ?? declaredName ?? null;
+  const isAgyUuid = (sid: string) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(sid);
+  const isImplicitAgyBoot =
+    (runtimeSession?.runtime === "antigravity" || (!runtimeSession && Boolean(discoverAntigravityHost()))) &&
+    !process.env.ANTIGRAVITY_CONVERSATION_ID?.trim();
+  if (activeName && isImplicitAgyBoot) {
+    const existingBoundSid = findBoundSessionForProfile(configDir, activeName, isAgyUuid);
+    const existingAgentRoute = resolveSessionForAgent(AGENT_ID, { configDir, filter: isAgyUuid });
+    const resolvedSid = existingBoundSid || existingAgentRoute?.sessionId || "";
+    if (resolvedSid) {
+      runtimeSession = { sessionId: resolvedSid, runtime: "antigravity" };
+      if (
+        profileSource === "default" &&
+        existingAgentRoute?.profileName &&
+        existingAgentRoute.profileName !== activeName
+      ) {
+        const aliasPath = nameToPath(existingAgentRoute.profileName);
+        if (existsSync(aliasPath)) {
+          activeProfileFile = aliasPath;
+          activeName = existingAgentRoute.profileName;
+        }
+      }
     }
   }
   acquireAgentLock({
@@ -708,7 +747,14 @@ if (!anonymousMode && AGENT_ID && !isOneShotCli && !toolOnlyMode) {
     runtime: runtimeSession?.runtime ?? "mcp",
   });
   if (runtimeSession?.sessionId && activeName) {
-    saveSessionBind(configDir, runtimeSession.sessionId, activeName);
+    // Only auto-persist session-binds at boot when the session ID was explicitly
+    // supplied (e.g. CLAUDE_CODE_SESSION_ID / ZCODE_SESSION_ID / ANTIGRAVITY_CONVERSATION_ID)
+    // or already matches an existing bind — never passively bind a random open
+    // Antigravity window before that conversation invokes any AgentsChat tool.
+    const existingBinds = loadSessionBinds(configDir);
+    if (!isImplicitAgyBoot || existingBinds[runtimeSession.sessionId] === activeName) {
+      saveSessionBind(configDir, runtimeSession.sessionId, activeName);
+    }
   }
 }
 
@@ -2605,6 +2651,34 @@ function setAnonymousCallerState(callerSession?: DetectedSession | null): void {
   }
 }
 
+function findSlotByAgentId(agentId: string | null | undefined): ProfileSlot | undefined {
+  if (!agentId) return undefined;
+  for (const s of profileSlots.values()) {
+    if (s.agentId === agentId) return s;
+  }
+  return undefined;
+}
+
+function upgradeAliasSlotInPlace(
+  slot: ProfileSlot,
+  newProfileName: string,
+  newProfileFile: string,
+  newProfile: any,
+  sess: DetectedSession,
+): void {
+  if (slot.profileName !== newProfileName) {
+    profileSlots.delete(slot.profileName);
+    slot.profileName = newProfileName;
+    profileSlots.set(newProfileName, slot);
+  }
+  slot.profileFile = newProfileFile;
+  slot.profile = newProfile;
+  slot.runtimeSession = sess;
+  if (activeSlot === slot) {
+    activateSlot(slot, sess);
+  }
+}
+
 function teardownSlot(slot: ProfileSlot, opts?: { releaseLock?: boolean }): void {
   try { flushSlotLastSeenMessageTs(slot); } catch {}
   try { slot.heartbeat.stop(); } catch {}
@@ -2799,11 +2873,15 @@ function formatProfileList(): string {
       : { locked: false };
     const slot = profileSlots.get(entry.name);
     const boundSid = findBoundSessionForProfile(configDir, entry.name);
-    const statusSuffix = lock.locked
-      ? ` [in use by pid=${lock.holder?.pid}${lock.holder?.runtime ? ` (${lock.holder.runtime})` : ""}${lock.holder?.sessionId ? ` session=${lock.holder.sessionId}` : ""}]`
-      : slot && slot.ws?.readyState === WebSocket.OPEN
-        ? ` [online${boundSid ? ` session=${boundSid}` : ""}]`
-        : "";
+    const dupCollision =
+      entry.name.toLowerCase() === "profile" ? findDefaultProfileCollision(configDir, entry.path) : null;
+    const statusSuffix = dupCollision
+      ? ` [duplicate of ${dupCollision.collidingName} — disallowed; delete profile.json]`
+      : lock.locked
+        ? ` [in use by pid=${lock.holder?.pid}${lock.holder?.runtime ? ` (${lock.holder.runtime})` : ""}${lock.holder?.sessionId ? ` session=${lock.holder.sessionId}` : ""}]`
+        : slot && slot.ws?.readyState === WebSocket.OPEN
+          ? ` [online${boundSid ? ` session=${boundSid}` : ""}]`
+          : "";
     return `${isCurrent ? "→ " : "  "}${entry.name}${statusSuffix}`;
   });
   return `Current: ${current || "(anonymous / disconnected)"}\nAvailable profiles:\n${lines.join("\n")}`;
@@ -2816,6 +2894,42 @@ async function registerAndConnectProfile(
   const cleanName = displayName.trim();
   if (!cleanName) {
     return { content: [{ type: "text", text: "Error: register_name / profile_name must be a non-empty string." }], isError: true };
+  }
+  const safeBase = cleanName.replace(/\.json$/, "").replace(/[^a-zA-Z0-9_-]/g, "_");
+  if (safeBase.toLowerCase() === "profile") {
+    return {
+      content: [{
+        type: "text",
+        text: 'Error: "profile" (profile.json) is reserved and cannot be registered as a named agent profile. Choose a distinct profile name (e.g. "Antigravity", "Claude_Work", "Codex_Dev").',
+      }],
+      isError: true,
+    };
+  }
+  const existingTargetFile = nameToPath(cleanName);
+  if (existsSync(existingTargetFile)) {
+    return {
+      content: [{
+        type: "text",
+        text: `Error: Profile "${cleanName}" already exists at ${existingTargetFile}. Pass profile_name="${cleanName}" to connect to it, or choose a different register_name.`,
+      }],
+      isError: true,
+    };
+  }
+  const existingDefaultPath = nameToPath("profile");
+  if (existsSync(existingDefaultPath)) {
+    try {
+      const defParsed = JSON.parse(readFileSync(existingDefaultPath, "utf-8"));
+      const defDisplay = typeof defParsed?.display_name === "string" ? defParsed.display_name.trim().toLowerCase() : "";
+      if (defDisplay && defDisplay === cleanName.toLowerCase()) {
+        return {
+          content: [{
+            type: "text",
+            text: `Error: Default profile.json already uses display_name "${defParsed.display_name}". Delete ${existingDefaultPath} or choose a distinct name so profile.json never collides with a named profile.`,
+          }],
+          isError: true,
+        };
+      }
+    } catch {}
   }
   const caps = ["claude-code", "coding", "chat"];
   try {
@@ -2848,10 +2962,6 @@ async function registerAndConnectProfile(
     validateIdentityProfile(newProfile, targetFile);
     mkdirSync(dirname(targetFile), { recursive: true });
     safeWriteProfile(targetFile, newProfile);
-    const defaultProfileFile = nameToPath("profile");
-    if (!existsSync(defaultProfileFile)) {
-      safeWriteProfile(defaultProfileFile, newProfile);
-    }
     applyIdentityFromProfile(newProfile, targetFile, bindSessionId);
     const claimEntry = `${REST_URL}/chat/${encodeURIComponent(data.id)}?claim=1`;
     return {
@@ -2939,6 +3049,21 @@ async function handleProfileSwitchOrConnect(args: any): Promise<{ content: any[]
       }],
       isError: true,
     };
+  }
+
+  if (profileNameFromPath(targetFile)?.toLowerCase() === "profile") {
+    const dupCollision = findDefaultProfileCollision(configDir, targetFile);
+    if (dupCollision) {
+      return {
+        content: [{
+          type: "text",
+          text:
+            `Refusing to connect "profile" (${targetFile}): profile.json collides (${dupCollision.reason}) with named profile "${dupCollision.collidingName}" (${dupCollision.collidingPath}). ` +
+            `Delete ${targetFile} and connect via profile_name="${dupCollision.collidingName}" instead.`,
+        }],
+        isError: true,
+      };
+    }
   }
 
   const newProfile = readIdentityProfile(targetFile);
@@ -3217,16 +3342,37 @@ const handleToolCall = async (request: any): Promise<any> => {
           if (existsSync(boundPath)) {
             try {
               const candidate = readIdentityProfile(boundPath);
-              const lock = checkAgentLock({
-                lockDir,
-                agentId: candidate?.agent_id,
-                currentSessionId: callerSession.sessionId,
-                lockOwnerPid,
-              });
-              if (!lock.locked) {
-                applyIdentityFromProfile(candidate, boundPath, callerSession.sessionId);
-              } else if (isPerCallSession) {
-                setAnonymousCallerState(callerSession);
+              const aliasSlot = candidate?.agent_id ? findSlotByAgentId(candidate.agent_id) : undefined;
+              const aliasSid = aliasSlot
+                ? aliasSlot.runtimeSession?.sessionId ||
+                  findBoundSessionForProfile(configDir, aliasSlot.profileName) ||
+                  resolveSessionForAgent(aliasSlot.agentId, { configDir })?.sessionId ||
+                  null
+                : null;
+              if (aliasSlot && (!aliasSid || aliasSid === callerSession.sessionId)) {
+                upgradeAliasSlotInPlace(aliasSlot, boundProfileName, boundPath, candidate, callerSession);
+                activateSlot(aliasSlot, callerSession);
+                if (!toolOnlyMode) {
+                  acquireAgentLock({
+                    lockDir,
+                    agentId: aliasSlot.agentId,
+                    profileName: boundProfileName,
+                    sessionId: callerSession.sessionId,
+                    runtime: callerSession.runtime,
+                  });
+                }
+              } else {
+                const lock = checkAgentLock({
+                  lockDir,
+                  agentId: candidate?.agent_id,
+                  currentSessionId: callerSession.sessionId,
+                  lockOwnerPid,
+                });
+                if (!lock.locked) {
+                  applyIdentityFromProfile(candidate, boundPath, callerSession.sessionId);
+                } else if (isPerCallSession) {
+                  setAnonymousCallerState(callerSession);
+                }
               }
             } catch {}
           } else if (isPerCallSession) {
@@ -3239,7 +3385,9 @@ const handleToolCall = async (request: any): Promise<any> => {
         let unboundSlot: ProfileSlot | null = null;
         for (const slot of profileSlots.values()) {
           const slotBoundSid =
-            slot.runtimeSession?.sessionId || findBoundSessionForProfile(configDir, slot.profileName);
+            slot.runtimeSession?.sessionId ||
+            findBoundSessionForProfile(configDir, slot.profileName) ||
+            resolveSessionForAgent(slot.agentId, { configDir })?.sessionId;
           if (!slotBoundSid || slotBoundSid === callerSession.sessionId) {
             unboundSlot = slot;
             break;
@@ -5106,13 +5254,16 @@ function clearFinishedHiddenIdentityGamesFromMessage(data: any) {
 // duplicate or drop older out-of-order messages that were never processed.
 // Dedup core (key derivation + bounded set) lives in ./dedup.ts; this file
 // keeps the thin logging wrapper so call sites and stderr output are unchanged.
+const processAgentMessageDedup = new MessageDedup();
 function deliverySource(data: any): string {
   return typeof data?.__source === "string" ? data.__source : "live";
 }
 function recordOrSkipDeliveredMessage(data: any, slot: ProfileSlot | null = activeSlot): boolean {
   const key = messageDedupKey(data);
   if (!key || !slot) return false;
-  const skip = slot.messageDedup.recordOrSkip(key);
+  const slotSkip = slot.messageDedup.recordOrSkip(key);
+  const agentSkip = slot.agentId ? processAgentMessageDedup.recordOrSkip(`${slot.agentId}:${key}`) : false;
+  const skip = slotSkip || agentSkip;
   if (skip) {
     process.stderr.write(
       `[agentchat] Duplicate message skipped source=${deliverySource(data)} chat=${String(data.channel_id).slice(0, 12)} id=${String(data.id).slice(0, 12)}\n`,
@@ -5205,6 +5356,26 @@ function syncOpenBoundSessions(): void {
     try {
       const candidate = readIdentityProfile(boundPath);
       validateIdentityProfile(candidate, boundPath);
+      const sess: DetectedSession = { sessionId: cid, runtime: "antigravity" };
+      // Prevent duplicate WebSocket slots when `profile.json` and `<Name>.json`
+      // share the same `agent_id`: upgrade the unbound alias slot in-place.
+      const existingByAgent = findSlotByAgentId(candidate.agent_id);
+      if (existingByAgent) {
+        const existingSid =
+          existingByAgent.runtimeSession?.sessionId ||
+          findBoundSessionForProfile(configDir, existingByAgent.profileName);
+        if (!existingSid || existingSid === cid) {
+          upgradeAliasSlotInPlace(existingByAgent, boundProf, boundPath, candidate, sess);
+          acquireAgentLock({
+            lockDir,
+            agentId: existingByAgent.agentId,
+            profileName: boundProf,
+            sessionId: cid,
+            runtime: "antigravity",
+          });
+        }
+        continue;
+      }
       const lock = checkAgentLock({
         lockDir,
         agentId: candidate.agent_id,
@@ -5212,7 +5383,6 @@ function syncOpenBoundSessions(): void {
         lockOwnerPid,
       });
       if (lock.locked) continue;
-      const sess: DetectedSession = { sessionId: cid, runtime: "antigravity" };
       acquireAgentLock({
         lockDir,
         agentId: candidate.agent_id,
@@ -5461,8 +5631,10 @@ function connectWS(slot: ProfileSlot | null = activeSlot) {
           process.env.AGENTCHAT_WAKE_MODE === "zcode" ||
           Boolean(findBoundSessionForProfile(configDir, slotProfName, (sid) => sid.startsWith("sess_")))
         ) {
+          const isZcodeSid = (sid: string) => sid.startsWith("sess_");
           const zcodeSid =
-            findBoundSessionForProfile(configDir, slotProfName, (sid) => sid.startsWith("sess_")) ||
+            findBoundSessionForProfile(configDir, slotProfName, isZcodeSid) ||
+            resolveSessionForAgent(slot!.agentId, { configDir, filter: isZcodeSid })?.sessionId ||
             (slotRuntime === "zcode" ? slot!.runtimeSession?.sessionId : "") ||
             "";
           if (zcodeSid) {
@@ -5480,9 +5652,10 @@ function connectWS(slot: ProfileSlot | null = activeSlot) {
           isDshHostProcess() ||
           Boolean(findBoundSessionForProfile(configDir, slotProfName, (sid) => sid.startsWith("session-")))
         ) {
+          const isDshSid = (sid: string) => sid.startsWith("session-");
           const dshSid =
-            findBoundSessionForProfile(configDir, slotProfName, (sid) => sid.startsWith("session-")) ||
-            resolveSessionForAgent(slot!.agentId, { configDir })?.sessionId ||
+            findBoundSessionForProfile(configDir, slotProfName, isDshSid) ||
+            resolveSessionForAgent(slot!.agentId, { configDir, filter: isDshSid })?.sessionId ||
             (slotRuntime === "dsh" ? slot!.runtimeSession?.sessionId : "") ||
             undefined;
           const dshWakeUrl =
@@ -5502,19 +5675,42 @@ function connectWS(slot: ProfileSlot | null = activeSlot) {
               const lsAddress = process.env.ANTIGRAVITY_LS_ADDRESS?.trim() || "";
               const csrfToken = (process.env.ANTIGRAVITY_CSRF_TOKEN || agyHost?.csrfToken || "").trim();
               if (!agyHost && !lsAddress) return;
+              const isAgyUuid = (sid: string) =>
+                /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(sid);
               const allBinds = loadSessionBinds(configDir);
               let targetCid =
-                findBoundSessionForProfile(configDir, slotProfName, (sid) => /^[0-9a-f-]{36}$/i.test(sid)) ||
-                (slotRuntime === "antigravity" ? slot!.runtimeSession?.sessionId : "") ||
+                findBoundSessionForProfile(configDir, slotProfName, isAgyUuid) ||
+                resolveSessionForAgent(slot!.agentId, { configDir, filter: isAgyUuid })?.sessionId ||
+                (slotRuntime === "antigravity" &&
+                slot!.runtimeSession?.sessionId &&
+                isAgyUuid(slot!.runtimeSession.sessionId)
+                  ? slot!.runtimeSession.sessionId
+                  : "") ||
                 "";
               if (!targetCid && agyHost) {
                 if (agyHost.openConversations.length === 1) {
-                  targetCid = agyHost.openConversations[0]!;
+                  const soleCid = agyHost.openConversations[0]!;
+                  const soleBoundProf = allBinds[soleCid];
+                  let soleMatchesAgent = false;
+                  if (soleBoundProf) {
+                    const p = nameToPath(soleBoundProf);
+                    if (existsSync(p)) {
+                      try {
+                        soleMatchesAgent = readIdentityProfile(p)?.agent_id === slot!.agentId;
+                      } catch {}
+                    }
+                  }
+                  if (!soleBoundProf || soleBoundProf === slotProfName || soleMatchesAgent) {
+                    targetCid = soleCid;
+                  }
                 } else if (agyHost.openConversations.length > 1) {
-                  const unboundOrSame = agyHost.openConversations.find(
-                    (cid) => !allBinds[cid] || allBinds[cid] === slotProfName,
+                  // Never guess an unbound conversation (`!allBinds[cid]`) or `openConversations[0]`
+                  // when multiple Antigravity windows are open — guessing leaks wakes into
+                  // unrelated project windows!
+                  rateLimitedLog(
+                    `agy-wake-unbound:${slot!.agentId}`,
+                    `[agentchat] Skipping ambiguous Antigravity wake for ${slot!.agentId}: ${agyHost.openConversations.length} conversations are open and none is bound to this agent (call whoami or connect_profile in the target conversation to bind it).\n`,
                   );
-                  targetCid = unboundOrSame || agyHost.openConversations[0]!;
                 }
               }
               if (targetCid && csrfToken) {
@@ -5680,6 +5876,17 @@ async function main() {
   installStdioLifecycleGuards();
   if (!toolOnlyMode) {
     syncOpenBoundSessions();
+    if (
+      process.env.__CFBundleIdentifier === "com.google.antigravity" ||
+      Boolean(process.env.AGY_BROWSER_WS_URL) ||
+      Boolean(process.env.ANTIGRAVITY_LS_ADDRESS) ||
+      Boolean(discoverAntigravityHost())
+    ) {
+      const agySyncTimer = setInterval(() => {
+        if (!shuttingDown) syncOpenBoundSessions();
+      }, 15_000);
+      (agySyncTimer as any).unref?.();
+    }
   }
   // Anonymous = no credentials to present. Connecting would just fail auth in a
   // reconnect loop; stdio (initialize/tools/list) is served either way.

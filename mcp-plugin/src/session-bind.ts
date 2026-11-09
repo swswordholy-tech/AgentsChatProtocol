@@ -200,19 +200,41 @@ export function loadSessionBinds(configDir: string): Record<string, string> {
   return merged;
 }
 
+function resolveAgentIdForProfileName(configDir: string, name: string): string | null {
+  if (!name || name.includes("/") || name.includes("\\")) return null;
+  const base = name.replace(/\.json$/, "").replace(/[^a-zA-Z0-9_-]/g, "_");
+  for (const candidate of [join(configDir, "profiles", `${base}.json`), join(configDir, `${base}.json`)]) {
+    if (!existsSync(candidate)) continue;
+    try {
+      const parsed = JSON.parse(readFileSync(candidate, "utf8")) as { agent_id?: unknown };
+      if (typeof parsed?.agent_id === "string" && parsed.agent_id.trim()) {
+        return parsed.agent_id.trim();
+      }
+    } catch {}
+  }
+  return null;
+}
+
 export function saveSessionBind(configDir: string, sessionId: string, profileName: string): void {
   const sid = sessionId.trim();
   const prof = profileName.trim();
   if (!sid || !prof) return;
+  const targetAgentId = resolveAgentIdForProfileName(configDir, prof);
+  const isSameProfileOrAgent = (existingProf: string): boolean => {
+    if (existingProf === prof) return true;
+    if (!targetAgentId) return false;
+    return resolveAgentIdForProfileName(configDir, existingProf) === targetAgentId;
+  };
   const path = join(configDir, DEFAULT_SESSION_BINDS_FILENAME);
   let current: Record<string, string> = {};
   if (existsSync(path)) {
     try { current = parseSessionBinds(JSON.parse(readFileSync(path, "utf8"))); } catch {}
   }
-  // Enforce 1:1 profileName <-> sessionId mapping so re-binding a profile to a
-  // conversation replaces any stale conversation bound to the same profile.
+  // Enforce 1:1 (profileName & agent_id) <-> sessionId mapping so re-binding a
+  // profile (or an alias file such as `profile.json` + `<Name>.json` sharing one
+  // `agent_id`) replaces any stale conversation bound to the same identity.
   for (const [existingSid, existingProf] of Object.entries(current)) {
-    if (existingProf === prof && existingSid !== sid) {
+    if (existingSid !== sid && isSameProfileOrAgent(existingProf)) {
       delete current[existingSid];
     }
   }
@@ -227,7 +249,7 @@ export function saveSessionBind(configDir: string, sessionId: string, profileNam
       const legacy = parseSessionBinds(JSON.parse(readFileSync(legacyPath, "utf8")));
       let changed = false;
       for (const [existingSid, existingProf] of Object.entries(legacy)) {
-        if (existingProf === prof && existingSid !== sid) {
+        if (existingSid !== sid && isSameProfileOrAgent(existingProf)) {
           delete legacy[existingSid];
           changed = true;
         }
@@ -318,12 +340,19 @@ export function detectRuntimeSession(
     return { sessionId: explicitSid, runtime: "custom" };
   }
 
-  // 6. Antigravity parent language_server discovery (macOS & Linux)
-  if (
-    env === process.env ||
+  // 6. Antigravity parent language_server discovery (macOS & Linux).
+  // Skip expensive ps/lsof parent-tree probing when running against a loopback mock
+  // hub in tests with a stripped env (unless explicit Antigravity env vars are set).
+  const hasExplicitAgyEnv =
     env.__CFBundleIdentifier === "com.google.antigravity" ||
-    Boolean(env.AGY_BROWSER_WS_URL)
-  ) {
+    Boolean(env.AGY_BROWSER_WS_URL) ||
+    Boolean(env.ANTIGRAVITY_LS_ADDRESS) ||
+    Boolean(env.ANTIGRAVITY_CSRF_TOKEN);
+  const isMockHubSubprocess =
+    !hasExplicitAgyEnv &&
+    typeof env.AGENTCHAT_REST_URL === "string" &&
+    /^http:\/\/127\.0\.0\.1:\d+/.test(env.AGENTCHAT_REST_URL);
+  if (!isMockHubSubprocess && (env === process.env || hasExplicitAgyEnv)) {
     const agyHost = discoverAntigravityHost();
     if (agyHost && agyHost.openConversations.length === 1) {
       return { sessionId: agyHost.openConversations[0]!, runtime: "antigravity" };
@@ -347,10 +376,90 @@ let cachedAgyHost: { at: number; info: AntigravityHostInfo | null } | null = nul
  * was spawned by Antigravity's `language_server`. Extracts `--csrf_token`,
  * listening loopback ports, and open `presence/<conversation_id>.lock` files.
  */
+/**
+ * Parse `lsof -Pan -p <language_server_pid>` output into listening loopback ports
+ * and currently open Antigravity IDE conversation UUIDs.
+ *
+ * Important distinctions verified on live Antigravity `language_server` processes:
+ * 1. `language_server` keeps all historical `~/.gemini/antigravity-cli/conversations/*.db`
+ *    files open read-only (`61r..137r`); those archived CLI DBs are NOT open IDE windows.
+ * 2. Active IDE windows hold an open FD on `/<appDataDir>/presence/<uuid>.lock`, whereas
+ *    closed tabs immediately release their presence lock while SQLite may keep their
+ *    `/<appDataDir>/conversations/<uuid>.db` cached in its pool. Prefer active presence
+ *    locks whenever present, falling back to non-CLI `.db` handles only when no presence
+ *    locks exist.
+ */
+export function parseAntigravityLsofOutput(
+  stdout: string,
+  appDataDir = "antigravity",
+): { ports: number[]; openConversations: string[] } {
+  const ports: number[] = [];
+  const presenceConversations: string[] = [];
+  const dbConversations: string[] = [];
+  const cleanAppDir = (appDataDir || "antigravity").trim().replace(/^\/+|\/+$/g, "");
+  const isCliTarget = cleanAppDir === "antigravity-cli";
+
+  for (const line of (stdout || "").split(/\r?\n/)) {
+    const portMatch = line.match(/127\.0\.0\.1:(\d+)\s+\(LISTEN\)/);
+    if (portMatch) {
+      const p = Number(portMatch[1]);
+      if (p > 0 && !ports.includes(p)) ports.push(p);
+    }
+    if (!isCliTarget && line.includes("/antigravity-cli/")) continue;
+
+    const presMatch = line.match(/\/presence\/([0-9a-fA-F-]{36})\.lock$/);
+    if (presMatch) {
+      const cid = presMatch[1]!;
+      if (!presenceConversations.includes(cid)) presenceConversations.push(cid);
+      continue;
+    }
+
+    const dbMatch = line.match(/\/conversations\/([0-9a-fA-F-]{36})\.db$/);
+    if (dbMatch) {
+      if (cleanAppDir && line.includes("/.gemini/") && !line.includes(`/${cleanAppDir}/conversations/`)) {
+        continue;
+      }
+      const cid = dbMatch[1]!;
+      if (!dbConversations.includes(cid)) dbConversations.push(cid);
+    }
+  }
+
+  // Antigravity allocates https_server_port first and http_server_port second;
+  // sort descending so the plaintext HTTP Connect-RPC port is tried first.
+  ports.sort((a, b) => b - a);
+  const openConversations =
+    presenceConversations.length > 0 ? presenceConversations : dbConversations;
+  return { ports, openConversations };
+}
+
 export function discoverAntigravityHost(opts?: {
   currentPid?: number;
   cacheMs?: number;
 }): AntigravityHostInfo | null {
+  if (!opts?.currentPid) {
+    const envAddr = process.env.ANTIGRAVITY_LS_ADDRESS?.trim() || "";
+    const envCsrf = process.env.ANTIGRAVITY_CSRF_TOKEN?.trim() || "";
+    if (envAddr && envCsrf) {
+      const portMatch = envAddr.match(/:(\d+)$/);
+      const ports = portMatch ? [Number(portMatch[1])] : [];
+      const openConversations = (process.env.ANTIGRAVITY_OPEN_CONVERSATIONS || "")
+        .split(",")
+        .map((s) => s.trim())
+        .filter((s) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s));
+      return { lsPid: process.ppid, csrfToken: envCsrf, ports, openConversations };
+    }
+    const hasExplicitAgyEnv =
+      process.env.__CFBundleIdentifier === "com.google.antigravity" ||
+      Boolean(process.env.AGY_BROWSER_WS_URL);
+    if (
+      !hasExplicitAgyEnv &&
+      typeof process.env.AGENTCHAT_REST_URL === "string" &&
+      /^http:\/\/127\.0\.0\.1:\d+/.test(process.env.AGENTCHAT_REST_URL)
+    ) {
+      return null;
+    }
+  }
+
   const now = Date.now();
   const cacheMs = opts?.cacheMs ?? 5_000;
   if (cachedAgyHost && now - cachedAgyHost.at < cacheMs) return cachedAgyHost.info;
@@ -391,28 +500,14 @@ export function discoverAntigravityHost(opts?: {
       return null;
     }
 
+    const appDirMatch = lsCmd.match(/--app_data_dir[=\s]+([^\s]+)/);
+    const appDataDir = appDirMatch?.[1]?.trim() || "antigravity";
+
     const lsof = spawnSync("lsof", ["-Pan", "-p", String(lsPid)], { encoding: "utf8", timeout: 1500 });
-    const ports: number[] = [];
-    const openConversations: string[] = [];
-    if (lsof.status === 0 && lsof.stdout) {
-      for (const line of lsof.stdout.split(/\r?\n/)) {
-        const portMatch = line.match(/127\.0\.0\.1:(\d+)\s+\(LISTEN\)/);
-        if (portMatch) {
-          const p = Number(portMatch[1]);
-          if (p > 0 && !ports.includes(p)) ports.push(p);
-        }
-        const presMatch =
-          line.match(/\/presence\/([0-9a-fA-F-]{36})\.lock$/) ||
-          line.match(/\/conversations\/([0-9a-fA-F-]{36})\.db$/);
-        if (presMatch) {
-          const cid = presMatch[1]!;
-          if (!openConversations.includes(cid)) openConversations.push(cid);
-        }
-      }
-    }
-    // Antigravity allocates https_server_port first and http_server_port second;
-    // sort descending so the plaintext HTTP Connect-RPC port is tried first.
-    ports.sort((a, b) => b - a);
+    const { ports, openConversations } =
+      lsof.status === 0 && lsof.stdout
+        ? parseAntigravityLsofOutput(lsof.stdout, appDataDir)
+        : { ports: [], openConversations: [] };
 
     const info: AntigravityHostInfo = { lsPid, csrfToken, ports, openConversations };
     cachedAgyHost = { at: now, info };

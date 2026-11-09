@@ -67,7 +67,11 @@ function readAgentId(path: string): string | undefined {
  */
 export function resolveSessionForAgent(
   agentId: string | null | undefined,
-  opts: { configDir?: string; env?: Record<string, string | undefined> } = {},
+  opts: {
+    configDir?: string;
+    env?: Record<string, string | undefined>;
+    filter?: (sessionId: string) => boolean;
+  } = {},
 ): AgentSessionRoute | undefined {
   if (typeof agentId !== "string" || agentId.length === 0) return undefined;
   const configDir = opts.configDir ?? agentschatConfigDir(opts.env);
@@ -78,6 +82,7 @@ export function resolveSessionForAgent(
     return undefined;
   }
   for (const [sessionId, profileName] of Object.entries(binds).reverse()) {
+    if (opts.filter && !opts.filter(sessionId)) continue;
     const path = profilePathForName(configDir, profileName);
     if (path === undefined) continue;
     if (readAgentId(path) !== agentId) continue;

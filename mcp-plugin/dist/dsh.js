@@ -456,6 +456,20 @@ import { join as join3 } from "node:path";
 // src/session-bind.ts
 import { closeSync, existsSync as existsSync2, mkdirSync, openSync, readFileSync as readFileSync2, readSync, readdirSync, statSync, unlinkSync } from "node:fs";
 import { join as join2 } from "node:path";
+
+// src/profile-store.ts
+var NON_PROFILE_JSON_FILES = new Set([
+  "session-binds.json",
+  "agy-binds.json",
+  "grok-binds.json",
+  "grok-binds-meta.json",
+  "grok-binds.meta.json",
+  "identity-guard.json",
+  "dsh.json",
+  "config.json"
+]);
+
+// src/session-bind.ts
 var DEFAULT_SESSION_BINDS_FILENAME = "session-binds.json";
 var LEGACY_AGY_BINDS_FILENAME = "agy-binds.json";
 function parseSessionBinds(raw) {
@@ -520,6 +534,8 @@ function resolveSessionForAgent(agentId, opts = {}) {
     return;
   }
   for (const [sessionId, profileName] of Object.entries(binds).reverse()) {
+    if (opts.filter && !opts.filter(sessionId))
+      continue;
     const path = profilePathForName(configDir, profileName);
     if (path === undefined)
       continue;

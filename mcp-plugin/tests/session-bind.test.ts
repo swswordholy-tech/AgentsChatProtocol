@@ -11,6 +11,7 @@ import {
   detectRuntimeSession,
   findBoundSessionForProfile,
   loadSessionBinds,
+  parseAntigravityLsofOutput,
   readAgentLock,
   releaseAgentLock,
   removeSessionBind,
@@ -18,6 +19,7 @@ import {
   saveSessionBind,
 } from "../src/session-bind.ts";
 import { decideIdentity } from "../src/identity.ts";
+import { findDefaultProfileCollision } from "../src/profile-store.ts";
 import { buildWakePrompt, fireAntigravityWake, fireZcodeWake } from "../src/wake.ts";
 
 const ENTRY = resolve(import.meta.dir, "../src/server.ts");
@@ -868,5 +870,321 @@ describe("multi-window lock & connect_profile / disconnect_profile integration t
         })) as any,
     });
     expect(allIdle).toBe("session-b");
+  });
+
+  test("parseAntigravityLsofOutput excludes antigravity-cli archived DBs and prefers active presence locks over cached closed DBs", () => {
+    const sampleLsof = [
+      "language_ 48306 user   12u  IPv4 0x0 0t0  TCP 127.0.0.1:61779 (LISTEN)",
+      "language_ 48306 user   13u  IPv4 0x0 0t0  TCP 127.0.0.1:61780 (LISTEN)",
+      "language_ 48306 user   21u  REG  1,13   0 1 /Users/test/.gemini/antigravity/presence/ba32c38a-052c-4291-86dd-373a68ea85a3.lock",
+      "language_ 48306 user   61r  REG  1,13 100 2 /Users/test/.gemini/antigravity-cli/conversations/04037723-dc99-4708-abbb-9a74d51a9504.db",
+      "language_ 48306 user 2573u  REG  1,13 100 3 /Users/test/.gemini/antigravity/conversations/ba32c38a-052c-4291-86dd-373a68ea85a3.db",
+      "language_ 48306 user 2912u  REG  1,13 100 4 /Users/test/.gemini/antigravity/conversations/967a065b-8d82-494f-a11f-dc7acb86251c.db",
+    ].join("\n");
+
+    const parsed = parseAntigravityLsofOutput(sampleLsof, "antigravity");
+    expect(parsed.ports).toEqual([61780, 61779]);
+    // Only the active presence lock is treated as open (archived antigravity-cli DB and closed cached DB are excluded)
+    expect(parsed.openConversations).toEqual(["ba32c38a-052c-4291-86dd-373a68ea85a3"]);
+
+    // Fallback when no presence lock FD exists: non-CLI IDE DBs are returned, still excluding antigravity-cli
+    const noPresence = sampleLsof
+      .split("\n")
+      .filter((l) => !l.includes("/presence/"))
+      .join("\n");
+    expect(parseAntigravityLsofOutput(noPresence, "antigravity").openConversations).toEqual([
+      "ba32c38a-052c-4291-86dd-373a68ea85a3",
+      "967a065b-8d82-494f-a11f-dc7acb86251c",
+    ]);
+  });
+
+  test("saveSessionBind enforces 1:1 agent_id <-> sessionId across profile.json and named alias files", () => {
+    const cfgDir = mkdtempSync(join(tmpdir(), "ac-alias-binds-"));
+    writeFileSync(join(cfgDir, "profile.json"), JSON.stringify({ agent_id: "same-agent-1", token: "ac_1" }));
+    writeFileSync(join(cfgDir, "Antigravity.json"), JSON.stringify({ agent_id: "same-agent-1", token: "ac_1" }));
+
+    saveSessionBind(cfgDir, "cid-old", "profile");
+    saveSessionBind(cfgDir, "cid-new", "Antigravity");
+
+    const binds = loadSessionBinds(cfgDir);
+    expect(binds).toEqual({ "cid-new": "Antigravity" });
+  });
+
+  test("Antigravity alias profile (profile.json + Antigravity.json sharing agent_id) opens only 1 WS and never leaks wakes to unbound sibling session", async () => {
+    const home = mkdtempSync(join(tmpdir(), "ac-agy-leak-reg-"));
+    const cfgDir = join(home, ".agentschat");
+    const brainDir = mkdtempSync(join(tmpdir(), "ac-agy-leak-brain-"));
+    mkdirSync(cfgDir, { recursive: true });
+
+    const cidBound = "ba32c38a-052c-4291-86dd-373a68ea85a3";
+    const cidUnbound = "967a065b-8d82-494f-a11f-dc7acb86251c";
+    mkdirSync(join(brainDir, cidBound, ".system_generated", "logs"), { recursive: true });
+    mkdirSync(join(brainDir, cidUnbound, ".system_generated", "logs"), { recursive: true });
+
+    // Exact real-world layout produced by first-time registration:
+    // both `profile.json` and `Antigravity.json` carry the same `agent_id`,
+    // while `session-binds.json` maps `cidBound -> "Antigravity"`.
+    const sharedIdentity = {
+      agent_id: "spinning-test-tunicate",
+      display_name: "Antigravity",
+      token: "ac_shared_tunicate",
+      capabilities: ["coding", "chat"],
+    };
+    writeFileSync(join(cfgDir, "profile.json"), JSON.stringify(sharedIdentity));
+    writeFileSync(join(cfgDir, "Antigravity.json"), JSON.stringify(sharedIdentity));
+    writeFileSync(join(cfgDir, "session-binds.json"), JSON.stringify({ [cidBound]: "Antigravity" }));
+
+    const wokenRecipients: string[] = [];
+    const mockLs = Bun.serve({
+      port: 0,
+      async fetch(req) {
+        const u = new URL(req.url);
+        if (u.pathname === "/exa.language_server_pb.LanguageServerService/SendAgentMessage") {
+          const body = (await req.json()) as any;
+          if (typeof body?.recipient === "string") wokenRecipients.push(body.recipient);
+          return Response.json({ ok: true });
+        }
+        return new Response("not found", { status: 404 });
+      },
+    });
+
+    const liveSockets = new Set<any>();
+    let totalAuthCount = 0;
+    const wsHub = Bun.serve<{ agentId?: string }>({
+      port: 0,
+      fetch(req, server) {
+        const u = new URL(req.url);
+        if (u.pathname === "/ws" && server.upgrade(req, { data: {} })) {
+          return undefined;
+        }
+        return Response.json({ ok: true, build: "test", messages: [] });
+      },
+      websocket: {
+        message(ws, message) {
+          try {
+            const data = JSON.parse(String(message));
+            if (data.type === "auth" && typeof data.agent_id === "string") {
+              totalAuthCount += 1;
+              ws.data.agentId = data.agent_id;
+              liveSockets.add(ws);
+              ws.send(JSON.stringify({ type: "auth_ok", session_id: `ws-sess-${totalAuthCount}` }));
+              // Trigger pong right away to exercise syncOpenBoundSessions()!
+              ws.send(JSON.stringify({ type: "pong" }));
+            } else if (data.type === "ping") {
+              ws.send(JSON.stringify({ type: "pong" }));
+            }
+          } catch {}
+        },
+        close(ws) {
+          liveSockets.delete(ws);
+        },
+      },
+    });
+
+    const mcp = spawnMcpSession(home, [], {
+      AGENTCHAT_REST_URL: `http://127.0.0.1:${wsHub.port}`,
+      AGENTCHAT_URL: `ws://127.0.0.1:${wsHub.port}/ws`,
+      AGENTSCHAT_AGY_BRAIN_DIR: brainDir,
+      ANTIGRAVITY_LS_ADDRESS: `127.0.0.1:${mockLs.port}`,
+      ANTIGRAVITY_CSRF_TOKEN: "csrf-leak-test",
+      ANTIGRAVITY_OPEN_CONVERSATIONS: `${cidBound},${cidUnbound}`,
+    });
+
+    try {
+      await mcp.send(INIT);
+      await mcp.send(INITED);
+
+      for (let i = 0; i < 30 && liveSockets.size === 0; i++) {
+        await new Promise((r) => setTimeout(r, 20));
+      }
+      // Give syncOpenBoundSessions() after pong plenty of time to run
+      await new Promise((r) => setTimeout(r, 120));
+
+      // 1. Must ONLY open ONE WebSocket slot for `spinning-test-tunicate`, NEVER two!
+      expect(liveSockets.size).toBe(1);
+      expect(totalAuthCount).toBe(1);
+
+      // 2. Unbound sibling conversation `cidUnbound` calling `whoami` must stay anonymous
+      //    and must NOT hijack the identity via the `profile.json` alias!
+      writeFileSync(
+        join(brainDir, cidUnbound, ".system_generated", "logs", "transcript.jsonl"),
+        JSON.stringify({
+          type: "PLANNER_RESPONSE",
+          tool_calls: [{ name: "call_mcp_tool", args: { ToolName: '"whoami"', Arguments: "{}" } }],
+        }) + "\n",
+      );
+      const unboundWho = await mcp.send(callTool(30, "whoami"));
+      expect(unboundWho.result.content[0].text).toContain("(none — anonymous, no profile written)");
+      expect(loadSessionBinds(cfgDir)).toEqual({ [cidBound]: "Antigravity" });
+
+      // 3. Push an inbound DM across all live sockets -> must wake ONLY `cidBound`, NEVER `cidUnbound`!
+      for (const sock of liveSockets) {
+        sock.send(
+          JSON.stringify({
+            type: "message",
+            id: "msg-no-leak-1",
+            channel_id: "dm-boss",
+            sender_id: "boss-user",
+            content: "hello bound session only",
+            timestamp: new Date().toISOString(),
+          }),
+        );
+      }
+
+      for (let i = 0; i < 30 && wokenRecipients.length === 0; i++) {
+        await new Promise((r) => setTimeout(r, 20));
+      }
+      await new Promise((r) => setTimeout(r, 80));
+
+      expect(wokenRecipients).toEqual([cidBound]);
+    } finally {
+      await mcp.close();
+      wsHub.stop(true);
+      mockLs.stop(true);
+    }
+  });
+
+  test("Unbound agent with >1 open Antigravity conversations never guesses or leaks wakes into an unbound window", async () => {
+    const home = mkdtempSync(join(tmpdir(), "ac-agy-ambig-"));
+    const cfgDir = join(home, ".agentschat");
+    mkdirSync(cfgDir, { recursive: true });
+
+    const cid1 = "11111111-1111-4111-8111-111111111111";
+    const cid2 = "22222222-2222-4222-8222-222222222222";
+    writeFileSync(
+      join(cfgDir, "profile.json"),
+      JSON.stringify({
+        agent_id: "unbound-boot-bot",
+        display_name: "UnboundBootBot",
+        token: "ac_unbound_tok",
+        capabilities: ["coding"],
+      }),
+    );
+
+    const wokenRecipients: string[] = [];
+    const mockLs = Bun.serve({
+      port: 0,
+      async fetch(req) {
+        const body = (await req.json().catch(() => ({}))) as any;
+        if (typeof body?.recipient === "string") wokenRecipients.push(body.recipient);
+        return Response.json({ ok: true });
+      },
+    });
+
+    const liveSockets = new Set<any>();
+    const wsHub = Bun.serve<Record<string, unknown>>({
+      port: 0,
+      fetch(req, server) {
+        const u = new URL(req.url);
+        if (u.pathname === "/ws" && server.upgrade(req, { data: {} })) return undefined;
+        return Response.json({ ok: true, messages: [] });
+      },
+      websocket: {
+        message(ws, message) {
+          const data = JSON.parse(String(message));
+          if (data.type === "auth") {
+            liveSockets.add(ws);
+            ws.send(JSON.stringify({ type: "auth_ok", session_id: "ws-ambig-1" }));
+          }
+        },
+        close(ws) {
+          liveSockets.delete(ws);
+        },
+      },
+    });
+
+    const mcp = spawnMcpSession(home, [], {
+      AGENTCHAT_REST_URL: `http://127.0.0.1:${wsHub.port}`,
+      AGENTCHAT_URL: `ws://127.0.0.1:${wsHub.port}/ws`,
+      ANTIGRAVITY_LS_ADDRESS: `127.0.0.1:${mockLs.port}`,
+      ANTIGRAVITY_CSRF_TOKEN: "csrf-ambig-test",
+      ANTIGRAVITY_OPEN_CONVERSATIONS: `${cid1},${cid2}`,
+    });
+
+    try {
+      await mcp.send(INIT);
+      await mcp.send(INITED);
+      for (let i = 0; i < 30 && liveSockets.size === 0; i++) {
+        await new Promise((r) => setTimeout(r, 20));
+      }
+      for (const sock of liveSockets) {
+        sock.send(
+          JSON.stringify({
+            type: "message",
+            id: "msg-ambig-1",
+            channel_id: "dm-boss",
+            sender_id: "boss-user",
+            content: "do not guess which window",
+            timestamp: new Date().toISOString(),
+          }),
+        );
+      }
+      await new Promise((r) => setTimeout(r, 150));
+      expect(wokenRecipients).toEqual([]);
+    } finally {
+      await mcp.close();
+      wsHub.stop(true);
+      mockLs.stop(true);
+    }
+  });
+
+  test("profile.json is disallowed from colliding with any named profile, and named registration never writes profile.json", async () => {
+    const home = mkdtempSync(join(tmpdir(), "ac-no-dup-default-"));
+    const cfgDir = join(home, ".agentschat");
+    mkdirSync(cfgDir, { recursive: true });
+
+    // 1. Unit check: findDefaultProfileCollision catches both agent_id and display_name collisions
+    const defPath = join(cfgDir, "profile.json");
+    writeFileSync(
+      join(cfgDir, "Antigravity.json"),
+      JSON.stringify({ agent_id: "agy-id-1", display_name: "Antigravity", token: "ac_agy_1" }),
+    );
+    writeFileSync(
+      defPath,
+      JSON.stringify({ agent_id: "agy-id-1", display_name: "Other", token: "ac_def_1" }),
+    );
+    expect(findDefaultProfileCollision(cfgDir, defPath)?.collidingName).toBe("Antigravity");
+    expect(findDefaultProfileCollision(cfgDir, defPath)?.reason).toBe("agent_id");
+
+    writeFileSync(
+      defPath,
+      JSON.stringify({ agent_id: "distinct-id", display_name: "antigravity", token: "ac_def_2" }),
+    );
+    expect(findDefaultProfileCollision(cfgDir, defPath)?.collidingName).toBe("Antigravity");
+    expect(findDefaultProfileCollision(cfgDir, defPath)?.reason).toBe("display_name");
+
+    // 2. E2E check: default startup refuses to load colliding profile.json (starts anonymous),
+    //    explicit connect_profile("profile") is rejected, and register_name never creates profile.json.
+    const mcp = spawnMcpSession(home, [], { CLAUDE_CODE_SESSION_ID: "sess-no-dup" });
+    try {
+      await mcp.send(INIT);
+      await mcp.send(INITED);
+
+      const who = await mcp.send(callTool(40, "whoami"));
+      expect(who.result.content[0].text).toContain("(none — anonymous, no profile written)");
+
+      const tryDupDefault = await mcp.send(callTool(41, "connect_profile", { profile_name: "profile" }));
+      expect(tryDupDefault.result.isError).toBe(true);
+      expect(tryDupDefault.result.content[0].text).toContain('collides (display_name) with named profile "Antigravity"');
+
+      // Delete colliding profile.json, then register a fresh named profile -> must NOT recreate profile.json!
+      const { unlinkSync } = await import("node:fs");
+      unlinkSync(defPath);
+
+      const tryReserved = await mcp.send(callTool(42, "connect_profile", { register_name: "profile" }));
+      expect(tryReserved.result.isError).toBe(true);
+      expect(tryReserved.result.content[0].text).toContain("reserved");
+
+      const tryExisting = await mcp.send(callTool(43, "connect_profile", { register_name: "Antigravity" }));
+      expect(tryExisting.result.isError).toBe(true);
+      expect(tryExisting.result.content[0].text).toContain("already exists");
+
+      const regFresh = await mcp.send(callTool(44, "connect_profile", { register_name: "FreshNamedBot" }));
+      expect(regFresh.result.isError).toBeUndefined();
+      expect(existsSync(join(cfgDir, "FreshNamedBot.json"))).toBe(true);
+      expect(existsSync(defPath)).toBe(false);
+    } finally {
+      await mcp.close();
+    }
   });
 });

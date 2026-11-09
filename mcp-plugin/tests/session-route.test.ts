@@ -91,3 +91,29 @@ test("a blank agent id resolves to undefined", () => {
   expect(resolveSessionForAgent("", { configDir: dir })).toBeUndefined();
   expect(resolveSessionForAgent(undefined, { configDir: dir })).toBeUndefined();
 });
+
+test("filter restricts resolution to the target harness runtime session ID shape", () => {
+  profile("AgyBot", "shared-agent", false);
+  profile("DshBot", "shared-agent", false);
+  bind("session-dsh-111", "DshBot");
+  bind("ba32c38a-052c-4291-86dd-373a68ea85a3", "AgyBot");
+
+  expect(
+    resolveSessionForAgent("shared-agent", {
+      configDir: dir,
+      filter: (sid) => sid.startsWith("session-"),
+    })?.sessionId,
+  ).toBe("session-dsh-111");
+  expect(
+    resolveSessionForAgent("shared-agent", {
+      configDir: dir,
+      filter: (sid) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(sid),
+    })?.sessionId,
+  ).toBe("ba32c38a-052c-4291-86dd-373a68ea85a3");
+  expect(
+    resolveSessionForAgent("shared-agent", {
+      configDir: dir,
+      filter: (sid) => sid.startsWith("sess_"),
+    }),
+  ).toBeUndefined();
+});
