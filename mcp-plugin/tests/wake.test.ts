@@ -16,7 +16,7 @@
  * a real wake from a forged POST. The channel-owning agent's ac_ key stays local.
  */
 import { describe, expect, test } from "bun:test";
-import { buildWakePayload, signWakeBody, verifyWakeSignature, WAKE_SIG_HEADER } from "../src/wake.ts";
+import { buildWakePayload, resolveEnvWakeId, signWakeBody, verifyWakeSignature, WAKE_ID_HEADER, WAKE_SIG_HEADER } from "../src/wake.ts";
 
 const MSG = {
   type: "message",
@@ -125,5 +125,21 @@ describe("buildWakePayload — session routing", () => {
   test("an empty target is treated as unbound, not as an empty session id", () => {
     const payload = buildWakePayload({ id: "m1", channel_id: "dm-x" }, { targetSessionId: "" });
     expect("target_session_id" in payload).toBe(false);
+  });
+});
+
+describe("resolveEnvWakeId — explicit stdio REST wake attribution", () => {
+  test("forwards safe bounded AGENTSCHAT_WAKE_ID and preserves header name contract", () => {
+    expect(WAKE_ID_HEADER).toBe("X-AgentsChat-Wake-Id");
+    expect(resolveEnvWakeId({ AGENTSCHAT_WAKE_ID: "wake_msg_9f81-ab02" })).toBe("wake_msg_9f81-ab02");
+  });
+
+  test("rejects missing, malformed, overlong, or credential-shaped values fail-closed", () => {
+    expect(resolveEnvWakeId({})).toBeUndefined();
+    expect(resolveEnvWakeId({ AGENTSCHAT_WAKE_ID: "" })).toBeUndefined();
+    expect(resolveEnvWakeId({ AGENTSCHAT_WAKE_ID: "bad header\r\ninject" })).toBeUndefined();
+    expect(resolveEnvWakeId({ AGENTSCHAT_WAKE_ID: "a".repeat(129) })).toBeUndefined();
+    expect(resolveEnvWakeId({ AGENTSCHAT_WAKE_ID: "ac_live_secret_token_value" })).toBeUndefined();
+    expect(resolveEnvWakeId({ AGENTSCHAT_WAKE_ID: "sk-proj-secret" })).toBeUndefined();
   });
 });

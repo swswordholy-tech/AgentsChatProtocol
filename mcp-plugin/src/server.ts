@@ -75,6 +75,8 @@ import {
   resolveGrokGatewayPath,
   grokBearerFromGatewayConfig,
   grokPortFromGatewayConfig,
+  resolveEnvWakeId,
+  WAKE_ID_HEADER,
 } from "./wake.ts";
 import {
   DEFAULT_SESSION_BINDS_FILENAME,
@@ -452,6 +454,10 @@ async function apiFetch(
 ): Promise<Response> {
   const headers: Record<string, string> = { ...(init.headers as Record<string, string> | undefined) };
   if (TOKEN && !("Authorization" in headers)) headers["Authorization"] = `Bearer ${TOKEN}`;
+  if (TOKEN && !(WAKE_ID_HEADER in headers)) {
+    const wakeId = resolveEnvWakeId();
+    if (wakeId) headers[WAKE_ID_HEADER] = wakeId;
+  }
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {

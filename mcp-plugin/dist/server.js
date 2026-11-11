@@ -560,6 +560,15 @@ function redactParticipantPii2(rawId) {
 
 // src/wake.ts
 var WAKE_SIG_HEADER = "x-agentschat-signature";
+var WAKE_ID_HEADER = "X-AgentsChat-Wake-Id";
+var SAFE_WAKE_ID_RE = /^[a-zA-Z0-9_-]{1,128}$/;
+var CREDENTIAL_PREFIX_RE = /^(ac_|sk-|sk_|ghp_|gho_|ghu_|ghs_|ghr_|github_pat_)/i;
+function resolveEnvWakeId(env = process.env) {
+  const raw = env.AGENTSCHAT_WAKE_ID?.trim();
+  if (!raw || !SAFE_WAKE_ID_RE.test(raw) || CREDENTIAL_PREFIX_RE.test(raw))
+    return;
+  return raw;
+}
 var WAKE_CONTENT_MAX = 500;
 var NATIVE_WAKE_CONTENT_MAX = 4000;
 function formatWakeAttachments(attachments) {
@@ -3121,6 +3130,11 @@ async function apiFetch(input, init = {}, timeoutMs = REST_TIMEOUT_MS, bufferBod
   const headers = { ...init.headers };
   if (TOKEN && !("Authorization" in headers))
     headers["Authorization"] = `Bearer ${TOKEN}`;
+  if (TOKEN && !(WAKE_ID_HEADER in headers)) {
+    const wakeId = resolveEnvWakeId();
+    if (wakeId)
+      headers[WAKE_ID_HEADER] = wakeId;
+  }
   const controller = new AbortController;
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {

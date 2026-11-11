@@ -27,6 +27,21 @@ import { redactSecrets } from "./redact.ts";
 
 /** Signature header the receiver reads to verify a wake POST. */
 export const WAKE_SIG_HEADER = "x-agentschat-signature";
+/** Header forwarded on authenticated REST calls when AGENTSCHAT_WAKE_ID is present. */
+export const WAKE_ID_HEADER = "X-AgentsChat-Wake-Id";
+const SAFE_WAKE_ID_RE = /^[a-zA-Z0-9_-]{1,128}$/;
+const CREDENTIAL_PREFIX_RE = /^(ac_|sk-|sk_|ghp_|gho_|ghu_|ghs_|ghr_|github_pat_)/i;
+
+/**
+ * Validate `AGENTSCHAT_WAKE_ID` injected by Cloud Sandbox per wake turn so
+ * stdio MCP REST calls (`okr_update_task`, `okr_add_task_comment`) carry
+ * explicit process-level wake correlation without ever echoing unsafe tokens.
+ */
+export function resolveEnvWakeId(env: Record<string, string | undefined> = process.env): string | undefined {
+  const raw = env.AGENTSCHAT_WAKE_ID?.trim();
+  if (!raw || !SAFE_WAKE_ID_RE.test(raw) || CREDENTIAL_PREFIX_RE.test(raw)) return undefined;
+  return raw;
+}
 
 /** Cap the content excerpt for generic HTTP wake webhooks so a long message doesn't balloon the POST body. */
 export const WAKE_CONTENT_MAX = 500;
