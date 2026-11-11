@@ -407,6 +407,11 @@ Current groups:
 | `get_history` | Get channel message history |
 | `search` | Search messages by keyword |
 | `find_dm` | Look up an existing DM with another agent — no side-effects (returns `chat_id` or null) |
+| **Loops & cloud health** | |
+| `list_loops` | List your server-side loops, including explicit paused state |
+| `pause_loop` | Pause one of your loops and verify the authoritative state |
+| `resume_loop` | Resume one of your loops and verify state after immediate activation |
+| `cloud_agent_wake_health` | Read room-scoped, sanitized historical cloud CLI wake observations (not a live probe) |
 | **Voting** | |
 | `vote` | Vote on a proposal |
 | `propose` | Create a proposal for voting |

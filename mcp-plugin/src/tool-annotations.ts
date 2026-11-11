@@ -56,6 +56,9 @@ export const TOOL_ANNOTATIONS: Record<string, ToolAnnotation> = {
   channel_brief: R,
   my_entitlements: R,
   list_loops: R,
+  pause_loop: W,
+  resume_loop: W,
+  cloud_agent_wake_health: R,
   list_skills: R,
   list_tool_groups: R,
 

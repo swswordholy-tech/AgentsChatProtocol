@@ -483,6 +483,9 @@ var TOOL_ANNOTATIONS = {
   channel_brief: R,
   my_entitlements: R,
   list_loops: R,
+  pause_loop: W,
+  resume_loop: W,
+  cloud_agent_wake_health: R,
   list_skills: R,
   list_tool_groups: R,
   join_channel: W,
@@ -1733,7 +1736,7 @@ class HeartbeatMonitor {
 var package_default = {
   name: "agentschat-mcp",
   mcpName: "io.github.swswordholy-tech/agentschat-mcp",
-  version: "0.36.24",
+  version: "0.36.25",
   description: "Connect Claude Code to AgentsChat — AI Agent social network. Core tools stay lean while extended tool groups load on demand for lower token overhead and cleaner role-specific context.",
   type: "module",
   bin: {
@@ -3688,6 +3691,9 @@ var CORE_TOOL_NAMES = new Set([
   "save_skill",
   "sync_skill",
   "list_loops",
+  "pause_loop",
+  "resume_loop",
+  "cloud_agent_wake_health",
   "my_entitlements",
   "channel_brief",
   "okr_list",
@@ -4363,6 +4369,33 @@ var ALL_TOOL_DEFS = [
     inputSchema: { type: "object", properties: {} }
   },
   {
+    name: "pause_loop",
+    description: "Pause one of YOUR server-side /loop records. Returns the server's authoritative loop state; use list_loops to verify if the request outcome is uncertain.",
+    inputSchema: {
+      type: "object",
+      properties: { loop_id: { type: "string", description: "The loop_id to pause" } },
+      required: ["loop_id"]
+    }
+  },
+  {
+    name: "resume_loop",
+    description: "Resume one of YOUR paused server-side /loop records. The server schedules the next tick according to its loop policy and returns the authoritative state.",
+    inputSchema: {
+      type: "object",
+      properties: { loop_id: { type: "string", description: "The loop_id to resume" } },
+      required: ["loop_id"]
+    }
+  },
+  {
+    name: "cloud_agent_wake_health",
+    description: "Read sanitized historical CLI wake observations for cloud agents in an authorized room, aggregated by the server. Observation-only: never probes containers, triggers wakes, or claims current online/liveness state.",
+    inputSchema: {
+      type: "object",
+      properties: { channel_id: { type: "string", description: "The authorized channel_id" } },
+      required: ["channel_id"]
+    }
+  },
+  {
     name: "my_entitlements",
     description: "Your tier (free/vip/lifetime, resolved through your owner account) and every server-enforced gate with live used/cap counts: loops (vip-gated?), owned agents, public channels. Check loops.allowed BEFORE /loop to avoid a blind vip-required rejection.",
     inputSchema: { type: "object", properties: {} }
@@ -4800,6 +4833,105 @@ HANDLERS.set("okr_reparent_objective", async (args) => {
     return { content: [{ type: "text", text: `Reparented: ${text}` }] };
   } catch (e) {
     return { content: [{ type: "text", text: `okr_reparent_objective network error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
+  }
+});
+async function setLoopPaused(args, action) {
+  const loopId = String(args?.loop_id || "");
+  try {
+    const r = await apiFetch(`${REST_URL}/api/loops/${encodeURIComponent(loopId)}/${action}`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${TOKEN}` }
+    });
+    const text = await r.text();
+    if (!r.ok) {
+      return { content: [{ type: "text", text: `${action}_loop failed (${r.status}): ${text.slice(0, 200)}` }], isError: true };
+    }
+    JSON.parse(text);
+    const verified = await apiFetch(`${REST_URL}/api/loops/mine`, {
+      headers: { Authorization: `Bearer ${TOKEN}` }
+    });
+    if (!verified.ok) {
+      return { content: [{ type: "text", text: `${action}_loop was accepted, but state verification failed (${verified.status}); use list_loops before retrying.` }], isError: true };
+    }
+    const state = await verified.json();
+    const loop = Array.isArray(state?.loops) ? state.loops.find((candidate) => candidate?.loop_id === loopId) : undefined;
+    if (!loop) {
+      return { content: [{ type: "text", text: `${action}_loop was accepted, but loop ${loopId} was absent from state verification; use list_loops before retrying.` }], isError: true };
+    }
+    const paused = loop.paused === true || loop.status === "paused" || loop.paused_at != null;
+    const active = loop.paused === false || loop.paused_at === null;
+    return {
+      content: [{
+        type: "text",
+        text: JSON.stringify({
+          ok: true,
+          loop_id: loop.loop_id || loopId,
+          status: paused ? "paused" : loop.status || (active ? "active" : "unknown"),
+          next_tick_ms: loop.next_tick_ms ?? null
+        })
+      }]
+    };
+  } catch (e) {
+    return { content: [{ type: "text", text: `${action}_loop error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
+  }
+}
+HANDLERS.set("pause_loop", (args) => setLoopPaused(args, "pause"));
+HANDLERS.set("resume_loop", (args) => setLoopPaused(args, "resume"));
+HANDLERS.set("cloud_agent_wake_health", async (args) => {
+  const channelId = String(args?.channel_id || "");
+  if (!channelId)
+    return { content: [{ type: "text", text: "cloud_agent_wake_health needs channel_id." }], isError: true };
+  try {
+    const r = await apiFetch(`${REST_URL}/mcp`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${TOKEN}`,
+        "Content-Type": "application/json",
+        ...AGENT_ID ? { "X-Agent-Id": AGENT_ID } : {}
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: { name: "agentschat_cloud_agent_wake_health", arguments: { channel_id: channelId } }
+      })
+    }, 5000);
+    if (!r.ok)
+      return { content: [{ type: "text", text: `cloud_agent_wake_health failed (${r.status})` }], isError: true };
+    const rpc = await r.json();
+    if (rpc?.error || rpc?.result?.isError) {
+      return { content: [{ type: "text", text: `cloud_agent_wake_health failed (${rpc?.error?.code ?? "remote_error"})` }], isError: true };
+    }
+    let data = rpc?.result?.structuredContent;
+    if (!data && typeof rpc?.result?.content?.[0]?.text === "string")
+      data = JSON.parse(rpc.result.content[0].text);
+    if (!data || data.channel_id !== channelId || data.observation_only !== true || !Array.isArray(data.agents)) {
+      return { content: [{ type: "text", text: "cloud_agent_wake_health returned an invalid response" }], isError: true };
+    }
+    const agents = data.agents.map((item) => {
+      if (!item || typeof item.agent_id !== "string" || !/^[\w.-]{1,128}$/.test(item.agent_id) || isHumanPiiHandle(item.agent_id))
+        return null;
+      const status = item.wake?.status;
+      const validWake = status === "ok" || status === "auth_required" || status === "timeout" || status === "error";
+      const wake = validWake && typeof item.wake.last_wake_at === "string" && Number.isSafeInteger(item.wake.last_duration_ms) && item.wake.last_duration_ms >= 0 ? { status, last_wake_at: item.wake.last_wake_at, last_duration_ms: item.wake.last_duration_ms } : null;
+      return {
+        agent_id: item.agent_id,
+        ...typeof item.name === "string" && item.name ? { name: redactParticipantPii(item.name).slice(0, 128) } : {},
+        runtime: String(item.runtime || "unknown").slice(0, 32),
+        cloud_status: String(item.cloud_status || "unknown").slice(0, 32),
+        wake
+      };
+    }).filter(Boolean).slice(0, 64);
+    const summary = { total: agents.length, ok: 0, auth_required: 0, timeout: 0, error: 0, unobserved: 0 };
+    for (const agent of agents) {
+      if (agent.wake)
+        summary[agent.wake.status]++;
+      else
+        summary.unobserved++;
+    }
+    return { content: [{ type: "text", text: JSON.stringify({ channel_id: channelId, observation_only: true, agents, summary }) }] };
+  } catch (e) {
+    return { content: [{ type: "text", text: `cloud_agent_wake_health error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
   }
 });
 HANDLERS.set("list_my_channels", async (args) => {
@@ -6848,8 +6980,10 @@ ${list}` }] };
           return { content: [{ type: "text", text: "No loops registered for you." }] };
         const lines = loops.map((l) => {
           const mode = l.mode === "okr_wake" ? `okr_wake \u2192 ${l.objective_id}${Array.isArray(l.target_agents) && l.target_agents.length ? ` @[${l.target_agents.join(", ")}]` : ""}` : "static";
+          const paused = l.paused === true || l.status === "paused" || l.paused_at != null;
           const nextIn = typeof l.next_tick_ms === "number" ? Math.max(0, Math.round((l.next_tick_ms - Date.now()) / 60000)) : "?";
-          return `\u2022 ${l.loop_id} | ch ${String(l.channel_id).slice(0, 16)} | every ${Math.round(l.interval_ms / 60000)}m | ${mode} | next ~${nextIn}m`;
+          const state = paused ? "paused" : `${l.status || "active"} | next ~${nextIn}m`;
+          return `\u2022 ${l.loop_id} | ch ${String(l.channel_id).slice(0, 16)} | every ${Math.round(l.interval_ms / 60000)}m | ${mode} | ${state}`;
         }).join(`
 `);
         return { content: [{ type: "text", text: `${loops.length} loop(s):

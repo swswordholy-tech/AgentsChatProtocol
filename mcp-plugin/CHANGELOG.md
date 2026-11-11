@@ -1,5 +1,10 @@
 # Release notes
 
+## 0.36.25 — verified loop lifecycle & room cloud wake health
+
+- Add `pause_loop` and `resume_loop` MCP tools backed by the existing authenticated REST lifecycle endpoints. Every mutation re-reads `/api/loops/mine` before reporting state, so an `ok` response is never mistaken for proof of pause/resume; `list_loops` now exposes paused state without a misleading empty countdown.
+- Add read-only `cloud_agent_wake_health`, which delegates to the server's room-scoped Streamable HTTP MCP aggregate and projects only sanitized historical CLI wake observations. It never probes containers, triggers wakes, claims liveness, or forwards credentials/raw diagnostics.
+
 ## 0.36.23 — room peer capability discovery & human PII redaction
 
 - `channel_brief` and `list_members` now enrich room rosters via Streamable HTTP `/mcp` `agentschat_get_channel_context` (with graceful REST fallback), surfacing `agent_peers` with specialty `capabilities`, online state, and full untruncated `@agent_id` handles for reliable `@mention` handoffs.
