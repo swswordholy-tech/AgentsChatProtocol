@@ -19,9 +19,11 @@ const runningLoop = {
   next_tick_ms: 1730000000000,
 };
 let currentLoop: any = runningLoop;
+let stallMcpBody = false;
 
 beforeEach(() => {
   currentLoop = { ...runningLoop };
+  stallMcpBody = false;
 });
 
 beforeAll(() => {
@@ -35,12 +37,20 @@ beforeAll(() => {
       if (req.method === "POST" && url.pathname === "/mcp") {
         const rpc = await req.json() as any;
         if (rpc.method === "tools/call" && rpc.params?.name === "agentschat_cloud_agent_wake_health" && rpc.params?.arguments?.channel_id === "channel-1") {
+          if (stallMcpBody) {
+            return new Response(new ReadableStream({
+              start(controller) {
+                controller.enqueue(new TextEncoder().encode('{"jsonrpc":"2.0","id":1,"result":'));
+              },
+            }), { headers: { "Content-Type": "application/json" } });
+          }
           const payload = {
             channel_id: "channel-1",
             observation_only: true,
+            untrusted: true,
             agents: [{
               agent_id: "cloud-peer",
-              name: "Cloud Peer",
+              name: "Cloud Peer sk-proj-1234567890abcdef",
               runtime: "agy",
               cloud_status: "active",
               wake: { status: "auth_required", last_wake_at: "2026-11-12T02:00:00.000Z", last_duration_ms: 1200 },
@@ -60,7 +70,7 @@ beforeAll(() => {
         return Response.json({ loops: [currentLoop] });
       }
       if (req.method === "POST" && url.pathname === "/api/loops/loop-1/pause") {
-        currentLoop = { ...runningLoop, status: "paused", paused: true, next_tick_ms: null };
+        currentLoop = { ...runningLoop, status: "paused", paused: true };
         return Response.json({ ok: true });
       }
       if (req.method === "POST" && url.pathname === "/api/loops/loop-1/resume") {
@@ -193,9 +203,10 @@ describe("MCP loop controls", () => {
     expect(payload).toEqual({
       channel_id: "channel-1",
       observation_only: true,
+      untrusted: true,
       agents: [{
         agent_id: "cloud-peer",
-        name: "Cloud Peer",
+        name: "Cloud Peer [REDACTED]",
         runtime: "agy",
         cloud_status: "active",
         wake: { status: "auth_required", last_wake_at: "2026-11-12T02:00:00.000Z", last_duration_ms: 1200 },
@@ -203,8 +214,21 @@ describe("MCP loop controls", () => {
       summary: { total: 1, ok: 0, auth_required: 1, timeout: 0, error: 0, unobserved: 0 },
     });
     expect(text).not.toContain("ac_should_not_leak");
+    expect(text).not.toContain("sk-proj-1234567890abcdef");
     expect(text).not.toContain("private provider output");
   });
+
+  test("cloud_agent_wake_health times out when the response body stalls", async () => {
+    stallMcpBody = true;
+    const { res } = await drive([
+      INIT,
+      INITED,
+      callTool(3, "cloud_agent_wake_health", { channel_id: "channel-1" }),
+    ], 7000);
+    const result = res.get(3)?.result;
+    expect(result?.isError).toBe(true);
+    expect(result?.content?.[0]?.text || "").toContain("cloud_agent_wake_health error");
+  }, 10000);
 
   test("list_loops exposes paused state instead of a misleading countdown", async () => {
     currentLoop = { ...runningLoop, status: "paused", paused: true, next_tick_ms: null };

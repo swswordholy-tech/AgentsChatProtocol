@@ -3117,14 +3117,18 @@ var TOKEN = "";
 var CAPABILITIES = [];
 var nativeFetch = fetch;
 var REST_TIMEOUT_MS = 15000;
-async function apiFetch(input, init = {}, timeoutMs = REST_TIMEOUT_MS) {
+async function apiFetch(input, init = {}, timeoutMs = REST_TIMEOUT_MS, bufferBody = false) {
   const headers = { ...init.headers };
   if (TOKEN && !("Authorization" in headers))
     headers["Authorization"] = `Bearer ${TOKEN}`;
   const controller = new AbortController;
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    return await nativeFetch(input, { ...init, headers, signal: init.signal ?? controller.signal });
+    const response = await nativeFetch(input, { ...init, headers, signal: init.signal ?? controller.signal });
+    if (!bufferBody)
+      return response;
+    const body = await response.text();
+    return new Response(body, { status: response.status, statusText: response.statusText, headers: response.headers });
   } finally {
     clearTimeout(timer);
   }
@@ -4867,7 +4871,7 @@ async function setLoopPaused(args, action) {
           ok: true,
           loop_id: loop.loop_id || loopId,
           status: paused ? "paused" : loop.status || (active ? "active" : "unknown"),
-          next_tick_ms: loop.next_tick_ms ?? null
+          next_tick_ms: paused ? null : loop.next_tick_ms ?? null
         })
       }]
     };
@@ -4877,6 +4881,10 @@ async function setLoopPaused(args, action) {
 }
 HANDLERS.set("pause_loop", (args) => setLoopPaused(args, "pause"));
 HANDLERS.set("resume_loop", (args) => setLoopPaused(args, "resume"));
+function redactCloudAgentDisplayName(name) {
+  const safe = redactSecrets(name).replace(/\bsk-(?:ant|proj|live|test)-[A-Za-z0-9_-]{12,}\b/g, "[REDACTED]").replace(/\bgh[pousr]_[A-Za-z0-9]{20,}\b/g, "[REDACTED]").replace(/\bAIza[0-9A-Za-z_-]{30,}\b/g, "[REDACTED]");
+  return redactParticipantPii(safe).slice(0, 128);
+}
 HANDLERS.set("cloud_agent_wake_health", async (args) => {
   const channelId = String(args?.channel_id || "");
   if (!channelId)
@@ -4895,7 +4903,7 @@ HANDLERS.set("cloud_agent_wake_health", async (args) => {
         method: "tools/call",
         params: { name: "agentschat_cloud_agent_wake_health", arguments: { channel_id: channelId } }
       })
-    }, 5000);
+    }, 5000, true);
     if (!r.ok)
       return { content: [{ type: "text", text: `cloud_agent_wake_health failed (${r.status})` }], isError: true };
     const rpc = await r.json();
@@ -4916,7 +4924,7 @@ HANDLERS.set("cloud_agent_wake_health", async (args) => {
       const wake = validWake && typeof item.wake.last_wake_at === "string" && Number.isSafeInteger(item.wake.last_duration_ms) && item.wake.last_duration_ms >= 0 ? { status, last_wake_at: item.wake.last_wake_at, last_duration_ms: item.wake.last_duration_ms } : null;
       return {
         agent_id: item.agent_id,
-        ...typeof item.name === "string" && item.name ? { name: redactParticipantPii(item.name).slice(0, 128) } : {},
+        ...typeof item.name === "string" && item.name ? { name: redactCloudAgentDisplayName(item.name) } : {},
         runtime: String(item.runtime || "unknown").slice(0, 32),
         cloud_status: String(item.cloud_status || "unknown").slice(0, 32),
         wake
@@ -4929,7 +4937,7 @@ HANDLERS.set("cloud_agent_wake_health", async (args) => {
       else
         summary.unobserved++;
     }
-    return { content: [{ type: "text", text: JSON.stringify({ channel_id: channelId, observation_only: true, agents, summary }) }] };
+    return { content: [{ type: "text", text: JSON.stringify({ channel_id: channelId, observation_only: true, agents, summary, untrusted: true }) }] };
   } catch (e) {
     return { content: [{ type: "text", text: `cloud_agent_wake_health error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
   }
