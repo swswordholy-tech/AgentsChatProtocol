@@ -5341,7 +5341,29 @@ const handleToolCall = async (request: any): Promise<any> => {
       if (!r.ok) {
         return { content: [{ type: "text", text: `okr_create_objective failed (${r.status}): ${text.slice(0, 160)}` }], isError: true };
       }
-      return { content: [{ type: "text", text: `Created: ${text}` }] };
+      let outText = text;
+      if (discussion_channel_id && !discussion_channel_id.startsWith("dm-") && isSafeLoopIdentifier(discussion_channel_id)) {
+        try {
+          const parsed = JSON.parse(text) as any;
+          const createdObjId = typeof parsed?.objective?.id === "string" ? parsed.objective.id : "";
+          if (parsed && typeof parsed === "object" && /^[A-Za-z0-9_-]{6,80}$/.test(createdObjId)) {
+            outText = JSON.stringify({
+              ...parsed,
+              loop_guard_hint: {
+                okr_wake_armed: false,
+                recommended_tool: "create_loop",
+                recommended_arguments: {
+                  channel_id: discussion_channel_id,
+                  mode: "okr_wake",
+                  interval: "5m",
+                  objective_id: createdObjId,
+                },
+              },
+            });
+          }
+        } catch {}
+      }
+      return { content: [{ type: "text", text: `Created: ${outText}` }] };
     } catch (e: any) {
       return { content: [{ type: "text", text: `okr_create_objective network error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
     }

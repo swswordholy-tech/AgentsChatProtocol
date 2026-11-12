@@ -42,6 +42,18 @@ beforeAll(() => {
           },
         });
       }
+      if (req.method === "POST" && url.pathname === "/api/okr/objectives") {
+        const body = await req.json() as any;
+        return Response.json({
+          ok: true,
+          objective: {
+            id: "obj_created_123",
+            title: body.title,
+            horizon: body.horizon,
+            discussion_channel_id: body.discussion_channel_id ?? null,
+          },
+        });
+      }
       return Response.json({ error: "not_found" }, { status: 404 });
     },
   });
@@ -150,6 +162,16 @@ describe("MCP okr_update_task structured evidence", () => {
         task_id: "task_ev_1",
         evidence: [{ kind: "external", ref: "ac_live_secret_token_1234567890" }],
       }),
+      callTool(7, "okr_create_objective", {
+        title: "Guarded Room Objective",
+        horizon: "week",
+        discussion_channel_id: "chan-sprint-1",
+      }),
+      callTool(8, "okr_create_objective", {
+        title: "DM Objective",
+        horizon: "week",
+        discussion_channel_id: "dm-owner1",
+      }),
     ]);
 
     const tools = res.get(3)?.result?.tools || [];
@@ -186,5 +208,22 @@ describe("MCP okr_update_task structured evidence", () => {
         evidence: [],
       },
     });
+
+    const createdRoomRaw = String(res.get(7)?.result?.content?.[0]?.text || "").replace(/^Created:\s*/, "");
+    const createdRoom = JSON.parse(createdRoomRaw);
+    expect(createdRoom.loop_guard_hint).toEqual({
+      okr_wake_armed: false,
+      recommended_tool: "create_loop",
+      recommended_arguments: {
+        channel_id: "chan-sprint-1",
+        mode: "okr_wake",
+        interval: "5m",
+        objective_id: "obj_created_123",
+      },
+    });
+
+    const createdDmRaw = String(res.get(8)?.result?.content?.[0]?.text || "").replace(/^Created:\s*/, "");
+    const createdDm = JSON.parse(createdDmRaw);
+    expect(createdDm.loop_guard_hint).toBeUndefined();
   });
 });
