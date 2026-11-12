@@ -90,6 +90,32 @@ beforeAll(() => {
           ],
         });
       }
+      if (req.method === "GET" && u.pathname === "/api/channels/chan-okr-guarded/members") {
+        return Response.json({
+          members: [{ agent_id: "spinning-midnight-tunicate", display_name: "Operator", role: "owner" }],
+        });
+      }
+      if (req.method === "GET" && u.pathname === "/api/channels/chan-okr-guarded/okr_snapshot") {
+        return Response.json({
+          objectives: [
+            { id: "obj_armed_1", title: "Armed Objective", archived: false },
+            { id: "obj_unarmed_2", title: "Unarmed Objective", archived: false },
+          ],
+          tasks: [
+            { id: "t1", objective_id: "obj_armed_1", status: "doing" },
+            { id: "t2", objective_id: "obj_unarmed_2", status: "todo" },
+          ],
+        });
+      }
+      if (req.method === "GET" && u.pathname === "/api/loops" && u.searchParams.get("channel_id") === "chan-okr-guarded") {
+        return Response.json({
+          loops: [
+            { loop_id: "l-wake", channel_id: "chan-okr-guarded", mode: "okr_wake", objective_id: "obj_armed_1", status: "active", paused: false },
+            { loop_id: "l-foreign", channel_id: "chan-okr-guarded", mode: "okr_watch", objective_id: "obj_foreign_secret", status: "active", paused: false },
+            { loop_id: "l-paused", channel_id: "chan-okr-guarded", mode: "okr_wake", objective_id: "obj_unarmed_2", status: "paused", paused: true },
+          ],
+        });
+      }
       if (req.method === "POST" && u.pathname === "/mcp") {
         const rpc = (await req.json().catch(() => ({}))) as any;
         if (rpc.method === "tools/call" && rpc.params?.name === "agentschat_get_channel_context") {
@@ -254,6 +280,7 @@ describe("Room peer capability discovery & human PII redaction", () => {
       callTool(2, "channel_brief", { chat_id: "chan-room-collab-123456" }),
       callTool(3, "channel_brief", { chat_id: "chan-legacy-no-mcp" }),
       callTool(4, "get_history", { chat_id: "chan-room-collab-123456", limit: 10 }),
+      callTool(5, "channel_brief", { chat_id: "chan-okr-guarded" }),
     ]);
 
     const briefRaw: string = res.get(2)?.result?.content?.[0]?.text || "{}";
@@ -302,5 +329,32 @@ describe("Room peer capability discovery & human PII redaction", () => {
     expect(hist).toContain("user:sw***: 请大家一起 review 这个 PR");
     expect(hist).toContain("knobbly-tangy-beacon: 收到，我来看 SwiftData 测试");
     expect(hist).not.toContain("swswordholy@");
+
+    // channel_brief surfaces okr_wake/okr_watch guard coverage without leaking foreign objective_ids
+    const guardedRaw: string = res.get(5)?.result?.content?.[0]?.text || "{}";
+    expect(guardedRaw).not.toContain("obj_foreign_secret");
+    const guarded = JSON.parse(guardedRaw);
+    expect(guarded.okr_objectives).toEqual([
+      {
+        id: "obj_armed_1",
+        title: "Armed Objective",
+        open_tasks: 1,
+        okr_wake_armed: true,
+        okr_watch_armed: false,
+      },
+      {
+        id: "obj_unarmed_2",
+        title: "Unarmed Objective",
+        open_tasks: 1,
+        okr_wake_armed: false,
+        okr_watch_armed: false,
+      },
+    ]);
+    expect(guarded.loop_summary).toMatchObject({
+      active_loop_count: 2,
+      okr_wake_objective_ids: ["obj_armed_1"],
+      okr_watch_objective_ids: [],
+      unarmed_objective_ids: ["obj_unarmed_2"],
+    });
   });
 });

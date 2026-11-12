@@ -174,3 +174,153 @@ export function validateTaskEvidenceInput(
   }
   return { ok: true, value: out };
 }
+
+export const CREATE_LOOP_MODES = ["okr_wake", "okr_watch", "prompt"] as const;
+export type CreateLoopMode = (typeof CREATE_LOOP_MODES)[number];
+
+export interface ValidatedCreateLoopBody {
+  channel_id: string;
+  mode: CreateLoopMode;
+  interval?: string;
+  interval_ms?: number;
+  objective_id?: string;
+  prompt?: string;
+  target_agents?: string[];
+  watch_idle?: boolean;
+  watch_supply?: boolean;
+}
+
+const LOOP_MIN_INTERVAL_MS = 60_000;
+const LOOP_MAX_INTERVAL_MS = 86_400_000;
+const SAFE_CHANNEL_OR_LOOP_ID_RE = /^[A-Za-z0-9_.:-]{1,128}$/;
+const SAFE_OBJECTIVE_ID_RE = /^[A-Za-z0-9_-]{6,80}$/;
+const SAFE_AGENT_HANDLE_RE = /^[A-Za-z0-9_-]{2,64}$/;
+const LOOP_PROMPT_CTRL_RE = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/;
+
+export function parseLoopIntervalShorthandMs(raw: string): number | null {
+  const m = raw.trim().match(/^(\d+)\s*(s|sec|m|min|h|hr|d)?$/i);
+  if (!m) return null;
+  const n = Number(m[1]);
+  if (!Number.isSafeInteger(n) || n <= 0) return null;
+  const unit = (m[2] || "m").toLowerCase();
+  const mult =
+    unit === "s" || unit === "sec" ? 1_000 :
+    unit === "m" || unit === "min" ? 60_000 :
+    unit === "h" || unit === "hr" ? 3_600_000 :
+    86_400_000;
+  const ms = n * mult;
+  if (!Number.isSafeInteger(ms) || ms < LOOP_MIN_INTERVAL_MS || ms > LOOP_MAX_INTERVAL_MS) {
+    return null;
+  }
+  return ms;
+}
+
+export function validateCreateLoopInput(
+  args: unknown,
+): { ok: true; value: ValidatedCreateLoopBody } | { ok: false; error: string } {
+  const a = args && typeof args === "object" && !Array.isArray(args)
+    ? (args as Record<string, unknown>)
+    : {};
+  const channelId = typeof a.channel_id === "string" ? a.channel_id.trim() : "";
+  if (!SAFE_CHANNEL_OR_LOOP_ID_RE.test(channelId) || channelId.includes("..")) {
+    return { ok: false, error: "create_loop needs a valid channel_id." };
+  }
+  const rawMode = typeof a.mode === "string" ? a.mode.trim() : "";
+  if (!(CREATE_LOOP_MODES as readonly string[]).includes(rawMode)) {
+    return { ok: false, error: "create_loop mode must be one of okr_wake|okr_watch|prompt." };
+  }
+  const mode = rawMode as CreateLoopMode;
+
+  let intervalMs: number | undefined;
+  let interval: string | undefined;
+  if (a.interval_ms !== undefined && a.interval_ms !== null) {
+    if (
+      typeof a.interval_ms !== "number" ||
+      !Number.isSafeInteger(a.interval_ms) ||
+      a.interval_ms < LOOP_MIN_INTERVAL_MS ||
+      a.interval_ms > LOOP_MAX_INTERVAL_MS
+    ) {
+      return {
+        ok: false,
+        error: `create_loop interval_ms must be an integer in ${LOOP_MIN_INTERVAL_MS}..${LOOP_MAX_INTERVAL_MS} (1m..24h).`,
+      };
+    }
+    intervalMs = a.interval_ms;
+  }
+  if (a.interval !== undefined && a.interval !== null) {
+    if (typeof a.interval !== "string" || !a.interval.trim()) {
+      return { ok: false, error: "create_loop interval must be a shorthand string such as 5m, 15m, 1h." };
+    }
+    const parsed = parseLoopIntervalShorthandMs(a.interval);
+    if (parsed === null) {
+      return { ok: false, error: "create_loop interval must resolve within 1m..24h (e.g. 5m, 15m, 30m, 1h)." };
+    }
+    interval = a.interval.trim();
+    if (intervalMs !== undefined && intervalMs !== parsed) {
+      return { ok: false, error: "create_loop interval and interval_ms disagree; pass only one or matching values." };
+    }
+  }
+
+  let targetAgents: string[] | undefined;
+  if (a.target_agents !== undefined && a.target_agents !== null) {
+    if (!Array.isArray(a.target_agents)) {
+      return { ok: false, error: "create_loop target_agents must be an array of agent handles." };
+    }
+    if (a.target_agents.length > 12) {
+      return { ok: false, error: "create_loop target_agents exceeds max 12 targets." };
+    }
+    const dedup: string[] = [];
+    const seenTargets = new Set<string>();
+    for (const entry of a.target_agents) {
+      if (typeof entry !== "string") {
+        return { ok: false, error: "create_loop target_agents items must be strings." };
+      }
+      const handle = entry.trim().replace(/^@+/, "");
+      if (!handle) continue;
+      if (!SAFE_AGENT_HANDLE_RE.test(handle)) {
+        return { ok: false, error: `create_loop invalid target agent handle "${handle}".` };
+      }
+      if (!seenTargets.has(handle)) {
+        seenTargets.add(handle);
+        dedup.push(handle);
+      }
+    }
+    if (dedup.length > 0) targetAgents = dedup;
+  }
+
+  const out: ValidatedCreateLoopBody = {
+    channel_id: channelId,
+    mode,
+    ...(intervalMs !== undefined ? { interval_ms: intervalMs } : interval ? { interval } : {}),
+    ...(targetAgents ? { target_agents: targetAgents } : {}),
+  };
+
+  if (mode === "okr_wake" || mode === "okr_watch") {
+    const objectiveId = typeof a.objective_id === "string" ? a.objective_id.trim() : "";
+    if (!SAFE_OBJECTIVE_ID_RE.test(objectiveId)) {
+      return { ok: false, error: `create_loop mode="${mode}" requires a valid objective_id.` };
+    }
+    out.objective_id = objectiveId;
+    if (mode === "okr_watch") {
+      if (typeof a.watch_idle === "boolean") out.watch_idle = a.watch_idle;
+      if (typeof a.watch_supply === "boolean") out.watch_supply = a.watch_supply;
+    }
+    return { ok: true, value: out };
+  }
+
+  const prompt = typeof a.prompt === "string" ? a.prompt.trim() : "";
+  if (!prompt) {
+    return { ok: false, error: 'create_loop mode="prompt" requires a non-empty prompt.' };
+  }
+  if (prompt.length > 500) {
+    return { ok: false, error: "create_loop prompt exceeds max 500 characters." };
+  }
+  if (LOOP_PROMPT_CTRL_RE.test(prompt)) {
+    return { ok: false, error: "create_loop prompt contains disallowed control characters." };
+  }
+  if (EVIDENCE_SECRET_RE.test(prompt)) {
+    return { ok: false, error: "create_loop prompt rejected: appears to contain a secret or token." };
+  }
+  out.prompt = prompt;
+  return { ok: true, value: out };
+}

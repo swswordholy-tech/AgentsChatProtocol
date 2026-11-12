@@ -56,6 +56,7 @@ export const TOOL_ANNOTATIONS: Record<string, ToolAnnotation> = {
   channel_brief: R,
   my_entitlements: R,
   list_loops: R,
+  create_loop: W,
   pause_loop: W,
   resume_loop: W,
   set_loop_interval: W,

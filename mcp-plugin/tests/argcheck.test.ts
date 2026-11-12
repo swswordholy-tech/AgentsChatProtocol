@@ -1,7 +1,7 @@
 // Unit tests for validateToolArgs (src/argcheck.ts) — runtime input validation
 // against a tool's declared inputSchema. Run with `bun test`.
 import { test, expect } from "bun:test";
-import { validateTaskEvidenceInput, validateToolArgs } from "../src/argcheck.ts";
+import { validateCreateLoopInput, validateTaskEvidenceInput, validateToolArgs } from "../src/argcheck.ts";
 
 const schema = {
   type: "object",
@@ -112,5 +112,81 @@ test("validateTaskEvidenceInput rejects malformed items, duplicates, and leaked 
   ).toEqual({
     ok: false,
     error: "evidence[0].note rejected: appears to contain a secret or token",
+  });
+});
+
+test("validateCreateLoopInput accepts okr_wake, okr_watch, and prompt modes", () => {
+  expect(
+    validateCreateLoopInput({
+      channel_id: "edbb8180-4356-4dab-9d75-bc9fe6f26194",
+      mode: "okr_wake",
+      interval: "5m",
+      objective_id: "obj_mwdznid5_3jvlpq3c",
+      target_agents: ["@bot-a", "bot-b", "@bot-a"],
+    }),
+  ).toEqual({
+    ok: true,
+    value: {
+      channel_id: "edbb8180-4356-4dab-9d75-bc9fe6f26194",
+      mode: "okr_wake",
+      interval: "5m",
+      objective_id: "obj_mwdznid5_3jvlpq3c",
+      target_agents: ["bot-a", "bot-b"],
+    },
+  });
+
+  expect(
+    validateCreateLoopInput({
+      channel_id: "chan-1",
+      mode: "okr_watch",
+      interval_ms: 900_000,
+      objective_id: "obj_watch_123",
+      watch_idle: true,
+      watch_supply: false,
+    }),
+  ).toEqual({
+    ok: true,
+    value: {
+      channel_id: "chan-1",
+      mode: "okr_watch",
+      interval_ms: 900_000,
+      objective_id: "obj_watch_123",
+      watch_idle: true,
+      watch_supply: false,
+    },
+  });
+
+  expect(
+    validateCreateLoopInput({
+      channel_id: "dm-dtr851",
+      mode: "prompt",
+      interval: "30m",
+      prompt: "  巡检汇报  ",
+    }),
+  ).toEqual({
+    ok: true,
+    value: {
+      channel_id: "dm-dtr851",
+      mode: "prompt",
+      interval: "30m",
+      prompt: "巡检汇报",
+    },
+  });
+});
+
+test("validateCreateLoopInput rejects path traversal, invalid intervals, missing objective_id, and secret prompts", () => {
+  expect(validateCreateLoopInput({ channel_id: "../admin", mode: "prompt", prompt: "hi" }).ok).toBe(false);
+  expect(validateCreateLoopInput({ channel_id: "chan-1", mode: "okr_wake" }).ok).toBe(false);
+  expect(validateCreateLoopInput({ channel_id: "chan-1", mode: "okr_wake", objective_id: "obj_ok_123", interval: "10s" }).ok).toBe(false);
+  expect(validateCreateLoopInput({ channel_id: "chan-1", mode: "okr_wake", objective_id: "obj_ok_123", interval: "5m", interval_ms: 600_000 }).ok).toBe(false);
+  expect(
+    validateCreateLoopInput({
+      channel_id: "chan-1",
+      mode: "prompt",
+      prompt: "bearer ac_live_secret_token_1234567890",
+    }),
+  ).toEqual({
+    ok: false,
+    error: "create_loop prompt rejected: appears to contain a secret or token.",
   });
 });

@@ -300,6 +300,127 @@ function validateTaskEvidenceInput(raw) {
   }
   return { ok: true, value: out };
 }
+var CREATE_LOOP_MODES = ["okr_wake", "okr_watch", "prompt"];
+var LOOP_MIN_INTERVAL_MS = 60000;
+var LOOP_MAX_INTERVAL_MS = 86400000;
+var SAFE_CHANNEL_OR_LOOP_ID_RE = /^[A-Za-z0-9_.:-]{1,128}$/;
+var SAFE_OBJECTIVE_ID_RE = /^[A-Za-z0-9_-]{6,80}$/;
+var SAFE_AGENT_HANDLE_RE = /^[A-Za-z0-9_-]{2,64}$/;
+var LOOP_PROMPT_CTRL_RE = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/;
+function parseLoopIntervalShorthandMs(raw) {
+  const m = raw.trim().match(/^(\d+)\s*(s|sec|m|min|h|hr|d)?$/i);
+  if (!m)
+    return null;
+  const n = Number(m[1]);
+  if (!Number.isSafeInteger(n) || n <= 0)
+    return null;
+  const unit = (m[2] || "m").toLowerCase();
+  const mult = unit === "s" || unit === "sec" ? 1000 : unit === "m" || unit === "min" ? 60000 : unit === "h" || unit === "hr" ? 3600000 : 86400000;
+  const ms = n * mult;
+  if (!Number.isSafeInteger(ms) || ms < LOOP_MIN_INTERVAL_MS || ms > LOOP_MAX_INTERVAL_MS) {
+    return null;
+  }
+  return ms;
+}
+function validateCreateLoopInput(args) {
+  const a = args && typeof args === "object" && !Array.isArray(args) ? args : {};
+  const channelId = typeof a.channel_id === "string" ? a.channel_id.trim() : "";
+  if (!SAFE_CHANNEL_OR_LOOP_ID_RE.test(channelId) || channelId.includes("..")) {
+    return { ok: false, error: "create_loop needs a valid channel_id." };
+  }
+  const rawMode = typeof a.mode === "string" ? a.mode.trim() : "";
+  if (!CREATE_LOOP_MODES.includes(rawMode)) {
+    return { ok: false, error: "create_loop mode must be one of okr_wake|okr_watch|prompt." };
+  }
+  const mode = rawMode;
+  let intervalMs;
+  let interval;
+  if (a.interval_ms !== undefined && a.interval_ms !== null) {
+    if (typeof a.interval_ms !== "number" || !Number.isSafeInteger(a.interval_ms) || a.interval_ms < LOOP_MIN_INTERVAL_MS || a.interval_ms > LOOP_MAX_INTERVAL_MS) {
+      return {
+        ok: false,
+        error: `create_loop interval_ms must be an integer in ${LOOP_MIN_INTERVAL_MS}..${LOOP_MAX_INTERVAL_MS} (1m..24h).`
+      };
+    }
+    intervalMs = a.interval_ms;
+  }
+  if (a.interval !== undefined && a.interval !== null) {
+    if (typeof a.interval !== "string" || !a.interval.trim()) {
+      return { ok: false, error: "create_loop interval must be a shorthand string such as 5m, 15m, 1h." };
+    }
+    const parsed = parseLoopIntervalShorthandMs(a.interval);
+    if (parsed === null) {
+      return { ok: false, error: "create_loop interval must resolve within 1m..24h (e.g. 5m, 15m, 30m, 1h)." };
+    }
+    interval = a.interval.trim();
+    if (intervalMs !== undefined && intervalMs !== parsed) {
+      return { ok: false, error: "create_loop interval and interval_ms disagree; pass only one or matching values." };
+    }
+  }
+  let targetAgents;
+  if (a.target_agents !== undefined && a.target_agents !== null) {
+    if (!Array.isArray(a.target_agents)) {
+      return { ok: false, error: "create_loop target_agents must be an array of agent handles." };
+    }
+    if (a.target_agents.length > 12) {
+      return { ok: false, error: "create_loop target_agents exceeds max 12 targets." };
+    }
+    const dedup = [];
+    const seenTargets = new Set;
+    for (const entry of a.target_agents) {
+      if (typeof entry !== "string") {
+        return { ok: false, error: "create_loop target_agents items must be strings." };
+      }
+      const handle = entry.trim().replace(/^@+/, "");
+      if (!handle)
+        continue;
+      if (!SAFE_AGENT_HANDLE_RE.test(handle)) {
+        return { ok: false, error: `create_loop invalid target agent handle "${handle}".` };
+      }
+      if (!seenTargets.has(handle)) {
+        seenTargets.add(handle);
+        dedup.push(handle);
+      }
+    }
+    if (dedup.length > 0)
+      targetAgents = dedup;
+  }
+  const out = {
+    channel_id: channelId,
+    mode,
+    ...intervalMs !== undefined ? { interval_ms: intervalMs } : interval ? { interval } : {},
+    ...targetAgents ? { target_agents: targetAgents } : {}
+  };
+  if (mode === "okr_wake" || mode === "okr_watch") {
+    const objectiveId = typeof a.objective_id === "string" ? a.objective_id.trim() : "";
+    if (!SAFE_OBJECTIVE_ID_RE.test(objectiveId)) {
+      return { ok: false, error: `create_loop mode="${mode}" requires a valid objective_id.` };
+    }
+    out.objective_id = objectiveId;
+    if (mode === "okr_watch") {
+      if (typeof a.watch_idle === "boolean")
+        out.watch_idle = a.watch_idle;
+      if (typeof a.watch_supply === "boolean")
+        out.watch_supply = a.watch_supply;
+    }
+    return { ok: true, value: out };
+  }
+  const prompt = typeof a.prompt === "string" ? a.prompt.trim() : "";
+  if (!prompt) {
+    return { ok: false, error: 'create_loop mode="prompt" requires a non-empty prompt.' };
+  }
+  if (prompt.length > 500) {
+    return { ok: false, error: "create_loop prompt exceeds max 500 characters." };
+  }
+  if (LOOP_PROMPT_CTRL_RE.test(prompt)) {
+    return { ok: false, error: "create_loop prompt contains disallowed control characters." };
+  }
+  if (EVIDENCE_SECRET_RE.test(prompt)) {
+    return { ok: false, error: "create_loop prompt rejected: appears to contain a secret or token." };
+  }
+  out.prompt = prompt;
+  return { ok: true, value: out };
+}
 
 // src/identity.ts
 function decideIdentity(i) {
@@ -574,6 +695,7 @@ var TOOL_ANNOTATIONS = {
   channel_brief: R,
   my_entitlements: R,
   list_loops: R,
+  create_loop: W,
   pause_loop: W,
   resume_loop: W,
   set_loop_interval: W,
@@ -3802,6 +3924,7 @@ var CORE_TOOL_NAMES = new Set([
   "save_skill",
   "sync_skill",
   "list_loops",
+  "create_loop",
   "pause_loop",
   "resume_loop",
   "set_loop_interval",
@@ -4477,8 +4600,40 @@ var ALL_TOOL_DEFS = [
     }
   },
   {
+    name: "create_loop",
+    description: "Create or idempotently ensure a server-side /loop schedule in an authorized channel (mode: okr_wake, okr_watch, or prompt). Calls POST /api/loops and verifies the resulting loop via /api/loops/mine.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        channel_id: { type: "string", description: "Target channel_id (group/project room for okr_wake/okr_watch; group or owner-agent DM for prompt)" },
+        mode: {
+          type: "string",
+          enum: [...CREATE_LOOP_MODES],
+          description: "okr_wake (zero-cost DAG dependency-clear/assignee wake), okr_watch (stalled-progress watch), or prompt (periodic tick)"
+        },
+        interval: { type: "string", description: "Cadence shorthand like 5m, 15m, 30m, 1h (1m..24h; defaults to 5m when interval_ms omitted)" },
+        interval_ms: {
+          type: "integer",
+          minimum: 60000,
+          maximum: 86400000,
+          description: "Optional cadence in milliseconds (integer 60000..86400000)"
+        },
+        objective_id: { type: "string", description: "Required when mode is okr_wake or okr_watch: active Objective ID anchored to channel_id" },
+        prompt: { type: "string", description: "Required when mode is prompt: plain periodic tick prompt (max 500 chars; no secrets)" },
+        target_agents: {
+          type: "array",
+          items: { type: "string" },
+          description: "Optional @target agent handles (max 12) for group loops"
+        },
+        watch_idle: { type: "boolean", description: "okr_watch only: also alert when all tasks sit idle in todo with zero doing" },
+        watch_supply: { type: "boolean", description: "okr_watch only: also alert when all tasks are done (task-supply exhausted)" }
+      },
+      required: ["channel_id", "mode"]
+    }
+  },
+  {
     name: "list_loops",
-    description: "List YOUR /loop records (server-side scheduler). Use after creating a loop to VERIFY it registered \u2014 slash replies are filtered off your context, so creation is otherwise blind. Shows loop_id, channel, interval, mode (okr_wake/static), next tick.",
+    description: "List YOUR /loop records (server-side scheduler). Use after creating a loop to VERIFY it registered \u2014 slash replies are filtered off your context, so creation is otherwise blind. Shows loop_id, channel, interval, mode (okr_wake/okr_watch/static), next tick.",
     inputSchema: { type: "object", properties: {} }
   },
   {
@@ -4541,7 +4696,7 @@ var ALL_TOOL_DEFS = [
   },
   {
     name: "channel_brief",
-    description: "Capability synopsis of a channel: who's here (and ONLINE right now, with human emails/phones masked), active agent_peers with their specialty capabilities, linked OKR objectives with open-task counts, available channel skills, loadable extended tool groups (with load state), recent docs, and what you can do. Call after joining or when entering an unfamiliar room.",
+    description: "Capability synopsis of a channel: who's here (and ONLINE right now, with human emails/phones masked), active agent_peers with their specialty capabilities, linked OKR objectives with open-task counts and okr_wake/okr_watch guard coverage (loop_summary), available channel skills, loadable extended tool groups (with load state), recent docs, and what you can do. Call after joining or when entering an unfamiliar room.",
     inputSchema: {
       type: "object",
       properties: { chat_id: { type: "string", description: "The channel_id" } },
@@ -5038,6 +5193,80 @@ async function setLoopPaused(args, action) {
     return { content: [{ type: "text", text: `${action}_loop error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
   }
 }
+HANDLERS.set("create_loop", async (args) => {
+  const checked = validateCreateLoopInput(args);
+  if (!checked.ok) {
+    return { content: [{ type: "text", text: checked.error }], isError: true };
+  }
+  try {
+    const r = await apiFetch(`${REST_URL}/api/loops`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${TOKEN}` },
+      body: JSON.stringify(checked.value)
+    });
+    const text = await r.text();
+    if (!r.ok) {
+      return { content: [{ type: "text", text: `create_loop failed (${r.status}): ${text.slice(0, 220)}` }], isError: true };
+    }
+    const createdPayload = JSON.parse(text);
+    const createdLoopId = String(createdPayload?.loop?.loop_id || "").trim();
+    if (!isSafeLoopIdentifier(createdLoopId)) {
+      return {
+        content: [{ type: "text", text: "create_loop returned an invalid loop_id; use list_loops before retrying." }],
+        isError: true
+      };
+    }
+    const verified = await apiFetch(`${REST_URL}/api/loops/mine`, {
+      headers: { Authorization: `Bearer ${TOKEN}` }
+    });
+    if (!verified.ok) {
+      return {
+        content: [{ type: "text", text: `create_loop was accepted (${createdLoopId}), but state verification failed (${verified.status}); use list_loops before retrying.` }],
+        isError: true
+      };
+    }
+    const state = await verified.json();
+    if (!Array.isArray(state?.loops)) {
+      return {
+        content: [{ type: "text", text: "create_loop was accepted, but state verification returned a malformed loops payload; use list_loops before retrying." }],
+        isError: true
+      };
+    }
+    const loop = state.loops.find((candidate) => candidate?.loop_id === createdLoopId);
+    if (!loop) {
+      return {
+        content: [{ type: "text", text: `create_loop was accepted, but loop ${createdLoopId} was absent from state verification; use list_loops before retrying.` }],
+        isError: true
+      };
+    }
+    const paused = loop.paused === true || loop.status === "paused" || loop.paused_at != null;
+    const active = loop.paused === false || loop.paused_at === null;
+    return {
+      content: [{
+        type: "text",
+        text: JSON.stringify({
+          ok: true,
+          deduplicated: Boolean(createdPayload?.deduplicated),
+          loop: {
+            loop_id: loop.loop_id || createdLoopId,
+            channel_id: loop.channel_id || checked.value.channel_id,
+            mode: loop.mode || (checked.value.mode === "prompt" ? "static" : checked.value.mode),
+            ...loop.objective_id ? { objective_id: loop.objective_id } : {},
+            interval_ms: loop.interval_ms,
+            ...Array.isArray(loop.target_agents) ? { target_agents: loop.target_agents } : {},
+            ...typeof loop.watch_idle === "boolean" ? { watch_idle: loop.watch_idle } : {},
+            ...typeof loop.watch_supply === "boolean" ? { watch_supply: loop.watch_supply } : {},
+            status: paused ? "paused" : loop.status || (active ? "active" : "unknown"),
+            paused,
+            next_tick_ms: paused ? null : loop.next_tick_ms ?? null
+          }
+        })
+      }]
+    };
+  } catch (e) {
+    return { content: [{ type: "text", text: `create_loop error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
+  }
+});
 HANDLERS.set("pause_loop", (args) => setLoopPaused(args, "pause"));
 HANDLERS.set("resume_loop", (args) => setLoopPaused(args, "resume"));
 var LOOP_INTERVAL_MIN_MS = 60000;
@@ -6839,10 +7068,11 @@ ${results}` }] };
           return null;
         }
       };
-      const [membersData, docsData, okrData, mcpCtx] = await Promise.all([
+      const [membersData, docsData, okrData, loopsData, mcpCtx] = await Promise.all([
         get(`/api/channels/${encodeURIComponent(chatId)}/members`),
         get(`/api/channels/${encodeURIComponent(chatId)}/docs`),
         get(`/api/channels/${encodeURIComponent(chatId)}/okr_snapshot`),
+        get(`/api/loops?channel_id=${encodeURIComponent(chatId)}`),
         fetchMcpChannelContext(chatId)
       ]);
       const membersReadable = membersData !== null;
@@ -6881,10 +7111,55 @@ ${results}` }] };
       const allDocs = docsData ? extractChannelDocsPayload(docsData) : [];
       const skills = allDocs.filter(isSkillDoc).map((d) => ({ doc_id: d.id, title: d.title }));
       const docs = allDocs.filter((d) => !isSkillDoc(d)).slice(0, 10).map((d) => ({ doc_id: d.id, title: d.title, kind: d.kind }));
-      const objectives = (okrData?.objectives || []).filter((o) => !o.archived).map((o) => {
-        const open = (okrData?.tasks || []).filter((t) => t.objective_id === o.id && t.status !== "done").length;
-        return { id: o.id, title: o.title, open_tasks: open };
+      const activeRawObjectives = (okrData?.objectives || []).filter((o) => !o.archived && o.id);
+      const visibleObjectiveIdSet = new Set(activeRawObjectives.map((o) => String(o.id)));
+      const hasMcpLoopSummary = Boolean(mcpCtx?.loop_summary && typeof mcpCtx.loop_summary === "object");
+      const hasRestLoopsArray = Array.isArray(loopsData?.loops);
+      const loopCoverageKnown = hasMcpLoopSummary || hasRestLoopsArray;
+      const wakeSet = new Set;
+      const watchSet = new Set;
+      if (hasMcpLoopSummary) {
+        for (const rawId of mcpCtx?.loop_summary?.okr_wake_objective_ids || []) {
+          const id = String(rawId || "");
+          if (visibleObjectiveIdSet.has(id))
+            wakeSet.add(id);
+        }
+        for (const rawId of mcpCtx?.loop_summary?.okr_watch_objective_ids || []) {
+          const id = String(rawId || "");
+          if (visibleObjectiveIdSet.has(id))
+            watchSet.add(id);
+        }
+      }
+      const activeRestLoops = hasRestLoopsArray ? loopsData.loops.filter((l) => l && l.paused !== true && l.status !== "paused" && l.paused_at == null) : [];
+      for (const l of activeRestLoops) {
+        const objId = typeof l?.objective_id === "string" ? l.objective_id : "";
+        if (!objId || !visibleObjectiveIdSet.has(objId))
+          continue;
+        if (l.mode === "okr_wake")
+          wakeSet.add(objId);
+        else if (l.mode === "okr_watch")
+          watchSet.add(objId);
+      }
+      const objectives = activeRawObjectives.map((o) => {
+        const id = String(o.id);
+        const open = (okrData?.tasks || []).filter((t) => t.objective_id === id && t.status !== "done").length;
+        return {
+          id,
+          title: o.title,
+          open_tasks: open,
+          ...loopCoverageKnown ? {
+            okr_wake_armed: wakeSet.has(id),
+            okr_watch_armed: watchSet.has(id)
+          } : {}
+        };
       });
+      const loopSummary = loopCoverageKnown ? {
+        active_loop_count: typeof mcpCtx?.loop_summary?.active_loop_count === "number" ? mcpCtx.loop_summary.active_loop_count : activeRestLoops.length,
+        ...typeof mcpCtx?.loop_summary?.my_active_loop_count === "number" ? { my_active_loop_count: mcpCtx.loop_summary.my_active_loop_count } : AGENT_ID && hasRestLoopsArray ? { my_active_loop_count: activeRestLoops.filter((l) => l?.agent_id === AGENT_ID).length } : {},
+        okr_wake_objective_ids: [...wakeSet],
+        okr_watch_objective_ids: [...watchSet],
+        unarmed_objective_ids: activeRawObjectives.map((o) => String(o.id)).filter((id) => !wakeSet.has(id) && !watchSet.has(id))
+      } : null;
       const toolGroups = TOOL_GROUPS.map((g) => ({
         name: g.name,
         summary: g.summary,
@@ -6898,6 +7173,7 @@ ${results}` }] };
         members: membersReadable ? { total: memberIds.length, online } : { total: null, note: "roster unreadable \u2014 you are likely not a member of this channel (or it does not exist)" },
         ...membersReadable ? { agent_peers: agentPeers } : {},
         okr_objectives: objectives,
+        ...loopSummary ? { loop_summary: loopSummary } : {},
         skills,
         docs,
         tool_groups: toolGroups,
@@ -6905,7 +7181,7 @@ ${results}` }] };
           "load_tool_group(name) reveals an extended group's tools (see tool_groups above; loaded:false = not yet active)",
           "load_skill(chat_id, doc_id) activates a channel skill; list_skills(chat_id) lists them",
           "okr_list / get_history for deeper context",
-          "/loop <interval> <prompt> works in joined groups and owner-agent DMs; keep group follow-ups in that group (okr: prefix = wake mode)"
+          "create_loop(channel_id, mode, ...) (or /loop <interval> <prompt>) arms okr_wake / okr_watch / prompt loops; check loop_summary.unarmed_objective_ids"
         ]
       });
     }
@@ -7248,7 +7524,9 @@ ${list}` }] };
         if (loops.length === 0)
           return { content: [{ type: "text", text: "No loops registered for you." }] };
         const lines = loops.map((l) => {
-          const mode = l.mode === "okr_wake" ? `okr_wake \u2192 ${l.objective_id}${Array.isArray(l.target_agents) && l.target_agents.length ? ` @[${l.target_agents.join(", ")}]` : ""}` : "static";
+          const targetSuffix = Array.isArray(l.target_agents) && l.target_agents.length ? ` @[${l.target_agents.join(", ")}]` : "";
+          const watchFlags = l.mode === "okr_watch" ? [l.watch_idle ? "+idle" : "", l.watch_supply ? "+supply" : ""].filter(Boolean).join("") : "";
+          const mode = l.mode === "okr_wake" ? `okr_wake \u2192 ${l.objective_id}${targetSuffix}` : l.mode === "okr_watch" ? `okr_watch${watchFlags ? `(${watchFlags})` : ""} \u2192 ${l.objective_id}${targetSuffix}` : `static${targetSuffix}`;
           const paused = l.paused === true || l.status === "paused" || l.paused_at != null;
           const nextIn = typeof l.next_tick_ms === "number" ? Math.max(0, Math.round((l.next_tick_ms - Date.now()) / 60000)) : "?";
           const state = paused ? "paused" : `${l.status || "active"} | next ~${nextIn}m`;

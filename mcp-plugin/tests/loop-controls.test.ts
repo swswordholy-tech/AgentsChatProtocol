@@ -22,12 +22,16 @@ let currentLoop: any = runningLoop;
 let stallMcpBody = false;
 let keepStoppedLoopAlive = false;
 let malformedLoopsVerification = false;
+let omitCreatedLoopOnVerify = false;
+let forceDeduplicatedCreate = false;
 
 beforeEach(() => {
   currentLoop = { ...runningLoop };
   stallMcpBody = false;
   keepStoppedLoopAlive = false;
   malformedLoopsVerification = false;
+  omitCreatedLoopOnVerify = false;
+  forceDeduplicatedCreate = false;
 });
 
 beforeAll(() => {
@@ -86,6 +90,29 @@ beforeAll(() => {
         const body = await req.json() as any;
         currentLoop = { ...currentLoop, interval_ms: body.interval_ms, next_tick_ms: 1730003600000 };
         return Response.json({ ok: true, loop_id: "loop-1", interval_ms: body.interval_ms });
+      }
+      if (req.method === "POST" && url.pathname === "/api/loops") {
+        const body = await req.json() as any;
+        const created = {
+          loop_id: forceDeduplicatedCreate ? "loop-existing-1" : "loop-created-1",
+          channel_id: body.channel_id,
+          interval_ms: body.interval_ms ?? 300000,
+          mode: body.mode === "prompt" ? "static" : body.mode,
+          ...(body.objective_id ? { objective_id: body.objective_id } : {}),
+          ...(Array.isArray(body.target_agents) ? { target_agents: body.target_agents } : {}),
+          ...(typeof body.watch_idle === "boolean" ? { watch_idle: body.watch_idle } : {}),
+          ...(typeof body.watch_supply === "boolean" ? { watch_supply: body.watch_supply } : {}),
+          status: "active",
+          paused: false,
+          next_tick_ms: 1730000300000,
+        };
+        if (!omitCreatedLoopOnVerify) {
+          currentLoop = created;
+        }
+        return Response.json(
+          { ok: true, ...(forceDeduplicatedCreate ? { deduplicated: true } : {}), loop: created },
+          { status: forceDeduplicatedCreate ? 200 : 201 },
+        );
       }
       if (req.method === "POST" && url.pathname === "/api/loops/loop-1/stop") {
         if (!keepStoppedLoopAlive) currentLoop = null;
@@ -309,5 +336,98 @@ describe("MCP loop controls", () => {
     ]);
     expect(res.get(3)?.result?.isError).toBe(true);
     expect(res.get(3)?.result?.content?.[0]?.text || "").toContain("malformed loops payload");
+  });
+
+  test("create_loop creates or deduplicates okr_wake / okr_watch loops, verifies /api/loops/mine, and list_loops formats okr_watch", async () => {
+    const { res } = await drive([
+      INIT,
+      INITED,
+      LIST,
+      callTool(3, "create_loop", {
+        channel_id: "channel-1",
+        mode: "okr_wake",
+        interval: "5m",
+        objective_id: "obj_mwdznid5_3jvlpq3c",
+        target_agents: ["@bot-a", "bot-b"],
+      }),
+      callTool(4, "create_loop", {
+        channel_id: "channel-1",
+        mode: "okr_watch",
+        interval_ms: 900000,
+        objective_id: "obj_mwdznid5_3jvlpq3c",
+        watch_idle: true,
+        watch_supply: true,
+        target_agents: ["bot-a"],
+      }),
+      callTool(5, "list_loops"),
+      callTool(6, "create_loop", {
+        channel_id: "channel-1",
+        mode: "prompt",
+        prompt: "leaked sk-proj-1234567890abcdefghijklmnop",
+      }),
+    ]);
+
+    const tools = res.get(2)?.result?.tools || [];
+    expect(tools.some((tool: any) => tool.name === "create_loop")).toBe(true);
+
+    const createdWake = JSON.parse(res.get(3)?.result?.content?.[0]?.text || "null");
+    expect(createdWake).toEqual({
+      ok: true,
+      deduplicated: false,
+      loop: {
+        loop_id: "loop-created-1",
+        channel_id: "channel-1",
+        mode: "okr_wake",
+        objective_id: "obj_mwdznid5_3jvlpq3c",
+        interval_ms: 300000,
+        target_agents: ["bot-a", "bot-b"],
+        status: "active",
+        paused: false,
+        next_tick_ms: 1730000300000,
+      },
+    });
+
+    const createdWatch = JSON.parse(res.get(4)?.result?.content?.[0]?.text || "null");
+    expect(createdWatch.loop.mode).toBe("okr_watch");
+    expect(createdWatch.loop.watch_idle).toBe(true);
+    expect(createdWatch.loop.watch_supply).toBe(true);
+
+    const listedText = res.get(5)?.result?.content?.[0]?.text || "";
+    expect(listedText).toContain("okr_watch(+idle+supply) → obj_mwdznid5_3jvlpq3c @[bot-a]");
+
+    expect(res.get(6)?.result?.isError).toBe(true);
+    expect(res.get(6)?.result?.content?.[0]?.text || "").toContain("appears to contain a secret");
+  });
+
+  test("create_loop surfaces deduplicated:true when server returns an existing loop", async () => {
+    forceDeduplicatedCreate = true;
+    const { res: dedupRes } = await drive([
+      INIT,
+      INITED,
+      callTool(3, "create_loop", {
+        channel_id: "channel-1",
+        mode: "okr_wake",
+        objective_id: "obj_mwdznid5_3jvlpq3c",
+      }),
+    ]);
+    const dedupJson = JSON.parse(dedupRes.get(3)?.result?.content?.[0]?.text || "null");
+    expect(dedupJson.ok).toBe(true);
+    expect(dedupJson.deduplicated).toBe(true);
+    expect(dedupJson.loop.loop_id).toBe("loop-existing-1");
+  });
+
+  test("create_loop fails closed if absent from /api/loops/mine", async () => {
+    omitCreatedLoopOnVerify = true;
+    const { res: missingRes } = await drive([
+      INIT,
+      INITED,
+      callTool(3, "create_loop", {
+        channel_id: "channel-1",
+        mode: "okr_wake",
+        objective_id: "obj_mwdznid5_3jvlpq3c",
+      }),
+    ]);
+    expect(missingRes.get(3)?.result?.isError).toBe(true);
+    expect(missingRes.get(3)?.result?.content?.[0]?.text || "").toContain("absent from state verification");
   });
 });
