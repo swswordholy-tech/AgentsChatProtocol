@@ -17,7 +17,7 @@
   "scripts": {
     "start": "bun src/server.ts",
     "dev": "bun --watch src/server.ts",
-    "test": "bun test tests dsh/tests && node --experimental-strip-types --test muse/tests/*.test.mjs",
+    "test": "bun test ./tests/ ./dsh/tests/ && node --experimental-strip-types --test muse/tests/*.test.mjs",
     "typecheck": "tsc --noEmit",
     "build": "bun scripts/build.mjs",
     "check:version": "bun scripts/check-version-sync.mjs",
@@ -74,7 +74,7 @@
     "url": "git+https://github.com/swswordholy-tech/AgentsChatProtocol.git",
     "directory": "mcp-plugin"
   },
-  "homepage": "https://agents-chat.com/landing",
+  "homepage": "https://agents-chat.com/",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
     "smol-toml": "^1.8.0",

@@ -20,10 +20,12 @@ const runningLoop = {
 };
 let currentLoop: any = runningLoop;
 let stallMcpBody = false;
+let keepStoppedLoopAlive = false;
 
 beforeEach(() => {
   currentLoop = { ...runningLoop };
   stallMcpBody = false;
+  keepStoppedLoopAlive = false;
 });
 
 beforeAll(() => {
@@ -67,7 +69,7 @@ beforeAll(() => {
         return Response.json({ jsonrpc: "2.0", id: rpc.id, error: { code: -32602, message: "unsupported" } });
       }
       if (req.method === "GET" && url.pathname === "/api/loops/mine") {
-        return Response.json({ loops: [currentLoop] });
+        return Response.json({ loops: currentLoop ? [currentLoop] : [] });
       }
       if (req.method === "POST" && url.pathname === "/api/loops/loop-1/pause") {
         currentLoop = { ...runningLoop, status: "paused", paused: true };
@@ -76,6 +78,15 @@ beforeAll(() => {
       if (req.method === "POST" && url.pathname === "/api/loops/loop-1/resume") {
         currentLoop = { ...runningLoop };
         return Response.json({ ok: true });
+      }
+      if (req.method === "POST" && url.pathname === "/api/loops/loop-1/interval") {
+        const body = await req.json() as any;
+        currentLoop = { ...currentLoop, interval_ms: body.interval_ms, next_tick_ms: 1730003600000 };
+        return Response.json({ ok: true, loop_id: "loop-1", interval_ms: body.interval_ms });
+      }
+      if (req.method === "POST" && url.pathname === "/api/loops/loop-1/stop") {
+        if (!keepStoppedLoopAlive) currentLoop = null;
+        return Response.json({ ok: true, stopped: "loop-1" });
       }
       return Response.json({ error: "not_found" }, { status: 404 });
     },
@@ -237,5 +248,47 @@ describe("MCP loop controls", () => {
     expect(text).toContain("loop-1");
     expect(text).toContain("paused");
     expect(text).not.toContain("next ~?m");
+  });
+
+  test("set_loop_interval and stop_loop validate inputs and verify authoritative /api/loops/mine state", async () => {
+    const { res } = await drive([
+      INIT,
+      INITED,
+      LIST,
+      callTool(3, "set_loop_interval", { loop_id: "loop-1", interval_ms: 1000 }),
+      callTool(4, "set_loop_interval", { loop_id: "../admin", interval_ms: 60000 }),
+      callTool(5, "set_loop_interval", { loop_id: "loop-1", interval_ms: 3600000 }),
+      callTool(6, "stop_loop", { loop_id: "loop-1" }),
+    ]);
+
+    const tools = res.get(2)?.result?.tools || [];
+    expect(tools.some((tool: any) => tool.name === "set_loop_interval")).toBe(true);
+    expect(tools.some((tool: any) => tool.name === "stop_loop")).toBe(true);
+
+    expect(res.get(3)?.result?.isError).toBe(true);
+    expect(res.get(4)?.result?.isError).toBe(true);
+
+    const updated = JSON.parse(res.get(5)?.result?.content?.[0]?.text || "null");
+    expect(updated).toEqual({
+      ok: true,
+      loop_id: "loop-1",
+      interval_ms: 3600000,
+      status: "active",
+      next_tick_ms: 1730003600000,
+    });
+
+    const stopped = JSON.parse(res.get(6)?.result?.content?.[0]?.text || "null");
+    expect(stopped).toEqual({ ok: true, stopped: "loop-1" });
+  });
+
+  test("stop_loop fails closed when /api/loops/mine still lists the loop", async () => {
+    keepStoppedLoopAlive = true;
+    const { res } = await drive([
+      INIT,
+      INITED,
+      callTool(3, "stop_loop", { loop_id: "loop-1" }),
+    ]);
+    expect(res.get(3)?.result?.isError).toBe(true);
+    expect(res.get(3)?.result?.content?.[0]?.text || "").toContain("still present in state verification");
   });
 });

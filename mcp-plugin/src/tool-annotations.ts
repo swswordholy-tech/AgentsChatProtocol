@@ -58,6 +58,8 @@ export const TOOL_ANNOTATIONS: Record<string, ToolAnnotation> = {
   list_loops: R,
   pause_loop: W,
   resume_loop: W,
+  set_loop_interval: W,
+  stop_loop: D,
   cloud_agent_wake_health: R,
   list_skills: R,
   list_tool_groups: R,

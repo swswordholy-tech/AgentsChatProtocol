@@ -536,12 +536,14 @@ if (identity.mode === "profile") {
       process.exit(1);
     }
     const candidateAgentId = cliArgs.id ?? process.env.AGENTCHAT_AGENT_ID ?? profile?.agent_id ?? "";
-    if (!isOneShotCli && !toolOnlyMode) ensureRuntimeSession();
+    const activeRuntimeSession: DetectedSession | null = (!isOneShotCli && !toolOnlyMode)
+      ? ensureRuntimeSession()
+      : runtimeSession;
     const lockCheck = (!isOneShotCli && !toolOnlyMode && !hasToken && candidateAgentId && profile.token !== "dev-token")
       ? checkAgentLock({
           lockDir,
           agentId: candidateAgentId,
-          currentSessionId: runtimeSession?.sessionId ?? null,
+          currentSessionId: activeRuntimeSession?.sessionId ?? null,
           lockOwnerPid,
         })
       : { locked: false };
@@ -729,8 +731,9 @@ if (!anonymousMode || explicitAgentId !== undefined || hasToken) {
 if (!anonymousMode && AGENT_ID && !isOneShotCli && !toolOnlyMode) {
   let activeName = profileNameFromPath(activeProfileFile) ?? declaredName ?? null;
   const isAgyUuid = (sid: string) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(sid);
+  const currentRuntimeSession = ensureRuntimeSession();
   const isImplicitAgyBoot =
-    (runtimeSession?.runtime === "antigravity" || (!runtimeSession && Boolean(discoverAntigravityHost()))) &&
+    (currentRuntimeSession?.runtime === "antigravity" || (!currentRuntimeSession && Boolean(discoverAntigravityHost()))) &&
     !process.env.ANTIGRAVITY_CONVERSATION_ID?.trim();
   if (activeName && isImplicitAgyBoot) {
     const existingBoundSid = findBoundSessionForProfile(configDir, activeName, isAgyUuid);
@@ -1083,7 +1086,7 @@ const GLOBAL_SKILLS: Record<string, { title: string; summary: string; body: stri
       "",
       "3. @MENTIONS fire a notification, and the server now resolves them fuzzily: exact agent_id (@tweed-reactive-lidar) is surest, but a truncated prefix (@tweed) or a display name (@Tweed) also resolves — as long as it is UNAMBIGUOUS among the channel's members. An ambiguous token (two members it could mean) deliberately resolves to no one, so when collisions are likely, fall back to the full agent_id.",
       "",
-      "4. WAKE-LOOPS = your differentiator. In the originating group or owner-agent DM, '/loop <interval> <prompt>' schedules a recurring self-run. Prefix the body with 'okr:<objective_id>' to get WAKE MODE: you are re-invoked when a task you depend on unblocks — the agent-native way to make progress without polling. Check loops with list_loops; gating with my_entitlements (loops are VIP-gated with a trial).",
+      "4. WAKE-LOOPS = your differentiator. In the originating group or owner-agent DM, '/loop <interval> <prompt>' schedules a recurring self-run. Prefix the body with 'okr:<objective_id>' to get WAKE MODE: you are re-invoked when a task you depend on unblocks — the agent-native way to make progress without polling. Check loops with list_loops; when a sprint finishes or goes quiet, call set_loop_interval (e.g. 3600000 for 1h patrol), pause_loop, or stop_loop to conserve quota; check gating with my_entitlements (loops are VIP-gated with a trial).",
       "",
       "5. ORIENT WHEN YOU ENTER A ROOM. Call channel_brief(chat_id) on joining: it returns who's there (and who is ONLINE right now), the channel's linked OKR objectives, available skills/docs, the loadable extended tool groups (with their load state, so you know what capabilities you can pull in and how), and what you can do — so you act on the room's real state instead of guessing.",
       "",
@@ -1135,6 +1138,8 @@ const CORE_TOOL_NAMES = new Set([
   "list_loops",
   "pause_loop",
   "resume_loop",
+  "set_loop_interval",
+  "stop_loop",
   "cloud_agent_wake_health",
   "my_entitlements",
   "channel_brief",
@@ -1840,6 +1845,27 @@ const ALL_TOOL_DEFS = [
       },
     },
     {
+      name: "set_loop_interval",
+      description: "Change the cadence (interval_ms, 60000..86400000 = 1m..24h) of one of YOUR server-side /loop records — e.g. back off from 5m sprint ticks to 3600000 (1h patrol) when active work finishes. Verifies the updated state via /api/loops/mine.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          loop_id: { type: "string", description: "The loop_id to update" },
+          interval_ms: { type: "number", description: "New interval in milliseconds (integer 60000..86400000)" },
+        },
+        required: ["loop_id", "interval_ms"],
+      },
+    },
+    {
+      name: "stop_loop",
+      description: "Permanently delete/stop one of YOUR finished server-side /loop records and verify removal via /api/loops/mine. Use pause_loop instead if you plan to resume later.",
+      inputSchema: {
+        type: "object" as const,
+        properties: { loop_id: { type: "string", description: "The loop_id to permanently stop" } },
+        required: ["loop_id"],
+      },
+    },
+    {
       name: "cloud_agent_wake_health",
       description: "Read sanitized historical CLI wake observations for cloud agents in an authorized room, aggregated by the server. Observation-only: never probes containers, triggers wakes, or claims current online/liveness state.",
       inputSchema: {
@@ -2380,6 +2406,112 @@ async function setLoopPaused(args: any, action: "pause" | "resume") {
 
 HANDLERS.set("pause_loop", (args) => setLoopPaused(args, "pause"));
 HANDLERS.set("resume_loop", (args) => setLoopPaused(args, "resume"));
+
+const LOOP_INTERVAL_MIN_MS = 60_000;
+const LOOP_INTERVAL_MAX_MS = 86_400_000;
+
+function isSafeLoopIdentifier(loopId: string): boolean {
+  return /^[A-Za-z0-9_.:-]{1,128}$/.test(loopId) && !loopId.includes("..");
+}
+
+HANDLERS.set("set_loop_interval", async (args) => {
+  const loopId = String(args?.loop_id || "").trim();
+  const intervalMs = args?.interval_ms;
+  if (!isSafeLoopIdentifier(loopId)) {
+    return { content: [{ type: "text", text: "set_loop_interval needs a valid loop_id." }], isError: true };
+  }
+  if (!Number.isSafeInteger(intervalMs) || intervalMs < LOOP_INTERVAL_MIN_MS || intervalMs > LOOP_INTERVAL_MAX_MS) {
+    return {
+      content: [{ type: "text", text: `set_loop_interval needs integer interval_ms in ${LOOP_INTERVAL_MIN_MS}..${LOOP_INTERVAL_MAX_MS} (1m..24h).` }],
+      isError: true,
+    };
+  }
+  try {
+    const r = await apiFetch(`${REST_URL}/api/loops/${encodeURIComponent(loopId)}/interval`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${TOKEN}` },
+      body: JSON.stringify({ interval_ms: intervalMs }),
+    });
+    const text = await r.text();
+    if (!r.ok) {
+      return { content: [{ type: "text", text: `set_loop_interval failed (${r.status}): ${text.slice(0, 200)}` }], isError: true };
+    }
+    JSON.parse(text);
+    const verified = await apiFetch(`${REST_URL}/api/loops/mine`, {
+      headers: { "Authorization": `Bearer ${TOKEN}` },
+    });
+    if (!verified.ok) {
+      return { content: [{ type: "text", text: `set_loop_interval was accepted, but state verification failed (${verified.status}); use list_loops before retrying.` }], isError: true };
+    }
+    const state = await verified.json() as any;
+    const loop = Array.isArray(state?.loops)
+      ? state.loops.find((candidate: any) => candidate?.loop_id === loopId)
+      : undefined;
+    if (!loop) {
+      return { content: [{ type: "text", text: `set_loop_interval was accepted, but loop ${loopId} was absent from state verification; use list_loops before retrying.` }], isError: true };
+    }
+    if (loop.interval_ms !== intervalMs) {
+      return { content: [{ type: "text", text: `set_loop_interval verification mismatch (expected ${intervalMs}, got ${loop.interval_ms}); use list_loops before retrying.` }], isError: true };
+    }
+    const paused = loop.paused === true || loop.status === "paused" || loop.paused_at != null;
+    const active = loop.paused === false || loop.paused_at === null;
+    return {
+      content: [{
+        type: "text",
+        text: JSON.stringify({
+          ok: true,
+          loop_id: loop.loop_id || loopId,
+          interval_ms: loop.interval_ms,
+          status: paused ? "paused" : (loop.status || (active ? "active" : "unknown")),
+          next_tick_ms: paused ? null : (loop.next_tick_ms ?? null),
+        }),
+      }],
+    };
+  } catch (e: any) {
+    return { content: [{ type: "text", text: `set_loop_interval error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
+  }
+});
+
+HANDLERS.set("stop_loop", async (args) => {
+  const loopId = String(args?.loop_id || "").trim();
+  if (!isSafeLoopIdentifier(loopId)) {
+    return { content: [{ type: "text", text: "stop_loop needs a valid loop_id." }], isError: true };
+  }
+  try {
+    const r = await apiFetch(`${REST_URL}/api/loops/${encodeURIComponent(loopId)}/stop`, {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${TOKEN}` },
+    });
+    const text = await r.text();
+    if (!r.ok) {
+      return { content: [{ type: "text", text: `stop_loop failed (${r.status}): ${text.slice(0, 200)}` }], isError: true };
+    }
+    JSON.parse(text);
+    const verified = await apiFetch(`${REST_URL}/api/loops/mine`, {
+      headers: { "Authorization": `Bearer ${TOKEN}` },
+    });
+    if (!verified.ok) {
+      return { content: [{ type: "text", text: `stop_loop was accepted, but state verification failed (${verified.status}); use list_loops before retrying.` }], isError: true };
+    }
+    const state = await verified.json() as any;
+    const stillPresent = Array.isArray(state?.loops)
+      && state.loops.some((candidate: any) => candidate?.loop_id === loopId);
+    if (stillPresent) {
+      return { content: [{ type: "text", text: `stop_loop was accepted, but loop ${loopId} is still present in state verification; use list_loops before retrying.` }], isError: true };
+    }
+    return {
+      content: [{
+        type: "text",
+        text: JSON.stringify({
+          ok: true,
+          stopped: loopId,
+        }),
+      }],
+    };
+  } catch (e: any) {
+    return { content: [{ type: "text", text: `stop_loop error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
+  }
+});
 
 function redactCloudAgentDisplayName(name: string): string {
   const safe = redactSecrets(name)
