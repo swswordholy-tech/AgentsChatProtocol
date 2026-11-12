@@ -1,7 +1,7 @@
 // Unit tests for validateToolArgs (src/argcheck.ts) — runtime input validation
 // against a tool's declared inputSchema. Run with `bun test`.
 import { test, expect } from "bun:test";
-import { validateToolArgs } from "../src/argcheck.ts";
+import { validateTaskEvidenceInput, validateToolArgs } from "../src/argcheck.ts";
 
 const schema = {
   type: "object",
@@ -68,4 +68,49 @@ test("object type accepts plain objects, rejects arrays", () => {
   const s = { type: "object", properties: { o: { type: "object" } }, required: [] };
   expect(validateToolArgs(s, { o: { k: 1 } })).toBe(null);
   expect(validateToolArgs(s, { o: [1, 2] })).toContain("must be object");
+});
+
+test("validateTaskEvidenceInput normalizes valid items and supports clearing", () => {
+  expect(validateTaskEvidenceInput([])).toEqual({ ok: true, value: [] });
+  expect(validateTaskEvidenceInput(null)).toEqual({ ok: true, value: [] });
+
+  const valid = validateTaskEvidenceInput([
+    { kind: "commit", ref: " 548958af ", note: "  Bun 145/145\npass  " },
+    { kind: "probe", ref: "bun test okr-task-evidence" },
+  ]);
+  expect(valid).toEqual({
+    ok: true,
+    value: [
+      { kind: "commit", ref: "548958af", note: "Bun 145/145 pass" },
+      { kind: "probe", ref: "bun test okr-task-evidence" },
+    ],
+  });
+});
+
+test("validateTaskEvidenceInput rejects malformed items, duplicates, and leaked secrets", () => {
+  expect(validateTaskEvidenceInput("nope").ok).toBe(false);
+  expect(validateTaskEvidenceInput([{ kind: "unknown", ref: "abc" }]).ok).toBe(false);
+  expect(validateTaskEvidenceInput([{ kind: "commit", ref: "   " }]).ok).toBe(false);
+  expect(
+    validateTaskEvidenceInput([
+      { kind: "commit", ref: "548958af" },
+      { kind: "commit", ref: " 548958af " },
+    ]).ok,
+  ).toBe(false);
+  expect(
+    validateTaskEvidenceInput([
+      { kind: "external", ref: "ac_live_secret_token_1234567890" },
+    ]),
+  ).toEqual({
+    ok: false,
+    error: "evidence[0].ref rejected: appears to contain a secret or token",
+  });
+  expect(
+    validateTaskEvidenceInput([
+      { kind: "doc", ref: "doc-1", note: "token sk-proj-1234567890abcdefghijklmnop" },
+    ]),
+  ).toEqual({
+    ok: false,
+    error: "evidence[0].note rejected: appears to contain a secret or token",
+  });
 });

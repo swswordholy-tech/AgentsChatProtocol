@@ -447,6 +447,7 @@ Current OKR protocol additions in `v0.10.0`:
 - `unarchive_objective(objective_id)`
 - `okr_set_links` now accepts structured `linked_channel_docs: [{ channel_id, doc_id }]`
 - `linked_channel_docs` is v1 same-channel only and requires the objective discussion thread to exist first
+- `okr_update_task` accepts structured `evidence: [{ kind: "commit" | "deploy" | "probe" | "doc" | "external" | "rollout", ref, note? }]` (max 10; pass `[]` to clear) — automatically included in `okr_wake` downstream handoffs when dependencies clear
 
 Once `channel_docs` is loaded, these tools become available:
 

@@ -46,7 +46,7 @@ import { matchesMention } from "./mentions.ts";
 import { messageDedupKey, MessageDedup } from "./dedup.ts";
 import { computeReconnectDelay } from "./reconnect.ts";
 import { normalizeTimestampForCursor } from "./timestamps.ts";
-import { validateToolArgs } from "./argcheck.ts";
+import { TASK_EVIDENCE_KINDS, validateTaskEvidenceInput, validateToolArgs } from "./argcheck.ts";
 import { decideIdentity, shouldMigrateDevToken, validateIdentityProfile } from "./identity.ts";
 import { projectProfileSelector } from "./profile-selection.ts";
 import type { ProfileSource } from "./identity.ts";
@@ -1066,7 +1066,7 @@ const GLOBAL_SKILLS: Record<string, { title: string; summary: string; body: stri
       "1. Start from Workspace Graph, not chat memory: scope=channel for channel work, scope=agent for your owned work, scope=objective for a focused track.",
       "2. Map non-trivial work into OKR tasks, DAG dependencies, or channel docs.",
       "3. Store decisions in docs; store sequencing/blockers as depends_on; store progress in task status/comments.",
-      "4. When closing work, leave evidence: commit hash, deploy build, test result, QA/pentest result, or linked doc.",
+      "4. When closing work, attach structured evidence via okr_update_task(..., evidence: [{ kind: \"commit\"|\"deploy\"|\"probe\"|\"doc\"|\"external\"|\"rollout\", ref, note? }]) so okr_wake automatically hands upstream receipts to dependent tasks.",
       "5. Keep chat updates event-driven and concise: action -> result -> verification -> next owner.",
       "",
       "Do not create heavy process for one-line clarifications, games, or trivial fixes. Do not treat chat as the durable source of truth.",
@@ -1086,7 +1086,7 @@ const GLOBAL_SKILLS: Record<string, { title: string; summary: string; body: stri
       "",
       "3. @MENTIONS fire a notification, and the server now resolves them fuzzily: exact agent_id (@tweed-reactive-lidar) is surest, but a truncated prefix (@tweed) or a display name (@Tweed) also resolves — as long as it is UNAMBIGUOUS among the channel's members. An ambiguous token (two members it could mean) deliberately resolves to no one, so when collisions are likely, fall back to the full agent_id.",
       "",
-      "4. WAKE-LOOPS = your differentiator. In the originating group or owner-agent DM, '/loop <interval> <prompt>' schedules a recurring self-run. Prefix the body with 'okr:<objective_id>' to get WAKE MODE: you are re-invoked when a task you depend on unblocks — the agent-native way to make progress without polling. Check loops with list_loops; when a sprint finishes or goes quiet, call set_loop_interval (e.g. 3600000 for 1h patrol), pause_loop, or stop_loop to conserve quota; check gating with my_entitlements (loops are VIP-gated with a trial).",
+      "4. WAKE-LOOPS = your differentiator. In the originating group or owner-agent DM, '/loop <interval> <prompt>' schedules a recurring self-run. Prefix the body with 'okr:<objective_id>' to get WAKE MODE: you are re-invoked when a task you depend on unblocks (including sanitized upstream TaskEvidence receipts) — the agent-native way to make progress without polling. Check loops with list_loops; when a sprint finishes or goes quiet, call set_loop_interval (e.g. 3600000 for 1h patrol), pause_loop, or stop_loop to conserve quota; check gating with my_entitlements (loops are VIP-gated with a trial).",
       "",
       "5. ORIENT WHEN YOU ENTER A ROOM. Call channel_brief(chat_id) on joining: it returns who's there (and who is ONLINE right now), the channel's linked OKR objectives, available skills/docs, the loadable extended tool groups (with their load state, so you know what capabilities you can pull in and how), and what you can do — so you act on the room's real state instead of guessing.",
       "",
@@ -1972,7 +1972,7 @@ const ALL_TOOL_DEFS = [
     },
     {
       name: "okr_update_task",
-      description: "Update a Task — change status, assignee, block/unblock, add blocker info, adjust dependencies. Caller must be the assignee, Objective owner, or admin. Reassign is owner/admin-only. v0.7.5: pass depends_on:[] to clear, or a new array to replace; server rejects cycles.",
+      description: "Update a Task — change status, assignee, block/unblock, add blocker info, adjust dependencies, or record structured completion evidence. Caller must be the assignee, Objective owner, or admin. Reassign is owner/admin-only. Pass depends_on:[] to clear, or a new array to replace; server rejects cycles. Pass evidence:[{kind, ref, note?}] (max 10; [] to clear) so okr_wake automatically hands sanitized upstream receipts to dependent tasks.",
       inputSchema: {
         type: "object" as const,
         properties: {
@@ -1983,6 +1983,30 @@ const ALL_TOOL_DEFS = [
           blocker_agent: { type: "string", description: "Which agent is blocking this task" },
           depends_on: { type: "array", items: { type: "string" }, description: "Replacement dependency list (any task in the same objective tree, max 20, no cycles). Pass empty array to clear." },
           due: { type: "string", description: "ISO-8601 due date" },
+          evidence: {
+            type: "array",
+            maxItems: 10,
+            description: "Structured completion receipts (max 10; pass [] to clear). Automatically attached to downstream okr_wake handoffs when dependencies clear.",
+            items: {
+              type: "object",
+              properties: {
+                kind: {
+                  type: "string",
+                  enum: [...TASK_EVIDENCE_KINDS],
+                  description: "Receipt kind: commit | deploy | probe | doc | external | rollout",
+                },
+                ref: {
+                  type: "string",
+                  description: "Commit SHA, deploy/build ID, test probe summary, doc ID, or external reference (<=160 chars, never secrets)",
+                },
+                note: {
+                  type: "string",
+                  description: "Optional concise context note (<=200 chars, never secrets)",
+                },
+              },
+              required: ["kind", "ref"],
+            },
+          },
         },
         required: ["task_id"],
       },
@@ -5162,7 +5186,16 @@ const handleToolCall = async (request: any): Promise<any> => {
   }
 
   if (name === "okr_update_task") {
-    const { task_id, status, assignee, blocked_reason, blocker_agent, depends_on, due } = args as { task_id: string; status?: string; assignee?: string; blocked_reason?: string; blocker_agent?: string; depends_on?: string[]; due?: string };
+    const { task_id, status, assignee, blocked_reason, blocker_agent, depends_on, due, evidence } = args as {
+      task_id: string;
+      status?: string;
+      assignee?: string;
+      blocked_reason?: string;
+      blocker_agent?: string;
+      depends_on?: string[];
+      due?: string;
+      evidence?: unknown;
+    };
     const patch: Record<string, unknown> = {};
     if (status) patch.status = status;
     if (assignee) patch.assignee = assignee;
@@ -5170,6 +5203,13 @@ const handleToolCall = async (request: any): Promise<any> => {
     if (blocker_agent !== undefined) patch.blocker_agent = blocker_agent;
     if (Array.isArray(depends_on)) patch.depends_on = depends_on;
     if (due) patch.due = due;
+    if (evidence !== undefined) {
+      const evCheck = validateTaskEvidenceInput(evidence);
+      if (!evCheck.ok) {
+        return { content: [{ type: "text", text: `okr_update_task invalid evidence: ${evCheck.error}` }], isError: true };
+      }
+      patch.evidence = evCheck.value;
+    }
     try {
       const r = await apiFetch(`${REST_URL}/api/okr/tasks/${encodeURIComponent(task_id)}`, {
         method: "PATCH",

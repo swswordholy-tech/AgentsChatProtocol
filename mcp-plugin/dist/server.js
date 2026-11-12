@@ -209,6 +209,97 @@ function matchesJsonType(val, expected) {
     }
   });
 }
+var TASK_EVIDENCE_KINDS = [
+  "commit",
+  "deploy",
+  "probe",
+  "doc",
+  "external",
+  "rollout"
+];
+var TASK_EVIDENCE_CAP = 10;
+var TASK_EVIDENCE_REF_MAX = 160;
+var TASK_EVIDENCE_NOTE_MAX = 200;
+var EVIDENCE_CTRL_RE = /[\u0000-\u001f\u007f]/;
+var EVIDENCE_SECRET_RE = /(?:ac_[A-Za-z0-9_-]{16,}|eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+|(?:sk|rk)-(?:live-|test-|proj-|ant-)?[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|AIza[0-9A-Za-z_-]{30,}|AKIA[0-9A-Z]{16})/;
+function isTaskEvidenceKind(v) {
+  return typeof v === "string" && TASK_EVIDENCE_KINDS.includes(v);
+}
+function validateTaskEvidenceInput(raw) {
+  if (raw === null)
+    return { ok: true, value: [] };
+  if (!Array.isArray(raw)) {
+    return { ok: false, error: "evidence must be an array (max 10 items; pass [] to clear)" };
+  }
+  if (raw.length === 0)
+    return { ok: true, value: [] };
+  if (raw.length > TASK_EVIDENCE_CAP) {
+    return { ok: false, error: `evidence exceeds max ${TASK_EVIDENCE_CAP} items` };
+  }
+  const out = [];
+  const seen = new Set;
+  for (let i = 0;i < raw.length; i++) {
+    const item = raw[i];
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      return { ok: false, error: `evidence[${i}] must be an object` };
+    }
+    const rawKind = item.kind;
+    const rawRef = item.ref;
+    const rawNote = item.note;
+    if (!isTaskEvidenceKind(rawKind)) {
+      return {
+        ok: false,
+        error: `evidence[${i}].kind must be one of ${TASK_EVIDENCE_KINDS.join("|")}`
+      };
+    }
+    if (typeof rawRef !== "string") {
+      return { ok: false, error: `evidence[${i}].ref must be a non-empty string` };
+    }
+    const ref = rawRef.trim();
+    if (!ref) {
+      return { ok: false, error: `evidence[${i}].ref must be a non-empty string` };
+    }
+    if (ref.length > TASK_EVIDENCE_REF_MAX) {
+      return { ok: false, error: `evidence[${i}].ref exceeds ${TASK_EVIDENCE_REF_MAX} chars` };
+    }
+    if (EVIDENCE_CTRL_RE.test(ref)) {
+      return { ok: false, error: `evidence[${i}].ref contains disallowed control characters` };
+    }
+    if (EVIDENCE_SECRET_RE.test(ref)) {
+      return { ok: false, error: `evidence[${i}].ref rejected: appears to contain a secret or token` };
+    }
+    let note;
+    if (rawNote !== undefined && rawNote !== null) {
+      if (typeof rawNote !== "string") {
+        return { ok: false, error: `evidence[${i}].note must be a string` };
+      }
+      const normalizedNote = rawNote.replace(/[\r\n\t]+/g, " ").trim();
+      if (normalizedNote.length > TASK_EVIDENCE_NOTE_MAX) {
+        return { ok: false, error: `evidence[${i}].note exceeds ${TASK_EVIDENCE_NOTE_MAX} chars` };
+      }
+      if (EVIDENCE_CTRL_RE.test(normalizedNote)) {
+        return { ok: false, error: `evidence[${i}].note contains disallowed control characters` };
+      }
+      if (normalizedNote.length > 0) {
+        if (EVIDENCE_SECRET_RE.test(normalizedNote)) {
+          return { ok: false, error: `evidence[${i}].note rejected: appears to contain a secret or token` };
+        }
+        note = normalizedNote;
+      }
+    }
+    const dedupKey = `${rawKind}:${ref}`;
+    if (seen.has(dedupKey)) {
+      return { ok: false, error: `duplicate evidence entry "${dedupKey}"` };
+    }
+    seen.add(dedupKey);
+    out.push({
+      kind: rawKind,
+      ref,
+      ...note ? { note } : {}
+    });
+  }
+  return { ok: true, value: out };
+}
 
 // src/identity.ts
 function decideIdentity(i) {
@@ -3658,7 +3749,7 @@ var GLOBAL_SKILLS = {
       "1. Start from Workspace Graph, not chat memory: scope=channel for channel work, scope=agent for your owned work, scope=objective for a focused track.",
       "2. Map non-trivial work into OKR tasks, DAG dependencies, or channel docs.",
       "3. Store decisions in docs; store sequencing/blockers as depends_on; store progress in task status/comments.",
-      "4. When closing work, leave evidence: commit hash, deploy build, test result, QA/pentest result, or linked doc.",
+      '4. When closing work, attach structured evidence via okr_update_task(..., evidence: [{ kind: "commit"|"deploy"|"probe"|"doc"|"external"|"rollout", ref, note? }]) so okr_wake automatically hands upstream receipts to dependent tasks.',
       "5. Keep chat updates event-driven and concise: action -> result -> verification -> next owner.",
       "",
       "Do not create heavy process for one-line clarifications, games, or trivial fixes. Do not treat chat as the durable source of truth."
@@ -3679,7 +3770,7 @@ var GLOBAL_SKILLS = {
       "",
       "3. @MENTIONS fire a notification, and the server now resolves them fuzzily: exact agent_id (@tweed-reactive-lidar) is surest, but a truncated prefix (@tweed) or a display name (@Tweed) also resolves \u2014 as long as it is UNAMBIGUOUS among the channel's members. An ambiguous token (two members it could mean) deliberately resolves to no one, so when collisions are likely, fall back to the full agent_id.",
       "",
-      "4. WAKE-LOOPS = your differentiator. In the originating group or owner-agent DM, '/loop <interval> <prompt>' schedules a recurring self-run. Prefix the body with 'okr:<objective_id>' to get WAKE MODE: you are re-invoked when a task you depend on unblocks \u2014 the agent-native way to make progress without polling. Check loops with list_loops; when a sprint finishes or goes quiet, call set_loop_interval (e.g. 3600000 for 1h patrol), pause_loop, or stop_loop to conserve quota; check gating with my_entitlements (loops are VIP-gated with a trial).",
+      "4. WAKE-LOOPS = your differentiator. In the originating group or owner-agent DM, '/loop <interval> <prompt>' schedules a recurring self-run. Prefix the body with 'okr:<objective_id>' to get WAKE MODE: you are re-invoked when a task you depend on unblocks (including sanitized upstream TaskEvidence receipts) \u2014 the agent-native way to make progress without polling. Check loops with list_loops; when a sprint finishes or goes quiet, call set_loop_interval (e.g. 3600000 for 1h patrol), pause_loop, or stop_loop to conserve quota; check gating with my_entitlements (loops are VIP-gated with a trial).",
       "",
       "5. ORIENT WHEN YOU ENTER A ROOM. Call channel_brief(chat_id) on joining: it returns who's there (and who is ONLINE right now), the channel's linked OKR objectives, available skills/docs, the loadable extended tool groups (with their load state, so you know what capabilities you can pull in and how), and what you can do \u2014 so you act on the room's real state instead of guessing.",
       "",
@@ -4536,7 +4627,7 @@ var ALL_TOOL_DEFS = [
   },
   {
     name: "okr_update_task",
-    description: "Update a Task \u2014 change status, assignee, block/unblock, add blocker info, adjust dependencies. Caller must be the assignee, Objective owner, or admin. Reassign is owner/admin-only. v0.7.5: pass depends_on:[] to clear, or a new array to replace; server rejects cycles.",
+    description: "Update a Task \u2014 change status, assignee, block/unblock, add blocker info, adjust dependencies, or record structured completion evidence. Caller must be the assignee, Objective owner, or admin. Reassign is owner/admin-only. Pass depends_on:[] to clear, or a new array to replace; server rejects cycles. Pass evidence:[{kind, ref, note?}] (max 10; [] to clear) so okr_wake automatically hands sanitized upstream receipts to dependent tasks.",
     inputSchema: {
       type: "object",
       properties: {
@@ -4546,7 +4637,31 @@ var ALL_TOOL_DEFS = [
         blocked_reason: { type: "string", description: "Why is this task blocked (max 500 chars)" },
         blocker_agent: { type: "string", description: "Which agent is blocking this task" },
         depends_on: { type: "array", items: { type: "string" }, description: "Replacement dependency list (any task in the same objective tree, max 20, no cycles). Pass empty array to clear." },
-        due: { type: "string", description: "ISO-8601 due date" }
+        due: { type: "string", description: "ISO-8601 due date" },
+        evidence: {
+          type: "array",
+          maxItems: 10,
+          description: "Structured completion receipts (max 10; pass [] to clear). Automatically attached to downstream okr_wake handoffs when dependencies clear.",
+          items: {
+            type: "object",
+            properties: {
+              kind: {
+                type: "string",
+                enum: [...TASK_EVIDENCE_KINDS],
+                description: "Receipt kind: commit | deploy | probe | doc | external | rollout"
+              },
+              ref: {
+                type: "string",
+                description: "Commit SHA, deploy/build ID, test probe summary, doc ID, or external reference (<=160 chars, never secrets)"
+              },
+              note: {
+                type: "string",
+                description: "Optional concise context note (<=200 chars, never secrets)"
+              }
+            },
+            required: ["kind", "ref"]
+          }
+        }
       },
       required: ["task_id"]
     }
@@ -7464,7 +7579,7 @@ ${list}` }] };
       }
     }
     if (name === "okr_update_task") {
-      const { task_id, status, assignee, blocked_reason, blocker_agent, depends_on, due } = args;
+      const { task_id, status, assignee, blocked_reason, blocker_agent, depends_on, due, evidence } = args;
       const patch = {};
       if (status)
         patch.status = status;
@@ -7478,6 +7593,13 @@ ${list}` }] };
         patch.depends_on = depends_on;
       if (due)
         patch.due = due;
+      if (evidence !== undefined) {
+        const evCheck = validateTaskEvidenceInput(evidence);
+        if (!evCheck.ok) {
+          return { content: [{ type: "text", text: `okr_update_task invalid evidence: ${evCheck.error}` }], isError: true };
+        }
+        patch.evidence = evCheck.value;
+      }
       try {
         const r = await apiFetch(`${REST_URL}/api/okr/tasks/${encodeURIComponent(task_id)}`, {
           method: "PATCH",
