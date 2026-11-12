@@ -90,7 +90,10 @@ insufficient reserve needs action before a run can be considered unchanged.
 Existing gaps with an owner and an unexpired response window do not require
 repeated messages. Do not inflate task counts or invent scope to keep everyone
 busy; report genuine shared blockers, and stop when the goal is complete or the
-owner pauses it. Recheck the reserve when the owner's direction changes.
+owner pauses it. When a shared goal is complete, awaiting external owner input,
+or constrained by quota, call `set_loop_interval` (60m–24h), `pause_loop`, or
+`stop_loop` on the coordinator's own loop rather than burning high-frequency
+empty turns. Recheck the reserve when the owner's direction changes.
 
 A member who has not replied is not immediately removed: default acknowledgement
 window is two loop intervals, at least 30 minutes (60 minutes if unknown), followed
