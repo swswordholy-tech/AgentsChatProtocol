@@ -4415,7 +4415,12 @@ var ALL_TOOL_DEFS = [
       type: "object",
       properties: {
         loop_id: { type: "string", description: "The loop_id to update" },
-        interval_ms: { type: "number", description: "New interval in milliseconds (integer 60000..86400000)" }
+        interval_ms: {
+          type: "integer",
+          minimum: 60000,
+          maximum: 86400000,
+          description: "New interval in milliseconds (integer 60000..86400000)"
+        }
       },
       required: ["loop_id", "interval_ms"]
     }
@@ -5002,7 +5007,10 @@ HANDLERS.set("stop_loop", async (args) => {
       return { content: [{ type: "text", text: `stop_loop was accepted, but state verification failed (${verified.status}); use list_loops before retrying.` }], isError: true };
     }
     const state = await verified.json();
-    const stillPresent = Array.isArray(state?.loops) && state.loops.some((candidate) => candidate?.loop_id === loopId);
+    if (!Array.isArray(state?.loops)) {
+      return { content: [{ type: "text", text: "stop_loop was accepted, but state verification returned a malformed loops payload; use list_loops before retrying." }], isError: true };
+    }
+    const stillPresent = state.loops.some((candidate) => candidate?.loop_id === loopId);
     if (stillPresent) {
       return { content: [{ type: "text", text: `stop_loop was accepted, but loop ${loopId} is still present in state verification; use list_loops before retrying.` }], isError: true };
     }

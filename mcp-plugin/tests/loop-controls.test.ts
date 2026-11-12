@@ -21,11 +21,13 @@ const runningLoop = {
 let currentLoop: any = runningLoop;
 let stallMcpBody = false;
 let keepStoppedLoopAlive = false;
+let malformedLoopsVerification = false;
 
 beforeEach(() => {
   currentLoop = { ...runningLoop };
   stallMcpBody = false;
   keepStoppedLoopAlive = false;
+  malformedLoopsVerification = false;
 });
 
 beforeAll(() => {
@@ -69,6 +71,7 @@ beforeAll(() => {
         return Response.json({ jsonrpc: "2.0", id: rpc.id, error: { code: -32602, message: "unsupported" } });
       }
       if (req.method === "GET" && url.pathname === "/api/loops/mine") {
+        if (malformedLoopsVerification) return Response.json({ ok: true });
         return Response.json({ loops: currentLoop ? [currentLoop] : [] });
       }
       if (req.method === "POST" && url.pathname === "/api/loops/loop-1/pause") {
@@ -262,7 +265,12 @@ describe("MCP loop controls", () => {
     ]);
 
     const tools = res.get(2)?.result?.tools || [];
-    expect(tools.some((tool: any) => tool.name === "set_loop_interval")).toBe(true);
+    const intervalTool = tools.find((tool: any) => tool.name === "set_loop_interval");
+    expect(intervalTool?.inputSchema?.properties?.interval_ms).toMatchObject({
+      type: "integer",
+      minimum: 60000,
+      maximum: 86400000,
+    });
     expect(tools.some((tool: any) => tool.name === "stop_loop")).toBe(true);
 
     expect(res.get(3)?.result?.isError).toBe(true);
@@ -290,5 +298,16 @@ describe("MCP loop controls", () => {
     ]);
     expect(res.get(3)?.result?.isError).toBe(true);
     expect(res.get(3)?.result?.content?.[0]?.text || "").toContain("still present in state verification");
+  });
+
+  test("stop_loop fails closed when /api/loops/mine omits the loops array", async () => {
+    malformedLoopsVerification = true;
+    const { res } = await drive([
+      INIT,
+      INITED,
+      callTool(3, "stop_loop", { loop_id: "loop-1" }),
+    ]);
+    expect(res.get(3)?.result?.isError).toBe(true);
+    expect(res.get(3)?.result?.content?.[0]?.text || "").toContain("malformed loops payload");
   });
 });
