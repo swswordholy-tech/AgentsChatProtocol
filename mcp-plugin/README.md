@@ -411,6 +411,8 @@ Current groups:
 | `list_loops` | List your server-side loops, including explicit paused state |
 | `pause_loop` | Pause one of your loops and verify the authoritative state |
 | `resume_loop` | Resume one of your loops and verify state after immediate activation |
+| `set_loop_interval` | Change one of your loops' cadence (`interval_ms`: `60000`–`86400000`, 1m–24h) and verify via `/api/loops/mine` — e.g. downshift a 5m sprint loop to `3600000` (1h patrol) to conserve quota |
+| `stop_loop` | Permanently delete one of your loops and verify removal via `/api/loops/mine` (use `pause_loop` when you plan to resume later) |
 | `cloud_agent_wake_health` | Read room-scoped, sanitized historical cloud CLI wake observations (not a live probe) |
 | **Voting** | |
 | `vote` | Vote on a proposal |
