@@ -157,6 +157,115 @@ export function isValidCollaborationRoster(
   return d.coordinator_ref === null || (typeof d.coordinator_ref === "string" && seenRefs.has(d.coordinator_ref));
 }
 
+const WORKSPACE_GRAPH_SCOPES = new Set(["channel", "objective", "agent"]);
+
+function safeGraphId(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    value.length >= 1 &&
+    value.length <= 160 &&
+    !/[/\\?#&\s\u0000-\u001F\u007F]/.test(value) &&
+    !value.includes("..") &&
+    !CREDENTIAL_PREFIX_RE.test(value) &&
+    !EMAIL_ID_RE.test(value) &&
+    !PHONE_ID_RE.test(value)
+  );
+}
+
+function safeGraphCount(value: unknown): number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+    ? Math.min(value, 1_000_000)
+    : 0;
+}
+
+export function summarizeWorkspaceGraphReadiness(
+  graph: unknown,
+): import("./types").WorkspaceGraphReadinessSummary | null {
+  if (!graph || typeof graph !== "object") return null;
+  const g = graph as Record<string, unknown>;
+  if (!g.scope || typeof g.scope !== "object") return null;
+  const scope = g.scope as Record<string, unknown>;
+  if (
+    typeof scope.type !== "string" ||
+    !WORKSPACE_GRAPH_SCOPES.has(scope.type) ||
+    !safeGraphId(scope.id)
+  ) {
+    return null;
+  }
+  if (!Array.isArray(g.nodes) || !Array.isArray(g.edges) || !Array.isArray(g.sections)) {
+    return null;
+  }
+
+  const sectionSummaries = new Map<string, Record<string, unknown>>();
+  for (const sec of g.sections) {
+    if (sec && typeof sec === "object") {
+      const s = sec as Record<string, unknown>;
+      if (typeof s.id === "string" && s.summary && typeof s.summary === "object") {
+        sectionSummaries.set(s.id, s.summary as Record<string, unknown>);
+      }
+    }
+  }
+  const okr = sectionSummaries.get("okr") ?? {};
+  const docs = sectionSummaries.get("docs") ?? {};
+  const dag = sectionSummaries.get("dag") ?? {};
+
+  const readyTaskIds: string[] = [];
+  const seenReady = new Set<string>();
+  for (const rawNode of g.nodes.slice(0, 1000)) {
+    if (!rawNode || typeof rawNode !== "object") continue;
+    const node = rawNode as Record<string, unknown>;
+    if (node.type === "task" && node.ready === true && safeGraphId(node.id) && !seenReady.has(node.id)) {
+      seenReady.add(node.id);
+      readyTaskIds.push(node.id);
+    }
+  }
+
+  const unchangedReferenceCount = Array.isArray(g.referenced_unchanged_ids)
+    ? g.referenced_unchanged_ids.slice(0, 5000).filter(safeGraphId).length
+    : 0;
+
+  const isIncremental =
+    typeof g.since === "string" &&
+    g.since.length <= 64 &&
+    /^\d{4}-\d{2}-\d{2}T/.test(g.since) &&
+    Number.isFinite(Date.parse(g.since));
+
+  const readyCount = Math.max(
+    safeGraphCount(okr.ready_tasks),
+    safeGraphCount(dag.ready_tasks),
+    readyTaskIds.length,
+  );
+
+  const summary: import("./types").WorkspaceGraphReadinessSummary = {
+    scope_type: scope.type as import("./types").WorkspaceGraphScopeType,
+    scope_id: scope.id,
+    active_objectives: safeGraphCount(okr.active_objectives),
+    active_tasks: safeGraphCount(okr.active_tasks),
+    doing_tasks: safeGraphCount(okr.doing_tasks),
+    ready_tasks: readyCount,
+    blocked_tasks: Math.max(safeGraphCount(okr.blocked_tasks), safeGraphCount(dag.blocked_tasks)),
+    blocker_tasks: safeGraphCount(dag.blocker_tasks),
+    unresolved_edges: safeGraphCount(dag.unresolved_edges),
+    evidence_tasks: Math.max(safeGraphCount(okr.evidence_tasks), safeGraphCount(dag.evidence_tasks)),
+    docs_count: safeGraphCount(docs.docs_count),
+    skills_count: safeGraphCount(docs.skills_count),
+    ready_task_ids: readyTaskIds,
+    is_incremental: isIncremental,
+    unchanged_reference_count: unchangedReferenceCount,
+  };
+  if (typeof okr.active_loops === "number" && Number.isSafeInteger(okr.active_loops) && okr.active_loops >= 0) {
+    summary.active_loops = Math.min(okr.active_loops, 1_000_000);
+  }
+  if (
+    typeof okr.unarmed_objectives === "number" &&
+    Number.isSafeInteger(okr.unarmed_objectives) &&
+    okr.unarmed_objectives >= 0
+  ) {
+    summary.unarmed_objectives = Math.min(okr.unarmed_objectives, 1_000_000);
+  }
+  return summary;
+}
+
 export interface RESTClientOptions {
   baseUrl: string; // e.g. "http://localhost:8080"
   bearerToken?: string;
@@ -964,20 +1073,27 @@ export class AgentChatREST {
     if (!["channel", "objective", "agent"].includes(scope)) {
       throw new Error("Invalid workspace graph scope");
     }
-    const trimmedId = id.trim();
+    const trimmedId = typeof id === "string" ? id.trim() : "";
     if (
       !trimmedId ||
       trimmedId.length > 160 ||
-      /[/\\?#&\s\u0000-\u001F]/.test(trimmedId) ||
+      /[/\\?#&\s\u0000-\u001F\u007F]/.test(trimmedId) ||
       trimmedId.includes("..") ||
-      /^(?:ac_|sk-)/i.test(trimmedId)
+      CREDENTIAL_PREFIX_RE.test(trimmedId) ||
+      EMAIL_ID_RE.test(trimmedId) ||
+      PHONE_ID_RE.test(trimmedId)
     ) {
       throw new Error("Invalid workspace graph ID");
     }
     const params = new URLSearchParams({ scope, id: trimmedId });
     if (opts?.since !== undefined) {
-      const since = opts.since.trim();
-      if (!since || Number.isNaN(Date.parse(since))) {
+      const since = typeof opts.since === "string" ? opts.since.trim() : "";
+      if (
+        !since ||
+        since.length > 64 ||
+        !/^\d{4}-\d{2}-\d{2}T/.test(since) ||
+        Number.isNaN(Date.parse(since))
+      ) {
         throw new Error("Invalid workspace graph since timestamp");
       }
       params.set("since", since);

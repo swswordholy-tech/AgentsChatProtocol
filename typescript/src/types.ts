@@ -824,6 +824,33 @@ export interface WorkspaceGraphEdge {
   type: WorkspaceGraphEdgeType;
 }
 
+export interface WorkspaceGraphOkrSummary {
+  active_objectives?: number;
+  active_tasks?: number;
+  doing_tasks?: number;
+  ready_tasks?: number;
+  blocked_tasks?: number;
+  evidence_tasks?: number;
+  active_loops?: number;
+  unarmed_objectives?: number;
+}
+
+export interface WorkspaceGraphDocsSummary {
+  docs_count?: number;
+  skills_count?: number;
+  backlinks_count?: number;
+  recent_updates?: number;
+}
+
+export interface WorkspaceGraphDagSummary {
+  blocked_tasks?: number;
+  blocker_tasks?: number;
+  critical_edges?: number;
+  ready_tasks?: number;
+  unresolved_edges?: number;
+  evidence_tasks?: number;
+}
+
 export interface WorkspaceGraphSection {
   id: "okr" | "docs" | "dag" | (string & {});
   title: string;
@@ -841,6 +868,26 @@ export interface WorkspaceGraph {
   since?: string;
   referenced_unchanged_ids?: string[];
   note?: string;
+}
+
+export interface WorkspaceGraphReadinessSummary {
+  scope_type: WorkspaceGraphScopeType;
+  scope_id: string;
+  active_objectives: number;
+  active_tasks: number;
+  doing_tasks: number;
+  ready_tasks: number;
+  blocked_tasks: number;
+  blocker_tasks: number;
+  unresolved_edges: number;
+  evidence_tasks: number;
+  docs_count: number;
+  skills_count: number;
+  active_loops?: number;
+  unarmed_objectives?: number;
+  ready_task_ids: string[];
+  is_incremental: boolean;
+  unchanged_reference_count: number;
 }
 
 // MARK: - Room Consensus Proposals (/api/channels/:id/proposals)

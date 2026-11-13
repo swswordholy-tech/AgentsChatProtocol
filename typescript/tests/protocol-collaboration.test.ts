@@ -3,6 +3,7 @@ import {
   AgentChatClient,
   AgentChatREST,
   isValidCollaborationRoster,
+  summarizeWorkspaceGraphReadiness,
   type ACMessage,
   type ChannelBrief,
   type ChannelDocUpdatedMessage,
@@ -2931,6 +2932,132 @@ describe("AgentChatClient realtime collaboration WS events", () => {
         await expect(rest.getChannelCollaborationRoster(bad)).rejects.toThrow("Invalid channel ID");
       }
       expect(fetchCount).toBe(1);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("summarizeWorkspaceGraphReadiness & hardened getWorkspaceGraph validate unresolved_edges, ?since= deltas, and zero-egress secret/PII guards", async () => {
+    const graph: WorkspaceGraph = {
+      scope: { type: "channel", id: "room-dev" },
+      nodes: [
+        { type: "channel", id: "room-dev" },
+        { type: "objective", id: "obj_38", title: "Campaign 38", status: "active" },
+        { type: "task", id: "task_ready_1", title: "Ship GEO corpus", owner: "spinning-midnight-tunicate", ready: true, evidence_count: 1 },
+        { type: "task", id: "ac_secret_leak_id", title: "Hostile task id", ready: true },
+        { type: "task", id: "owner@example.com", title: "PII task id", ready: true },
+        { type: "task", id: "task_waiting", title: "Wait on archived dep", ready: false },
+      ],
+      edges: [
+        { from: ["task", "task_waiting"], to: ["task", "task_ready_1"], type: "depends_on" },
+      ],
+      sections: [
+        {
+          id: "okr",
+          title: "OKR",
+          summary: {
+            active_objectives: 1,
+            active_tasks: 2,
+            doing_tasks: 1,
+            ready_tasks: 1,
+            blocked_tasks: 0,
+            evidence_tasks: 1,
+            active_loops: 2,
+            unarmed_objectives: 0,
+          },
+        },
+        {
+          id: "docs",
+          title: "Docs",
+          summary: { docs_count: 4, skills_count: 2 },
+        },
+        {
+          id: "dag",
+          title: "DAG",
+          summary: {
+            blocked_tasks: 0,
+            blocker_tasks: 1,
+            critical_edges: 1,
+            ready_tasks: 1,
+            unresolved_edges: 3,
+            evidence_tasks: 1,
+          },
+        },
+      ],
+      as_of: "2026-11-14T07:00:00.000Z",
+      since: "2026-11-14T06:55:00.000Z",
+      referenced_unchanged_ids: ["obj_parent", "ac_live_secret", "user@example.com", "doc_sop"],
+    };
+
+    const summary = summarizeWorkspaceGraphReadiness(graph);
+    expect(summary).toEqual({
+      scope_type: "channel",
+      scope_id: "room-dev",
+      active_objectives: 1,
+      active_tasks: 2,
+      doing_tasks: 1,
+      ready_tasks: 1,
+      blocked_tasks: 0,
+      blocker_tasks: 1,
+      unresolved_edges: 3,
+      evidence_tasks: 1,
+      docs_count: 4,
+      skills_count: 2,
+      active_loops: 2,
+      unarmed_objectives: 0,
+      ready_task_ids: ["task_ready_1"],
+      is_incremental: true,
+      unchanged_reference_count: 2,
+    });
+
+    // Reject hostile or malformed graph scopes
+    expect(summarizeWorkspaceGraphReadiness(null)).toBeNull();
+    expect(
+      summarizeWorkspaceGraphReadiness({
+        ...graph,
+        scope: { type: "channel", id: "ac_live_secret" },
+      }),
+    ).toBeNull();
+    expect(
+      summarizeWorkspaceGraphReadiness({
+        ...graph,
+        scope: { type: "agent", id: "owner@example.com" },
+      }),
+    ).toBeNull();
+
+    const originalFetch = globalThis.fetch;
+    let fetchCalls = 0;
+    globalThis.fetch = (async () => {
+      fetchCalls += 1;
+      return Response.json(graph);
+    }) as unknown as typeof fetch;
+
+    try {
+      const rest = new AgentChatREST({ baseUrl: "https://agents-chat.com", bearerToken: "tok_38" });
+      for (const badId of [
+        "agent_key_12345",
+        "ghp_secret123",
+        "github_pat_abc123",
+        "AIzaSySecretKey",
+        "eyJhbGciOiJIUzI1NiJ9.payload.sig",
+        "owner@example.com",
+        "+86 13800138000",
+        "room/../escape",
+      ]) {
+        await expect(rest.getWorkspaceGraph("channel", badId)).rejects.toThrow("Invalid workspace graph ID");
+      }
+      for (const badSince of ["2026", "1731548400000", "2026-11-14", "not-an-iso"]) {
+        await expect(rest.getWorkspaceGraph("channel", "room-dev", { since: badSince })).rejects.toThrow(
+          "Invalid workspace graph since timestamp",
+        );
+      }
+      expect(fetchCalls).toBe(0);
+
+      const okGraph = await rest.getWorkspaceGraph("channel", "room-dev", {
+        since: "2026-11-14T06:55:00.000Z",
+      });
+      expect(fetchCalls).toBe(1);
+      expect(summarizeWorkspaceGraphReadiness(okGraph)?.unresolved_edges).toBe(3);
     } finally {
       globalThis.fetch = originalFetch;
     }

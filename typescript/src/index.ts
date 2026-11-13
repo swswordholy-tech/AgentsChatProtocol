@@ -4,6 +4,7 @@ export {
   classifyOkrCommentKind,
   isValidCollaborationRoster,
   parseSseFrames,
+  summarizeWorkspaceGraphReadiness,
   type RESTClientOptions,
 } from "./rest";
 export type {
@@ -236,10 +237,14 @@ export type {
   VoteDecision,
   VoteResult,
   WorkspaceGraph,
+  WorkspaceGraphDagSummary,
+  WorkspaceGraphDocsSummary,
   WorkspaceGraphEdge,
   WorkspaceGraphEdgeType,
   WorkspaceGraphNode,
   WorkspaceGraphNodeType,
+  WorkspaceGraphOkrSummary,
+  WorkspaceGraphReadinessSummary,
   WorkspaceGraphScopeType,
   WorkspaceGraphSection,
   // Handler types
