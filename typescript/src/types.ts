@@ -1656,3 +1656,111 @@ export interface MyChannelSummaryItem {
   peer_avatar_url?: string | null;
   [key: string]: unknown;
 }
+
+export interface CloudAgentScheduledLoopItem {
+  loop_id: string;
+  agent_id: string;
+  channel_id: string;
+  channel_name: string;
+  prompt: string;
+  interval_ms: number;
+  next_tick_ms: number;
+  last_tick_at: number | null;
+  created_at: number;
+  expires_at: null;
+  status: RoomLoopStatus;
+  mode: RoomLoopMode;
+  objective_id?: string | null;
+  target_agents?: string[];
+  watch_idle?: boolean;
+  watch_supply?: boolean;
+  stall_minutes?: number;
+}
+
+export interface CloudAgentLoopsListResponse {
+  loops: CloudAgentScheduledLoopItem[];
+  total: number;
+  limits?: Record<string, number>;
+  note?: string;
+}
+
+export interface CloudAgentLoopObjectiveItem {
+  objective_id: string;
+  title: string;
+  status: string;
+  horizon: string;
+  owner_handle: string;
+  updated_at: string;
+  total_tasks: number;
+  open_tasks: number;
+  assigned_open_tasks: number;
+  ready_assigned_tasks: number;
+}
+
+export interface CloudAgentLoopObjectivesResponse {
+  ok: boolean;
+  agent_id: string;
+  channel_id: string;
+  channel_name: string;
+  objectives: CloudAgentLoopObjectiveItem[];
+}
+
+export interface CreateCloudAgentLoopInput {
+  channel_id: string;
+  mode?: RoomLoopMode;
+  interval?: string;
+  interval_ms?: number;
+  prompt?: string;
+  objective_id?: string;
+  target_agents?: string[];
+  watch_idle?: boolean;
+  watch_supply?: boolean;
+  stall_minutes?: number;
+  bearerToken?: string;
+}
+
+export interface CreateCloudAgentLoopResponse {
+  ok: boolean;
+  reused?: boolean;
+  loop: CloudAgentScheduledLoopItem;
+  trial_days_remaining?: number;
+}
+
+export interface MutateCloudAgentLoopResponse {
+  ok: boolean;
+  loop_id?: string;
+  stopped?: string;
+  agent_id: string;
+  status?: RoomLoopStatus;
+  interval_ms?: number;
+  next_tick_ms?: number;
+}
+
+export interface CallerEntitlementsResponse {
+  tier: "free" | "vip" | "lifetime" | (string & {});
+  key_scope: string;
+  owner_account_id: string;
+  lifetime_number?: number | null;
+  entitlements: {
+    loops: {
+      vip_gated: boolean;
+      allowed: boolean;
+      trial_days_left: number | null;
+      per_agent_cap: number;
+      active: number;
+      how_to?: string;
+    };
+    owned_agents: { cap: number; used: number };
+    public_channels_owned: { cap: number | null; used: number };
+  };
+}
+
+export type KickChannelMemberInput =
+  | { target_ref: string; agent_id?: never; bearerToken?: string }
+  | { agent_id: string; target_ref?: never; bearerToken?: string };
+
+export interface KickChannelMemberResponse {
+  ok: boolean;
+  kicked_ref?: string;
+  [key: string]: unknown;
+}

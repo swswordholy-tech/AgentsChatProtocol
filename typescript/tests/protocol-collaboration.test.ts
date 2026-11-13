@@ -1699,4 +1699,193 @@ describe("AgentChatClient realtime collaboration WS events", () => {
       globalThis.fetch = originalFetch;
     }
   });
+
+  test("Owner Cloud Agent loop lifecycle, getMyEntitlements, and kickChannelMember enforce strict input/secret guards", async () => {
+    const originalFetch = globalThis.fetch;
+    const seen: Array<{ url: string; method: string; headers: Record<string, string>; body?: any }> = [];
+
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      const method = init?.method ?? "GET";
+      const headers: Record<string, string> = {};
+      if (init?.headers) {
+        for (const [k, v] of Object.entries(init.headers as Record<string, string>)) {
+          headers[k.toLowerCase()] = String(v);
+        }
+      }
+      const body = init?.body ? JSON.parse(String(init.body)) : undefined;
+      seen.push({ url, method, headers, body });
+
+      if (url.endsWith("/api/cloud-agents/codex-cloud-01/loops") && method === "GET") {
+        return Response.json({
+          loops: [
+            {
+              loop_id: "loop_abc12345",
+              agent_id: "codex-cloud-01",
+              channel_id: "room-dev",
+              channel_name: "AgentChatDev",
+              prompt: "okr:obj_mwfdxgql",
+              interval_ms: 300000,
+              next_tick_ms: 1763092000000,
+              last_tick_at: null,
+              created_at: 1763091700000,
+              expires_at: null,
+              status: "active",
+              mode: "okr_wake",
+              objective_id: "obj_mwfdxgql",
+            },
+          ],
+          total: 1,
+        });
+      }
+      if (url.endsWith("/api/cloud-agents/codex-cloud-01/loops/objectives?channel_id=room-dev") && method === "GET") {
+        return Response.json({
+          ok: true,
+          agent_id: "codex-cloud-01",
+          channel_id: "room-dev",
+          channel_name: "AgentChatDev",
+          objectives: [
+            {
+              objective_id: "obj_mwfdxgql",
+              title: "Sprint 28",
+              status: "active",
+              horizon: "week",
+              owner_handle: "spinning-midnight-tunicate",
+              updated_at: "2026-11-14T03:44:00Z",
+              total_tasks: 3,
+              open_tasks: 2,
+              assigned_open_tasks: 1,
+              ready_assigned_tasks: 1,
+            },
+          ],
+        });
+      }
+      if (url.endsWith("/api/cloud-agents/codex-cloud-01/loops") && method === "POST") {
+        return Response.json({
+          ok: true,
+          loop: {
+            loop_id: "loop_watch999",
+            agent_id: "codex-cloud-01",
+            channel_id: body.channel_id,
+            channel_name: "AgentChatDev",
+            prompt: "okr-watch:obj_mwfdxgql",
+            interval_ms: 900000,
+            next_tick_ms: 1763092600000,
+            last_tick_at: null,
+            created_at: 1763091700000,
+            expires_at: null,
+            status: "active",
+            mode: body.mode,
+            objective_id: body.objective_id,
+            stall_minutes: body.stall_minutes,
+          },
+        });
+      }
+      if (url.endsWith("/api/cloud-agents/codex-cloud-01/loops/loop_watch999/pause") && method === "POST") {
+        return Response.json({ ok: true, loop_id: "loop_watch999", agent_id: "codex-cloud-01", status: "paused" });
+      }
+      if (url.endsWith("/api/cloud-agents/codex-cloud-01/loops/loop_watch999/resume") && method === "POST") {
+        return Response.json({
+          ok: true,
+          loop_id: "loop_watch999",
+          agent_id: "codex-cloud-01",
+          status: "active",
+          next_tick_ms: 1763093000000,
+        });
+      }
+      if (url.endsWith("/api/cloud-agents/codex-cloud-01/loops/loop_watch999/interval") && method === "POST") {
+        return Response.json({
+          ok: true,
+          loop_id: "loop_watch999",
+          agent_id: "codex-cloud-01",
+          interval_ms: 1800000,
+          next_tick_ms: 1763093500000,
+        });
+      }
+      if (url.endsWith("/api/cloud-agents/codex-cloud-01/loops/loop_watch999") && method === "DELETE") {
+        return Response.json({ ok: true, stopped: "loop_watch999", agent_id: "codex-cloud-01" });
+      }
+      if (url.endsWith("/api/me/entitlements") && method === "GET") {
+        return Response.json({
+          tier: "vip",
+          key_scope: "full",
+          owner_account_id: "user:sw***",
+          lifetime_number: null,
+          entitlements: {
+            loops: { vip_gated: false, allowed: true, trial_days_left: null, per_agent_cap: 5, active: 2 },
+            owned_agents: { cap: 20, used: 4 },
+            public_channels_owned: { cap: null, used: 1 },
+          },
+        });
+      }
+      if (url.endsWith("/api/channels/room-dev/kick") && method === "POST") {
+        return Response.json({ ok: true, kicked_ref: body.target_ref ?? body.agent_id });
+      }
+      return Response.json({ ok: true });
+    }) as typeof fetch;
+
+    try {
+      const rest = new AgentChatREST({ baseUrl: "https://agents-chat.com", bearerToken: "owner-jwt-28" });
+
+      const list = await rest.listCloudAgentLoops("codex-cloud-01");
+      expect(list.loops[0]?.loop_id).toBe("loop_abc12345");
+      expect(seen[0]?.headers["cache-control"]).toBe("no-store");
+
+      const objs = await rest.listCloudAgentLoopObjectives("codex-cloud-01", "room-dev");
+      expect(objs.objectives[0]?.ready_assigned_tasks).toBe(1);
+
+      const created = await rest.createCloudAgentLoop("codex-cloud-01", {
+        channel_id: "room-dev",
+        mode: "okr_watch",
+        interval: "15m",
+        objective_id: "obj_mwfdxgql",
+        watch_idle: true,
+        stall_minutes: 30,
+      });
+      expect(created.loop.loop_id).toBe("loop_watch999");
+
+      const paused = await rest.pauseCloudAgentLoop("codex-cloud-01", "loop_watch999");
+      expect(paused.status).toBe("paused");
+
+      const resumed = await rest.resumeCloudAgentLoop("codex-cloud-01", "loop_watch999");
+      expect(resumed.status).toBe("active");
+
+      const retuned = await rest.setCloudAgentLoopInterval("codex-cloud-01", "loop_watch999", { interval: "30m" });
+      expect(retuned.interval_ms).toBe(1800000);
+
+      const stopped = await rest.stopCloudAgentLoop("codex-cloud-01", "loop_watch999");
+      expect(stopped.stopped).toBe("loop_watch999");
+
+      const ent = await rest.getMyEntitlements();
+      expect(ent.tier).toBe("vip");
+      expect(ent.entitlements.loops.allowed).toBe(true);
+
+      const kicked = await rest.kickChannelMember("room-dev", { target_ref: "mr_hmac_ref_01" });
+      expect(kicked.kicked_ref).toBe("mr_hmac_ref_01");
+
+      await expect(
+        rest.createCloudAgentLoop("codex-cloud-01", {
+          channel_id: "arena-duel-1",
+          interval: "5m",
+          prompt: "hello",
+        }),
+      ).rejects.toThrow("Invalid channel ID");
+      await expect(
+        rest.createCloudAgentLoop("codex-cloud-01", {
+          channel_id: "room-dev",
+          interval: "5m",
+          prompt: "Leak sk-proj-ABCDEFGHIJKLMNOPQRSTUVWXYZ123456",
+        }),
+      ).rejects.toThrow("Loop prompt must not contain API keys, tokens, or private keys");
+      await expect(rest.pauseCloudAgentLoop("codex-cloud-01", "bad_id")).rejects.toThrow("Invalid cloud loop ID");
+      await expect(
+        rest.kickChannelMember("room-dev", { target_ref: "mr_1", agent_id: "bot_1" } as any),
+      ).rejects.toThrow("Provide exactly one of target_ref or agent_id");
+      await expect(rest.kickChannelMember("room-dev", { agent_id: "ac_live_secret_token_value" })).rejects.toThrow(
+        "Invalid agent ID",
+      );
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
 });

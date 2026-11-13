@@ -2219,6 +2219,264 @@ export class AgentChatREST {
     );
   }
 
+  private assertCloudLoopId(loopId: string): string {
+    const trimmed = typeof loopId === "string" ? loopId.trim() : "";
+    if (!/^loop_[A-Za-z0-9_-]{6,64}$/.test(trimmed)) {
+      throw new Error("Invalid cloud loop ID");
+    }
+    return trimmed;
+  }
+
+  async listCloudAgentLoops(
+    agentId: string,
+    opts?: { bearerToken?: string },
+  ): Promise<import("./types").CloudAgentLoopsListResponse> {
+    const safeAgent = this.assertCloudAgentId(agentId);
+    return this.get<import("./types").CloudAgentLoopsListResponse>(
+      `/api/cloud-agents/${encodeURIComponent(safeAgent)}/loops`,
+      {
+        "Cache-Control": "no-store",
+        ...(this.authHeaders(opts?.bearerToken) ?? {}),
+      },
+    );
+  }
+
+  async listCloudAgentLoopObjectives(
+    agentId: string,
+    channelId: string,
+    opts?: { bearerToken?: string },
+  ): Promise<import("./types").CloudAgentLoopObjectivesResponse> {
+    const safeAgent = this.assertCloudAgentId(agentId);
+    const trimmedChannel = typeof channelId === "string" ? channelId.trim() : "";
+    if (
+      !trimmedChannel ||
+      !/^[A-Za-z0-9_][A-Za-z0-9_-]{0,127}$/.test(trimmedChannel) ||
+      trimmedChannel.startsWith("arena-") ||
+      /^(?:ac_|agent_key_|sk[-_]|gh[pousr]_|github_pat_|AIza|eyJ)/i.test(trimmedChannel)
+    ) {
+      throw new Error("Invalid channel ID");
+    }
+    return this.get<import("./types").CloudAgentLoopObjectivesResponse>(
+      `/api/cloud-agents/${encodeURIComponent(safeAgent)}/loops/objectives?channel_id=${encodeURIComponent(trimmedChannel)}`,
+      {
+        "Cache-Control": "no-store",
+        ...(this.authHeaders(opts?.bearerToken) ?? {}),
+      },
+    );
+  }
+
+  async createCloudAgentLoop(
+    agentId: string,
+    input: import("./types").CreateCloudAgentLoopInput,
+  ): Promise<import("./types").CreateCloudAgentLoopResponse> {
+    const safeAgent = this.assertCloudAgentId(agentId);
+    const channelId = typeof input?.channel_id === "string" ? input.channel_id.trim() : "";
+    if (
+      !channelId ||
+      !/^[A-Za-z0-9_][A-Za-z0-9_-]{0,127}$/.test(channelId) ||
+      channelId.startsWith("arena-") ||
+      /^(?:ac_|agent_key_|sk[-_]|gh[pousr]_|github_pat_|AIza|eyJ)/i.test(channelId)
+    ) {
+      throw new Error("Invalid channel ID");
+    }
+    const mode = input.mode ?? "prompt";
+    if (!["prompt", "okr_wake", "okr_watch"].includes(mode)) {
+      throw new Error("Invalid loop mode");
+    }
+    const body: Record<string, unknown> = { channel_id: channelId, mode };
+    if (input.interval !== undefined) {
+      const iv = String(input.interval).trim();
+      if (!iv) throw new Error("Invalid loop interval");
+      body.interval = iv;
+    } else if (input.interval_ms !== undefined) {
+      if (!Number.isInteger(input.interval_ms) || input.interval_ms < 60_000 || input.interval_ms > 86_400_000) {
+        throw new Error("interval_ms must be an integer between 60000 and 86400000");
+      }
+      body.interval_ms = input.interval_ms;
+    } else {
+      throw new Error("Provide interval or interval_ms");
+    }
+
+    if (input.prompt !== undefined) {
+      const prompt = String(input.prompt).trim();
+      if (this.containsMemorySecretShape(prompt)) {
+        throw new Error("Loop prompt must not contain API keys, tokens, or private keys");
+      }
+      body.prompt = prompt;
+    } else if (mode === "prompt") {
+      throw new Error("Non-empty prompt required for prompt mode");
+    }
+
+    if (mode !== "prompt") {
+      const oid = typeof input.objective_id === "string" ? input.objective_id.trim() : "";
+      if (!/^[A-Za-z0-9_-]{6,80}$/.test(oid) || /^ac_/i.test(oid)) {
+        throw new Error("Invalid objective ID");
+      }
+      body.objective_id = oid;
+      if (input.target_agents !== undefined) {
+        body.target_agents = input.target_agents;
+      }
+      if (mode === "okr_watch") {
+        if (input.watch_idle !== undefined) body.watch_idle = Boolean(input.watch_idle);
+        if (input.watch_supply !== undefined) body.watch_supply = Boolean(input.watch_supply);
+        if (input.stall_minutes !== undefined) {
+          if (!Number.isInteger(input.stall_minutes) || input.stall_minutes < 5 || input.stall_minutes > 1440) {
+            throw new Error("stall_minutes must be an integer between 5 and 1440");
+          }
+          body.stall_minutes = input.stall_minutes;
+        }
+      }
+    }
+
+    return this.post<import("./types").CreateCloudAgentLoopResponse>(
+      `/api/cloud-agents/${encodeURIComponent(safeAgent)}/loops`,
+      body,
+      {
+        "Cache-Control": "no-store",
+        ...(this.authHeaders(input.bearerToken) ?? {}),
+      },
+    );
+  }
+
+  async pauseCloudAgentLoop(
+    agentId: string,
+    loopId: string,
+    opts?: { bearerToken?: string },
+  ): Promise<import("./types").MutateCloudAgentLoopResponse> {
+    const safeAgent = this.assertCloudAgentId(agentId);
+    const safeLoop = this.assertCloudLoopId(loopId);
+    return this.post<import("./types").MutateCloudAgentLoopResponse>(
+      `/api/cloud-agents/${encodeURIComponent(safeAgent)}/loops/${encodeURIComponent(safeLoop)}/pause`,
+      {},
+      {
+        "Cache-Control": "no-store",
+        ...(this.authHeaders(opts?.bearerToken) ?? {}),
+      },
+    );
+  }
+
+  async resumeCloudAgentLoop(
+    agentId: string,
+    loopId: string,
+    opts?: { bearerToken?: string },
+  ): Promise<import("./types").MutateCloudAgentLoopResponse> {
+    const safeAgent = this.assertCloudAgentId(agentId);
+    const safeLoop = this.assertCloudLoopId(loopId);
+    return this.post<import("./types").MutateCloudAgentLoopResponse>(
+      `/api/cloud-agents/${encodeURIComponent(safeAgent)}/loops/${encodeURIComponent(safeLoop)}/resume`,
+      {},
+      {
+        "Cache-Control": "no-store",
+        ...(this.authHeaders(opts?.bearerToken) ?? {}),
+      },
+    );
+  }
+
+  async setCloudAgentLoopInterval(
+    agentId: string,
+    loopId: string,
+    intervalInput: { interval?: string; interval_ms?: number; bearerToken?: string },
+  ): Promise<import("./types").MutateCloudAgentLoopResponse> {
+    const safeAgent = this.assertCloudAgentId(agentId);
+    const safeLoop = this.assertCloudLoopId(loopId);
+    const body: Record<string, unknown> = {};
+    if (intervalInput?.interval !== undefined) {
+      const iv = String(intervalInput.interval).trim();
+      if (!iv) throw new Error("Invalid loop interval");
+      body.interval = iv;
+    } else if (intervalInput?.interval_ms !== undefined) {
+      if (
+        !Number.isInteger(intervalInput.interval_ms) ||
+        intervalInput.interval_ms < 60_000 ||
+        intervalInput.interval_ms > 86_400_000
+      ) {
+        throw new Error("interval_ms must be an integer between 60000 and 86400000");
+      }
+      body.interval_ms = intervalInput.interval_ms;
+    } else {
+      throw new Error("Provide interval or interval_ms");
+    }
+    return this.post<import("./types").MutateCloudAgentLoopResponse>(
+      `/api/cloud-agents/${encodeURIComponent(safeAgent)}/loops/${encodeURIComponent(safeLoop)}/interval`,
+      body,
+      {
+        "Cache-Control": "no-store",
+        ...(this.authHeaders(intervalInput.bearerToken) ?? {}),
+      },
+    );
+  }
+
+  async stopCloudAgentLoop(
+    agentId: string,
+    loopId: string,
+    opts?: { bearerToken?: string },
+  ): Promise<import("./types").MutateCloudAgentLoopResponse> {
+    const safeAgent = this.assertCloudAgentId(agentId);
+    const safeLoop = this.assertCloudLoopId(loopId);
+    return this.del<import("./types").MutateCloudAgentLoopResponse>(
+      `/api/cloud-agents/${encodeURIComponent(safeAgent)}/loops/${encodeURIComponent(safeLoop)}`,
+      {},
+      {
+        "Cache-Control": "no-store",
+        ...(this.authHeaders(opts?.bearerToken) ?? {}),
+      },
+    );
+  }
+
+  async getMyEntitlements(opts?: { bearerToken?: string }): Promise<import("./types").CallerEntitlementsResponse> {
+    return this.get<import("./types").CallerEntitlementsResponse>("/api/me/entitlements", {
+      "Cache-Control": "no-store",
+      ...(this.authHeaders(opts?.bearerToken) ?? {}),
+    });
+  }
+
+  async kickChannelMember(
+    channelId: string,
+    input: import("./types").KickChannelMemberInput,
+  ): Promise<import("./types").KickChannelMemberResponse> {
+    const trimmedChannel = typeof channelId === "string" ? channelId.trim() : "";
+    if (
+      !trimmedChannel ||
+      !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(trimmedChannel) ||
+      trimmedChannel.includes("..") ||
+      /^(?:ac_|agent_key_|sk[-_]|gh[pousr]_|github_pat_|AIza|eyJ)/i.test(trimmedChannel)
+    ) {
+      throw new Error("Invalid channel ID");
+    }
+    const hasTargetRef = typeof (input as any)?.target_ref === "string" && (input as any).target_ref.trim().length > 0;
+    const hasAgentId = typeof (input as any)?.agent_id === "string" && (input as any).agent_id.trim().length > 0;
+    if (hasTargetRef === hasAgentId) {
+      throw new Error("Provide exactly one of target_ref or agent_id");
+    }
+    const body: Record<string, unknown> = {};
+    if (hasTargetRef) {
+      const ref = (input as { target_ref: string }).target_ref.trim();
+      if (ref.length > 160 || /[\u0000-\u001F\s]/.test(ref) || this.containsMemorySecretShape(ref)) {
+        throw new Error("Invalid target_ref");
+      }
+      body.target_ref = ref;
+    } else {
+      const aid = (input as { agent_id: string }).agent_id.trim();
+      if (
+        aid.length > 128 ||
+        /[/\\?#&\s\u0000-\u001F]/.test(aid) ||
+        aid.includes("..") ||
+        /^(?:ac_|agent_key_|sk[-_]|gh[pousr]_|github_pat_|AIza|eyJ)/i.test(aid)
+      ) {
+        throw new Error("Invalid agent ID");
+      }
+      body.agent_id = aid;
+    }
+    return this.post<import("./types").KickChannelMemberResponse>(
+      `/api/channels/${encodeURIComponent(trimmedChannel)}/kick`,
+      body,
+      {
+        "Cache-Control": "no-store",
+        ...(this.authHeaders(input.bearerToken) ?? {}),
+      },
+    );
+  }
+
   // MARK: - Internal
 
   private async get<T = any>(path: string, headers?: Record<string, string>): Promise<T> {
