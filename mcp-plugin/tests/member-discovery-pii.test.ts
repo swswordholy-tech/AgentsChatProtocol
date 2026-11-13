@@ -104,9 +104,9 @@ beforeAll(() => {
             { id: "obj_done_4", title: "Done Objective", status: "done", archived: false },
           ],
           tasks: [
-            { id: "t1", objective_id: "obj_armed_1", status: "doing" },
-            { id: "t2", objective_id: "obj_unarmed_2", status: "todo" },
-            { id: "t3", objective_id: "obj_watch_only_3", status: "todo" },
+            { id: "t1", objective_id: "obj_armed_1", status: "doing", assignee: "test-observer-bot" },
+            { id: "t2", objective_id: "obj_unarmed_2", status: "todo", assignee: "test-observer-bot" },
+            { id: "t3", objective_id: "obj_watch_only_3", status: "todo", assignee: "test-observer-bot", depends_on: ["t1"] },
           ],
           loop_summary: {
             active_loop_count: 3,
@@ -120,10 +120,36 @@ beforeAll(() => {
       if (req.method === "GET" && u.pathname === "/api/loops" && u.searchParams.get("channel_id") === "chan-okr-guarded") {
         return Response.json({ error: "REST /api/loops degraded; okr_snapshot.loop_summary fallback should still succeed" }, { status: 503 });
       }
+      if (req.method === "GET" && u.pathname === "/api/channels/chan-outage-brief/members") {
+        return Response.json({
+          members: [{ agent_id: "test-observer-bot", display_name: "Observer", role: "member" }],
+        });
+      }
+      if (
+        req.method === "GET" &&
+        (u.pathname === "/api/channels/chan-outage-brief/docs" ||
+          u.pathname === "/api/channels/chan-outage-brief/okr_snapshot")
+      ) {
+        return Response.json({ error: "storage_unavailable" }, { status: 503 });
+      }
       if (req.method === "POST" && u.pathname === "/mcp") {
         const rpc = (await req.json().catch(() => ({}))) as any;
         if (rpc.method === "tools/call" && rpc.params?.name === "agentschat_get_channel_context") {
           const cid = rpc.params?.arguments?.channel_id;
+          if (cid === "chan-outage-brief") {
+            const payload = {
+              channel: { id: "chan-outage-brief", name: "OutageRoom", type: "group", member_count: 1 },
+              agents: [{ id: "test-observer-bot", name: "Observer", capabilities: [], online: true, is_self: true }],
+            };
+            return Response.json({
+              jsonrpc: "2.0",
+              id: rpc.id ?? 1,
+              result: {
+                content: [{ type: "text", text: JSON.stringify(payload) }],
+                structuredContent: payload,
+              },
+            });
+          }
           if (cid === "chan-room-collab-123456") {
             const payload = {
               channel: {
@@ -149,6 +175,19 @@ beforeAll(() => {
                   is_self: false,
                 },
               ],
+              docs_summary: [
+                { id: "patrol-sop", title: "24/7 Patrol Skill", kind: "channel_skill", level: 1 },
+              ],
+              okr_summary: {
+                active_objective_count: 1,
+                total_task_count: 2,
+                ready_for_me_count: 1,
+                doing_for_me_count: 0,
+                blocked_for_me_count: 1,
+                ready_task_count: 1,
+                doing_task_count: 0,
+                blocked_task_count: 1,
+              },
             };
             return Response.json({
               jsonrpc: "2.0",
@@ -285,6 +324,7 @@ describe("Room peer capability discovery & human PII redaction", () => {
       callTool(3, "channel_brief", { chat_id: "chan-legacy-no-mcp" }),
       callTool(4, "get_history", { chat_id: "chan-room-collab-123456", limit: 10 }),
       callTool(5, "channel_brief", { chat_id: "chan-okr-guarded" }),
+      callTool(6, "channel_brief", { chat_id: "chan-outage-brief" }),
     ]);
 
     const briefRaw: string = res.get(2)?.result?.content?.[0]?.text || "{}";
@@ -361,6 +401,17 @@ describe("Room peer capability discovery & human PII redaction", () => {
         okr_watch_armed: true,
       },
     ]);
+    expect(guarded.okr_readable).toBe(true);
+    expect(guarded.okr_summary).toEqual({
+      active_objective_count: 3,
+      total_task_count: 3,
+      ready_for_me_count: 1,
+      doing_for_me_count: 1,
+      blocked_for_me_count: 0,
+      ready_task_count: 1,
+      doing_task_count: 1,
+      blocked_task_count: 0,
+    });
     expect(guarded.loop_summary).toMatchObject({
       active_loop_count: 3,
       my_active_loop_count: 2,
@@ -368,5 +419,26 @@ describe("Room peer capability discovery & human PII redaction", () => {
       okr_watch_objective_ids: ["obj_watch_only_3"],
       unarmed_objective_ids: ["obj_unarmed_2", "obj_watch_only_3"],
     });
+
+    // MCP 1-shot briefing populates okr_readable/docs_readable/okr_summary/skills even when REST /docs & /okr_snapshot are absent
+    expect(brief.okr_readable).toBe(true);
+    expect(brief.docs_readable).toBe(true);
+    expect(brief.skills).toEqual([{ doc_id: "patrol-sop", title: "24/7 Patrol Skill" }]);
+    expect(brief.okr_summary).toEqual({
+      active_objective_count: 1,
+      total_task_count: 2,
+      ready_for_me_count: 1,
+      doing_for_me_count: 0,
+      blocked_for_me_count: 1,
+      ready_task_count: 1,
+      doing_task_count: 0,
+      blocked_task_count: 1,
+    });
+
+    // Fail-closed outage: when both REST and MCP omit docs/OKR summaries, okr_readable & docs_readable are false and okr_summary is omitted
+    const outageBrief = JSON.parse(res.get(6)?.result?.content?.[0]?.text || "{}");
+    expect(outageBrief.okr_readable).toBe(false);
+    expect(outageBrief.docs_readable).toBe(false);
+    expect(outageBrief.okr_summary).toBeUndefined();
   });
 });

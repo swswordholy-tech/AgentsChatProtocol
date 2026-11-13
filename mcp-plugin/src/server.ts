@@ -1925,7 +1925,7 @@ const ALL_TOOL_DEFS = [
     },
     {
       name: "channel_brief",
-      description: "Capability synopsis of a channel: who's here (and ONLINE right now, with human emails/phones masked), active agent_peers with their specialty capabilities, linked OKR objectives with open-task counts and okr_wake/okr_watch guard coverage (loop_summary), available channel skills, loadable extended tool groups (with load state), recent docs, and what you can do. Call after joining or when entering an unfamiliar room.",
+      description: "Capability synopsis of a channel: who's here (and ONLINE right now, with human emails/phones masked), active agent_peers with their specialty capabilities, okr_readable/docs_readable health flags, linked OKR objectives + DAG-aware okr_summary (ready/doing/blocked counts for you and room) + okr_wake/okr_watch guard coverage (loop_summary), available channel skills, loadable extended tool groups (with load state), recent docs, and what you can do. Call after joining or when entering an unfamiliar room.",
       inputSchema: {
         type: "object" as const,
         properties: { chat_id: { type: "string", description: "The channel_id" } },
@@ -4475,6 +4475,17 @@ const handleToolCall = async (request: any): Promise<any> => {
   async function fetchMcpChannelContext(chatId: string): Promise<{
     channel?: { id?: string; name?: string; type?: string; topic?: string; member_count?: number };
     agents?: Array<{ id: string; name?: string; capabilities?: string[]; online?: boolean; is_self?: boolean }>;
+    docs_summary?: Array<{ id?: string; doc_id?: string; title?: string; kind?: string; level?: number }>;
+    okr_summary?: {
+      active_objective_count: number;
+      total_task_count: number;
+      ready_for_me_count: number;
+      doing_for_me_count?: number;
+      blocked_for_me_count?: number;
+      ready_task_count?: number;
+      doing_task_count?: number;
+      blocked_task_count?: number;
+    };
     loop_summary?: {
       active_loop_count?: number;
       my_active_loop_count?: number;
@@ -4500,7 +4511,7 @@ const handleToolCall = async (request: any): Promise<any> => {
             method: "tools/call",
             params: {
               name: "agentschat_get_channel_context",
-              arguments: { channel_id: chatId },
+              arguments: { channel_id: chatId, include_briefing: true },
             },
           }),
         },
@@ -4590,12 +4601,91 @@ const handleToolCall = async (request: any): Promise<any> => {
                 : {}),
             is_self: String(m.agent_id) === AGENT_ID,
           }));
-    const allDocs = docsData ? extractChannelDocsPayload(docsData) : [];
+    const hasRestDocsPayload = Boolean(
+      docsData && (Array.isArray(docsData) || Array.isArray(docsData.docs) || Array.isArray(docsData.channel_docs)),
+    );
+    const docsReadable = hasRestDocsPayload || Array.isArray(mcpCtx?.docs_summary);
+    const allDocs = hasRestDocsPayload
+      ? extractChannelDocsPayload(docsData)
+      : Array.isArray(mcpCtx?.docs_summary)
+        ? mcpCtx!.docs_summary.map((d: any) => ({ ...d, id: d?.id ?? d?.doc_id }))
+        : [];
     const skills = allDocs.filter(isSkillDoc).map((d: any) => ({ doc_id: d.id, title: d.title }));
     const docs = allDocs.filter((d: any) => !isSkillDoc(d)).slice(0, 10).map((d: any) => ({ doc_id: d.id, title: d.title, kind: d.kind }));
+    const okrNotConfigured = typeof okrData?.note === "string" && okrData.note.toLowerCase().includes("not configured");
+    const hasRestOkrSnapshot = Boolean(
+      okrData && !okrNotConfigured && (Array.isArray(okrData.objectives) || Array.isArray(okrData.tasks)),
+    );
+    const hasMcpOkrSummary = Boolean(
+      mcpCtx?.okr_summary &&
+        typeof mcpCtx.okr_summary === "object" &&
+        typeof mcpCtx.okr_summary.active_objective_count === "number",
+    );
+    const okrReadable = hasRestOkrSnapshot || hasMcpOkrSummary;
     const activeRawObjectives = (okrData?.objectives || []).filter(
       (o: any) => !o.archived && o.id && String(o.status || "active").toLowerCase() === "active",
     );
+    let okrSummary:
+      | {
+          active_objective_count: number;
+          total_task_count: number;
+          ready_for_me_count: number;
+          doing_for_me_count?: number;
+          blocked_for_me_count?: number;
+          ready_task_count?: number;
+          doing_task_count?: number;
+          blocked_task_count?: number;
+        }
+      | null = null;
+    if (hasMcpOkrSummary && typeof mcpCtx!.okr_summary!.doing_for_me_count === "number") {
+      const s = mcpCtx!.okr_summary!;
+      okrSummary = {
+        active_objective_count: s.active_objective_count,
+        total_task_count: s.total_task_count,
+        ready_for_me_count: s.ready_for_me_count,
+        doing_for_me_count: s.doing_for_me_count,
+        ...(typeof s.blocked_for_me_count === "number" ? { blocked_for_me_count: s.blocked_for_me_count } : {}),
+        ...(typeof s.ready_task_count === "number" ? { ready_task_count: s.ready_task_count } : {}),
+        ...(typeof s.doing_task_count === "number" ? { doing_task_count: s.doing_task_count } : {}),
+        ...(typeof s.blocked_task_count === "number" ? { blocked_task_count: s.blocked_task_count } : {}),
+      };
+    } else if (hasRestOkrSnapshot) {
+      const archivedObjIds = new Set<string>(
+        (okrData?.objectives || []).filter((o: any) => o?.archived && o?.id).map((o: any) => String(o.id)),
+      );
+      const snapshotTasks = (Array.isArray(okrData?.tasks) ? okrData.tasks : []).filter(
+        (t: any) => t && typeof t.id === "string" && !archivedObjIds.has(String(t.objective_id || "")),
+      );
+      const taskStatusById = new Map<string, string>();
+      for (const t of snapshotTasks) taskStatusById.set(String(t.id), String(t.status || "todo"));
+      const isTaskReady = (t: any): boolean => {
+        if (String(t.status || "todo") !== "todo") return false;
+        if (Array.isArray(t.unresolved_depends_on)) return t.unresolved_depends_on.length === 0;
+        if (typeof t.ready === "boolean") return t.ready;
+        const deps = Array.isArray(t.depends_on)
+          ? t.depends_on.filter((d: unknown): d is string => typeof d === "string" && d.length > 0)
+          : [];
+        return deps.every((depId: string) => taskStatusById.get(depId) === "done");
+      };
+      const isMine = (t: any): boolean => Boolean(AGENT_ID && t?.assignee === AGENT_ID);
+      okrSummary = {
+        active_objective_count: activeRawObjectives.length,
+        total_task_count: snapshotTasks.length,
+        ready_for_me_count: snapshotTasks.filter((t: any) => isMine(t) && isTaskReady(t)).length,
+        doing_for_me_count: snapshotTasks.filter((t: any) => isMine(t) && t.status === "doing").length,
+        blocked_for_me_count: snapshotTasks.filter((t: any) => isMine(t) && t.status === "blocked").length,
+        ready_task_count: snapshotTasks.filter((t: any) => isTaskReady(t)).length,
+        doing_task_count: snapshotTasks.filter((t: any) => t.status === "doing").length,
+        blocked_task_count: snapshotTasks.filter((t: any) => t.status === "blocked").length,
+      };
+    } else if (hasMcpOkrSummary) {
+      const s = mcpCtx!.okr_summary!;
+      okrSummary = {
+        active_objective_count: s.active_objective_count,
+        total_task_count: s.total_task_count,
+        ready_for_me_count: s.ready_for_me_count,
+      };
+    }
     const visibleObjectiveIdSet = new Set<string>(activeRawObjectives.map((o: any) => String(o.id)));
     const snapshotLoopSummary =
       okrData?.loop_summary && typeof okrData.loop_summary === "object" ? okrData.loop_summary : null;
@@ -4686,7 +4776,10 @@ const handleToolCall = async (request: any): Promise<any> => {
         ? { total: memberIds.length, online }
         : { total: null, note: "roster unreadable — you are likely not a member of this channel (or it does not exist)" },
       ...(membersReadable ? { agent_peers: agentPeers } : {}),
+      okr_readable: okrReadable,
+      docs_readable: docsReadable,
       okr_objectives: objectives,
+      ...(okrSummary ? { okr_summary: okrSummary } : {}),
       ...(loopSummary ? { loop_summary: loopSummary } : {}),
       skills,
       docs,
