@@ -36,11 +36,15 @@ interface StoredPersonalSkill {
 
 let personalSkills: Record<string, StoredPersonalSkill> = {};
 let channelDocs: Record<string, Record<string, any>> = {};
+let channelOkrSnapshots: Record<string, any> = {};
+let ignoreActiveOnlyOnRoom = new Set<string>();
 let recorded: Array<{ method: string; path: string; search: string; ifMatch: string | null; body: any }> = [];
 
 beforeEach(() => {
   personalSkills = {};
   channelDocs = {};
+  channelOkrSnapshots = {};
+  ignoreActiveOnlyOnRoom = new Set<string>();
   recorded = [];
 });
 
@@ -160,11 +164,26 @@ beforeAll(() => {
         }
       }
 
+      const chanMembersMatch = url.pathname.match(/^\/api\/channels\/([^/]+)\/members$/);
+      if (req.method === "GET" && chanMembersMatch) {
+        return Response.json({
+          members: [{ agent_id: "test-bot-skills", display_name: "Test Bot", type: "agent", online: true }],
+        });
+      }
+      const chanOkrMatch = url.pathname.match(/^\/api\/channels\/([^/]+)\/okr_snapshot$/);
+      if (req.method === "GET" && chanOkrMatch) {
+        const room = decodeURIComponent(chanOkrMatch[1]);
+        return Response.json(channelOkrSnapshots[room] ?? { objectives: [], tasks: [] });
+      }
+      if (req.method === "GET" && url.pathname === "/api/loops") {
+        return Response.json({ loops: [] });
+      }
       const chanListMatch = url.pathname.match(/^\/api\/channels\/([^/]+)\/docs$/);
       if (req.method === "GET" && chanListMatch) {
         const room = decodeURIComponent(chanListMatch[1]);
         recorded.push({ method: "GET", path: url.pathname, search: url.search, ifMatch: null, body: null });
-        const activeOnly = ["1", "true"].includes(url.searchParams.get("active_only") ?? "");
+        const activeOnly =
+          !ignoreActiveOnlyOnRoom.has(room) && ["1", "true"].includes(url.searchParams.get("active_only") ?? "");
         const docs = Object.values(channelDocs[room] ?? {}).filter(
           (d) => !activeOnly || (!d.archived && String(d.body_markdown ?? "").length > 0),
         );
@@ -415,5 +434,126 @@ describe("MCP personal skills full lifecycle (CAS save, load, active_only list, 
     // Channel skill archive handles 204 + ETag cleanly
     expect(res.get(11)?.result?.isError).toBeUndefined();
     expect(res.get(11)?.result?.content?.[0]?.text).toContain("Archived CHANNEL skill room-1/skill-live (v2)");
+  });
+
+  test("channel_brief excludes archived tombstones and surfaces active channel/personal skill outlines + same-room linked docs", async () => {
+    ignoreActiveOnlyOnRoom.add("room-brief");
+    channelDocs["room-brief"] = {
+      "skill-deploy": {
+        id: "skill-deploy",
+        title: "Deploy SOP",
+        kind: "channel_skill",
+        level: 2,
+        version: 3,
+        body_markdown: "---\nname: Deploy SOP\ndescription: Zero-downtime rollout\ntrigger: /deploy\nargument-hint: [env]\n---\n\nSteps",
+        skill_meta: {
+          name: "Deploy SOP",
+          description: "Zero-downtime rollout",
+          trigger: "/deploy",
+          argument_hint: "[env]",
+        },
+      },
+      "skill-tombstone": {
+        id: "skill-tombstone",
+        title: "Retired Skill",
+        kind: "channel_skill",
+        level: 3,
+        version: 4,
+        archived: true,
+        body_markdown: "",
+      },
+      "spec-arch": {
+        id: "spec-arch",
+        title: "Architecture Spec",
+        kind: "spec",
+        level: 1,
+        version: 2,
+        body_markdown: "# Architecture",
+      },
+      "spec-tombstone": {
+        id: "spec-tombstone",
+        title: "Old Spec",
+        kind: "spec",
+        level: 2,
+        version: 5,
+        body_markdown: "",
+      },
+    };
+    personalSkills["triage-playbook"] = {
+      name: "triage-playbook",
+      title: "Triage Playbook",
+      description: "Fast incident triage",
+      body_markdown: "---\nname: Triage Playbook\ndescription: Fast incident triage\ntrigger: /triage\n---\n\nCheck logs",
+      version: 2,
+      updated_at: "2026-11-13T11:30:00Z",
+      skill_meta: { name: "Triage Playbook", description: "Fast incident triage", trigger: "/triage" },
+      revisions: [],
+    };
+    personalSkills["archived-personal"] = {
+      name: "archived-personal",
+      title: "Archived Personal",
+      description: "Retired",
+      body_markdown: "",
+      archived: true,
+      version: 3,
+      updated_at: "2026-11-13T11:30:00Z",
+      skill_meta: { name: "Archived Personal", description: "Retired" },
+      revisions: [],
+    };
+    channelOkrSnapshots["room-brief"] = {
+      objectives: [{ id: "obj_1", title: "Ship v2", status: "active", archived: false }],
+      tasks: [
+        {
+          id: "task_open_1",
+          objective_id: "obj_1",
+          assignee: "test-bot-skills",
+          status: "doing",
+          linked_channel_docs: [
+            { channel_id: "room-brief", doc_id: "skill-deploy" },
+            { channel_id: "room-brief", doc_id: "spec-tombstone" },
+            { channel_id: "foreign-room", doc_id: "secret-doc" },
+          ],
+        },
+      ],
+    };
+
+    const { res } = await drive([
+      INIT,
+      INITED,
+      callTool(2, "channel_brief", { chat_id: "room-brief" }),
+    ]);
+
+    expect(res.get(2)?.result?.isError).toBeUndefined();
+    const brief = JSON.parse(res.get(2)?.result?.content?.[0]?.text ?? "{}");
+    expect(brief.skills).toEqual([
+      {
+        doc_id: "skill-deploy",
+        title: "Deploy SOP",
+        version: 3,
+        name: "Deploy SOP",
+        description: "Zero-downtime rollout",
+        trigger: "/deploy",
+        argument_hint: "[env]",
+      },
+    ]);
+    expect(brief.docs).toEqual([
+      { doc_id: "spec-arch", title: "Architecture Spec", kind: "spec" },
+    ]);
+    expect(brief.personal_skills).toEqual([
+      {
+        name: "triage-playbook",
+        description: "Fast incident triage",
+        trigger: "/triage",
+        version: 2,
+      },
+    ]);
+    expect(brief.active_task_linked_docs).toEqual([
+      {
+        task_id: "task_open_1",
+        doc_id: "skill-deploy",
+        title: "Deploy SOP",
+        is_skill: true,
+      },
+    ]);
   });
 });

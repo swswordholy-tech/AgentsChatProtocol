@@ -4175,7 +4175,7 @@ const handleToolCall = async (request: any): Promise<any> => {
       const pr = await apiFetch(`${REST_URL}/api/skills${activeQuery}`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
       if (pr.ok) {
         const rawSkills = (JSON.parse(await pr.text()).skills) || [];
-        out.personal_skills = rawSkills.filter((s: any) => !activeOnly || s?.archived !== true);
+        out.personal_skills = rawSkills.filter((s: any) => !activeOnly || !isArchivedSkillOrDoc(s));
       } else {
         out.personal_skills_error = `failed (${pr.status})`;
       }
@@ -4958,7 +4958,28 @@ const handleToolCall = async (request: any): Promise<any> => {
   async function fetchMcpChannelContext(chatId: string): Promise<{
     channel?: { id?: string; name?: string; type?: string; topic?: string; member_count?: number };
     agents?: Array<{ id: string; name?: string; capabilities?: string[]; online?: boolean; is_self?: boolean }>;
-    docs_summary?: Array<{ id?: string; doc_id?: string; title?: string; kind?: string; level?: number }>;
+    docs_summary?: Array<{
+      id?: string;
+      doc_id?: string;
+      title?: string;
+      kind?: string;
+      level?: number;
+      version?: number;
+      archived?: boolean;
+      skill_meta?: { name?: string; description?: string; trigger?: string; argument_hint?: string };
+    }>;
+    skills_summary?: {
+      channel_skills?: Array<{
+        doc_id?: string;
+        version?: number;
+        skill_meta?: { name?: string; description?: string; trigger?: string; argument_hint?: string };
+      }>;
+      personal_skills?: Array<{
+        name?: string;
+        version?: number;
+        skill_meta?: { name?: string; description?: string; trigger?: string; argument_hint?: string };
+      }>;
+    };
     okr_summary?: {
       active_objective_count: number;
       total_task_count: number;
@@ -5025,11 +5046,12 @@ const handleToolCall = async (request: any): Promise<any> => {
         return r.ok ? await r.json() as any : null;
       } catch { return null; }
     };
-    const [membersData, docsData, okrData, loopsData, mcpCtx] = await Promise.all([
+    const [membersData, docsData, okrData, loopsData, personalSkillsData, mcpCtx] = await Promise.all([
       get(`/api/channels/${encodeURIComponent(chatId)}/members`),
-      get(`/api/channels/${encodeURIComponent(chatId)}/docs`),
+      get(`/api/channels/${encodeURIComponent(chatId)}/docs?active_only=1`),
       get(`/api/channels/${encodeURIComponent(chatId)}/okr_snapshot`),
       get(`/api/loops?channel_id=${encodeURIComponent(chatId)}`),
+      get(`/api/skills?active_only=1`),
       fetchMcpChannelContext(chatId),
     ]);
     // membersData === null means the /members read FAILED (most often a 403 because
@@ -5087,14 +5109,96 @@ const handleToolCall = async (request: any): Promise<any> => {
     const hasRestDocsPayload = Boolean(
       docsData && (Array.isArray(docsData) || Array.isArray(docsData.docs) || Array.isArray(docsData.channel_docs)),
     );
-    const docsReadable = hasRestDocsPayload || Array.isArray(mcpCtx?.docs_summary);
+    const docsReadable =
+      hasRestDocsPayload ||
+      Array.isArray(mcpCtx?.docs_summary) ||
+      Array.isArray(mcpCtx?.skills_summary?.channel_skills);
     const allDocs = hasRestDocsPayload
       ? extractChannelDocsPayload(docsData)
       : Array.isArray(mcpCtx?.docs_summary)
         ? mcpCtx!.docs_summary.map((d: any) => ({ ...d, id: d?.id ?? d?.doc_id }))
         : [];
-    const skills = allDocs.filter(isSkillDoc).map((d: any) => ({ doc_id: d.id, title: d.title }));
-    const docs = allDocs.filter((d: any) => !isSkillDoc(d)).slice(0, 10).map((d: any) => ({ doc_id: d.id, title: d.title, kind: d.kind }));
+    const archivedDocIds = new Set<string>(
+      allDocs
+        .filter((d: any) => isArchivedSkillOrDoc(d) && (d?.id || d?.doc_id))
+        .map((d: any) => String(d.id ?? d.doc_id)),
+    );
+    const activeDocs = allDocs.filter((d: any) => !isArchivedSkillOrDoc(d));
+    const activeDocById = new Map<string, any>();
+    for (const d of activeDocs) {
+      const id = d?.id ?? d?.doc_id;
+      if (id) activeDocById.set(String(id), d);
+    }
+    const mcpChannelSkills = Array.isArray(mcpCtx?.skills_summary?.channel_skills)
+      ? mcpCtx!.skills_summary!.channel_skills!.filter(
+          (cs: any) => cs?.doc_id && !archivedDocIds.has(String(cs.doc_id)) && !isArchivedSkillOrDoc(cs),
+        )
+      : [];
+    const mcpSkillByDocId = new Map<string, any>();
+    for (const cs of mcpChannelSkills) {
+      mcpSkillByDocId.set(String(cs.doc_id), cs);
+    }
+    const formatBriefChannelSkill = (d: any) => {
+      const docId = String(d?.id ?? d?.doc_id ?? "");
+      const fallback = mcpSkillByDocId.get(docId);
+      const meta = d?.skill_meta || d?.skillMeta || fallback?.skill_meta || {};
+      const version =
+        typeof d?.version === "number"
+          ? d.version
+          : typeof fallback?.version === "number"
+            ? fallback.version
+            : undefined;
+      const argHint = meta.argument_hint ?? meta.argumentHint;
+      return {
+        doc_id: docId,
+        ...(d?.title !== undefined ? { title: d.title } : meta.name ? { title: String(meta.name) } : {}),
+        ...(typeof version === "number" ? { version } : {}),
+        ...(meta.name ? { name: String(meta.name) } : {}),
+        ...(meta.description ? { description: String(meta.description) } : {}),
+        ...(meta.trigger ? { trigger: String(meta.trigger) } : {}),
+        ...(argHint ? { argument_hint: String(argHint) } : {}),
+      };
+    };
+    const seenSkillDocIds = new Set<string>();
+    const skills = activeDocs
+      .filter(isSkillDoc)
+      .map((d: any) => {
+        const entry = formatBriefChannelSkill(d);
+        seenSkillDocIds.add(entry.doc_id);
+        return entry;
+      });
+    if (!hasRestDocsPayload) {
+      for (const cs of mcpChannelSkills) {
+        const docId = String(cs.doc_id);
+        if (seenSkillDocIds.has(docId)) continue;
+        seenSkillDocIds.add(docId);
+        skills.push(formatBriefChannelSkill({ doc_id: docId, ...cs }));
+      }
+    }
+    const docs = activeDocs
+      .filter((d: any) => !isSkillDoc(d))
+      .slice(0, 10)
+      .map((d: any) => ({ doc_id: d.id, title: d.title, kind: d.kind }));
+    const rawPersonalSkills: any[] = Array.isArray(personalSkillsData?.skills)
+      ? personalSkillsData.skills
+      : Array.isArray(mcpCtx?.skills_summary?.personal_skills)
+        ? mcpCtx!.skills_summary!.personal_skills!
+        : [];
+    const personalSkills = rawPersonalSkills
+      .filter((s: any) => s?.name && !isArchivedSkillOrDoc(s))
+      .map((s: any) => {
+        const meta = s?.skill_meta || s?.skillMeta || {};
+        const desc = s?.description ?? meta.description;
+        const trig = s?.trigger ?? meta.trigger;
+        const argHint = s?.argument_hint ?? s?.argumentHint ?? meta.argument_hint ?? meta.argumentHint;
+        return {
+          name: String(s.name),
+          ...(desc ? { description: String(desc) } : {}),
+          ...(trig ? { trigger: String(trig) } : {}),
+          ...(argHint ? { argument_hint: String(argHint) } : {}),
+          ...(typeof s?.version === "number" ? { version: s.version } : {}),
+        };
+      });
     const okrNotConfigured = typeof okrData?.note === "string" && okrData.note.toLowerCase().includes("not configured");
     const hasRestOkrSnapshot = Boolean(
       okrData && !okrNotConfigured && (Array.isArray(okrData.objectives) || Array.isArray(okrData.tasks)),
@@ -5240,6 +5344,34 @@ const handleToolCall = async (request: any): Promise<any> => {
             .filter((id: string) => !wakeSet.has(id)),
         }
       : null;
+    const activeTaskLinkedDocs: Array<{
+      task_id: string;
+      doc_id: string;
+      title?: string;
+      is_skill?: boolean;
+    }> = [];
+    const seenTaskDocPair = new Set<string>();
+    for (const t of Array.isArray(okrData?.tasks) ? okrData.tasks : []) {
+      if (!t?.id || t.archived || String(t.status || "todo") === "done") continue;
+      if (t.objective_id && !visibleObjectiveIdSet.has(String(t.objective_id))) continue;
+      const refs = Array.isArray(t.linked_channel_docs) ? t.linked_channel_docs : [];
+      for (const ref of refs) {
+        const docId = typeof ref?.doc_id === "string" ? ref.doc_id.trim() : "";
+        const refCh = typeof ref?.channel_id === "string" ? ref.channel_id.trim() : "";
+        if (!docId || (refCh && refCh !== chatId)) continue;
+        if (archivedDocIds.has(docId)) continue;
+        const pairKey = `${t.id}:${docId}`;
+        if (seenTaskDocPair.has(pairKey)) continue;
+        seenTaskDocPair.add(pairKey);
+        const matchedDoc = activeDocById.get(docId);
+        activeTaskLinkedDocs.push({
+          task_id: String(t.id),
+          doc_id: docId,
+          ...(matchedDoc?.title ? { title: String(matchedDoc.title) } : {}),
+          ...(matchedDoc && isSkillDoc(matchedDoc) ? { is_skill: true } : {}),
+        });
+      }
+    }
     // Loadable extended tool groups — surfaced here so entering a room hands
     // you the full capability menu (not just skills). Without this an agent has
     // to already KNOW to call list_tool_groups; now "what can I do here / how to
@@ -5265,11 +5397,13 @@ const handleToolCall = async (request: any): Promise<any> => {
       ...(okrSummary ? { okr_summary: okrSummary } : {}),
       ...(loopSummary ? { loop_summary: loopSummary } : {}),
       skills,
+      ...(personalSkills.length > 0 ? { personal_skills: personalSkills } : {}),
+      ...(activeTaskLinkedDocs.length > 0 ? { active_task_linked_docs: activeTaskLinkedDocs } : {}),
       docs,
       tool_groups: toolGroups,
       tips: [
         "load_tool_group(name) reveals an extended group's tools (see tool_groups above; loaded:false = not yet active)",
-        "load_skill(chat_id, doc_id) activates a channel skill; list_skills(chat_id) lists them",
+        "load_skill(chat_id, doc_id) activates a channel skill; load_skill(name) loads a personal skill; list_skills(chat_id) lists both",
         "okr_list / get_history for deeper context",
         "create_loop(channel_id, mode, ...) (or /loop <interval> <prompt>) arms okr_wake / okr_watch / prompt loops; check loop_summary.unarmed_objective_ids",
       ],

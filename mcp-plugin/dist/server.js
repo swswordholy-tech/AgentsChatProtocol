@@ -7821,7 +7821,7 @@ var handleToolCall = async (request) => {
         const pr = await apiFetch(`${REST_URL}/api/skills${activeQuery}`, { headers: { Authorization: `Bearer ${TOKEN}` } });
         if (pr.ok) {
           const rawSkills = JSON.parse(await pr.text()).skills || [];
-          out.personal_skills = rawSkills.filter((s) => !activeOnly || s?.archived !== true);
+          out.personal_skills = rawSkills.filter((s) => !activeOnly || !isArchivedSkillOrDoc(s));
         } else {
           out.personal_skills_error = `failed (${pr.status})`;
         }
@@ -8681,11 +8681,12 @@ ${results}` }] };
           return null;
         }
       };
-      const [membersData, docsData, okrData, loopsData, mcpCtx] = await Promise.all([
+      const [membersData, docsData, okrData, loopsData, personalSkillsData, mcpCtx] = await Promise.all([
         get(`/api/channels/${encodeURIComponent(chatId)}/members`),
-        get(`/api/channels/${encodeURIComponent(chatId)}/docs`),
+        get(`/api/channels/${encodeURIComponent(chatId)}/docs?active_only=1`),
         get(`/api/channels/${encodeURIComponent(chatId)}/okr_snapshot`),
         get(`/api/loops?channel_id=${encodeURIComponent(chatId)}`),
+        get(`/api/skills?active_only=1`),
         fetchMcpChannelContext(chatId)
       ]);
       const membersReadable = membersData !== null;
@@ -8722,10 +8723,67 @@ ${results}` }] };
         is_self: String(m.agent_id) === AGENT_ID
       }));
       const hasRestDocsPayload = Boolean(docsData && (Array.isArray(docsData) || Array.isArray(docsData.docs) || Array.isArray(docsData.channel_docs)));
-      const docsReadable = hasRestDocsPayload || Array.isArray(mcpCtx?.docs_summary);
+      const docsReadable = hasRestDocsPayload || Array.isArray(mcpCtx?.docs_summary) || Array.isArray(mcpCtx?.skills_summary?.channel_skills);
       const allDocs = hasRestDocsPayload ? extractChannelDocsPayload(docsData) : Array.isArray(mcpCtx?.docs_summary) ? mcpCtx.docs_summary.map((d) => ({ ...d, id: d?.id ?? d?.doc_id })) : [];
-      const skills = allDocs.filter(isSkillDoc).map((d) => ({ doc_id: d.id, title: d.title }));
-      const docs = allDocs.filter((d) => !isSkillDoc(d)).slice(0, 10).map((d) => ({ doc_id: d.id, title: d.title, kind: d.kind }));
+      const archivedDocIds = new Set(allDocs.filter((d) => isArchivedSkillOrDoc(d) && (d?.id || d?.doc_id)).map((d) => String(d.id ?? d.doc_id)));
+      const activeDocs = allDocs.filter((d) => !isArchivedSkillOrDoc(d));
+      const activeDocById = new Map;
+      for (const d of activeDocs) {
+        const id = d?.id ?? d?.doc_id;
+        if (id)
+          activeDocById.set(String(id), d);
+      }
+      const mcpChannelSkills = Array.isArray(mcpCtx?.skills_summary?.channel_skills) ? mcpCtx.skills_summary.channel_skills.filter((cs) => cs?.doc_id && !archivedDocIds.has(String(cs.doc_id)) && !isArchivedSkillOrDoc(cs)) : [];
+      const mcpSkillByDocId = new Map;
+      for (const cs of mcpChannelSkills) {
+        mcpSkillByDocId.set(String(cs.doc_id), cs);
+      }
+      const formatBriefChannelSkill = (d) => {
+        const docId = String(d?.id ?? d?.doc_id ?? "");
+        const fallback = mcpSkillByDocId.get(docId);
+        const meta = d?.skill_meta || d?.skillMeta || fallback?.skill_meta || {};
+        const version = typeof d?.version === "number" ? d.version : typeof fallback?.version === "number" ? fallback.version : undefined;
+        const argHint = meta.argument_hint ?? meta.argumentHint;
+        return {
+          doc_id: docId,
+          ...d?.title !== undefined ? { title: d.title } : meta.name ? { title: String(meta.name) } : {},
+          ...typeof version === "number" ? { version } : {},
+          ...meta.name ? { name: String(meta.name) } : {},
+          ...meta.description ? { description: String(meta.description) } : {},
+          ...meta.trigger ? { trigger: String(meta.trigger) } : {},
+          ...argHint ? { argument_hint: String(argHint) } : {}
+        };
+      };
+      const seenSkillDocIds = new Set;
+      const skills = activeDocs.filter(isSkillDoc).map((d) => {
+        const entry = formatBriefChannelSkill(d);
+        seenSkillDocIds.add(entry.doc_id);
+        return entry;
+      });
+      if (!hasRestDocsPayload) {
+        for (const cs of mcpChannelSkills) {
+          const docId = String(cs.doc_id);
+          if (seenSkillDocIds.has(docId))
+            continue;
+          seenSkillDocIds.add(docId);
+          skills.push(formatBriefChannelSkill({ doc_id: docId, ...cs }));
+        }
+      }
+      const docs = activeDocs.filter((d) => !isSkillDoc(d)).slice(0, 10).map((d) => ({ doc_id: d.id, title: d.title, kind: d.kind }));
+      const rawPersonalSkills = Array.isArray(personalSkillsData?.skills) ? personalSkillsData.skills : Array.isArray(mcpCtx?.skills_summary?.personal_skills) ? mcpCtx.skills_summary.personal_skills : [];
+      const personalSkills = rawPersonalSkills.filter((s) => s?.name && !isArchivedSkillOrDoc(s)).map((s) => {
+        const meta = s?.skill_meta || s?.skillMeta || {};
+        const desc = s?.description ?? meta.description;
+        const trig = s?.trigger ?? meta.trigger;
+        const argHint = s?.argument_hint ?? s?.argumentHint ?? meta.argument_hint ?? meta.argumentHint;
+        return {
+          name: String(s.name),
+          ...desc ? { description: String(desc) } : {},
+          ...trig ? { trigger: String(trig) } : {},
+          ...argHint ? { argument_hint: String(argHint) } : {},
+          ...typeof s?.version === "number" ? { version: s.version } : {}
+        };
+      });
       const okrNotConfigured = typeof okrData?.note === "string" && okrData.note.toLowerCase().includes("not configured");
       const hasRestOkrSnapshot = Boolean(okrData && !okrNotConfigured && (Array.isArray(okrData.objectives) || Array.isArray(okrData.tasks)));
       const hasMcpOkrSummary = Boolean(mcpCtx?.okr_summary && typeof mcpCtx.okr_summary === "object" && typeof mcpCtx.okr_summary.active_objective_count === "number");
@@ -8831,6 +8889,34 @@ ${results}` }] };
         okr_watch_objective_ids: [...watchSet],
         unarmed_objective_ids: activeRawObjectives.map((o) => String(o.id)).filter((id) => !wakeSet.has(id))
       } : null;
+      const activeTaskLinkedDocs = [];
+      const seenTaskDocPair = new Set;
+      for (const t of Array.isArray(okrData?.tasks) ? okrData.tasks : []) {
+        if (!t?.id || t.archived || String(t.status || "todo") === "done")
+          continue;
+        if (t.objective_id && !visibleObjectiveIdSet.has(String(t.objective_id)))
+          continue;
+        const refs = Array.isArray(t.linked_channel_docs) ? t.linked_channel_docs : [];
+        for (const ref of refs) {
+          const docId = typeof ref?.doc_id === "string" ? ref.doc_id.trim() : "";
+          const refCh = typeof ref?.channel_id === "string" ? ref.channel_id.trim() : "";
+          if (!docId || refCh && refCh !== chatId)
+            continue;
+          if (archivedDocIds.has(docId))
+            continue;
+          const pairKey = `${t.id}:${docId}`;
+          if (seenTaskDocPair.has(pairKey))
+            continue;
+          seenTaskDocPair.add(pairKey);
+          const matchedDoc = activeDocById.get(docId);
+          activeTaskLinkedDocs.push({
+            task_id: String(t.id),
+            doc_id: docId,
+            ...matchedDoc?.title ? { title: String(matchedDoc.title) } : {},
+            ...matchedDoc && isSkillDoc(matchedDoc) ? { is_skill: true } : {}
+          });
+        }
+      }
       const toolGroups = TOOL_GROUPS.map((g) => ({
         name: g.name,
         summary: g.summary,
@@ -8849,11 +8935,13 @@ ${results}` }] };
         ...okrSummary ? { okr_summary: okrSummary } : {},
         ...loopSummary ? { loop_summary: loopSummary } : {},
         skills,
+        ...personalSkills.length > 0 ? { personal_skills: personalSkills } : {},
+        ...activeTaskLinkedDocs.length > 0 ? { active_task_linked_docs: activeTaskLinkedDocs } : {},
         docs,
         tool_groups: toolGroups,
         tips: [
           "load_tool_group(name) reveals an extended group's tools (see tool_groups above; loaded:false = not yet active)",
-          "load_skill(chat_id, doc_id) activates a channel skill; list_skills(chat_id) lists them",
+          "load_skill(chat_id, doc_id) activates a channel skill; load_skill(name) loads a personal skill; list_skills(chat_id) lists both",
           "okr_list / get_history for deeper context",
           "create_loop(channel_id, mode, ...) (or /loop <interval> <prompt>) arms okr_wake / okr_watch / prompt loops; check loop_summary.unarmed_objective_ids"
         ]
