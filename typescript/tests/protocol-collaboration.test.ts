@@ -2276,4 +2276,129 @@ describe("AgentChatClient realtime collaboration WS events", () => {
       globalThis.fetch = originalFetch;
     }
   });
+
+  test("discover, getOnlineAgents, discoverChannels attach Bearer + no-store, and Cloud Catalog/Models/ProbeModels enforce HTTPS SSRF guards", async () => {
+    const originalFetch = globalThis.fetch;
+    const seen: Array<{ url: string; method: string; headers: Record<string, string>; body?: any }> = [];
+
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      const method = (init?.method ?? "GET").toUpperCase();
+      const rawHeaders = (init?.headers ?? {}) as Record<string, string>;
+      const headers: Record<string, string> = {};
+      for (const [k, v] of Object.entries(rawHeaders)) headers[k.toLowerCase()] = v;
+      const body = init?.body ? JSON.parse(String(init.body)) : undefined;
+      seen.push({ url, method, headers, body });
+
+      if (!headers.authorization) {
+        return Response.json({ error: "Authentication required" }, { status: 401 });
+      }
+      if (url.includes("/api/agents?")) {
+        return Response.json({
+          agents: [
+            { agent_id: "codex-1", display_name: "Codex", capabilities: ["swift", "typescript"], reputation: 100, status: "online" },
+          ],
+        });
+      }
+      if (url.includes("/api/discover?")) {
+        return Response.json({
+          agents: [
+            { agent_id: "codex-1", display_name: "Codex", capabilities: ["swift", "typescript"], reputation: 100, status: "online" },
+          ],
+        });
+      }
+      if (url.includes("/api/channels/discover?")) {
+        return Response.json({
+          channels: [{ id: "ch_swift", name: "Swift Guild", type: "group", visibility: "public", member_count: 12 }],
+        });
+      }
+      if (url.endsWith("/api/cloud-agents/catalog")) {
+        return Response.json({
+          ok: true,
+          catalog: { harnesses: [{ id: "codex", name: "Codex", badge: "CLI", icon: "terminal", description: "Codex", config_files: [], default_model: "deepseek-flash", default_provider: "managed-deepseek" }], efforts: [], managed_models: [], providers: [] },
+          sandbox_enabled: true,
+          sandbox_subscription_runtimes: ["codex", "claude", "agy"],
+          models_dev: { source: "models.dev", url: "https://models.dev/api.json", synced_at: "2026-11-14T00:00:00Z", total_models: 42, providers: [], subscription_cli_models: { codex: [], claude: [], agy: [] } },
+        });
+      }
+      if (url.endsWith("/api/cloud-agents/models")) {
+        return Response.json({
+          ok: true,
+          source: "models.dev",
+          url: "https://models.dev/api.json",
+          synced_at: "2026-11-14T00:00:00Z",
+          total_models: 42,
+          providers: [],
+          subscription_cli_models: { codex: [{ id: "gpt-5.4", name: "GPT-5.4", kind: "model" }], claude: [], agy: [] },
+        });
+      }
+      if (url.endsWith("/api/cloud-agents/probe-models") && method === "POST") {
+        return Response.json({
+          ok: true,
+          count: 2,
+          models: [
+            { id: "glm-5.3", name: "GLM-5.3" },
+            { id: "deepseek-v4", name: "DeepSeek V4" },
+          ],
+        });
+      }
+      return Response.json({ ok: true });
+    }) as typeof fetch;
+
+    try {
+      // Client without constructor bearerToken — verifies per-call bearerToken override works on all 6 endpoints!
+      const rest = new AgentChatREST({ baseUrl: "https://agents-chat.com" });
+
+      const online = await rest.getOnlineAgents({ status: "online", limit: 25, offset: 0, bearerToken: "tok_override_32" });
+      expect(online[0]?.agent_id).toBe("codex-1");
+      expect(seen[0]?.url).toBe("https://agents-chat.com/api/agents?status=online&limit=25&offset=0");
+      expect(seen[0]?.headers.authorization).toBe("Bearer tok_override_32");
+      expect(seen[0]?.headers["cache-control"]).toBe("no-store");
+
+      const discovered = await rest.discover(["swift", "typescript"], 15, {
+        q: "codex",
+        online_only: true,
+        bearerToken: "tok_override_32",
+      });
+      expect(discovered[0]?.agent_id).toBe("codex-1");
+      expect(seen[1]?.url).toContain("capabilities=swift%2Ctypescript");
+      expect(seen[1]?.url).toContain("q=codex");
+      expect(seen[1]?.url).toContain("online_only=1");
+      expect(seen[1]?.headers["cache-control"]).toBe("no-store");
+
+      const pubRooms = await rest.discoverChannels("swift", 10, {
+        agent_id: "codex-1",
+        bearerToken: "tok_override_32",
+      });
+      expect(pubRooms[0]?.id).toBe("ch_swift");
+      expect(seen[2]?.url).toBe("https://agents-chat.com/api/channels/discover?q=swift&limit=10&agent_id=codex-1");
+      expect(seen[2]?.headers["cache-control"]).toBe("no-store");
+
+      const catalog = await rest.getCloudAgentCatalog({ bearerToken: "tok_override_32" });
+      expect(catalog.sandbox_subscription_runtimes).toContain("codex");
+      expect(seen[3]?.headers["cache-control"]).toBe("no-store");
+
+      const models = await rest.getCloudAgentModels({ bearerToken: "tok_override_32" });
+      expect(models.subscription_cli_models.codex[0]?.id).toBe("gpt-5.4");
+      expect(seen[4]?.headers["cache-control"]).toBe("no-store");
+
+      const probed = await rest.probeCloudEndpointModels(
+        { base_url: "https://open.bigmodel.cn/api/anthropic", agent_id: "codex-1" },
+        { bearerToken: "tok_override_32" },
+      );
+      expect(probed.count).toBe(2);
+      expect(seen[5]?.headers["cache-control"]).toBe("no-store");
+
+      const callCountBeforeGuards = seen.length;
+      await expect(rest.probeCloudEndpointModels({ base_url: "http://api.openai.com/v1" })).rejects.toThrow("HTTPS");
+      await expect(rest.probeCloudEndpointModels({ base_url: "https://127.0.0.1/v1" })).rejects.toThrow("Private");
+      await expect(rest.probeCloudEndpointModels({ base_url: "https://[fd00::1]/v1" })).rejects.toThrow("Private");
+      await expect(rest.probeCloudEndpointModels({ base_url: "https://[::ffff:10.0.0.5]/v1" })).rejects.toThrow("Private");
+      await expect(rest.probeCloudEndpointModels({ base_url: "https://api.example.com/v1?key=abc" })).rejects.toThrow("query");
+      await expect(rest.discoverChannels("ok", 10, { agent_id: "ac_live_secret_token_123456" })).rejects.toThrow("Invalid agent ID");
+      expect(seen.length).toBe(callCountBeforeGuards);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
 });

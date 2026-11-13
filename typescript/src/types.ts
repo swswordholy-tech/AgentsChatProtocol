@@ -1977,3 +1977,146 @@ export interface KickChannelMemberResponse {
   kicked_ref?: string;
   [key: string]: unknown;
 }
+
+export interface OnlineAgentsQuery {
+  status?: "online" | "offline" | "all";
+  limit?: number;
+  offset?: number;
+  bearerToken?: string;
+}
+
+export interface DiscoverAgentsOptions {
+  q?: string;
+  online_only?: boolean;
+  bearerToken?: string;
+}
+
+export interface DiscoverChannelsOptions {
+  agent_id?: string;
+  bearerToken?: string;
+}
+
+export type ModelVideoCapabilityLevel = "native" | "frame_sampled" | "unsupported";
+
+export interface ModelsDevModelEntry {
+  id: string;
+  name: string;
+  provider_id: string;
+  release_date: string;
+  reasoning: boolean;
+  tool_call: boolean;
+  supports_image?: boolean;
+  supports_video?: boolean;
+  video_level?: ModelVideoCapabilityLevel;
+  context_window: number;
+  cost_input_per_1m: number | null;
+  cost_output_per_1m: number | null;
+}
+
+export interface ModelsDevProviderEntry {
+  id: string;
+  models_dev_key: string;
+  name: string;
+  base_url: string;
+  env_key: string;
+  default_model: string;
+  models: ModelsDevModelEntry[];
+}
+
+export interface SubscriptionCliModelEntry {
+  id: string;
+  name: string;
+  release_date?: string;
+  kind: "alias" | "model";
+}
+
+export interface SubscriptionCliModelsByRuntime {
+  codex: SubscriptionCliModelEntry[];
+  claude: SubscriptionCliModelEntry[];
+  agy: SubscriptionCliModelEntry[];
+}
+
+export interface ModelsDevCatalogSnapshot {
+  source: "models.dev" | "builtin_fallback" | (string & {});
+  url: string;
+  synced_at: string;
+  total_models: number;
+  providers: ModelsDevProviderEntry[];
+  subscription_cli_models: SubscriptionCliModelsByRuntime;
+}
+
+export interface CloudAgentCatalogHarnessItem {
+  id: string;
+  name: string;
+  badge: string;
+  icon: string;
+  description: string;
+  config_files: string[];
+  default_model: string;
+  default_provider: string;
+}
+
+export interface CloudAgentCatalogEffortItem {
+  id: string;
+  name: string;
+  thinking_budget_tokens: number;
+  description: string;
+}
+
+export interface CloudAgentCatalogManagedModelItem {
+  id: string;
+  name: string;
+  provider: string;
+  context_window: number;
+  input_credits_per_1k: number;
+  output_credits_per_1k: number;
+  min_turn_credits: number;
+  badge?: string;
+}
+
+export interface CloudAgentCatalogProviderItem {
+  id: string;
+  name: string;
+  auth_mode: "managed" | "byok" | (string & {});
+  base_url: string;
+  default_model: string;
+}
+
+export interface CloudAgentCatalogResponse {
+  ok: boolean;
+  catalog: {
+    harnesses: CloudAgentCatalogHarnessItem[];
+    efforts: CloudAgentCatalogEffortItem[];
+    managed_models: CloudAgentCatalogManagedModelItem[];
+    providers: CloudAgentCatalogProviderItem[];
+    membership_plans?: Array<Record<string, unknown>>;
+    credit_packs?: Array<Record<string, unknown>>;
+    [key: string]: unknown;
+  };
+  sandbox_enabled: boolean;
+  sandbox_subscription_runtimes: string[];
+  models_dev: ModelsDevCatalogSnapshot;
+  persistence_notice?: string | null;
+}
+
+export interface CloudAgentModelsResponse extends ModelsDevCatalogSnapshot {
+  ok: boolean;
+}
+
+export interface ProbeCloudEndpointModelsInput {
+  base_url: string;
+  api_key?: string;
+  agent_id?: string;
+  bearerToken?: string;
+}
+
+export interface ProbedEndpointModel {
+  id: string;
+  name: string;
+}
+
+export interface ProbeCloudEndpointModelsResponse {
+  ok: boolean;
+  count: number;
+  models: ProbedEndpointModel[];
+}

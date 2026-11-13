@@ -57,20 +57,75 @@ export class AgentChatREST {
 
   // MARK: - Agents
 
-  async getOnlineAgents(): Promise<AgentCard[]> {
-    const data = await this.get<{ agents: AgentCard[] }>("/api/agents");
+  async getOnlineAgents(opts?: import("./types").OnlineAgentsQuery): Promise<AgentCard[]> {
+    const params = new URLSearchParams();
+    if (opts?.status !== undefined) {
+      if (opts.status !== "online" && opts.status !== "offline" && opts.status !== "all") {
+        throw new Error("Invalid agent status filter");
+      }
+      params.set("status", opts.status);
+    }
+    if (opts?.limit !== undefined) {
+      if (!Number.isInteger(opts.limit) || opts.limit < 1 || opts.limit > 200) {
+        throw new Error("Invalid limit");
+      }
+      params.set("limit", String(opts.limit));
+    }
+    if (opts?.offset !== undefined) {
+      if (!Number.isInteger(opts.offset) || opts.offset < 0) {
+        throw new Error("Invalid offset");
+      }
+      params.set("offset", String(opts.offset));
+    }
+    const qs = params.size > 0 ? `?${params.toString()}` : "";
+    const data = await this.get<{ agents: AgentCard[] }>(`/api/agents${qs}`, {
+      "Cache-Control": "no-store",
+      ...(this.authHeaders(opts?.bearerToken) ?? {}),
+    });
     return data.agents;
   }
 
-  async getAgent(agentId: string): Promise<AgentCard> {
-    return this.get(`/api/agents/${encodeURIComponent(agentId)}`);
+  async getAgent(agentId: string, opts?: { bearerToken?: string }): Promise<AgentCard> {
+    const safeId = this.assertSafeDiscoveryAgentId(agentId);
+    return this.get(`/api/agents/${encodeURIComponent(safeId)}`, {
+      "Cache-Control": "no-store",
+      ...(this.authHeaders(opts?.bearerToken) ?? {}),
+    });
   }
 
-  async discover(capabilities: string[] = [], limit = 20): Promise<AgentCard[]> {
+  async discover(
+    capabilities: string[] = [],
+    limit = 20,
+    opts?: import("./types").DiscoverAgentsOptions,
+  ): Promise<AgentCard[]> {
+    if (!Number.isInteger(limit) || limit < 1 || limit > 200) {
+      throw new Error("Invalid limit");
+    }
     const params = new URLSearchParams();
-    if (capabilities.length > 0) params.set("capabilities", capabilities.join(","));
+    const cleanedCaps = capabilities
+      .map((c) => (typeof c === "string" ? c.trim() : ""))
+      .filter((c) => c.length > 0);
+    for (const cap of cleanedCaps) {
+      if (cap.length > 64 || /[\u0000-\u001F]/.test(cap) || this.containsMemorySecretShape(cap)) {
+        throw new Error("Invalid capability filter");
+      }
+    }
+    if (cleanedCaps.length > 0) params.set("capabilities", cleanedCaps.join(","));
+    if (opts?.q !== undefined) {
+      const q = opts.q.trim();
+      if (q.length > 200 || /[\u0000-\u001F]/.test(q) || this.containsMemorySecretShape(q)) {
+        throw new Error("Invalid search query");
+      }
+      if (q.length > 0) params.set("q", q);
+    }
+    if (opts?.online_only !== undefined) {
+      params.set("online_only", opts.online_only ? "1" : "0");
+    }
     params.set("limit", String(limit));
-    const data = await this.get<{ agents: AgentCard[] }>(`/api/discover?${params}`);
+    const data = await this.get<{ agents: AgentCard[] }>(`/api/discover?${params}`, {
+      "Cache-Control": "no-store",
+      ...(this.authHeaders(opts?.bearerToken) ?? {}),
+    });
     return data.agents;
   }
 
@@ -253,10 +308,141 @@ export class AgentChatREST {
     return this.post("/api/account/status", { owner_id: ownerId, agent_id: agentId, status });
   }
 
-  async discoverChannels(query?: string, limit = 20): Promise<DiscoverableChannelSummary[]> {
-    const q = query ? `?q=${encodeURIComponent(query)}&limit=${limit}` : `?limit=${limit}`;
-    const data = await this.get<{ channels: DiscoverableChannelSummary[] }>(`/api/channels/discover${q}`);
+  private assertSafeDiscoveryAgentId(rawAgentId: string): string {
+    const trimmed = typeof rawAgentId === "string" ? rawAgentId.trim() : "";
+    if (
+      !trimmed ||
+      trimmed.length > 160 ||
+      /[/\\?#&\s\u0000-\u001F]/.test(trimmed) ||
+      trimmed.includes("..") ||
+      /^(?:ac_|agent_key_|sk[-_]|gh[pousr]_|github_pat_|AIza|eyJ)/i.test(trimmed) ||
+      this.containsMemorySecretShape(trimmed)
+    ) {
+      throw new Error("Invalid agent ID");
+    }
+    return trimmed;
+  }
+
+  private assertSafeHttpsProbeEndpoint(rawBaseUrl: string): string {
+    const trimmed = typeof rawBaseUrl === "string" ? rawBaseUrl.trim() : "";
+    if (!trimmed || trimmed.length > 512 || /[\u0000-\u001F]/.test(trimmed)) {
+      throw new Error("A valid HTTPS API Base URL is required");
+    }
+    if (this.containsMemorySecretShape(trimmed)) {
+      throw new Error("API Base URL must not contain secrets");
+    }
+    let parsed: URL;
+    try {
+      parsed = new URL(trimmed);
+    } catch {
+      throw new Error("A valid HTTPS API Base URL is required");
+    }
+    if (parsed.protocol !== "https:") {
+      throw new Error("Only HTTPS API Base URLs are supported");
+    }
+    if (parsed.username || parsed.password || parsed.search || parsed.hash) {
+      throw new Error("API Base URL must not include credentials, query parameters, or fragments");
+    }
+    const host = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+    if (
+      !host ||
+      host === "localhost" ||
+      host.endsWith(".localhost") ||
+      host.endsWith(".local") ||
+      host.endsWith(".internal") ||
+      host === "::1" ||
+      host === "::" ||
+      /^f[cd][0-9a-f]{0,2}:/i.test(host) ||
+      /^fe[89ab][0-9a-f]:/i.test(host) ||
+      this.isPrivateIpv4Host(host)
+    ) {
+      throw new Error("Private or internal network endpoints are not allowed");
+    }
+    const mappedV4 = host.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/i);
+    if (mappedV4 && this.isPrivateIpv4Host(mappedV4[1])) {
+      throw new Error("Private or internal network endpoints are not allowed");
+    }
+    const mappedHex = host.match(/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i);
+    if (mappedHex) {
+      const hi = parseInt(mappedHex[1], 16);
+      const lo = parseInt(mappedHex[2], 16);
+      const dotted = `${(hi >> 8) & 0xff}.${hi & 0xff}.${(lo >> 8) & 0xff}.${lo & 0xff}`;
+      if (this.isPrivateIpv4Host(dotted)) {
+        throw new Error("Private or internal network endpoints are not allowed");
+      }
+    }
+    return parsed.toString();
+  }
+
+  async discoverChannels(
+    query?: string,
+    limit = 20,
+    opts?: import("./types").DiscoverChannelsOptions,
+  ): Promise<DiscoverableChannelSummary[]> {
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+      throw new Error("Invalid limit");
+    }
+    const params = new URLSearchParams();
+    if (query !== undefined) {
+      const q = query.trim();
+      if (q.length > 200 || /[\u0000-\u001F]/.test(q) || this.containsMemorySecretShape(q)) {
+        throw new Error("Invalid search query");
+      }
+      if (q.length > 0) params.set("q", q);
+    }
+    params.set("limit", String(limit));
+    if (opts?.agent_id !== undefined) {
+      params.set("agent_id", this.assertSafeDiscoveryAgentId(opts.agent_id));
+    }
+    const data = await this.get<{ channels: DiscoverableChannelSummary[] }>(
+      `/api/channels/discover?${params.toString()}`,
+      {
+        "Cache-Control": "no-store",
+        ...(this.authHeaders(opts?.bearerToken) ?? {}),
+      },
+    );
     return data.channels;
+  }
+
+  async getCloudAgentCatalog(opts?: { bearerToken?: string }): Promise<import("./types").CloudAgentCatalogResponse> {
+    return this.get<import("./types").CloudAgentCatalogResponse>("/api/cloud-agents/catalog", {
+      "Cache-Control": "no-store",
+      ...(this.authHeaders(opts?.bearerToken) ?? {}),
+    });
+  }
+
+  async getCloudAgentModels(opts?: { bearerToken?: string }): Promise<import("./types").CloudAgentModelsResponse> {
+    return this.get<import("./types").CloudAgentModelsResponse>("/api/cloud-agents/models", {
+      "Cache-Control": "no-store",
+      ...(this.authHeaders(opts?.bearerToken) ?? {}),
+    });
+  }
+
+  async probeCloudEndpointModels(
+    input: import("./types").ProbeCloudEndpointModelsInput,
+    opts?: { bearerToken?: string },
+  ): Promise<import("./types").ProbeCloudEndpointModelsResponse> {
+    const safeBaseUrl = this.assertSafeHttpsProbeEndpoint(input?.base_url);
+    const body: Record<string, unknown> = { base_url: safeBaseUrl };
+    if (input?.api_key !== undefined) {
+      if (typeof input.api_key !== "string" || input.api_key.length > 512 || /[\u0000-\u001F]/.test(input.api_key)) {
+        throw new Error("Invalid api_key");
+      }
+      const trimmedKey = input.api_key.trim();
+      if (trimmedKey) body.api_key = trimmedKey;
+    }
+    if (input?.agent_id !== undefined) {
+      body.agent_id = this.assertSafeDiscoveryAgentId(input.agent_id);
+    }
+    const bearerToken = input?.bearerToken ?? opts?.bearerToken;
+    return this.post<import("./types").ProbeCloudEndpointModelsResponse>(
+      "/api/cloud-agents/probe-models",
+      body,
+      {
+        "Cache-Control": "no-store",
+        ...(this.authHeaders(bearerToken) ?? {}),
+      },
+    );
   }
 
   async myChannels(
