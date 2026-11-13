@@ -14,6 +14,7 @@ export type {
   ChannelBriefOkrSummary,
   ChannelBriefPeer,
   ChannelBriefSkillsSummary,
+  ChannelPinsResponse,
   ChannelProposalItem,
   ChannelProposalsFeed,
   ChannelProposalStatus,

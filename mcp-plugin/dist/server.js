@@ -1853,6 +1853,7 @@ var TOOL_ANNOTATIONS = {
   react: W,
   thread_reply: W,
   pin: W,
+  list_pins: R,
   edit_message: W,
   delete_message: D,
   set_status: W,
@@ -5169,6 +5170,7 @@ var TOOL_GROUPS = [
       "react",
       "thread_reply",
       "pin",
+      "list_pins",
       "edit_message",
       "delete_message",
       "archive_channel",
@@ -5393,6 +5395,17 @@ var ALL_TOOL_DEFS = [
         action: { type: "string", enum: ["pin", "unpin"], description: "pin or unpin (default: pin)" }
       },
       required: ["chat_id", "message_id"]
+    }
+  },
+  {
+    name: "list_pins",
+    description: "List active pinned message IDs for a channel via GET /api/channels/:id/pins (deleted messages are automatically excluded).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        chat_id: { type: "string", description: "The channel_id" }
+      },
+      required: ["chat_id"]
     }
   },
   {
@@ -6922,6 +6935,51 @@ function sanitizeProposalItem(p) {
     ...p.vote_result && typeof p.vote_result === "object" ? { vote_result: p.vote_result } : {}
   };
 }
+HANDLERS.set("list_pins", async (args) => {
+  const chatId = String(args?.chat_id || "").trim();
+  if (!chatId || /[\x00-\x1f\x7f]/.test(chatId) || /^(?:ac_|sk-)/i.test(chatId)) {
+    return { content: [{ type: "text", text: "list_pins needs a valid chat_id." }], isError: true };
+  }
+  try {
+    const r = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(chatId)}/pins`, {
+      headers: {
+        Authorization: `Bearer ${TOKEN}`,
+        "Cache-Control": "no-store",
+        ...AGENT_ID ? { "X-Agent-Id": AGENT_ID } : {}
+      }
+    });
+    const text = await r.text();
+    if (!r.ok) {
+      return { content: [{ type: "text", text: `list_pins failed (${r.status}): ${redactSecrets(text).slice(0, 180)}` }], isError: true };
+    }
+    const body = JSON.parse(text);
+    const seen = new Set;
+    const pinnedMessages = [];
+    if (Array.isArray(body?.pinned_messages)) {
+      for (const rawId of body.pinned_messages) {
+        if (typeof rawId !== "string")
+          continue;
+        const cleaned = rawId.trim().slice(0, 128);
+        if (!cleaned || /[\x00-\x1f\x7f]/.test(cleaned) || seen.has(cleaned))
+          continue;
+        seen.add(cleaned);
+        pinnedMessages.push(cleaned);
+      }
+    }
+    return {
+      content: [{
+        type: "text",
+        text: JSON.stringify({
+          channel_id: chatId,
+          count: pinnedMessages.length,
+          pinned_messages: pinnedMessages
+        })
+      }]
+    };
+  } catch (e) {
+    return { content: [{ type: "text", text: `list_pins error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
+  }
+});
 HANDLERS.set("list_proposals", async (args) => {
   const chatId = String(args?.chat_id || "").trim();
   const statusFilter = String(args?.status || "all").trim().toLowerCase();

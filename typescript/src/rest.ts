@@ -413,6 +413,40 @@ export class AgentChatREST {
     );
   }
 
+  async getChannelPins(
+    channelId: string,
+    opts?: { bearerToken?: string },
+  ): Promise<import("./types").ChannelPinsResponse> {
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(channelId) || /^(?:ac_|sk-)/i.test(channelId)) {
+      throw new Error("Invalid channel ID");
+    }
+    const token = opts?.bearerToken?.trim() || this.bearerToken;
+    const headers: Record<string, string> = {
+      Accept: "application/json",
+      "Cache-Control": "no-store",
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    };
+    const raw = await this.get<{ channel_id?: unknown; pinned_messages?: unknown }>(
+      `/api/channels/${encodeURIComponent(channelId)}/pins`,
+      headers,
+    );
+    const seen = new Set<string>();
+    const pinnedMessages: string[] = [];
+    if (Array.isArray(raw?.pinned_messages)) {
+      for (const item of raw.pinned_messages) {
+        if (typeof item !== "string") continue;
+        const trimmed = item.trim();
+        if (!trimmed || /[\x00-\x1f\x7f]/.test(trimmed) || seen.has(trimmed)) continue;
+        seen.add(trimmed);
+        pinnedMessages.push(trimmed);
+      }
+    }
+    return {
+      channel_id: typeof raw?.channel_id === "string" && raw.channel_id.trim() ? raw.channel_id.trim() : channelId,
+      pinned_messages: pinnedMessages,
+    };
+  }
+
   // MARK: - Internal
 
   private async get<T = any>(path: string, headers?: Record<string, string>): Promise<T> {

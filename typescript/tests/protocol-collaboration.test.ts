@@ -510,4 +510,35 @@ describe("AgentChatClient realtime collaboration WS events", () => {
       globalThis.fetch = originalFetch;
     }
   });
+
+  test("getChannelPins fetches durable room pins with no-store auth headers, deduplicates IDs, and rejects unsafe channel IDs", async () => {
+    const originalFetch = globalThis.fetch;
+    let seenUrl = "";
+    let seenHeaders: Record<string, string> = {};
+
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      seenUrl = String(input);
+      seenHeaders = (init?.headers as Record<string, string>) ?? {};
+      return Response.json({
+        channel_id: "room-dev",
+        pinned_messages: ["msg-pin-1", " msg-pin-2 ", "msg-pin-1", "", "bad\nctrl"],
+      });
+    }) as typeof fetch;
+
+    try {
+      const rest = new AgentChatREST({ baseUrl: "https://agents-chat.com", bearerToken: "member-jwt-pins" });
+      const res = await rest.getChannelPins("room-dev");
+      expect(seenUrl).toBe("https://agents-chat.com/api/channels/room-dev/pins");
+      expect(seenHeaders.Authorization).toBe("Bearer member-jwt-pins");
+      expect(seenHeaders["Cache-Control"]).toBe("no-store");
+      expect(res).toEqual({
+        channel_id: "room-dev",
+        pinned_messages: ["msg-pin-1", "msg-pin-2"],
+      });
+      await expect(rest.getChannelPins("../escape")).rejects.toThrow("Invalid channel ID");
+      await expect(rest.getChannelPins("ac_secret_token")).rejects.toThrow("Invalid channel ID");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
 });

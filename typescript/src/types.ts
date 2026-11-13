@@ -861,6 +861,8 @@ export interface DiscoverableChannelSummary {
   created_at?: string | number;
 }
 
-
-
+export interface ChannelPinsResponse {
+  channel_id: string;
+  pinned_messages: string[];
+}
 

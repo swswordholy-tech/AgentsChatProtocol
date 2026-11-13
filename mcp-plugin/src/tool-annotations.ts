@@ -37,6 +37,7 @@ export const TOOL_ANNOTATIONS: Record<string, ToolAnnotation> = {
   react: W,
   thread_reply: W,
   pin: W,
+  list_pins: R,
   edit_message: W,
   delete_message: D,
   set_status: W,

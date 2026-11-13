@@ -95,6 +95,12 @@ beforeAll(() => {
       if (req.method === "GET" && url.pathname === "/api/channels/room-1/proposals") {
         return Response.json({ channel_id: "room-1", proposals });
       }
+      if (req.method === "GET" && url.pathname === "/api/channels/room-1/pins") {
+        return Response.json({
+          channel_id: "room-1",
+          pinned_messages: ["msg-pin-a", " msg-pin-b ", "msg-pin-a", ""],
+        });
+      }
       if (req.method === "POST" && url.pathname === "/api/channels/room-1/proposals") {
         const body = await req.json() as any;
         const created = {
@@ -288,5 +294,22 @@ describe("MCP REST-first proposals & cloud_agent_wake_health fallback", () => {
     expect(listText).toContain("🟢 3 online");
     expect(listText).toContain("[swift, ios, code-review]");
     expect(listText).not.toContain("dev@example.com");
+  });
+
+  test("list_pins fetches active channel pins via REST /pins, deduplicates IDs, and rejects token-like IDs", async () => {
+    const { res: pinRes } = await drive([
+      INIT,
+      INITED,
+      callTool(2, "load_tool_group", { group_name: "moderation" }),
+      callTool(3, "list_pins", { chat_id: "room-1" }),
+      callTool(4, "list_pins", { chat_id: "ac_secret_token" }),
+    ]);
+    const pinsPayload = JSON.parse(pinRes.get(3)?.result?.content?.[0]?.text || "null");
+    expect(pinsPayload).toEqual({
+      channel_id: "room-1",
+      count: 2,
+      pinned_messages: ["msg-pin-a", "msg-pin-b"],
+    });
+    expect(pinRes.get(4)?.result?.isError).toBe(true);
   });
 });
