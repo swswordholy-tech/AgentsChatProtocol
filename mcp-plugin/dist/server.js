@@ -594,6 +594,64 @@ function validateOkrSetKrProgressInput(args) {
     }
   };
 }
+var OKR_TASK_CONTRIBUTES_CAP = 5;
+function validateOkrTaskAssigneeInput(raw) {
+  if (typeof raw !== "string") {
+    return { ok: false, error: "assignee must be a non-empty agent handle string" };
+  }
+  const trimmed = raw.trim().replace(/^@+/, "");
+  if (!trimmed || trimmed.length > 128 || EVIDENCE_CTRL_RE.test(trimmed)) {
+    return { ok: false, error: "assignee must be a non-empty agent handle (<=128 chars)" };
+  }
+  if (trimmed.includes("@")) {
+    return { ok: false, error: "assignee rejected: must be an agent handle, never an email address" };
+  }
+  if (EVIDENCE_SECRET_RE.test(trimmed)) {
+    return { ok: false, error: "assignee rejected: appears to contain a secret or token" };
+  }
+  if (!SAFE_CHANNEL_OR_LOOP_ID_RE.test(trimmed) || trimmed.includes("..")) {
+    return { ok: false, error: `assignee "${trimmed}" contains invalid characters` };
+  }
+  return { ok: true, value: trimmed };
+}
+function validateOkrTaskContributesToInput(raw) {
+  if (raw === null)
+    return { ok: true, value: [] };
+  if (!Array.isArray(raw)) {
+    return {
+      ok: false,
+      error: `contributes_to must be an array of KR IDs (0..${OKR_TASK_CONTRIBUTES_CAP} items; pass [] to clear)`
+    };
+  }
+  if (raw.length === 0)
+    return { ok: true, value: [] };
+  if (raw.length > OKR_TASK_CONTRIBUTES_CAP) {
+    return { ok: false, error: `contributes_to exceeds max ${OKR_TASK_CONTRIBUTES_CAP} KR IDs` };
+  }
+  const out = [];
+  const seen = new Set;
+  for (let i = 0;i < raw.length; i++) {
+    const item = raw[i];
+    if (typeof item !== "string") {
+      return { ok: false, error: `contributes_to[${i}] must be a non-empty KR ID string` };
+    }
+    const id = item.trim();
+    if (!id || id.length > 128 || EVIDENCE_CTRL_RE.test(id)) {
+      return { ok: false, error: `contributes_to[${i}] must be a non-empty KR ID (<=128 chars)` };
+    }
+    if (EVIDENCE_SECRET_RE.test(id)) {
+      return { ok: false, error: `contributes_to[${i}] rejected: appears to contain a secret or token` };
+    }
+    if (!SAFE_CHANNEL_OR_LOOP_ID_RE.test(id) || id.includes("..")) {
+      return { ok: false, error: `contributes_to[${i}] contains invalid KR ID characters` };
+    }
+    if (!seen.has(id)) {
+      seen.add(id);
+      out.push(id);
+    }
+  }
+  return { ok: true, value: out };
+}
 
 // src/identity.ts
 function decideIdentity(i) {
@@ -4945,8 +5003,8 @@ var ALL_TOOL_DEFS = [
       properties: {
         objective_id: { type: "string", description: "Parent Objective id" },
         title: { type: "string", description: "Task title (max 200 chars)" },
-        assignee: { type: "string", description: "Agent/account id to assign the task to" },
-        contributes_to: { type: "array", items: { type: "string" }, description: "Optional KR ids this task advances" },
+        assignee: { type: "string", description: "Agent handle to assign the task to (never an email address)" },
+        contributes_to: { type: "array", maxItems: 5, items: { type: "string" }, description: "Optional KR ids (0..5) on the Objective that this task advances" },
         depends_on: { type: "array", items: { type: "string" }, description: "Optional task ids this task waits on. Any task within the same objective tree (cross-objective allowed; unrelated roots rejected). Max 20 direct deps. Server rejects cycles." },
         due: { type: "string", description: "ISO-8601 due date" }
       },
@@ -4955,13 +5013,19 @@ var ALL_TOOL_DEFS = [
   },
   {
     name: "okr_update_task",
-    description: "Update a Task \u2014 change status, assignee, block/unblock, add blocker info, adjust dependencies, or record structured completion evidence. Caller must be the assignee, Objective owner, or admin. Reassign is owner/admin-only. Pass depends_on:[] to clear, or a new array to replace; server rejects cycles. Prefer append_evidence:[{kind, ref, note?}] (1..10 items, deduplicated without overwriting existing receipts) or pass evidence:[{kind, ref, note?}] (full replacement; [] to clear) plus optional if_match_updated_at CAS token.",
+    description: "Update a Task \u2014 change status, re-assign assignee, bind/clear contributes_to Key Results, block/unblock, add blocker info, adjust dependencies, or record structured completion evidence. Caller must be the assignee, Objective owner, or admin. Reassign and contributes_to changes are owner/admin-only. Pass depends_on:[] or contributes_to:[] to clear, or a new array to replace; server rejects cycles. Prefer append_evidence:[{kind, ref, note?}] (1..10 items, deduplicated without overwriting existing receipts) or pass evidence:[{kind, ref, note?}] (full replacement; [] to clear) plus optional if_match_updated_at CAS token.",
     inputSchema: {
       type: "object",
       properties: {
         task_id: { type: "string", description: "Task id to update" },
         status: { type: "string", enum: ["todo", "doing", "done", "blocked"], description: "New status" },
-        assignee: { type: "string", description: "Re-assign to another agent (owner/admin only)" },
+        assignee: { type: "string", description: "Re-assign to another agent handle (Objective owner/admin only; never an email address)" },
+        contributes_to: {
+          type: "array",
+          maxItems: 5,
+          items: { type: "string" },
+          description: "Replacement Key Result IDs (0..5) on the Objective tree that this task advances (Objective owner/admin only; pass [] to clear)."
+        },
         blocked_reason: { type: "string", description: "Why is this task blocked (max 500 chars)" },
         blocker_agent: { type: "string", description: "Which agent is blocking this task" },
         depends_on: { type: "array", items: { type: "string" }, description: "Replacement dependency list (any task in the same objective tree, max 20, no cycles). Pass empty array to clear." },
@@ -8119,9 +8183,19 @@ ${list}` }] };
     }
     if (name === "okr_add_task") {
       const { objective_id, title, assignee, contributes_to, depends_on, due } = args;
-      const body = { title, assignee };
-      if (Array.isArray(contributes_to) && contributes_to.length > 0)
-        body.contributes_to = contributes_to;
+      const assigneeCheck = validateOkrTaskAssigneeInput(assignee);
+      if (!assigneeCheck.ok) {
+        return { content: [{ type: "text", text: `okr_add_task invalid assignee: ${assigneeCheck.error}` }], isError: true };
+      }
+      const body = { title, assignee: assigneeCheck.value };
+      if (contributes_to !== undefined) {
+        const contribCheck = validateOkrTaskContributesToInput(contributes_to);
+        if (!contribCheck.ok) {
+          return { content: [{ type: "text", text: `okr_add_task invalid contributes_to: ${contribCheck.error}` }], isError: true };
+        }
+        if (contribCheck.value.length > 0)
+          body.contributes_to = contribCheck.value;
+      }
       if (Array.isArray(depends_on) && depends_on.length > 0)
         body.depends_on = depends_on;
       if (due)
@@ -8146,6 +8220,7 @@ ${list}` }] };
         task_id,
         status,
         assignee,
+        contributes_to,
         blocked_reason,
         blocker_agent,
         depends_on,
@@ -8163,8 +8238,20 @@ ${list}` }] };
       const patch = {};
       if (status)
         patch.status = status;
-      if (assignee)
-        patch.assignee = assignee;
+      if (assignee !== undefined) {
+        const assigneeCheck = validateOkrTaskAssigneeInput(assignee);
+        if (!assigneeCheck.ok) {
+          return { content: [{ type: "text", text: `okr_update_task invalid assignee: ${assigneeCheck.error}` }], isError: true };
+        }
+        patch.assignee = assigneeCheck.value;
+      }
+      if (contributes_to !== undefined) {
+        const contribCheck = validateOkrTaskContributesToInput(contributes_to);
+        if (!contribCheck.ok) {
+          return { content: [{ type: "text", text: `okr_update_task invalid contributes_to: ${contribCheck.error}` }], isError: true };
+        }
+        patch.contributes_to = contribCheck.value;
+      }
       if (blocked_reason !== undefined)
         patch.blocked_reason = blocked_reason;
       if (blocker_agent !== undefined)

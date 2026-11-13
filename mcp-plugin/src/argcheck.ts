@@ -534,3 +534,66 @@ export function validateOkrSetKrProgressInput(
     },
   };
 }
+
+const OKR_TASK_CONTRIBUTES_CAP = 5;
+
+export function validateOkrTaskAssigneeInput(
+  raw: unknown,
+): { ok: true; value: string } | { ok: false; error: string } {
+  if (typeof raw !== "string") {
+    return { ok: false, error: "assignee must be a non-empty agent handle string" };
+  }
+  const trimmed = raw.trim().replace(/^@+/, "");
+  if (!trimmed || trimmed.length > 128 || EVIDENCE_CTRL_RE.test(trimmed)) {
+    return { ok: false, error: "assignee must be a non-empty agent handle (<=128 chars)" };
+  }
+  if (trimmed.includes("@")) {
+    return { ok: false, error: "assignee rejected: must be an agent handle, never an email address" };
+  }
+  if (EVIDENCE_SECRET_RE.test(trimmed)) {
+    return { ok: false, error: "assignee rejected: appears to contain a secret or token" };
+  }
+  if (!SAFE_CHANNEL_OR_LOOP_ID_RE.test(trimmed) || trimmed.includes("..")) {
+    return { ok: false, error: `assignee "${trimmed}" contains invalid characters` };
+  }
+  return { ok: true, value: trimmed };
+}
+
+export function validateOkrTaskContributesToInput(
+  raw: unknown,
+): { ok: true; value: string[] } | { ok: false; error: string } {
+  if (raw === null) return { ok: true, value: [] };
+  if (!Array.isArray(raw)) {
+    return {
+      ok: false,
+      error: `contributes_to must be an array of KR IDs (0..${OKR_TASK_CONTRIBUTES_CAP} items; pass [] to clear)`,
+    };
+  }
+  if (raw.length === 0) return { ok: true, value: [] };
+  if (raw.length > OKR_TASK_CONTRIBUTES_CAP) {
+    return { ok: false, error: `contributes_to exceeds max ${OKR_TASK_CONTRIBUTES_CAP} KR IDs` };
+  }
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (let i = 0; i < raw.length; i++) {
+    const item = raw[i];
+    if (typeof item !== "string") {
+      return { ok: false, error: `contributes_to[${i}] must be a non-empty KR ID string` };
+    }
+    const id = item.trim();
+    if (!id || id.length > 128 || EVIDENCE_CTRL_RE.test(id)) {
+      return { ok: false, error: `contributes_to[${i}] must be a non-empty KR ID (<=128 chars)` };
+    }
+    if (EVIDENCE_SECRET_RE.test(id)) {
+      return { ok: false, error: `contributes_to[${i}] rejected: appears to contain a secret or token` };
+    }
+    if (!SAFE_CHANNEL_OR_LOOP_ID_RE.test(id) || id.includes("..")) {
+      return { ok: false, error: `contributes_to[${i}] contains invalid KR ID characters` };
+    }
+    if (!seen.has(id)) {
+      seen.add(id);
+      out.push(id);
+    }
+  }
+  return { ok: true, value: out };
+}

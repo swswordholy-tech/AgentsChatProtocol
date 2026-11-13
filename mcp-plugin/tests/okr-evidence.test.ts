@@ -52,11 +52,15 @@ beforeAll(() => {
           nextEv = base;
           storedEvidenceByTask[taskId] = nextEv;
         }
+        if (Array.isArray(body.contributes_to)) {
+          storedContributesByTask[taskId] = body.contributes_to;
+        }
         return Response.json({
           ok: true,
           task: {
             id: taskId,
             status: body.status ?? "doing",
+            assignee: body.assignee ?? "test-bot-okr",
             updated_at: "2026-11-12T19:36:00.000Z",
             contributes_to: storedContributesByTask[taskId],
             evidence: nextEv && nextEv.length > 0 ? nextEv : undefined,
@@ -404,5 +408,70 @@ describe("MCP okr_update_task structured evidence", () => {
     expect(out.res.get(4)?.result?.content?.[0]?.text).toContain("bool current must be 0 or 1");
     expect(out.res.get(5)?.result?.content?.[0]?.text).toContain("percent current must be <= 100");
     expect(out.res.get(6)?.result?.content?.[0]?.text).toContain("0..1000000");
+  });
+
+  test("okr_update_task supports assignee normalization, contributes_to bind/dedup/clear, and blocks email/secret/oversize inputs client-side", async () => {
+    const out = await drive([
+      INIT,
+      INITED,
+      callTool(2, "load_tool_group", { group_name: "okr" }),
+      { jsonrpc: "2.0", id: 3, method: "tools/list", params: {} },
+      callTool(4, "okr_update_task", {
+        task_id: "task_gov_1",
+        assignee: " @codex-staff-engineer-ca7590 ",
+        contributes_to: [" kr_1 ", "kr_2", "kr_1"],
+      }),
+      callTool(5, "okr_update_task", {
+        task_id: "task_gov_1",
+        contributes_to: [],
+      }),
+      callTool(6, "okr_update_task", {
+        task_id: "task_gov_1",
+        assignee: "boss@example.com",
+      }),
+      callTool(7, "okr_update_task", {
+        task_id: "task_gov_1",
+        contributes_to: ["kr_1", "kr_2", "kr_3", "kr_4", "kr_5", "kr_6"],
+      }),
+      callTool(8, "okr_update_task", {
+        task_id: "task_gov_1",
+        contributes_to: ["agent_key_supersecret123456"],
+      }),
+      callTool(9, "okr_add_task", {
+        objective_id: "obj_1",
+        title: "Email assignee blocked",
+        assignee: "human@company.io",
+      }),
+    ], 1800);
+
+    const tools = out.res.get(3)?.result?.tools || [];
+    const okrUpdateDef = tools.find((t: any) => t.name === "okr_update_task");
+    expect(okrUpdateDef?.inputSchema?.properties?.contributes_to?.type).toBe("array");
+    expect(okrUpdateDef?.inputSchema?.properties?.contributes_to?.maxItems).toBe(5);
+
+    expect(out.res.get(4)?.result?.isError).toBeUndefined();
+    expect(out.res.get(5)?.result?.isError).toBeUndefined();
+    for (const id of [6, 7, 8, 9]) {
+      expect(out.res.get(id)?.result?.isError).toBe(true);
+    }
+    expect(out.res.get(6)?.result?.content?.[0]?.text).toContain("never an email address");
+    expect(out.res.get(7)?.result?.content?.[0]?.text).toContain("exceeds max 5");
+    expect(out.res.get(8)?.result?.content?.[0]?.text).toContain("secret or token");
+    expect(out.res.get(9)?.result?.content?.[0]?.text).toContain("never an email address");
+
+    expect(receivedPatches).toHaveLength(2);
+    expect(receivedPatches[0]).toEqual({
+      taskId: "task_gov_1",
+      body: {
+        assignee: "codex-staff-engineer-ca7590",
+        contributes_to: ["kr_1", "kr_2"],
+      },
+    });
+    expect(receivedPatches[1]).toEqual({
+      taskId: "task_gov_1",
+      body: {
+        contributes_to: [],
+      },
+    });
   });
 });

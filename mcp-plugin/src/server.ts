@@ -56,6 +56,8 @@ import {
   validateCreateLoopInput,
   validateOkrAddKrInput,
   validateOkrSetKrProgressInput,
+  validateOkrTaskAssigneeInput,
+  validateOkrTaskContributesToInput,
   validateTaskEvidenceInput,
   validateTaskVersionToken,
   validateToolArgs,
@@ -2008,8 +2010,8 @@ const ALL_TOOL_DEFS = [
         properties: {
           objective_id: { type: "string", description: "Parent Objective id" },
           title: { type: "string", description: "Task title (max 200 chars)" },
-          assignee: { type: "string", description: "Agent/account id to assign the task to" },
-          contributes_to: { type: "array", items: { type: "string" }, description: "Optional KR ids this task advances" },
+          assignee: { type: "string", description: "Agent handle to assign the task to (never an email address)" },
+          contributes_to: { type: "array", maxItems: 5, items: { type: "string" }, description: "Optional KR ids (0..5) on the Objective that this task advances" },
           depends_on: { type: "array", items: { type: "string" }, description: "Optional task ids this task waits on. Any task within the same objective tree (cross-objective allowed; unrelated roots rejected). Max 20 direct deps. Server rejects cycles." },
           due: { type: "string", description: "ISO-8601 due date" },
         },
@@ -2018,13 +2020,19 @@ const ALL_TOOL_DEFS = [
     },
     {
       name: "okr_update_task",
-      description: "Update a Task — change status, assignee, block/unblock, add blocker info, adjust dependencies, or record structured completion evidence. Caller must be the assignee, Objective owner, or admin. Reassign is owner/admin-only. Pass depends_on:[] to clear, or a new array to replace; server rejects cycles. Prefer append_evidence:[{kind, ref, note?}] (1..10 items, deduplicated without overwriting existing receipts) or pass evidence:[{kind, ref, note?}] (full replacement; [] to clear) plus optional if_match_updated_at CAS token.",
+      description: "Update a Task — change status, re-assign assignee, bind/clear contributes_to Key Results, block/unblock, add blocker info, adjust dependencies, or record structured completion evidence. Caller must be the assignee, Objective owner, or admin. Reassign and contributes_to changes are owner/admin-only. Pass depends_on:[] or contributes_to:[] to clear, or a new array to replace; server rejects cycles. Prefer append_evidence:[{kind, ref, note?}] (1..10 items, deduplicated without overwriting existing receipts) or pass evidence:[{kind, ref, note?}] (full replacement; [] to clear) plus optional if_match_updated_at CAS token.",
       inputSchema: {
         type: "object" as const,
         properties: {
           task_id: { type: "string", description: "Task id to update" },
           status: { type: "string", enum: ["todo", "doing", "done", "blocked"], description: "New status" },
-          assignee: { type: "string", description: "Re-assign to another agent (owner/admin only)" },
+          assignee: { type: "string", description: "Re-assign to another agent handle (Objective owner/admin only; never an email address)" },
+          contributes_to: {
+            type: "array",
+            maxItems: 5,
+            items: { type: "string" },
+            description: "Replacement Key Result IDs (0..5) on the Objective tree that this task advances (Objective owner/admin only; pass [] to clear).",
+          },
           blocked_reason: { type: "string", description: "Why is this task blocked (max 500 chars)" },
           blocker_agent: { type: "string", description: "Which agent is blocking this task" },
           depends_on: { type: "array", items: { type: "string" }, description: "Replacement dependency list (any task in the same objective tree, max 20, no cycles). Pass empty array to clear." },
@@ -5515,10 +5523,20 @@ const handleToolCall = async (request: any): Promise<any> => {
 
   if (name === "okr_add_task") {
     const { objective_id, title, assignee, contributes_to, depends_on, due } = args as {
-      objective_id: string; title: string; assignee: string; contributes_to?: string[]; depends_on?: string[]; due?: string;
+      objective_id: string; title: string; assignee: string; contributes_to?: unknown; depends_on?: string[]; due?: string;
     };
-    const body: Record<string, unknown> = { title, assignee };
-    if (Array.isArray(contributes_to) && contributes_to.length > 0) body.contributes_to = contributes_to;
+    const assigneeCheck = validateOkrTaskAssigneeInput(assignee);
+    if (!assigneeCheck.ok) {
+      return { content: [{ type: "text", text: `okr_add_task invalid assignee: ${assigneeCheck.error}` }], isError: true };
+    }
+    const body: Record<string, unknown> = { title, assignee: assigneeCheck.value };
+    if (contributes_to !== undefined) {
+      const contribCheck = validateOkrTaskContributesToInput(contributes_to);
+      if (!contribCheck.ok) {
+        return { content: [{ type: "text", text: `okr_add_task invalid contributes_to: ${contribCheck.error}` }], isError: true };
+      }
+      if (contribCheck.value.length > 0) body.contributes_to = contribCheck.value;
+    }
     if (Array.isArray(depends_on) && depends_on.length > 0) body.depends_on = depends_on;
     if (due) body.due = due;
     try {
@@ -5542,6 +5560,7 @@ const handleToolCall = async (request: any): Promise<any> => {
       task_id,
       status,
       assignee,
+      contributes_to,
       blocked_reason,
       blocker_agent,
       depends_on,
@@ -5552,7 +5571,8 @@ const handleToolCall = async (request: any): Promise<any> => {
     } = args as {
       task_id: string;
       status?: string;
-      assignee?: string;
+      assignee?: unknown;
+      contributes_to?: unknown;
       blocked_reason?: string;
       blocker_agent?: string;
       depends_on?: string[];
@@ -5569,7 +5589,20 @@ const handleToolCall = async (request: any): Promise<any> => {
     }
     const patch: Record<string, unknown> = {};
     if (status) patch.status = status;
-    if (assignee) patch.assignee = assignee;
+    if (assignee !== undefined) {
+      const assigneeCheck = validateOkrTaskAssigneeInput(assignee);
+      if (!assigneeCheck.ok) {
+        return { content: [{ type: "text", text: `okr_update_task invalid assignee: ${assigneeCheck.error}` }], isError: true };
+      }
+      patch.assignee = assigneeCheck.value;
+    }
+    if (contributes_to !== undefined) {
+      const contribCheck = validateOkrTaskContributesToInput(contributes_to);
+      if (!contribCheck.ok) {
+        return { content: [{ type: "text", text: `okr_update_task invalid contributes_to: ${contribCheck.error}` }], isError: true };
+      }
+      patch.contributes_to = contribCheck.value;
+    }
     if (blocked_reason !== undefined) patch.blocked_reason = blocked_reason;
     if (blocker_agent !== undefined) patch.blocker_agent = blocker_agent;
     if (Array.isArray(depends_on)) patch.depends_on = depends_on;
