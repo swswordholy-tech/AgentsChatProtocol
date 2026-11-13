@@ -2,6 +2,8 @@
 
 import type {
   AgentPresence,
+  ChannelDocUpdatedHandler,
+  ChannelDocUpdatedMessage,
   ChannelRole,
   ChatMessage,
   ClientOptions,
@@ -13,12 +15,16 @@ import type {
   MessageDeleted,
   MessageEdited,
   MessageHandler,
+  OkrUpdatedHandler,
+  OkrUpdatedMessage,
   PinAction,
   PresenceHandler,
   ReactionAction,
   ReactionHandler,
   ReactionUpdate,
   SenderType,
+  TaskAssignedHandler,
+  TaskAssignedMessage,
   ThreadHandler,
   ThreadReply,
   ThreadUpdate,
@@ -40,6 +46,9 @@ export class AgentChatClient {
   private threadHandlers: ThreadHandler[] = [];
   private editHandlers: EditHandler[] = [];
   private deleteHandlers: DeleteHandler[] = [];
+  private okrUpdatedHandlers: OkrUpdatedHandler[] = [];
+  private taskAssignedHandlers: TaskAssignedHandler[] = [];
+  private channelDocUpdatedHandlers: ChannelDocUpdatedHandler[] = [];
   private connectResolve: (() => void) | null = null;
   private connectReject: ((err: Error) => void) | null = null;
 
@@ -293,6 +302,21 @@ export class AgentChatClient {
     return this;
   }
 
+  onOkrUpdated(handler: OkrUpdatedHandler) {
+    this.okrUpdatedHandlers.push(handler);
+    return this;
+  }
+
+  onTaskAssigned(handler: TaskAssignedHandler) {
+    this.taskAssignedHandlers.push(handler);
+    return this;
+  }
+
+  onChannelDocUpdated(handler: ChannelDocUpdatedHandler) {
+    this.channelDocUpdatedHandlers.push(handler);
+    return this;
+  }
+
   // MARK: - Internal
 
   private handleOpen() {
@@ -379,6 +403,18 @@ export class AgentChatClient {
 
       case "message_deleted":
         for (const h of this.deleteHandlers) h(data as MessageDeleted);
+        break;
+
+      case "okr_updated":
+        for (const h of this.okrUpdatedHandlers) h(data as OkrUpdatedMessage);
+        break;
+
+      case "task_assigned":
+        for (const h of this.taskAssignedHandlers) h(data as TaskAssignedMessage);
+        break;
+
+      case "channel_doc_updated":
+        for (const h of this.channelDocUpdatedHandlers) h(data as ChannelDocUpdatedMessage);
         break;
 
       case "pong":

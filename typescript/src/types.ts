@@ -430,7 +430,51 @@ export interface AgentStatusBroadcast {
   status_emoji?: string;
 }
 
-/** Union of all 48 protocol message types */
+export type ChannelDocKind = "rule" | "plan" | "context" | "decision" | "skill" | "channel_skill";
+
+export interface OkrUpdatedMessage {
+  type: "okr_updated";
+  kind: string;
+  objective_id: string;
+  channel_id?: string;
+  discussion_channel_id?: string;
+  task_id?: string;
+  kr_id?: string;
+  updated_kr_ids?: string[];
+  title?: string;
+  status?: string;
+  owner?: string;
+  actor_id?: string;
+  from?: string;
+  to?: string;
+  parent_id?: string | null;
+  auto?: boolean;
+}
+
+export interface TaskAssignedMessage {
+  type: "task_assigned";
+  task_id: string;
+  objective_id: string;
+  title: string;
+  assignee: string;
+  channel_id?: string;
+  discussion_channel_id?: string;
+}
+
+export interface ChannelDocUpdatedMessage {
+  type: "channel_doc_updated";
+  channel_id: string;
+  doc_id: string;
+  title: string;
+  kind: ChannelDocKind;
+  level: 1 | 2 | 3 | 4;
+  version: number;
+  archived: boolean;
+  updated_at: string;
+  updated_by: string;
+}
+
+/** Union of all protocol message types */
 export type ACMessage =
   // Client → Server
   | AuthMessage
@@ -475,14 +519,17 @@ export type ACMessage =
   | AgentStatusBroadcast
   | TopicUpdateMessage
   | ChannelArchivedMessage
-  // V2: Raft + DAG
+  // V2: Raft + DAG + Realtime Collaboration
   | RequestVoteMessage
   | VoteGrantedMessage
   | LeaderElectedMessage
   | CreateDAGMessage
   | AssignTaskMessage
   | TaskUpdateMessage
-  | TaskVerifiedMessage;
+  | TaskVerifiedMessage
+  | OkrUpdatedMessage
+  | TaskAssignedMessage
+  | ChannelDocUpdatedMessage;
 
 // Handler types
 export type MessageHandler = (msg: ChatMessage) => void | Promise<void>;
@@ -493,3 +540,6 @@ export type ReactionHandler = (update: ReactionUpdate) => void | Promise<void>;
 export type ThreadHandler = (data: ThreadReply | ThreadUpdate) => void | Promise<void>;
 export type EditHandler = (data: MessageEdited) => void | Promise<void>;
 export type DeleteHandler = (data: MessageDeleted) => void | Promise<void>;
+export type OkrUpdatedHandler = (data: OkrUpdatedMessage) => void | Promise<void>;
+export type TaskAssignedHandler = (data: TaskAssignedMessage) => void | Promise<void>;
+export type ChannelDocUpdatedHandler = (data: ChannelDocUpdatedMessage) => void | Promise<void>;
