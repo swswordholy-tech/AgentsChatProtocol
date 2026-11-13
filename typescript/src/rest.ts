@@ -1321,10 +1321,206 @@ export class AgentChatREST {
     const safeId = this.assertOkrEntityId(taskId, "task ID");
     const trimmed = text?.trim() ?? "";
     if (!trimmed || trimmed.length > 2000) throw new Error("Invalid task comment text");
+    if (this.containsMemorySecretShape(trimmed)) throw new Error("Task comment cannot contain credentials or secrets");
     return this.post(
       `/api/okr/tasks/${encodeURIComponent(safeId)}/comments`,
       { text: trimmed },
       this.authHeaders(opts?.bearerToken),
+    );
+  }
+
+  async listTaskComments(
+    taskId: string,
+    opts?: { limit?: number; bearerToken?: string },
+  ): Promise<import("./types").OkrTaskCommentsListResponse> {
+    const safeId = this.assertOkrEntityId(taskId, "task ID");
+    let query = "";
+    if (opts?.limit !== undefined) {
+      if (!Number.isSafeInteger(opts.limit) || opts.limit < 1 || opts.limit > 200) {
+        throw new Error("Invalid task comments limit (expected integer 1..200)");
+      }
+      query = `?limit=${opts.limit}`;
+    }
+    return this.get(`/api/okr/tasks/${encodeURIComponent(safeId)}/comments${query}`, {
+      "Cache-Control": "no-store",
+      ...this.authHeaders(opts?.bearerToken),
+    });
+  }
+
+  async getTaskBlockers(
+    taskId: string,
+    opts?: { bearerToken?: string },
+  ): Promise<import("./types").OkrTaskBlockersResponse> {
+    const safeId = this.assertOkrEntityId(taskId, "task ID");
+    return this.get(`/api/okr/tasks/${encodeURIComponent(safeId)}/blockers`, {
+      "Cache-Control": "no-store",
+      ...this.authHeaders(opts?.bearerToken),
+    });
+  }
+
+  async getTaskBlocks(
+    taskId: string,
+    opts?: { bearerToken?: string },
+  ): Promise<import("./types").OkrTaskBlocksResponse> {
+    const safeId = this.assertOkrEntityId(taskId, "task ID");
+    return this.get(`/api/okr/tasks/${encodeURIComponent(safeId)}/blocks`, {
+      "Cache-Control": "no-store",
+      ...this.authHeaders(opts?.bearerToken),
+    });
+  }
+
+  async logTaskProgress(
+    taskId: string,
+    input?: import("./types").LogOkrTaskProgressInput,
+    opts?: { bearerToken?: string },
+  ): Promise<import("./types").LogOkrTaskProgressResponse> {
+    const safeId = this.assertOkrEntityId(taskId, "task ID");
+    const body: Record<string, unknown> = {};
+    if (input?.note !== undefined) {
+      if (typeof input.note !== "string" || input.note.length > 500) {
+        throw new Error("Invalid task progress note (max 500 chars)");
+      }
+      if (this.containsMemorySecretShape(input.note)) {
+        throw new Error("Task progress note cannot contain credentials or secrets");
+      }
+      if (input.note.trim()) body.note = input.note.trim();
+    }
+    if (input?.wake_id !== undefined) {
+      body.wake_id = this.assertOkrEntityId(input.wake_id, "wake ID");
+    }
+    return this.post(
+      `/api/okr/tasks/${encodeURIComponent(safeId)}/progress`,
+      body,
+      {
+        "Cache-Control": "no-store",
+        ...this.authHeaders(opts?.bearerToken),
+      },
+    );
+  }
+
+  async openOkrThread(
+    input: import("./types").OpenOkrThreadInput,
+    opts?: { bearerToken?: string },
+  ): Promise<import("./types").OpenOkrThreadResponse> {
+    if (!input || !["objective", "kr", "task"].includes(input.target_type)) {
+      throw new Error("Invalid OKR thread target_type");
+    }
+    const safeTargetId = this.assertOkrEntityId(input.target_id, "target ID");
+    return this.post(
+      "/api/okr/threads",
+      { target_type: input.target_type, target_id: safeTargetId },
+      {
+        "Cache-Control": "no-store",
+        ...this.authHeaders(opts?.bearerToken),
+      },
+    );
+  }
+
+  async setOkrLinks(
+    targetType: import("./types").OkrNodeType,
+    targetId: string,
+    input: import("./types").SetOkrLinksInput,
+    opts?: { bearerToken?: string },
+  ): Promise<import("./types").SetOkrLinksResponse> {
+    if (!["objective", "kr", "task"].includes(targetType)) {
+      throw new Error("Invalid OKR link targetType");
+    }
+    const safeTargetId = this.assertOkrEntityId(targetId, `${targetType} ID`);
+    if (!input || typeof input !== "object" || Array.isArray(input)) {
+      throw new Error("Invalid OKR links payload");
+    }
+    const cas = this.assertOkrVersion(input.if_match_updated_at);
+    if ((input.narrative !== undefined || input.narrative_path !== undefined) && targetType !== "objective") {
+      throw new Error("narrative and narrative_path are only supported on objective targets");
+    }
+    if (input.discussion_channel_id !== undefined && targetType !== "objective") {
+      throw new Error("discussion_channel_id is only supported on objective targets");
+    }
+    const body: Record<string, unknown> = {
+      ...(cas !== undefined ? { if_match_updated_at: cas } : {}),
+    };
+    if (input.narrative !== undefined) {
+      if (input.narrative !== null && input.narrative !== "") {
+        if (typeof input.narrative !== "string" || input.narrative.length > 4000) {
+          throw new Error("Invalid objective narrative");
+        }
+        if (this.containsMemorySecretShape(input.narrative)) {
+          throw new Error("Objective narrative cannot contain credentials or secrets");
+        }
+      }
+      body.narrative = input.narrative;
+    }
+    if (input.narrative_path !== undefined) {
+      if (input.narrative_path !== null && input.narrative_path !== "") {
+        if (
+          typeof input.narrative_path !== "string" ||
+          input.narrative_path.length > 256 ||
+          input.narrative_path.includes("..") ||
+          /[\x00-\x1f\x7f]/.test(input.narrative_path)
+        ) {
+          throw new Error("Invalid narrative_path");
+        }
+      }
+      body.narrative_path = input.narrative_path;
+    }
+    if (input.discussion_channel_id !== undefined) {
+      if (input.discussion_channel_id === null || input.discussion_channel_id === "") {
+        body.discussion_channel_id = input.discussion_channel_id;
+      } else {
+        const safeCh = this.assertOkrEntityId(input.discussion_channel_id, "discussion_channel_id");
+        if (/^(?:dm-|direct(?:$|[-_:]))/i.test(safeCh)) {
+          throw new Error("OKR discussion_channel_id cannot target a direct message channel");
+        }
+        body.discussion_channel_id = safeCh;
+      }
+    }
+    if (input.linked_docs !== undefined) {
+      if (!Array.isArray(input.linked_docs) || input.linked_docs.length > 20) {
+        throw new Error("Invalid linked_docs array (max 20)");
+      }
+      body.linked_docs = input.linked_docs.map((p) => {
+        if (typeof p !== "string" || !p.trim() || p.length > 256 || p.includes("..") || this.containsMemorySecretShape(p)) {
+          throw new Error("Invalid linked_docs path");
+        }
+        return p.trim();
+      });
+    }
+    if (input.linked_channel_docs !== undefined) {
+      if (!Array.isArray(input.linked_channel_docs) || input.linked_channel_docs.length > 20) {
+        throw new Error("Invalid linked_channel_docs array (max 20)");
+      }
+      body.linked_channel_docs = input.linked_channel_docs.map((ref) => ({
+        channel_id: this.assertOkrEntityId(ref?.channel_id, "linked_channel_docs.channel_id"),
+        doc_id: this.assertChannelDocId(ref?.doc_id),
+      }));
+    }
+    return this.patch(
+      `/api/okr/links/${targetType}/${encodeURIComponent(safeTargetId)}`,
+      body,
+      {
+        "Cache-Control": "no-store",
+        ...this.authHeaders(opts?.bearerToken),
+      },
+    );
+  }
+
+  async transferObjective(
+    objectiveId: string,
+    input: import("./types").TransferOkrObjectiveInput,
+    opts?: { bearerToken?: string },
+  ): Promise<import("./types").TransferOkrObjectiveResponse> {
+    const safeOid = this.assertOkrEntityId(objectiveId, "objective ID");
+    const newOwner = typeof input?.new_owner === "string" ? input.new_owner.trim() : "";
+    if (!newOwner || newOwner.length > 160 || /[\x00-\x1f\x7f/]/.test(newOwner) || this.containsMemorySecretShape(newOwner)) {
+      throw new Error("Invalid new_owner");
+    }
+    return this.post(
+      `/api/okr/objectives/${encodeURIComponent(safeOid)}/transfer`,
+      { new_owner: newOwner },
+      {
+        "Cache-Control": "no-store",
+        ...this.authHeaders(opts?.bearerToken),
+      },
     );
   }
 

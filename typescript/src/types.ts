@@ -843,6 +843,8 @@ export interface ChannelProposalItem {
 export interface ChannelProposalsFeed {
   channel_id: string;
   proposals: ChannelProposalItem[];
+  can_propose?: boolean;
+  read_only?: boolean;
 }
 
 export interface CreateChannelProposalInput {
@@ -1151,6 +1153,79 @@ export interface UpdateOkrTaskInput {
   linked_channel_docs?: OkrChannelDocRef[];
   append_evidence?: string;
   if_match_updated_at?: string;
+}
+
+export type OkrNodeType = "objective" | "kr" | "task";
+
+export interface OkrTaskBlockersResponse {
+  ok: boolean;
+  task_id: string;
+  blockers: string[];
+}
+
+export interface OkrTaskBlocksResponse {
+  ok: boolean;
+  task_id: string;
+  blocks: string[];
+}
+
+export interface OkrTaskCommentsListResponse {
+  ok: boolean;
+  task_id: string;
+  objective_id: string;
+  comment_count: number;
+  truncated: boolean;
+  comments: Array<OkrTaskCommentItem & { kind?: string }>;
+}
+
+export interface LogOkrTaskProgressInput {
+  note?: string;
+  wake_id?: string;
+}
+
+export interface LogOkrTaskProgressResponse {
+  ok: boolean;
+  task_id: string;
+  last_progress_at: string;
+  commented: boolean;
+}
+
+export interface OpenOkrThreadInput {
+  target_type: OkrNodeType;
+  target_id: string;
+}
+
+export interface OpenOkrThreadResponse {
+  ok: boolean;
+  channel_id: string;
+  already_existed: boolean;
+  seeded_members: string[];
+}
+
+export interface SetOkrLinksInput {
+  linked_docs?: string[];
+  linked_channel_docs?: OkrChannelDocRef[];
+  narrative?: string | null;
+  narrative_path?: string | null;
+  discussion_channel_id?: string | null;
+  if_match_updated_at?: string;
+}
+
+export interface SetOkrLinksResponse {
+  ok: boolean;
+  objective?: OkrObjectiveItem;
+  kr?: OkrKeyResultItem;
+  task?: OkrTaskItem;
+}
+
+export interface TransferOkrObjectiveInput {
+  new_owner: string;
+}
+
+export interface TransferOkrObjectiveResponse {
+  ok: boolean;
+  objective: OkrObjectiveItem;
+  unchanged?: boolean;
 }
 
 // MARK: - Channel Docs CAS & Revision History (/api/channels/:id/docs) & Key Rotation

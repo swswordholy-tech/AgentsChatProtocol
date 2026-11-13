@@ -2023,4 +2023,113 @@ describe("AgentChatClient realtime collaboration WS events", () => {
       globalThis.fetch = originalFetch;
     }
   });
+
+  test("REST complete OKR DAG blockers/blocks, task comments list, progress ping, openOkrThread, setOkrLinks, and transferObjective enforce strict validation and no-store", async () => {
+    const seen: Array<{ url: string; method: string; headers: Record<string, string>; body?: any }> = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      const method = init?.method ?? "GET";
+      const headers: Record<string, string> = {};
+      if (init?.headers) {
+        for (const [k, v] of Object.entries(init.headers as Record<string, string>)) {
+          headers[k.toLowerCase()] = v;
+        }
+      }
+      const body = typeof init?.body === "string" ? JSON.parse(init.body) : undefined;
+      seen.push({ url, method, headers, body });
+
+      if (url.endsWith("/api/okr/tasks/task_30/blockers") && method === "GET") {
+        return Response.json({ ok: true, task_id: "task_30", blockers: ["task_29a", "task_29b"] });
+      }
+      if (url.endsWith("/api/okr/tasks/task_30/blocks") && method === "GET") {
+        return Response.json({ ok: true, task_id: "task_30", blocks: ["task_31"] });
+      }
+      if (url.endsWith("/api/okr/tasks/task_30/comments?limit=20") && method === "GET") {
+        return Response.json({
+          ok: true,
+          task_id: "task_30",
+          objective_id: "obj_30",
+          comment_count: 1,
+          truncated: false,
+          comments: [{ id: "c_1", author: "spinning-midnight-tunicate", kind: "spec", text: "[SPEC] Ship it", at: "2026-11-13T20:30:00Z" }],
+        });
+      }
+      if (url.endsWith("/api/okr/tasks/task_30/progress") && method === "POST") {
+        return Response.json({ ok: true, task_id: "task_30", last_progress_at: "2026-11-13T20:31:00Z", commented: Boolean(body?.note) });
+      }
+      if (url.endsWith("/api/okr/threads") && method === "POST") {
+        return Response.json({ ok: true, channel_id: "okr-obj_30", already_existed: false, seeded_members: ["spinning-midnight-tunicate"] }, { status: 201 });
+      }
+      if (url.endsWith("/api/okr/links/objective/obj_30") && method === "PATCH") {
+        return Response.json({
+          ok: true,
+          objective: {
+            id: "obj_30",
+            title: "Campaign 30",
+            owner: "spinning-midnight-tunicate",
+            horizon: "week",
+            status: "active",
+            discussion_channel_id: body.discussion_channel_id,
+            narrative: body.narrative,
+          },
+        });
+      }
+      if (url.endsWith("/api/okr/objectives/obj_30/transfer") && method === "POST") {
+        return Response.json({
+          ok: true,
+          objective: {
+            id: "obj_30",
+            title: "Campaign 30",
+            owner: body.new_owner,
+            horizon: "week",
+            status: "active",
+          },
+        });
+      }
+      return Response.json({ ok: true });
+    }) as typeof fetch;
+
+    try {
+      const rest = new AgentChatREST({ baseUrl: "https://agents-chat.com", bearerToken: "owner-jwt-30" });
+
+      const blockers = await rest.getTaskBlockers("task_30");
+      expect(blockers.blockers).toEqual(["task_29a", "task_29b"]);
+      expect(seen[0]?.headers["cache-control"]).toBe("no-store");
+
+      const blocks = await rest.getTaskBlocks("task_30");
+      expect(blocks.blocks).toEqual(["task_31"]);
+
+      const comments = await rest.listTaskComments("task_30", { limit: 20 });
+      expect(comments.comments[0]?.kind).toBe("spec");
+
+      const prog = await rest.logTaskProgress("task_30", { note: "Halfway green", wake_id: "wake_1" });
+      expect(prog.commented).toBe(true);
+      expect(seen[3]?.body).toEqual({ note: "Halfway green", wake_id: "wake_1" });
+
+      const thread = await rest.openOkrThread({ target_type: "objective", target_id: "obj_30" });
+      expect(thread.channel_id).toBe("okr-obj_30");
+
+      const linked = await rest.setOkrLinks("objective", "obj_30", {
+        discussion_channel_id: "room-dev",
+        narrative: "Unified working-memory supervision",
+        linked_docs: ["docs/ARCH.md"],
+        linked_channel_docs: [{ channel_id: "room-dev", doc_id: "spec-30" }],
+        if_match_updated_at: "2026-11-13T20:25:59.845Z",
+      });
+      expect(linked.objective?.discussion_channel_id).toBe("room-dev");
+
+      const transferred = await rest.transferObjective("obj_30", { new_owner: "codex-staff-engineer-ca7590" });
+      expect(transferred.objective.owner).toBe("codex-staff-engineer-ca7590");
+
+      // Strict client-side guards
+      await expect(rest.logTaskProgress("task_30", { note: "Leak ac_live_secret_token_123456" })).rejects.toThrow("secrets");
+      await expect(rest.addTaskComment("task_30", "Leak sk-proj-1234567890abcdef")).rejects.toThrow("secrets");
+      await expect(rest.setOkrLinks("task", "task_30", { narrative: "Wrong target" })).rejects.toThrow("only supported on objective");
+      await expect(rest.setOkrLinks("objective", "obj_30", { discussion_channel_id: "dm-secret" })).rejects.toThrow("direct message");
+      await expect(rest.transferObjective("obj_30", { new_owner: "ac_live_secret_token_123456" })).rejects.toThrow("Invalid new_owner");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
 });
