@@ -1880,6 +1880,284 @@ export class AgentChatREST {
     );
   }
 
+  private assertCloudAgentId(rawId: string): string {
+    const safe = rawId?.trim() ?? "";
+    if (
+      !/^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/.test(safe) ||
+      safe.includes("..") ||
+      /^(?:ac_|sk[-_])/i.test(safe)
+    ) {
+      throw new Error("Invalid cloud agent ID");
+    }
+    return safe;
+  }
+
+  async listCloudAgents(
+    query?: import("./types").CloudAgentsListQuery,
+  ): Promise<import("./types").CloudAgentsListResponse> {
+    const params = new URLSearchParams();
+    if (query?.host_environment_id !== undefined) {
+      const envId = query.host_environment_id.trim();
+      if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(envId) || /^(?:ac_|sk[-_])/i.test(envId)) {
+        throw new Error("Invalid host_environment_id");
+      }
+      params.set("host_environment_id", envId);
+    }
+    if (query?.parent_agent_id !== undefined) {
+      params.set("parent_agent_id", this.assertCloudAgentId(query.parent_agent_id));
+    }
+    const qs = params.toString();
+    return this.get<import("./types").CloudAgentsListResponse>(
+      `/api/cloud-agents${qs ? `?${qs}` : ""}`,
+      {
+        Accept: "application/json",
+        "Cache-Control": "no-store",
+        ...(this.authHeaders(query?.bearerToken) ?? {}),
+      },
+    );
+  }
+
+  async tuneCloudAgent(
+    agentId: string,
+    input: import("./types").TuneCloudAgentInput,
+  ): Promise<import("./types").TuneCloudAgentResponse> {
+    const safeAgent = this.assertCloudAgentId(agentId);
+    if (!input || typeof input !== "object") {
+      throw new Error("Cloud agent tuning input object is required");
+    }
+    const body: Record<string, unknown> = {};
+    if (input.display_name !== undefined) {
+      if (typeof input.display_name !== "string" || !input.display_name.trim() || input.display_name.length > 80) {
+        throw new Error("display_name must be a non-empty string up to 80 characters");
+      }
+      if (this.containsMemorySecretShape(input.display_name)) {
+        throw new Error("display_name must not contain credentials");
+      }
+      body.display_name = input.display_name.trim();
+    }
+    if (input.system_prompt !== undefined) {
+      if (input.system_prompt !== null) {
+        if (typeof input.system_prompt !== "string" || input.system_prompt.length > 16_000) {
+          throw new Error("system_prompt must be null or a string up to 16000 characters");
+        }
+        if (this.containsMemorySecretShape(input.system_prompt)) {
+          throw new Error("system_prompt must not contain credentials");
+        }
+      }
+      body.system_prompt = input.system_prompt;
+    }
+    if (input.model !== undefined) {
+      if (input.model !== null && (typeof input.model !== "string" || input.model.length > 120)) {
+        throw new Error("model must be null or a string up to 120 characters");
+      }
+      body.model = input.model;
+    }
+    if (input.effort !== undefined) {
+      if (input.effort !== null && (typeof input.effort !== "string" || input.effort.length > 32)) {
+        throw new Error("effort must be null or a string up to 32 characters");
+      }
+      body.effort = input.effort;
+    }
+    if (input.capabilities !== undefined) {
+      if (!Array.isArray(input.capabilities) || input.capabilities.length > 24) {
+        throw new Error("capabilities must be an array of up to 24 tags");
+      }
+      body.capabilities = input.capabilities.map((raw) => {
+        if (typeof raw !== "string") throw new Error("Capability tag must be a string");
+        const tag = raw.trim();
+        if (!tag || tag.length > 48 || /[\x00-\x1f\x7f]/.test(tag)) {
+          throw new Error("Invalid capability tag");
+        }
+        if (this.containsMemorySecretShape(tag) || /^(?:ac_|sk[-_])/i.test(tag)) {
+          throw new Error("Capability tag must not contain credentials");
+        }
+        return tag;
+      });
+    }
+    let ifMatchHeader: string | undefined;
+    if (input.if_match_updated_at !== undefined) {
+      const ver = input.if_match_updated_at.trim();
+      if (!ver || ver.length > 64 || /[\x00-\x1f\x7f"]/.test(ver)) {
+        throw new Error("Invalid if_match_updated_at version");
+      }
+      body.if_match_updated_at = ver;
+      ifMatchHeader = ver;
+    }
+    if (Object.keys(body).length === 0) {
+      throw new Error("At least one tuning field is required");
+    }
+    return this.patch<import("./types").TuneCloudAgentResponse>(
+      `/api/cloud-agents/${encodeURIComponent(safeAgent)}`,
+      body,
+      {
+        "Cache-Control": "no-store",
+        ...(this.authHeaders(input.bearerToken) ?? {}),
+        ...(ifMatchHeader ? { "If-Match": ifMatchHeader } : {}),
+      },
+    );
+  }
+
+  async listCloudAgentMemories(
+    agentId: string,
+    opts?: { bearerToken?: string },
+  ): Promise<import("./types").CloudAgentMemoryListResponse> {
+    const safeAgent = this.assertCloudAgentId(agentId);
+    return this.get<import("./types").CloudAgentMemoryListResponse>(
+      `/api/cloud-agents/${encodeURIComponent(safeAgent)}/memory`,
+      {
+        Accept: "application/json",
+        "Cache-Control": "no-store",
+        ...(this.authHeaders(opts?.bearerToken) ?? {}),
+      },
+    );
+  }
+
+  async getCloudAgentMemory(
+    agentId: string,
+    name: string,
+    opts?: { bearerToken?: string },
+  ): Promise<import("./types").CloudAgentMemoryDetailResponse> {
+    const safeAgent = this.assertCloudAgentId(agentId);
+    const safeName = this.assertMemorySlug(name);
+    return this.get<import("./types").CloudAgentMemoryDetailResponse>(
+      `/api/cloud-agents/${encodeURIComponent(safeAgent)}/memory/${encodeURIComponent(safeName)}`,
+      {
+        Accept: "application/json",
+        "Cache-Control": "no-store",
+        ...(this.authHeaders(opts?.bearerToken) ?? {}),
+      },
+    );
+  }
+
+  async getCloudAgentMemoryRevisions(
+    agentId: string,
+    name: string,
+    opts?: { bearerToken?: string },
+  ): Promise<import("./types").AgentMemoryRevisionsResponse> {
+    const safeAgent = this.assertCloudAgentId(agentId);
+    const safeName = this.assertMemorySlug(name);
+    return this.get<import("./types").AgentMemoryRevisionsResponse>(
+      `/api/cloud-agents/${encodeURIComponent(safeAgent)}/memory/${encodeURIComponent(safeName)}/revisions`,
+      {
+        Accept: "application/json",
+        "Cache-Control": "no-store",
+        ...(this.authHeaders(opts?.bearerToken) ?? {}),
+      },
+    );
+  }
+
+  async saveCloudAgentMemory(
+    agentId: string,
+    name: string,
+    input: import("./types").SaveAgentMemoryInput,
+  ): Promise<import("./types").SaveCloudAgentMemoryResponse> {
+    const safeAgent = this.assertCloudAgentId(agentId);
+    const safeName = this.assertMemorySlug(name);
+    if (typeof input?.body_markdown !== "string" || !input.body_markdown.trim()) {
+      throw new Error("Memory body_markdown is required");
+    }
+    const byteLen = new TextEncoder().encode(input.body_markdown).byteLength;
+    if (byteLen > 256_000) {
+      throw new Error("Memory body_markdown exceeds 256000 UTF-8 bytes");
+    }
+    if (
+      this.containsMemorySecretShape(input.body_markdown) ||
+      (typeof input.description === "string" && this.containsMemorySecretShape(input.description))
+    ) {
+      throw new Error("Memory must not contain API keys, tokens, or private keys");
+    }
+    if (input.description !== undefined && (typeof input.description !== "string" || input.description.length > 280)) {
+      throw new Error("Memory description must be a string up to 280 characters");
+    }
+    if (
+      input.if_match_version !== undefined &&
+      (!Number.isInteger(input.if_match_version) || input.if_match_version < 0 || input.if_match_version > 1_000_000)
+    ) {
+      throw new Error("Invalid memory if_match_version");
+    }
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+      "Cache-Control": "no-store",
+      ...(this.bearerToken ? { Authorization: `Bearer ${this.bearerToken}` } : {}),
+      ...(this.authHeaders(input.bearerToken) ?? {}),
+      ...(input.if_match_version !== undefined ? { "If-Match": `"${input.if_match_version}"` } : {}),
+    };
+    const body: Record<string, unknown> = {
+      body_markdown: input.body_markdown,
+      ...(typeof input.description === "string" ? { description: input.description } : {}),
+      ...(input.if_match_version !== undefined ? { if_match_version: input.if_match_version } : {}),
+    };
+    const res = await fetch(
+      `${this.baseUrl}/api/cloud-agents/${encodeURIComponent(safeAgent)}/memory/${encodeURIComponent(safeName)}`,
+      {
+        method: "PUT",
+        headers,
+        body: JSON.stringify(body),
+      },
+    );
+    if (!res.ok) {
+      const error = await res.json().catch(() => ({ message: res.statusText }));
+      throw new Error(`HTTP ${res.status}: ${error.message ?? error.error ?? res.statusText}`);
+    }
+    return res.json();
+  }
+
+  async deleteCloudAgentMemory(
+    agentId: string,
+    name: string,
+    opts?: { if_match_version?: number; bearerToken?: string },
+  ): Promise<import("./types").DeleteAgentMemoryResponse> {
+    const safeAgent = this.assertCloudAgentId(agentId);
+    const safeName = this.assertMemorySlug(name);
+    if (
+      opts?.if_match_version !== undefined &&
+      (!Number.isInteger(opts.if_match_version) || opts.if_match_version < 1 || opts.if_match_version > 1_000_000)
+    ) {
+      throw new Error("Memory delete if_match_version must be an integer >= 1");
+    }
+    const qs = opts?.if_match_version !== undefined ? `?if_match_version=${opts.if_match_version}` : "";
+    const headers: Record<string, string> = {
+      "Cache-Control": "no-store",
+      ...(this.bearerToken ? { Authorization: `Bearer ${this.bearerToken}` } : {}),
+      ...(this.authHeaders(opts?.bearerToken) ?? {}),
+      ...(opts?.if_match_version !== undefined ? { "If-Match": `"${opts.if_match_version}"` } : {}),
+    };
+    const res = await fetch(
+      `${this.baseUrl}/api/cloud-agents/${encodeURIComponent(safeAgent)}/memory/${encodeURIComponent(safeName)}${qs}`,
+      {
+        method: "DELETE",
+        headers,
+      },
+    );
+    if (!res.ok) {
+      const error = await res.json().catch(() => ({ message: res.statusText }));
+      throw new Error(`HTTP ${res.status}: ${error.message ?? error.error ?? res.statusText}`);
+    }
+    return res.json();
+  }
+
+  async recoverCloudAgent(
+    agentId: string,
+    input?: import("./types").RecoverCloudAgentInput,
+  ): Promise<import("./types").RecoverCloudAgentResponse> {
+    const safeAgent = this.assertCloudAgentId(agentId);
+    const body: Record<string, unknown> = {};
+    if (input?.gemini_api_key !== undefined) {
+      if (typeof input.gemini_api_key !== "string" || !input.gemini_api_key.trim() || input.gemini_api_key.length > 512) {
+        throw new Error("gemini_api_key must be a non-empty string up to 512 characters when provided");
+      }
+      body.gemini_api_key = input.gemini_api_key.trim();
+    }
+    return this.post<import("./types").RecoverCloudAgentResponse>(
+      `/api/cloud-agents/${encodeURIComponent(safeAgent)}/recover`,
+      body,
+      {
+        "Cache-Control": "no-store",
+        ...(this.authHeaders(input?.bearerToken) ?? {}),
+      },
+    );
+  }
+
   // MARK: - Internal
 
   private async get<T = any>(path: string, headers?: Record<string, string>): Promise<T> {

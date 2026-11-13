@@ -1493,3 +1493,96 @@ export interface WakeCloudAgentResponse {
   ok: boolean;
   [key: string]: unknown;
 }
+
+export interface CloudAgentLoopSummary {
+  active_count: number;
+  paused_count: number;
+  total_count: number;
+  okr_wake_count?: number;
+  okr_watch_count?: number;
+}
+
+export interface CloudAgentMemorySummary {
+  note_count: number;
+  total_bytes: number;
+  updated_at?: string | null;
+}
+
+export interface CloudAgentSummaryItem {
+  agent_id: string;
+  display_name?: string;
+  is_host?: boolean;
+  status?: string;
+  runtime_type?: string;
+  harness?: string;
+  model?: string | null;
+  effort?: string | null;
+  auth_mode?: string;
+  capabilities?: string[];
+  channels?: string[];
+  host_environment_id?: string | null;
+  parent_agent_id?: string | null;
+  updated_at?: string;
+  loop_summary?: CloudAgentLoopSummary;
+  memory_summary?: CloudAgentMemorySummary;
+  okr_summary?: Record<string, unknown> | null;
+  [key: string]: unknown;
+}
+
+export interface CloudAgentsListQuery {
+  host_environment_id?: string;
+  parent_agent_id?: string;
+  bearerToken?: string;
+}
+
+export interface CloudAgentsListResponse {
+  agents: CloudAgentSummaryItem[];
+  catalog?: unknown[];
+  sandbox_enabled?: boolean;
+  sandbox_subscription_runtimes?: string[];
+  persistence_notice?: string | null;
+}
+
+export interface CloudAgentMemoryListResponse {
+  agent_id: string;
+  memories: AgentMemorySummaryItem[];
+  max_docs?: number;
+  max_body_bytes?: number;
+}
+
+export interface CloudAgentMemoryDetailResponse {
+  agent_id: string;
+  memory: AgentMemoryDetailItem;
+}
+
+export interface SaveCloudAgentMemoryResponse {
+  ok: boolean;
+  agent_id: string;
+  created: boolean;
+  memory: AgentMemoryDetailItem;
+}
+
+export interface TuneCloudAgentInput {
+  display_name?: string;
+  system_prompt?: string | null;
+  model?: string | null;
+  effort?: "low" | "medium" | "high" | "xhigh" | "max" | (string & {}) | null;
+  capabilities?: string[];
+  if_match_updated_at?: string;
+  bearerToken?: string;
+}
+
+export interface TuneCloudAgentResponse {
+  ok: boolean;
+  agent: CloudAgentSummaryItem;
+}
+
+export interface RecoverCloudAgentInput {
+  gemini_api_key?: string;
+  bearerToken?: string;
+}
+
+export interface RecoverCloudAgentResponse {
+  ok: boolean;
+  [key: string]: unknown;
+}

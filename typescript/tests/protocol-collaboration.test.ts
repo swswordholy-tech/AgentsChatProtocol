@@ -1396,4 +1396,187 @@ describe("AgentChatClient realtime collaboration WS events", () => {
       globalThis.fetch = originalFetch;
     }
   });
+
+  test("AgentChatREST supports owner-scoped Cloud Agent inventory, tuning, working memory CAS, and recovery", async () => {
+    const originalFetch = globalThis.fetch;
+    const seen: Array<{ method: string; url: string; headers: Record<string, string>; body: any }> = [];
+
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      const method = (init?.method ?? "GET").toUpperCase();
+      const headers = Object.fromEntries(new Headers(init?.headers).entries());
+      const body = typeof init?.body === "string" ? JSON.parse(init.body) : null;
+      seen.push({ method, url, headers, body });
+
+      if (url.includes("/api/cloud-agents?") && method === "GET") {
+        return Response.json({
+          agents: [
+            {
+              agent_id: "codex-cloud-01",
+              display_name: "Codex Staff",
+              is_host: false,
+              status: "active",
+              memory_summary: { note_count: 2, total_bytes: 1420, updated_at: "2026-11-14T03:00:00Z" },
+              loop_summary: { active_count: 1, paused_count: 0, total_count: 1, okr_wake_count: 1 },
+            },
+          ],
+          sandbox_enabled: true,
+          sandbox_subscription_runtimes: ["codex", "claude", "gemini"],
+        });
+      }
+      if (url.endsWith("/api/cloud-agents/codex-cloud-01") && method === "PATCH") {
+        return Response.json({
+          ok: true,
+          agent: {
+            agent_id: "codex-cloud-01",
+            display_name: body?.display_name,
+            capabilities: body?.capabilities,
+            effort: body?.effort,
+            updated_at: "2026-11-14T03:05:00Z",
+          },
+        });
+      }
+      if (url.endsWith("/api/cloud-agents/codex-cloud-01/memory") && method === "GET") {
+        return Response.json({
+          agent_id: "codex-cloud-01",
+          memories: [
+            {
+              name: "runbook",
+              description: "Incident runbook",
+              version: 4,
+              bytes: 128,
+              updated_at: "2026-11-14T03:01:00Z",
+            },
+          ],
+          max_docs: 20,
+          max_body_bytes: 256000,
+        });
+      }
+      if (url.endsWith("/api/cloud-agents/codex-cloud-01/memory/runbook") && method === "GET") {
+        return Response.json({
+          agent_id: "codex-cloud-01",
+          memory: {
+            name: "runbook",
+            description: "Incident runbook",
+            version: 4,
+            bytes: 128,
+            updated_at: "2026-11-14T03:01:00Z",
+            body_markdown: "# Runbook\n- Verify cross-pod parity",
+          },
+        });
+      }
+      if (url.endsWith("/api/cloud-agents/codex-cloud-01/memory/runbook/revisions") && method === "GET") {
+        return Response.json({
+          name: "runbook",
+          revisions: [
+            {
+              version: 3,
+              description: "Prior runbook",
+              bytes: 96,
+              body_markdown: "# Runbook\n- Draft",
+              updated_at: "2026-11-14T02:30:00Z",
+            },
+          ],
+        });
+      }
+      if (url.endsWith("/api/cloud-agents/codex-cloud-01/memory/runbook") && method === "PUT") {
+        expect(headers["if-match"]).toBe('"4"');
+        expect(Object.keys(body).sort()).toEqual(["body_markdown", "description", "if_match_version"]);
+        return Response.json({
+          ok: true,
+          agent_id: "codex-cloud-01",
+          created: false,
+          memory: {
+            name: "runbook",
+            description: body.description,
+            version: 5,
+            bytes: 140,
+            updated_at: "2026-11-14T03:06:00Z",
+            body_markdown: body.body_markdown,
+          },
+        });
+      }
+      if (url.includes("/api/cloud-agents/codex-cloud-01/memory/runbook?") && method === "DELETE") {
+        expect(headers["if-match"]).toBe('"5"');
+        return Response.json({
+          ok: true,
+          agent_id: "codex-cloud-01",
+          name: "runbook",
+          deleted: true,
+        });
+      }
+      if (url.endsWith("/api/cloud-agents/codex-cloud-01/recover") && method === "POST") {
+        return Response.json({ ok: true, recovered: true, container_id: "sbx-01" });
+      }
+      return Response.json({ ok: true });
+    }) as typeof fetch;
+
+    try {
+      const rest = new AgentChatREST({ baseUrl: "https://agents-chat.com", bearerToken: "owner-jwt-01" });
+
+      const fleet = await rest.listCloudAgents({
+        host_environment_id: "env-prod-01",
+        parent_agent_id: "host-01",
+      });
+      expect(fleet.agents[0]?.memory_summary?.note_count).toBe(2);
+      expect(seen[0]?.url).toContain("host_environment_id=env-prod-01");
+      expect(seen[0]?.url).toContain("parent_agent_id=host-01");
+      expect(seen[0]?.headers["cache-control"]).toBe("no-store");
+
+      const tuned = await rest.tuneCloudAgent("codex-cloud-01", {
+        display_name: "Codex Staff v2",
+        capabilities: ["typescript", "security-audit"],
+        effort: "high",
+        if_match_updated_at: "2026-11-14T03:00:00Z",
+      });
+      expect(tuned.agent.display_name).toBe("Codex Staff v2");
+      expect(seen[1]?.headers["if-match"]).toBe("2026-11-14T03:00:00Z");
+
+      const memList = await rest.listCloudAgentMemories("codex-cloud-01");
+      expect(memList.max_docs).toBe(20);
+      expect(memList.memories[0]?.name).toBe("runbook");
+
+      const memDetail = await rest.getCloudAgentMemory("codex-cloud-01", "runbook");
+      expect(memDetail.memory.body_markdown).toContain("cross-pod parity");
+
+      const memRevs = await rest.getCloudAgentMemoryRevisions("codex-cloud-01", "runbook");
+      expect(memRevs.revisions[0]?.version).toBe(3);
+
+      const memSaved = await rest.saveCloudAgentMemory("codex-cloud-01", "runbook", {
+        body_markdown: "# Runbook\n- Verify cross-pod parity + SSE suppression",
+        description: "Updated incident runbook",
+        if_match_version: 4,
+      });
+      expect(memSaved.memory.version).toBe(5);
+
+      const memDeleted = await rest.deleteCloudAgentMemory("codex-cloud-01", "runbook", {
+        if_match_version: 5,
+      });
+      expect(memDeleted.deleted).toBe(true);
+
+      const recovered = await rest.recoverCloudAgent("codex-cloud-01");
+      expect(recovered.ok).toBe(true);
+      expect(seen[seen.length - 1]?.body).toEqual({});
+
+      await expect(rest.listCloudAgentMemories("ac_live_secret_token_value")).rejects.toThrow(
+        "Invalid cloud agent ID",
+      );
+      await expect(
+        rest.saveCloudAgentMemory("codex-cloud-01", "../escape", { body_markdown: "nope" }),
+      ).rejects.toThrow("Invalid memory name");
+      await expect(
+        rest.saveCloudAgentMemory("codex-cloud-01", "runbook", {
+          body_markdown: "Leak ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ123456",
+        }),
+      ).rejects.toThrow("Memory must not contain API keys, tokens, or private keys");
+      await expect(
+        rest.deleteCloudAgentMemory("codex-cloud-01", "runbook", { if_match_version: 0 }),
+      ).rejects.toThrow("Memory delete if_match_version must be an integer >= 1");
+      await expect(
+        rest.tuneCloudAgent("codex-cloud-01", { capabilities: ["ac_live_secret_token_1234"] }),
+      ).rejects.toThrow("Capability tag must not contain credentials");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
 });
