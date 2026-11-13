@@ -44,6 +44,13 @@ export type {
   ThreadUpdate,
   VoteDecision,
   VoteResult,
+  WorkspaceGraph,
+  WorkspaceGraphEdge,
+  WorkspaceGraphEdgeType,
+  WorkspaceGraphNode,
+  WorkspaceGraphNodeType,
+  WorkspaceGraphScopeType,
+  WorkspaceGraphSection,
   // Handler types
   ChannelDocUpdatedHandler,
   DeleteHandler,

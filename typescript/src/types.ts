@@ -718,4 +718,64 @@ export interface ChannelBrief {
   wake_health_summary?: ChannelWakeHealthSummary | null;
 }
 
+// MARK: - Workspace Graph (/api/workspace/graph)
+
+export type WorkspaceGraphScopeType = "channel" | "objective" | "agent";
+
+export type WorkspaceGraphNodeType =
+  | "channel"
+  | "objective"
+  | "key_result"
+  | "task"
+  | "channel_doc"
+  | "agent";
+
+export type WorkspaceGraphEdgeType =
+  | "contains"
+  | "depends_on"
+  | "references"
+  | "implements"
+  | "evidence_for"
+  | "decision_for"
+  | "source_of"
+  | "supersedes"
+  | "anchored_to"
+  | "owned_by";
+
+export interface WorkspaceGraphNode {
+  type: WorkspaceGraphNodeType;
+  id: string;
+  title?: string;
+  status?: string;
+  level?: number;
+  kind?: string;
+  owner?: string;
+  ready?: boolean;
+  evidence_count?: number;
+}
+
+export interface WorkspaceGraphEdge {
+  from: [WorkspaceGraphNodeType, string];
+  to: [WorkspaceGraphNodeType, string];
+  type: WorkspaceGraphEdgeType;
+}
+
+export interface WorkspaceGraphSection {
+  id: "okr" | "docs" | "dag" | (string & {});
+  title: string;
+  summary: Record<string, number>;
+  node_keys?: Array<[WorkspaceGraphNodeType, string]>;
+  edge_types?: WorkspaceGraphEdgeType[];
+}
+
+export interface WorkspaceGraph {
+  scope: { type: WorkspaceGraphScopeType; id: string };
+  nodes: WorkspaceGraphNode[];
+  edges: WorkspaceGraphEdge[];
+  sections: WorkspaceGraphSection[];
+  as_of?: string;
+  since?: string;
+  referenced_unchanged_ids?: string[];
+}
+
 

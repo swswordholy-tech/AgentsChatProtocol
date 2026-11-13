@@ -10,6 +10,7 @@ import {
   type OkrUpdatedMessage,
   type RoomLoopsFeed,
   type TaskAssignedMessage,
+  type WorkspaceGraph,
 } from "../src/index";
 
 describe("AgentChatClient realtime collaboration WS events", () => {
@@ -324,6 +325,60 @@ describe("AgentChatClient realtime collaboration WS events", () => {
 
       await expect(rest.getChannelBrief("ac_secret_leak")).rejects.toThrow("Invalid channel ID");
       await expect(rest.getChannelBrief("../escape")).rejects.toThrow("Invalid channel ID");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("getWorkspaceGraph fetches scoped graph with optional since cursor, enriched skill/evidence counts, and traversal guards", async () => {
+    const originalFetch = globalThis.fetch;
+    const seenUrls: string[] = [];
+    let seenHeaders: Record<string, string> = {};
+
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      seenUrls.push(String(input));
+      seenHeaders = (init?.headers as Record<string, string>) ?? {};
+      const payload: WorkspaceGraph = {
+        scope: { type: "channel", id: "edbb8180-4356-4dab-9d75-bc9fe6f26194" },
+        nodes: [
+          { type: "channel", id: "edbb8180-4356-4dab-9d75-bc9fe6f26194" },
+          { type: "channel_doc", id: "deploy-sop", title: "Deploy SOP", level: 3, kind: "channel_skill" },
+          { type: "task", id: "task_1", title: "Ship graph", status: "done", owner: "codex-staff-engineer-ca7590", ready: false, evidence_count: 2 },
+        ],
+        edges: [
+          { from: ["channel_doc", "deploy-sop"], to: ["channel", "edbb8180-4356-4dab-9d75-bc9fe6f26194"], type: "anchored_to" },
+        ],
+        sections: [
+          { id: "okr", title: "OKR", summary: { active_objectives: 1, active_tasks: 2, ready_tasks: 1, evidence_tasks: 1 } },
+          { id: "docs", title: "Docs", summary: { docs_count: 3, skills_count: 1, backlinks_count: 2, recent_updates: 1 } },
+          { id: "dag", title: "DAG", summary: { blocked_tasks: 0, blocker_tasks: 1, critical_edges: 1, evidence_tasks: 1 } },
+        ],
+        as_of: "2026-11-13T13:40:00.000Z",
+        since: "2026-11-13T13:10:00.000Z",
+        referenced_unchanged_ids: ["obj_root"],
+      };
+      return Response.json(payload, { status: 200 });
+    }) as typeof fetch;
+
+    try {
+      const rest = new AgentChatREST({ baseUrl: "https://agents-chat.com", bearerToken: "member-jwt-graph" });
+      const graph = await rest.getWorkspaceGraph("channel", "edbb8180-4356-4dab-9d75-bc9fe6f26194", {
+        since: "2026-11-13T13:10:00.000Z",
+      });
+      expect(seenUrls[0]).toBe(
+        "https://agents-chat.com/api/workspace/graph?scope=channel&id=edbb8180-4356-4dab-9d75-bc9fe6f26194&since=2026-11-13T13%3A10%3A00.000Z",
+      );
+      expect(seenHeaders.Authorization).toBe("Bearer member-jwt-graph");
+      expect(seenHeaders["Cache-Control"]).toBe("no-store");
+      expect(graph.sections.find((s) => s.id === "docs")?.summary.skills_count).toBe(1);
+      expect(graph.sections.find((s) => s.id === "okr")?.summary.evidence_tasks).toBe(1);
+      expect(graph.referenced_unchanged_ids).toEqual(["obj_root"]);
+
+      await expect(rest.getWorkspaceGraph("objective", "../accounts/victim")).rejects.toThrow("Invalid workspace graph ID");
+      await expect(rest.getWorkspaceGraph("agent", "ac_secret_key")).rejects.toThrow("Invalid workspace graph ID");
+      await expect(
+        rest.getWorkspaceGraph("channel", "edbb8180-4356-4dab-9d75-bc9fe6f26194", { since: "not-iso" }),
+      ).rejects.toThrow("Invalid workspace graph since timestamp");
     } finally {
       globalThis.fetch = originalFetch;
     }

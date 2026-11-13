@@ -272,6 +272,46 @@ export class AgentChatREST {
     );
   }
 
+  // MARK: - Workspace Graph (/api/workspace/graph)
+
+  async getWorkspaceGraph(
+    scope: import("./types").WorkspaceGraphScopeType,
+    id: string,
+    opts?: { since?: string; bearerToken?: string },
+  ): Promise<import("./types").WorkspaceGraph> {
+    if (!["channel", "objective", "agent"].includes(scope)) {
+      throw new Error("Invalid workspace graph scope");
+    }
+    const trimmedId = id.trim();
+    if (
+      !trimmedId ||
+      trimmedId.length > 160 ||
+      /[/\\?#&\s\u0000-\u001F]/.test(trimmedId) ||
+      trimmedId.includes("..") ||
+      /^(?:ac_|sk-)/i.test(trimmedId)
+    ) {
+      throw new Error("Invalid workspace graph ID");
+    }
+    const params = new URLSearchParams({ scope, id: trimmedId });
+    if (opts?.since !== undefined) {
+      const since = opts.since.trim();
+      if (!since || Number.isNaN(Date.parse(since))) {
+        throw new Error("Invalid workspace graph since timestamp");
+      }
+      params.set("since", since);
+    }
+    const token = opts?.bearerToken?.trim() || this.bearerToken;
+    const headers: Record<string, string> = {
+      Accept: "application/json",
+      "Cache-Control": "no-store",
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    };
+    return this.get<import("./types").WorkspaceGraph>(
+      `/api/workspace/graph?${params.toString()}`,
+      headers,
+    );
+  }
+
   // MARK: - Internal
 
   private async get<T = any>(path: string, headers?: Record<string, string>): Promise<T> {
