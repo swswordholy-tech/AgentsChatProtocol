@@ -1177,3 +1177,86 @@ export function validateDeleteMemoryInput(
   }
   return { ok: true, value: out };
 }
+
+export function validateOkrParentIdOptionalInput(
+  parentId: unknown,
+): { ok: true; value: string | undefined } | { ok: false; error: string } {
+  if (parentId === undefined || parentId === null || parentId === "") {
+    return { ok: true, value: undefined };
+  }
+  if (typeof parentId !== "string") {
+    return { ok: false, error: "parent_id must be a string objective identifier" };
+  }
+  const trimmed = parentId.trim();
+  if (!trimmed) {
+    return { ok: true, value: undefined };
+  }
+  if (EVIDENCE_SECRET_RE.test(trimmed)) {
+    return { ok: false, error: "parent_id rejected: appears to contain a secret or token" };
+  }
+  if (
+    !SAFE_CHANNEL_OR_LOOP_ID_RE.test(trimmed) ||
+    trimmed.includes("..") ||
+    EVIDENCE_CTRL_RE.test(trimmed)
+  ) {
+    return { ok: false, error: "parent_id must be a valid objective identifier" };
+  }
+  return { ok: true, value: trimmed };
+}
+
+export function validateOkrReparentObjectiveInput(
+  args: unknown,
+): { ok: true; value: { objective_id: string; body: Record<string, unknown> } } | { ok: false; error: string } {
+  if (!args || typeof args !== "object" || Array.isArray(args)) {
+    return { ok: false, error: "okr_reparent_objective requires objective_id and parent_id." };
+  }
+  const a = args as Record<string, unknown>;
+  const objectiveId = typeof a.objective_id === "string" ? a.objective_id.trim() : "";
+  if (
+    !objectiveId ||
+    !SAFE_CHANNEL_OR_LOOP_ID_RE.test(objectiveId) ||
+    objectiveId.includes("..") ||
+    EVIDENCE_CTRL_RE.test(objectiveId) ||
+    EVIDENCE_SECRET_RE.test(objectiveId)
+  ) {
+    return { ok: false, error: "objective_id must be a valid non-empty identifier." };
+  }
+  if (!("parent_id" in a) || a.parent_id === undefined) {
+    return {
+      ok: false,
+      error: "okr_reparent_objective needs parent_id (an objective id to attach under, or null to detach to a top-level root).",
+    };
+  }
+  let normalizedParent: string | null;
+  if (a.parent_id === null || (typeof a.parent_id === "string" && a.parent_id.trim() === "")) {
+    normalizedParent = null;
+  } else if (typeof a.parent_id === "string") {
+    const trimmedParent = a.parent_id.trim();
+    if (EVIDENCE_SECRET_RE.test(trimmedParent)) {
+      return { ok: false, error: "parent_id rejected: appears to contain a secret or token" };
+    }
+    if (
+      !SAFE_CHANNEL_OR_LOOP_ID_RE.test(trimmedParent) ||
+      trimmedParent.includes("..") ||
+      EVIDENCE_CTRL_RE.test(trimmedParent)
+    ) {
+      return { ok: false, error: "parent_id must be a valid objective identifier or null to detach" };
+    }
+    if (trimmedParent === objectiveId) {
+      return { ok: false, error: "parent_id cannot equal objective_id (self-reparent cycle)" };
+    }
+    normalizedParent = trimmedParent;
+  } else {
+    return { ok: false, error: "parent_id must be a string objective identifier or null to detach" };
+  }
+
+  const body: Record<string, unknown> = { parent_id: normalizedParent };
+  if (a.if_match_updated_at !== undefined && a.if_match_updated_at !== null) {
+    const verCheck = validateTaskVersionToken(a.if_match_updated_at);
+    if (!verCheck.ok) {
+      return { ok: false, error: verCheck.error };
+    }
+    body.if_match_updated_at = verCheck.value;
+  }
+  return { ok: true, value: { objective_id: objectiveId, body } };
+}

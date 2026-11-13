@@ -11,6 +11,7 @@ let BASE = "";
 let receivedPatches: Array<{ taskId: string; body: any }> = [];
 let receivedObjectives: any[] = [];
 let receivedObjectivePatches: Array<{ objectiveId: string; body: any }> = [];
+let receivedReparentPatches: Array<{ objectiveId: string; body: any }> = [];
 let receivedArchivedObjectives: Array<{ objectiveId: string; body: any }> = [];
 let receivedAddedTasks: Array<{ objectiveId: string; body: any }> = [];
 let receivedKrPatches: Array<{ krId: string; body: any }> = [];
@@ -24,6 +25,7 @@ beforeEach(() => {
   receivedPatches = [];
   receivedObjectives = [];
   receivedObjectivePatches = [];
+  receivedReparentPatches = [];
   receivedArchivedObjectives = [];
   receivedAddedTasks = [];
   receivedKrPatches = [];
@@ -110,6 +112,23 @@ beforeAll(() => {
             assignee: body.assignee,
             depends_on: body.depends_on ?? null,
             linked_channel_docs: body.linked_channel_docs,
+          },
+        });
+      }
+      const reparentObjMatch = url.pathname.match(/^\/api\/okr\/objectives\/([^/]+)\/parent$/);
+      if (req.method === "PATCH" && reparentObjMatch) {
+        const body = await req.json() as any;
+        const objectiveId = decodeURIComponent(reparentObjMatch[1]);
+        receivedReparentPatches.push({ objectiveId, body });
+        if (body.if_match_updated_at === "stale-v0") {
+          return Response.json({ error: "stale_objective_version" }, { status: 409 });
+        }
+        return Response.json({
+          ok: true,
+          objective: {
+            id: objectiveId,
+            ...(body.parent_id ? { parent_id: body.parent_id } : {}),
+            updated_at: "2026-11-13T10:00:00.000Z",
           },
         });
       }
@@ -1037,5 +1056,101 @@ describe("MCP okr_update_task structured evidence", () => {
       },
     ]);
     expect(receivedKrPatches).toEqual([]);
+  });
+
+  test("okr_reparent_objective and okr_create_objective validate parent_id, detach to root, forward CAS, and block self-cycles & secrets", async () => {
+    const out = await drive([
+      INIT,
+      INITED,
+      callTool(2, "load_tool_group", { group_name: "okr" }),
+      { jsonrpc: "2.0", id: 3, method: "tools/list", params: {} },
+      callTool(4, "okr_reparent_objective", {
+        objective_id: " obj_child_1 ",
+        parent_id: " obj_parent_q4 ",
+        if_match_updated_at: " 2026-11-13T09:50:00.000Z ",
+      }),
+      callTool(5, "okr_reparent_objective", {
+        objective_id: "obj_child_1",
+        parent_id: "",
+        if_match_updated_at: "2026-11-13T10:00:00.000Z",
+      }),
+      callTool(6, "okr_reparent_objective", {
+        objective_id: "obj_child_1",
+        parent_id: null,
+        if_match_updated_at: "stale-v0",
+      }),
+      callTool(7, "okr_reparent_objective", {
+        objective_id: "obj_child_1",
+      }),
+      callTool(8, "okr_reparent_objective", {
+        objective_id: "obj_child_1",
+        parent_id: "obj_child_1",
+      }),
+      callTool(9, "okr_reparent_objective", {
+        objective_id: "obj_child_1",
+        parent_id: "agent_key_supersecret123456",
+      }),
+      callTool(10, "okr_create_objective", {
+        title: "Aligned Sprint Objective",
+        horizon: "week",
+        parent_id: " obj_parent_q4 ",
+      }),
+      callTool(11, "okr_create_objective", {
+        title: "Secret Parent Objective",
+        horizon: "week",
+        parent_id: "ac_live_secret_token_999999",
+      }),
+    ], 2400);
+
+    const tools = out.res.get(3)?.result?.tools || [];
+    const reparentDef = tools.find((t: any) => t.name === "okr_reparent_objective");
+    expect(reparentDef?.inputSchema?.properties?.if_match_updated_at?.maxLength).toBe(64);
+
+    expect(out.res.get(4)?.result?.isError).toBeUndefined();
+    expect(out.res.get(5)?.result?.isError).toBeUndefined();
+    expect(out.res.get(10)?.result?.isError).toBeUndefined();
+
+    expect(out.res.get(6)?.result?.isError).toBe(true);
+    expect(out.res.get(6)?.result?.content?.[0]?.text).toContain("409");
+    expect(out.res.get(6)?.result?.content?.[0]?.text).toContain("stale_objective_version");
+
+    for (const id of [7, 8, 9, 11]) {
+      expect(out.res.get(id)?.result?.isError).toBe(true);
+    }
+    expect(out.res.get(7)?.result?.content?.[0]?.text).toContain("needs parent_id");
+    expect(out.res.get(8)?.result?.content?.[0]?.text).toContain("self-reparent cycle");
+    expect(out.res.get(9)?.result?.content?.[0]?.text).toContain("secret or token");
+    expect(out.res.get(11)?.result?.content?.[0]?.text).toContain("secret or token");
+
+    expect(receivedReparentPatches).toEqual([
+      {
+        objectiveId: "obj_child_1",
+        body: {
+          parent_id: "obj_parent_q4",
+          if_match_updated_at: "2026-11-13T09:50:00.000Z",
+        },
+      },
+      {
+        objectiveId: "obj_child_1",
+        body: {
+          parent_id: null,
+          if_match_updated_at: "2026-11-13T10:00:00.000Z",
+        },
+      },
+      {
+        objectiveId: "obj_child_1",
+        body: {
+          parent_id: null,
+          if_match_updated_at: "stale-v0",
+        },
+      },
+    ]);
+    expect(receivedObjectives).toEqual([
+      {
+        title: "Aligned Sprint Objective",
+        horizon: "week",
+        parent_id: "obj_parent_q4",
+      },
+    ]);
   });
 });

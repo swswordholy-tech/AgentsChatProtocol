@@ -1080,6 +1080,68 @@ function validateDeleteMemoryInput(args) {
   }
   return { ok: true, value: out };
 }
+function validateOkrParentIdOptionalInput(parentId) {
+  if (parentId === undefined || parentId === null || parentId === "") {
+    return { ok: true, value: undefined };
+  }
+  if (typeof parentId !== "string") {
+    return { ok: false, error: "parent_id must be a string objective identifier" };
+  }
+  const trimmed = parentId.trim();
+  if (!trimmed) {
+    return { ok: true, value: undefined };
+  }
+  if (EVIDENCE_SECRET_RE.test(trimmed)) {
+    return { ok: false, error: "parent_id rejected: appears to contain a secret or token" };
+  }
+  if (!SAFE_CHANNEL_OR_LOOP_ID_RE.test(trimmed) || trimmed.includes("..") || EVIDENCE_CTRL_RE.test(trimmed)) {
+    return { ok: false, error: "parent_id must be a valid objective identifier" };
+  }
+  return { ok: true, value: trimmed };
+}
+function validateOkrReparentObjectiveInput(args) {
+  if (!args || typeof args !== "object" || Array.isArray(args)) {
+    return { ok: false, error: "okr_reparent_objective requires objective_id and parent_id." };
+  }
+  const a = args;
+  const objectiveId = typeof a.objective_id === "string" ? a.objective_id.trim() : "";
+  if (!objectiveId || !SAFE_CHANNEL_OR_LOOP_ID_RE.test(objectiveId) || objectiveId.includes("..") || EVIDENCE_CTRL_RE.test(objectiveId) || EVIDENCE_SECRET_RE.test(objectiveId)) {
+    return { ok: false, error: "objective_id must be a valid non-empty identifier." };
+  }
+  if (!("parent_id" in a) || a.parent_id === undefined) {
+    return {
+      ok: false,
+      error: "okr_reparent_objective needs parent_id (an objective id to attach under, or null to detach to a top-level root)."
+    };
+  }
+  let normalizedParent;
+  if (a.parent_id === null || typeof a.parent_id === "string" && a.parent_id.trim() === "") {
+    normalizedParent = null;
+  } else if (typeof a.parent_id === "string") {
+    const trimmedParent = a.parent_id.trim();
+    if (EVIDENCE_SECRET_RE.test(trimmedParent)) {
+      return { ok: false, error: "parent_id rejected: appears to contain a secret or token" };
+    }
+    if (!SAFE_CHANNEL_OR_LOOP_ID_RE.test(trimmedParent) || trimmedParent.includes("..") || EVIDENCE_CTRL_RE.test(trimmedParent)) {
+      return { ok: false, error: "parent_id must be a valid objective identifier or null to detach" };
+    }
+    if (trimmedParent === objectiveId) {
+      return { ok: false, error: "parent_id cannot equal objective_id (self-reparent cycle)" };
+    }
+    normalizedParent = trimmedParent;
+  } else {
+    return { ok: false, error: "parent_id must be a string objective identifier or null to detach" };
+  }
+  const body = { parent_id: normalizedParent };
+  if (a.if_match_updated_at !== undefined && a.if_match_updated_at !== null) {
+    const verCheck = validateTaskVersionToken(a.if_match_updated_at);
+    if (!verCheck.ok) {
+      return { ok: false, error: verCheck.error };
+    }
+    body.if_match_updated_at = verCheck.value;
+  }
+  return { ok: true, value: { objective_id: objectiveId, body } };
+}
 
 // src/identity.ts
 function decideIdentity(i) {
@@ -5708,12 +5770,13 @@ var ALL_TOOL_DEFS = [
   },
   {
     name: "okr_reparent_objective",
-    description: "Re-parent one of YOUR objectives under another objective (build the company OKR tree), or detach it to a top-level root with parent_id=null. Owner-only; the server rejects cycles and depth >3. Use this instead of a hand-rolled curl \u2014 the plugin handles auth for you.",
+    description: 'Re-parent one of YOUR objectives under another objective (build the 3-level OKR tree), or detach it back to a top-level root with parent_id=null (or empty string ""). Open to Objective stewards (owner or sibling agent of the same human owner); server rejects cycles and depth >3, and supports optional if_match_updated_at optimistic concurrency guard (409 stale_objective_version on conflict).',
     inputSchema: {
       type: "object",
       properties: {
         objective_id: { type: "string", description: "Your objective's id to move" },
-        parent_id: { type: ["string", "null"], description: "New parent objective id to attach under, or null to detach to a top-level root. Required to be present (pass null explicitly to detach)." }
+        parent_id: { type: ["string", "null"], description: 'New parent objective id to attach under, or null (or empty string "") to detach to a top-level root. Required to be present.' },
+        if_match_updated_at: { type: "string", maxLength: 64, description: "Optional optimistic concurrency guard (objective.updated_at; server returns 409 stale_objective_version on concurrent edit)" }
       },
       required: ["objective_id"]
     }
@@ -5948,18 +6011,16 @@ HANDLERS.set("send_typing", async (args) => {
   return { content: [{ type: "text", text: "Typing indicator dispatched" }] };
 });
 HANDLERS.set("okr_reparent_objective", async (args) => {
-  const { objective_id, parent_id } = args || {};
-  if (!objective_id) {
-    return { content: [{ type: "text", text: "okr_reparent_objective needs objective_id." }], isError: true };
+  const validated = validateOkrReparentObjectiveInput(args);
+  if (!validated.ok) {
+    return { content: [{ type: "text", text: `okr_reparent_objective invalid arguments: ${validated.error}` }], isError: true };
   }
-  if (!(args && typeof args === "object" && ("parent_id" in args))) {
-    return { content: [{ type: "text", text: "okr_reparent_objective needs parent_id (an objective id to attach under, or null to detach to a top-level root)." }], isError: true };
-  }
+  const { objective_id, body } = validated.value;
   try {
     const r = await apiFetch(`${REST_URL}/api/okr/objectives/${encodeURIComponent(objective_id)}/parent`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${TOKEN}` },
-      body: JSON.stringify({ parent_id: parent_id ?? null })
+      body: JSON.stringify(body)
     });
     const text = await r.text();
     if (!r.ok) {
@@ -8786,8 +8847,14 @@ ${list}` }] };
       const body = { title, horizon };
       if (owner)
         body.owner = owner;
-      if (parent_id)
-        body.parent_id = parent_id;
+      if (parent_id !== undefined) {
+        const parentCheck = validateOkrParentIdOptionalInput(parent_id);
+        if (!parentCheck.ok) {
+          return { content: [{ type: "text", text: `okr_create_objective invalid parent_id: ${parentCheck.error}` }], isError: true };
+        }
+        if (parentCheck.value)
+          body.parent_id = parentCheck.value;
+      }
       if (due)
         body.due = due;
       if (discussion_channel_id)
