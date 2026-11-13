@@ -1533,3 +1533,298 @@ export function validateUpsertChannelDocInput(
     },
   };
 }
+
+const SAFE_PERSONAL_SKILL_SLUG_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/;
+const PERSONAL_SKILL_BODY_MAX_CHARS = 100_000;
+
+export function derivePersonalSkillSlug(rawDocId: unknown, rawName: string): string {
+  if (typeof rawDocId === "string" && rawDocId.trim()) {
+    const trimmed = rawDocId.trim();
+    if (SAFE_PERSONAL_SKILL_SLUG_RE.test(trimmed) && !trimmed.includes("..")) {
+      return trimmed;
+    }
+  }
+  return (
+    String(rawDocId || rawName)
+      .toLowerCase()
+      .replace(/[^a-z0-9._-]+/g, "-")
+      .replace(/^[^a-z0-9]+/, "")
+      .replace(/[^a-z0-9]+$/, "")
+      .replace(/\.{2,}/g, "-")
+      .slice(0, 64) || "skill"
+  );
+}
+
+export function validatePersonalSkillSlugInput(
+  raw: unknown,
+  toolName: string,
+): { ok: true; value: string } | { ok: false; error: string } {
+  const slug = typeof raw === "string" ? raw.trim() : "";
+  if (
+    !slug ||
+    !SAFE_PERSONAL_SKILL_SLUG_RE.test(slug) ||
+    slug.includes("..") ||
+    EVIDENCE_CTRL_RE.test(slug) ||
+    EVIDENCE_SECRET_RE.test(slug)
+  ) {
+    return {
+      ok: false,
+      error: `${toolName} requires a valid personal skill slug (1..64 alphanumeric/._- chars starting with alphanumeric).`,
+    };
+  }
+  return { ok: true, value: slug };
+}
+
+export type ValidatedLoadSkillTarget =
+  | { scope: "global"; skill_id?: string }
+  | { scope: "personal"; name: string; include_revisions: boolean }
+  | { scope: "channel"; chat_id: string; doc_id: string; include_revisions: boolean };
+
+export function validateLoadSkillInput(
+  args: unknown,
+): { ok: true; value: ValidatedLoadSkillTarget } | { ok: false; error: string } {
+  const a = args && typeof args === "object" && !Array.isArray(args)
+    ? (args as Record<string, unknown>)
+    : {};
+  const includeRevisions = a.include_revisions === true;
+  if (a.include_revisions !== undefined && typeof a.include_revisions !== "boolean") {
+    return { ok: false, error: "load_skill include_revisions must be a boolean when provided." };
+  }
+  const hasChat = typeof a.chat_id === "string" && a.chat_id.trim().length > 0;
+  const hasDoc = typeof a.doc_id === "string" && a.doc_id.trim().length > 0;
+  const hasName = typeof a.name === "string" && a.name.trim().length > 0;
+  const hasSkillId = typeof a.skill_id === "string" && a.skill_id.trim().length > 0;
+
+  if ((hasChat || hasDoc) && (hasName || hasSkillId)) {
+    return {
+      ok: false,
+      error: "load_skill target is ambiguous: pass (chat_id + doc_id) for a channel skill, (name) for a personal skill, or (skill_id) for a global skill.",
+    };
+  }
+  if (hasName && hasSkillId) {
+    return {
+      ok: false,
+      error: "load_skill target is ambiguous: pass either name (personal skill) or skill_id (global skill), not both.",
+    };
+  }
+  if (hasChat || hasDoc) {
+    if (!hasChat || !hasDoc) {
+      return { ok: false, error: "load_skill for a channel skill requires both chat_id and doc_id." };
+    }
+    const roomCheck = validateChannelDocRoomId(a.chat_id, "load_skill");
+    if (!roomCheck.ok) return roomCheck;
+    const docCheck = validateChannelDocIdInput(a.doc_id, "load_skill");
+    if (!docCheck.ok) return docCheck;
+    return {
+      ok: true,
+      value: { scope: "channel", chat_id: roomCheck.value, doc_id: docCheck.value, include_revisions: includeRevisions },
+    };
+  }
+  if (hasName) {
+    const slugCheck = validatePersonalSkillSlugInput(a.name, "load_skill");
+    if (!slugCheck.ok) return slugCheck;
+    return {
+      ok: true,
+      value: { scope: "personal", name: slugCheck.value, include_revisions: includeRevisions },
+    };
+  }
+  if (includeRevisions) {
+    return {
+      ok: false,
+      error: "load_skill include_revisions is supported for personal skills (name) or channel skills (chat_id + doc_id), not built-in global skills.",
+    };
+  }
+  const skillId = hasSkillId ? (a.skill_id as string).trim() : undefined;
+  return { ok: true, value: { scope: "global", ...(skillId ? { skill_id: skillId } : {}) } };
+}
+
+export type ValidatedSaveSkillResult =
+  | {
+      scope: "personal";
+      mode: "archive";
+      slug: string;
+      if_match_version: number;
+    }
+  | {
+      scope: "personal";
+      mode: "save";
+      slug: string;
+      name: string;
+      body_markdown: string;
+      if_match_version?: number;
+    }
+  | {
+      scope: "channel";
+      mode: "archive";
+      chat_id: string;
+      doc_id: string;
+      if_match_version: number;
+    }
+  | {
+      scope: "channel";
+      mode: "save";
+      chat_id: string;
+      doc_id: string;
+      name: string;
+      level: 1 | 2 | 3 | 4;
+      body_markdown: string;
+      if_match_version?: number;
+    };
+
+export function validateSaveSkillInput(
+  args: unknown,
+): { ok: true; value: ValidatedSaveSkillResult } | { ok: false; error: string } {
+  const a = args && typeof args === "object" && !Array.isArray(args)
+    ? (args as Record<string, unknown>)
+    : {};
+  const rawName = typeof a.name === "string" ? a.name.trim() : "";
+  if (!rawName || rawName.length > 120 || EVIDENCE_CTRL_RE.test(rawName)) {
+    return { ok: false, error: "save_skill requires name (1..120 chars)." };
+  }
+  if (EVIDENCE_SECRET_RE.test(rawName)) {
+    return { ok: false, error: "save_skill rejected: name appears to contain a secret or token." };
+  }
+  if (a.archived !== undefined && typeof a.archived !== "boolean") {
+    return { ok: false, error: "save_skill archived must be a boolean when provided." };
+  }
+  const archived = a.archived === true;
+  let ifMatchVersion: number | undefined;
+  if (a.if_match_version !== undefined && a.if_match_version !== null) {
+    if (
+      typeof a.if_match_version !== "number" ||
+      !Number.isSafeInteger(a.if_match_version) ||
+      a.if_match_version < 0 ||
+      a.if_match_version > 999_999_999
+    ) {
+      return { ok: false, error: "save_skill if_match_version must be an integer in 0..999999999." };
+    }
+    ifMatchVersion = a.if_match_version;
+  }
+
+  const hasChat = typeof a.chat_id === "string" && a.chat_id.trim().length > 0;
+  if (archived) {
+    if (ifMatchVersion === undefined || ifMatchVersion < 1) {
+      return {
+        ok: false,
+        error: "save_skill archived=true requires a positive integer if_match_version (>= 1) for non-destructive CAS archiving.",
+      };
+    }
+    if (!hasChat) {
+      const pslug =
+        typeof a.doc_id === "string" && a.doc_id.trim()
+          ? validatePersonalSkillSlugInput(a.doc_id, "save_skill")
+          : validatePersonalSkillSlugInput(derivePersonalSkillSlug(undefined, rawName), "save_skill");
+      if (!pslug.ok) return pslug;
+      return {
+        ok: true,
+        value: { scope: "personal", mode: "archive", slug: pslug.value, if_match_version: ifMatchVersion },
+      };
+    }
+    const roomCheck = validateChannelDocRoomId(a.chat_id, "save_skill");
+    if (!roomCheck.ok) return roomCheck;
+    const defaultDocId = `skill-${rawName.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 48) || "skill"}`;
+    const docCheck = validateChannelDocIdInput(
+      typeof a.doc_id === "string" && a.doc_id.trim() ? a.doc_id : defaultDocId,
+      "save_skill",
+    );
+    if (!docCheck.ok) return docCheck;
+    return {
+      ok: true,
+      value: { scope: "channel", mode: "archive", chat_id: roomCheck.value, doc_id: docCheck.value, if_match_version: ifMatchVersion },
+    };
+  }
+
+  const rawDesc = typeof a.description === "string" ? a.description.trim() : "";
+  if (!rawDesc) {
+    return {
+      ok: false,
+      error: "save_skill needs name + description (body is the skill markdown). Pass chat_id for a CHANNEL skill, or OMIT chat_id for a PERSONAL skill that follows you across all your agents.",
+    };
+  }
+  if (EVIDENCE_SECRET_RE.test(rawDesc)) {
+    return { ok: false, error: "save_skill rejected: description appears to contain a secret or token." };
+  }
+  const rawBody = a.body === undefined || a.body === null ? "" : typeof a.body === "string" ? a.body : null;
+  if (rawBody === null) {
+    return { ok: false, error: "save_skill body must be a markdown string when provided." };
+  }
+  if (EVIDENCE_SECRET_RE.test(rawBody)) {
+    return {
+      ok: false,
+      error: "save_skill rejected: body appears to contain an API key, token, or private key.",
+    };
+  }
+  const oneLine = (s: string, cap = 480) => String(s).replace(/\r?\n/g, " ").trim().slice(0, cap);
+  const triggerLine =
+    typeof a.trigger === "string" && a.trigger.trim()
+      ? `\ntrigger: ${oneLine(a.trigger, 80)}`
+      : "";
+  const argHintLine =
+    typeof a.argument_hint === "string" && a.argument_hint.trim()
+      ? `\nargument-hint: ${JSON.stringify(oneLine(a.argument_hint, 160))}`
+      : "";
+  const md = `---\nname: ${oneLine(rawName, 120)}\ndescription: ${oneLine(rawDesc, 480)}${triggerLine}${argHintLine}\n---\n\n${rawBody}`;
+
+  if (!hasChat) {
+    if (md.length > PERSONAL_SKILL_BODY_MAX_CHARS) {
+      return { ok: false, error: `save_skill personal skill markdown exceeds ${PERSONAL_SKILL_BODY_MAX_CHARS} chars.` };
+    }
+    if (typeof a.doc_id === "string" && a.doc_id.trim()) {
+      const explicitSlug = validatePersonalSkillSlugInput(a.doc_id, "save_skill");
+      if (!explicitSlug.ok) return explicitSlug;
+      return {
+        ok: true,
+        value: {
+          scope: "personal",
+          mode: "save",
+          slug: explicitSlug.value,
+          name: rawName,
+          body_markdown: md,
+          ...(ifMatchVersion !== undefined ? { if_match_version: ifMatchVersion } : {}),
+        },
+      };
+    }
+    const derived = derivePersonalSkillSlug(undefined, rawName);
+    return {
+      ok: true,
+      value: {
+        scope: "personal",
+        mode: "save",
+        slug: derived,
+        name: rawName,
+        body_markdown: md,
+        ...(ifMatchVersion !== undefined ? { if_match_version: ifMatchVersion } : {}),
+      },
+    };
+  }
+
+  const roomCheck = validateChannelDocRoomId(a.chat_id, "save_skill");
+  if (!roomCheck.ok) return roomCheck;
+  const defaultDocId = `skill-${rawName.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 48) || "skill"}`;
+  const docCheck = validateChannelDocIdInput(
+    typeof a.doc_id === "string" && a.doc_id.trim() ? a.doc_id : defaultDocId,
+    "save_skill",
+  );
+  if (!docCheck.ok) return docCheck;
+  const level = a.level === undefined ? 3 : normalizeDocLevelValue(a.level);
+  if (level === null) {
+    return { ok: false, error: "save_skill level must be 1|2|3|4." };
+  }
+  const cap = channelDocBodyByteCap(level);
+  if (Buffer.byteLength(md, "utf8") > cap) {
+    return { ok: false, error: `save_skill markdown exceeds L${level} cap (${cap} UTF-8 bytes).` };
+  }
+  return {
+    ok: true,
+    value: {
+      scope: "channel",
+      mode: "save",
+      chat_id: roomCheck.value,
+      doc_id: docCheck.value,
+      name: rawName,
+      level,
+      body_markdown: md,
+      ...(ifMatchVersion !== undefined ? { if_match_version: ifMatchVersion } : {}),
+    },
+  };
+}

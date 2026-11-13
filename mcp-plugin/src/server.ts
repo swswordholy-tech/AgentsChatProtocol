@@ -72,8 +72,11 @@ import {
   validateOkrTaskDependsOnInput,
   validateOkrTaskDueInput,
   validateOkrTaskTitleInput,
+  validateLoadSkillInput,
   validateOkrUpdateKrInput,
   validateOkrUpdateObjectiveInput,
+  validatePersonalSkillSlugInput,
+  validateSaveSkillInput,
   validateTaskEvidenceInput,
   validateTaskVersionToken,
   validateToolArgs,
@@ -1718,40 +1721,47 @@ const ALL_TOOL_DEFS = [
     },
     {
       name: "list_skills",
-      description: "List loadable skills: centrally-maintained GLOBAL skills (operating loops, platform rules) always, plus this CHANNEL's skill docs when chat_id is given. Load one with load_skill.",
+      description: "List loadable skills: centrally-maintained GLOBAL skills always, your cross-room PERSONAL skills (per-owner), plus a CHANNEL's skill docs when chat_id is given. Soft-archived tombstones are excluded by default (active_only=true); pass active_only=false to inspect archived skills too.",
       inputSchema: {
         type: "object" as const,
         properties: {
           chat_id: { type: "string", description: "Optional channel_id — also lists that channel's skill docs" },
+          active_only: { type: "boolean", description: "Exclude soft-archived tombstones (default: true). Pass false to include archived skills." },
         },
       },
     },
     {
       name: "load_skill",
-      description: "Load a skill's full text into context. GLOBAL skill: pass skill_id (default workspace-driven-eng). CHANNEL skill: pass chat_id + doc_id (ids come from list_skills or channel_brief).",
+      description: "Load a skill's full text (and optional revision history) into context. Three scopes: GLOBAL skill via skill_id (default workspace-driven-eng); PERSONAL skill via name (from list_skills.personal_skills); CHANNEL skill via chat_id + doc_id (from list_skills or channel_brief). Pass include_revisions=true on a personal or channel skill to inspect prior revisions for CAS restore.",
       inputSchema: {
         type: "object" as const,
         properties: {
           skill_id: { type: "string", description: "Global skill id (default: workspace-driven-eng)" },
+          name: { type: "string", description: "Personal skill slug (per-owner, from list_skills.personal_skills)" },
           chat_id: { type: "string", description: "Channel id (for a channel skill, paired with doc_id)" },
           doc_id: { type: "string", description: "Channel doc id to load as a skill (paired with chat_id)" },
+          include_revisions: { type: "boolean", description: "When true, also fetch revision history for a personal or channel skill" },
         },
       },
     },
     {
       name: "save_skill",
-      description: "Save/publish a reusable skill that AgentsChat persists + versions; you and others CONSUME it via load_skill/sync_skill in your own runtime. Two scopes: pass chat_id → CHANNEL skill (shared in that channel); OMIT chat_id → PERSONAL skill, namespaced to your owner and shared across ALL your agents (a flat name that follows you). Pass name + description + body (the markdown instructions). Reuse the same name/doc_id to update in place.",
+      description: "Save, CAS-update, or non-destructively archive a reusable skill. Two scopes: pass chat_id → CHANNEL skill (shared in that channel); OMIT chat_id → PERSONAL skill, namespaced to your owner and shared across ALL your agents (up to 50 active personal skills). Pass name + description + body to create/update (optional if_match_version CAS guard: 0 for create-only, positive integer for update-only). Pass archived=true with a positive if_match_version to soft-archive without deleting revision history.",
       inputSchema: {
         type: "object" as const,
         properties: {
           chat_id: { type: "string", description: "Channel to save into (CHANNEL skill). OMIT for a PERSONAL skill (per-owner, follows you across agents)." },
           name: { type: "string", description: "Skill name (short)" },
-          description: { type: "string", description: "One line: what it does / when to use it" },
+          description: { type: "string", description: "One line: what it does / when to use it (required unless archived=true)" },
           body: { type: "string", description: "The skill content in markdown — the instructions an agent follows" },
-          doc_id: { type: "string", description: "Optional stable id/slug (default: a slug of name). Reuse to update." },
+          trigger: { type: "string", description: "Optional slash trigger hint (e.g. '/deploy') stored in YAML frontmatter" },
+          argument_hint: { type: "string", description: "Optional argument hint (e.g. '[target]') stored in YAML frontmatter" },
+          doc_id: { type: "string", description: "Optional stable id/slug (default: a slug of name). Reuse to update or archive." },
           level: { type: "number", description: "CHANNEL only: doc tier 1-4 (default 3 = any member may write; 1-2 require channel admin)" },
+          if_match_version: { type: "integer", minimum: 0, maximum: 999999999, description: "Optional CAS guard: 0 to create only if absent, positive version to update/archive without overwriting concurrent edits (required when archived=true)." },
+          archived: { type: "boolean", description: "Pass true with a positive if_match_version to non-destructively soft-archive (keeps revisions intact and frees active quota)." },
         },
-        required: ["name", "description"],
+        required: ["name"],
       },
     },
     {
@@ -4132,7 +4142,9 @@ const handleToolCall = async (request: any): Promise<any> => {
     }
 
   if (name === "list_skills") {
-    const { chat_id } = (args || {}) as { chat_id?: string };
+    const { chat_id, active_only } = (args || {}) as { chat_id?: string; active_only?: boolean };
+    const activeOnly = active_only !== false;
+    const activeQuery = activeOnly ? "?active_only=1" : "";
     const out: any = {
       global_skills: Object.entries(GLOBAL_SKILLS).map(([skill_id, skill]) => ({
         skill_id,
@@ -4143,27 +4155,103 @@ const handleToolCall = async (request: any): Promise<any> => {
     };
     if (chat_id) {
       try {
-        const r = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(chat_id)}/docs`, {
+        const r = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(chat_id)}/docs${activeQuery}`, {
           headers: { "Authorization": `Bearer ${TOKEN}` },
         });
-        if (r.ok) out.channel_skills = extractChannelDocsPayload(JSON.parse(await r.text())).filter(isSkillDoc).map(compactSkillDoc);
-        else out.channel_skills_error = `failed (${r.status})`;
+        if (r.ok) {
+          out.channel_skills = extractChannelDocsPayload(JSON.parse(await r.text()))
+            .filter(isSkillDoc)
+            .filter((d: any) => !activeOnly || !isArchivedSkillOrDoc(d))
+            .map(compactSkillDoc);
+        } else {
+          out.channel_skills_error = `failed (${r.status})`;
+        }
       } catch (e: any) {
         out.channel_skills_error = `network/parse error: ${String(e?.message || e).slice(0, 120)}`;
       }
     }
-    // Personal skills (per-owner, follow you across agents). sync_skill(name=…) / load via GET /api/skills/:name.
+    // Personal skills (per-owner, follow you across agents). sync_skill(name=…) / load_skill(name=…).
     try {
-      const pr = await apiFetch(`${REST_URL}/api/skills`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
-      if (pr.ok) out.personal_skills = (JSON.parse(await pr.text()).skills) || [];
+      const pr = await apiFetch(`${REST_URL}/api/skills${activeQuery}`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
+      if (pr.ok) {
+        const rawSkills = (JSON.parse(await pr.text()).skills) || [];
+        out.personal_skills = rawSkills.filter((s: any) => !activeOnly || s?.archived !== true);
+      } else {
+        out.personal_skills_error = `failed (${pr.status})`;
+      }
     } catch { /* best-effort */ }
     return { content: [{ type: "text", text: JSON.stringify(out) }] };
   }
 
   if (name === "load_skill") {
-    const { skill_id, chat_id, doc_id } = (args || {}) as { skill_id?: string; chat_id?: string; doc_id?: string };
+    const targetCheck = validateLoadSkillInput(args);
+    if (!targetCheck.ok) {
+      return { content: [{ type: "text", text: targetCheck.error }], isError: true };
+    }
+    const target = targetCheck.value;
+    // PERSONAL skill: name (per-owner, shared across your agents).
+    if (target.scope === "personal") {
+      try {
+        const r = await apiFetch(`${REST_URL}/api/skills/${encodeURIComponent(target.name)}`, {
+          headers: { "Authorization": `Bearer ${TOKEN}` },
+        });
+        const text = await r.text();
+        if (!r.ok) {
+          return { content: [{ type: "text", text: `load_skill (personal) failed (${r.status}): ${text.slice(0, 200)}` }], isError: true };
+        }
+        const doc = JSON.parse(text);
+        const body = String(doc?.body_markdown ?? "");
+        const version = doc?.version ?? "?";
+        const title = doc?.title || target.name;
+        const archived = doc?.archived === true || body === "";
+        const parsed = parseSkillFrontmatter(body);
+        const metadata = { ...(parsed.metadata || {}), ...(doc?.skill_meta || {}) };
+        const metaLines = [
+          metadata.name ? `name: ${metadata.name}` : null,
+          metadata.description ? `description: ${metadata.description}` : null,
+          metadata.trigger ? `trigger: ${metadata.trigger}` : null,
+          (metadata.argument_hint ?? metadata.argumentHint) ? `argument-hint: ${metadata.argument_hint ?? metadata.argumentHint}` : null,
+        ].filter(Boolean).join("\n");
+        let revisionsBlock = "";
+        if (target.include_revisions) {
+          const revR = await apiFetch(`${REST_URL}/api/skills/${encodeURIComponent(target.name)}/revisions`, {
+            headers: { "Authorization": `Bearer ${TOKEN}` },
+          });
+          if (revR.ok) {
+            const revJson = JSON.parse(await revR.text());
+            revisionsBlock = `\n\nRevisions:\n${JSON.stringify(revJson?.revisions ?? [], null, 2)}`;
+          } else {
+            revisionsBlock = `\n\nRevisions: fetch failed (${revR.status})`;
+          }
+        }
+        if (archived) {
+          const hint = target.include_revisions
+            ? `Restore by calling save_skill(name="${title}", doc_id="${target.name}", description=..., body=..., if_match_version=${version}).`
+            : `Pass include_revisions=true to inspect prior snapshots for CAS restore (if_match_version=${version}).`;
+          return {
+            content: [{
+              type: "text",
+              text: `[ARCHIVED PERSONAL SKILL "${target.name}" (v${version})]\n${metaLines ? `\nMetadata:\n${metaLines}\n` : ""}\n${hint}${revisionsBlock}`,
+            }],
+          };
+        }
+        return {
+          content: [{
+            type: "text",
+            text: [
+              `Personal skill loaded: "${target.name}" (v${version}).`,
+              metaLines ? `\nMetadata:\n${metaLines}` : "",
+              `\n# ${title}\n\n${parsed.body}${revisionsBlock}`,
+            ].join("\n"),
+          }],
+        };
+      } catch (e: any) {
+        return { content: [{ type: "text", text: `load_skill (personal) network/parse error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
+      }
+    }
     // CHANNEL skill: chat_id + doc_id (full frontmatter/metadata handling).
-    if (chat_id && doc_id) {
+    if (target.scope === "channel") {
+      const { chat_id, doc_id, include_revisions } = target;
       try {
         const r = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(chat_id)}/docs/${encodeURIComponent(doc_id)}`, {
           headers: { "Authorization": `Bearer ${TOKEN}` },
@@ -4173,11 +4261,13 @@ const handleToolCall = async (request: any): Promise<any> => {
           return { content: [{ type: "text", text: `load_skill (channel) failed (${r.status}): ${text.slice(0, 200)}` }], isError: true };
         }
         const doc = JSON.parse(text);
-        const body = doc?.body_markdown ?? doc?.bodyMarkdown ?? "";
+        const body = String(doc?.body_markdown ?? doc?.bodyMarkdown ?? "");
         const title = doc?.title || doc_id;
         const kind = doc?.kind || "unknown";
         const level = doc?.level ?? "?";
-        const parsed = parseSkillFrontmatter(String(body));
+        const version = doc?.version ?? "?";
+        const archived = isArchivedSkillOrDoc(doc);
+        const parsed = parseSkillFrontmatter(body);
         const metadata = { ...(parsed.metadata || {}), ...(doc?.skill_meta || doc?.skillMeta || {}) };
         const metaLines = [
           metadata.name ? `name: ${metadata.name}` : null,
@@ -4185,16 +4275,40 @@ const handleToolCall = async (request: any): Promise<any> => {
           metadata.trigger ? `trigger: ${metadata.trigger}` : null,
           (metadata.argument_hint ?? metadata.argumentHint) ? `argument-hint: ${metadata.argument_hint ?? metadata.argumentHint}` : null,
         ].filter(Boolean).join("\n");
+        let revisionsBlock = "";
+        if (include_revisions) {
+          const revR = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(chat_id)}/docs/${encodeURIComponent(doc_id)}/revisions`, {
+            headers: { "Authorization": `Bearer ${TOKEN}` },
+          });
+          if (revR.ok) {
+            const revJson = JSON.parse(await revR.text());
+            const revs = Array.isArray(revJson) ? revJson : (revJson?.revisions ?? []);
+            revisionsBlock = `\n\nRevisions:\n${JSON.stringify(revs, null, 2)}`;
+          } else {
+            revisionsBlock = `\n\nRevisions: fetch failed (${revR.status})`;
+          }
+        }
+        if (archived) {
+          const hint = include_revisions
+            ? `Restore by calling save_skill(chat_id="${chat_id}", doc_id="${doc_id}", name=..., description=..., body=..., if_match_version=${version}).`
+            : `Pass include_revisions=true to inspect prior snapshots for CAS restore (if_match_version=${version}).`;
+          return {
+            content: [{
+              type: "text",
+              text: `[ARCHIVED CHANNEL SKILL ${chat_id}/${doc_id} (L${level}, v${version})]\n${metaLines ? `\nMetadata:\n${metaLines}\n` : ""}\n${hint}${revisionsBlock}`,
+            }],
+          };
+        }
         if (!String(kind).toLowerCase().includes("skill") && !String(doc_id).toLowerCase().includes("skill")) {
-          return { content: [{ type: "text", text: `Loaded channel doc "${doc_id}" as requested, but it is not marked kind=skill.\n\n# ${title}\n\n${parsed.body}` }] };
+          return { content: [{ type: "text", text: `Loaded channel doc "${doc_id}" as requested, but it is not marked kind=skill.\n\n# ${title}\n\n${parsed.body}${revisionsBlock}` }] };
         }
         return {
           content: [{
             type: "text",
             text: [
-              `Channel-specific skill loaded from ${chat_id}/${doc_id} (L${level}, kind=${kind}).`,
+              `Channel-specific skill loaded from ${chat_id}/${doc_id} (L${level}, kind=${kind}, v${version}).`,
               metaLines ? `\nMetadata:\n${metaLines}` : "",
-              `\n# ${title}\n\n${parsed.body}`,
+              `\n# ${title}\n\n${parsed.body}${revisionsBlock}`,
             ].join("\n"),
           }],
         };
@@ -4203,7 +4317,7 @@ const handleToolCall = async (request: any): Promise<any> => {
       }
     }
     // GLOBAL skill: skill_id (default workspace-driven-eng).
-    const id = skill_id || DEFAULT_GLOBAL_SKILL_ID;
+    const id = target.skill_id || DEFAULT_GLOBAL_SKILL_ID;
     const skill = GLOBAL_SKILLS[id];
     if (!skill) {
       return { content: [{ type: "text", text: `Unknown global skill: ${id}` }], isError: true };
@@ -4263,55 +4377,108 @@ const handleToolCall = async (request: any): Promise<any> => {
   }
 
   if (name === "save_skill") {
-    const a = (args || {}) as { chat_id?: string; name?: string; description?: string; body?: string; doc_id?: string; level?: number };
-    if (!a.name || !a.description) {
-      return { content: [{ type: "text", text: "save_skill needs name + description (body is the skill markdown). Pass chat_id for a CHANNEL skill, or OMIT chat_id for a PERSONAL skill that follows you across all your agents." }], isError: true };
+    const validated = validateSaveSkillInput(args);
+    if (!validated.ok) {
+      return { content: [{ type: "text", text: validated.error }], isError: true };
     }
-    // Skill markdown = YAML frontmatter (name, description) + body — the exact
-    // shape parseSkillFrontmatter + the skill validators expect.
-    const oneLine = (s: string) => String(s).replace(/\r?\n/g, " ").slice(0, 480);
-    const md = `---\nname: ${oneLine(a.name)}\ndescription: ${oneLine(a.description)}\n---\n\n${a.body || ""}`;
+    const v = validated.value;
     // PERSONAL skill (no chat_id): per-owner store, shared across YOUR agents.
-    if (!a.chat_id) {
-      const pslug = String(a.doc_id || a.name).toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^[^a-z0-9]+/, "").replace(/[^a-z0-9]+$/, "").slice(0, 64) || "skill";
+    if (v.scope === "personal") {
+      if (v.mode === "archive") {
+        try {
+          const r = await apiFetch(`${REST_URL}/api/skills/${encodeURIComponent(v.slug)}`, {
+            method: "DELETE",
+            headers: {
+              "Authorization": `Bearer ${TOKEN}`,
+              "If-Match": String(v.if_match_version),
+            },
+          });
+          const text = await r.text();
+          if (!r.ok) return { content: [{ type: "text", text: `save_skill (personal archive) failed (${r.status}): ${text.slice(0, 240)}` }], isError: true };
+          const resp = text.trim() ? JSON.parse(text) : {};
+          const nextVer = resp?.version ?? v.if_match_version + 1;
+          return {
+            content: [{
+              type: "text",
+              text: `Archived PERSONAL skill "${v.slug}" (v${nextVer}) — revision history preserved & active quota freed. Inspect history via load_skill(name="${v.slug}", include_revisions=true).`,
+            }],
+          };
+        } catch (e: any) {
+          return { content: [{ type: "text", text: `save_skill (personal archive) network error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
+        }
+      }
       try {
-        const r = await apiFetch(`${REST_URL}/api/skills/${encodeURIComponent(pslug)}`, {
+        const headers: Record<string, string> = {
+          "Authorization": `Bearer ${TOKEN}`,
+          "Content-Type": "application/json",
+          ...(v.if_match_version !== undefined ? { "If-Match": String(v.if_match_version) } : {}),
+        };
+        const r = await apiFetch(`${REST_URL}/api/skills/${encodeURIComponent(v.slug)}`, {
           method: "PUT",
-          headers: { "Authorization": `Bearer ${TOKEN}`, "Content-Type": "application/json" },
-          body: JSON.stringify({ body_markdown: md }),
+          headers,
+          body: JSON.stringify({
+            body_markdown: v.body_markdown,
+            ...(v.if_match_version !== undefined ? { if_match_version: v.if_match_version } : {}),
+          }),
         });
         const text = await r.text();
         if (!r.ok) return { content: [{ type: "text", text: `save_skill (personal) failed (${r.status}): ${text.slice(0, 240)}` }], isError: true };
         const resp = JSON.parse(text);
-        return { content: [{ type: "text", text: `Saved PERSONAL skill "${a.name}" as "${pslug}" (v${resp.version}) — shared across all your agents. Pull/refresh: sync_skill(name="${pslug}"); list: list_skills.` }] };
+        return { content: [{ type: "text", text: `Saved PERSONAL skill "${v.name}" as "${v.slug}" (v${resp.version}) — shared across all your agents. Load: load_skill(name="${v.slug}"); sync: sync_skill(name="${v.slug}"); list: list_skills.` }] };
       } catch (e: any) {
         return { content: [{ type: "text", text: `save_skill (personal) network error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
       }
     }
-    // CHANNEL skill (chat_id given). Stable doc id: caller-supplied, else slug of name.
-    const slug = String(a.name).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 48) || "skill";
-    const docId = (a.doc_id && String(a.doc_id).trim()) || `skill-${slug}`;
-    const level = (typeof a.level === "number" && a.level >= 1 && a.level <= 4) ? a.level : 3; // 3 = member-writable
-    try {
-      // If-Match: fetch current version (0 = create). The doc store uses
-      // optimistic concurrency; "0" creates, current version updates.
-      let ifMatch = "0";
-      const cur = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(a.chat_id)}/docs/${encodeURIComponent(docId)}`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
-      if (cur.ok) {
-        const curDoc = await cur.json().catch(() => null) as any;
-        if (curDoc && curDoc.version != null) ifMatch = String(curDoc.version);
+
+    // CHANNEL skill (chat_id given).
+    if (v.mode === "archive") {
+      try {
+        const r = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(v.chat_id)}/docs/${encodeURIComponent(v.doc_id)}`, {
+          method: "DELETE",
+          headers: {
+            "Authorization": `Bearer ${TOKEN}`,
+            "If-Match": String(v.if_match_version),
+          },
+        });
+        const text = await r.text();
+        if (!r.ok) {
+          return { content: [{ type: "text", text: `save_skill (channel archive) failed (${r.status}): ${text.slice(0, 240)}` }], isError: true };
+        }
+        const etagVer = Number((r.headers.get("etag") ?? "").replace(/"/g, ""));
+        const parsed = text.trim() ? JSON.parse(text) : null;
+        const nextVer = parsed?.version ?? (Number.isSafeInteger(etagVer) && etagVer >= 1 ? etagVer : v.if_match_version + 1);
+        return {
+          content: [{
+            type: "text",
+            text: `Archived CHANNEL skill ${v.chat_id}/${v.doc_id} (v${nextVer}) — revision history preserved & active quota freed. Inspect history via load_skill(chat_id="${v.chat_id}", doc_id="${v.doc_id}", include_revisions=true).`,
+          }],
+        };
+      } catch (e: any) {
+        return { content: [{ type: "text", text: `save_skill (channel archive) network error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
       }
-      const r = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(a.chat_id)}/docs/${encodeURIComponent(docId)}`, {
+    }
+    try {
+      let ifMatch = v.if_match_version !== undefined ? String(v.if_match_version) : "0";
+      if (v.if_match_version === undefined) {
+        const cur = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(v.chat_id)}/docs/${encodeURIComponent(v.doc_id)}`, {
+          headers: { "Authorization": `Bearer ${TOKEN}` },
+        });
+        if (cur.ok) {
+          const curDoc = await cur.json().catch(() => null) as any;
+          if (curDoc && curDoc.version != null) ifMatch = String(curDoc.version);
+        }
+      }
+      const r = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(v.chat_id)}/docs/${encodeURIComponent(v.doc_id)}`, {
         method: "PUT",
         headers: { "Authorization": `Bearer ${TOKEN}`, "Content-Type": "application/json", "If-Match": ifMatch },
-        body: JSON.stringify({ kind: "channel_skill", level, title: a.name, body_markdown: md }),
+        body: JSON.stringify({ kind: "channel_skill", level: v.level, title: v.name, body_markdown: v.body_markdown }),
       });
       const text = await r.text();
       if (!r.ok) {
         return { content: [{ type: "text", text: `save_skill failed (${r.status}): ${text.slice(0, 240)}` }], isError: true };
       }
       const verb = ifMatch === "0" ? "Saved" : "Updated";
-      return { content: [{ type: "text", text: `${verb} skill "${a.name}" → ${a.chat_id}/${docId} (L${level}). Others load it with: load_skill(chat_id="${a.chat_id}", doc_id="${docId}") — discoverable via list_skills(chat_id="${a.chat_id}").` }] };
+      return { content: [{ type: "text", text: `${verb} skill "${v.name}" → ${v.chat_id}/${v.doc_id} (L${v.level}). Others load it with: load_skill(chat_id="${v.chat_id}", doc_id="${v.doc_id}") — discoverable via list_skills(chat_id="${v.chat_id}").` }] };
     } catch (e: any) {
       return { content: [{ type: "text", text: `save_skill network error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
     }
@@ -4325,28 +4492,52 @@ const handleToolCall = async (request: any): Promise<any> => {
     // PERSONAL skill: sync_skill({name}) — version from GET /api/skills (cheap,
     // no body), body from GET /api/skills/:name only when missing/stale.
     if (a.name && !a.chat_id) {
-      const pBase = `${cacheDir}/personal__${safe(a.name)}`;
+      const slugCheck = validatePersonalSkillSlugInput(a.name, "sync_skill");
+      if (!slugCheck.ok) {
+        return { content: [{ type: "text", text: slugCheck.error }], isError: true };
+      }
+      const pSlug = slugCheck.value;
+      const pBase = `${cacheDir}/personal__${safe(pSlug)}`;
       const pMd = `${pBase}.md`; const pMeta = `${pBase}.json`;
       try {
         const listR = await apiFetch(`${REST_URL}/api/skills`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
         if (!listR.ok) return { content: [{ type: "text", text: `sync_skill (personal): list failed (${listR.status})` }], isError: true };
-        const meta = (JSON.parse(await listR.text()).skills || []).find((s: any) => s.name === a.name);
-        if (!meta) return { content: [{ type: "text", text: `sync_skill: personal skill "${a.name}" not found (save it with save_skill — no chat_id).` }], isError: true };
+        const meta = (JSON.parse(await listR.text()).skills || []).find((s: any) => s.name === pSlug);
+        if (!meta) return { content: [{ type: "text", text: `sync_skill: personal skill "${pSlug}" not found (save it with save_skill — no chat_id).` }], isError: true };
+        if (meta.archived === true) {
+          return {
+            content: [{
+              type: "text",
+              text: `sync_skill: personal skill "${pSlug}" is soft-archived (v${meta.version ?? "?"}); refusing to overwrite local file with an empty tombstone. Inspect revisions via load_skill(name="${pSlug}", include_revisions=true).`,
+            }],
+            isError: true,
+          };
+        }
         const currentVersion = Number(meta.version ?? 0);
         let cachedVersion: number | null = null;
         try { cachedVersion = Number(JSON.parse(readFileSync(pMeta, "utf8")).version); } catch {}
         if (cachedVersion !== null && cachedVersion === currentVersion) {
-          return { content: [{ type: "text", text: `up-to-date: personal skill "${a.name}" v${currentVersion} already at ${pMd} — no download. Read that file to run it.` }] };
+          return { content: [{ type: "text", text: `up-to-date: personal skill "${pSlug}" v${currentVersion} already at ${pMd} — no download. Read that file to run it.` }] };
         }
-        const bodyR = await apiFetch(`${REST_URL}/api/skills/${encodeURIComponent(a.name)}`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
+        const bodyR = await apiFetch(`${REST_URL}/api/skills/${encodeURIComponent(pSlug)}`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
         if (!bodyR.ok) return { content: [{ type: "text", text: `sync_skill (personal): body fetch failed (${bodyR.status})` }], isError: true };
         const doc = JSON.parse(await bodyR.text());
+        const body = String(doc?.body_markdown ?? "");
+        if (doc?.archived === true || !body.trim()) {
+          return {
+            content: [{
+              type: "text",
+              text: `sync_skill: personal skill "${pSlug}" is archived; refusing to overwrite local file.`,
+            }],
+            isError: true,
+          };
+        }
         // node:fs (not Bun.write) — runs on plain Node too. Bun.write auto-creates
         // parent dirs; writeFileSync does not, so mkdir the cache dir first.
         mkdirSync(dirname(pMd), { recursive: true });
-        writeFileSync(pMd, String(doc?.body_markdown ?? ""));
-        writeFileSync(pMeta, JSON.stringify({ version: currentVersion, name: a.name, syncedAt: new Date().toISOString() }));
-        return { content: [{ type: "text", text: `synced personal skill "${a.name}" v${currentVersion} → ${pMd} (was ${cachedVersion === null ? "missing" : `stale v${cachedVersion}`}). Read that file to run it.` }] };
+        writeFileSync(pMd, body);
+        writeFileSync(pMeta, JSON.stringify({ version: currentVersion, name: pSlug, syncedAt: new Date().toISOString() }));
+        return { content: [{ type: "text", text: `synced personal skill "${pSlug}" v${currentVersion} → ${pMd} (was ${cachedVersion === null ? "missing" : `stale v${cachedVersion}`}). Read that file to run it.` }] };
       } catch (e: any) {
         return { content: [{ type: "text", text: `sync_skill (personal) error: ${String(e?.message || e).slice(0, 140)}` }], isError: true };
       }
@@ -4366,6 +4557,15 @@ const handleToolCall = async (request: any): Promise<any> => {
       const docs = extractChannelDocsPayload(JSON.parse(await listR.text()));
       const meta = docs.find((d: any) => (d?.id ?? d?.doc_id) === a.doc_id);
       if (!meta) return { content: [{ type: "text", text: `sync_skill: skill "${a.doc_id}" not found in channel ${a.chat_id}` }], isError: true };
+      if (isArchivedSkillOrDoc(meta)) {
+        return {
+          content: [{
+            type: "text",
+            text: `sync_skill: channel skill "${a.doc_id}" is soft-archived (v${meta.version ?? "?"}); refusing to overwrite local file with an empty tombstone. Inspect revisions via load_skill(chat_id="${a.chat_id}", doc_id="${a.doc_id}", include_revisions=true).`,
+          }],
+          isError: true,
+        };
+      }
       const currentVersion = Number(meta.version ?? 0);
       // 2. Local cache check — skip the body fetch if we already have this version.
       let cachedVersion: number | null = null;
@@ -4378,6 +4578,15 @@ const handleToolCall = async (request: any): Promise<any> => {
       if (!docR.ok) return { content: [{ type: "text", text: `sync_skill: fetch body failed (${docR.status})` }], isError: true };
       const doc = JSON.parse(await docR.text());
       const body = String(doc?.body_markdown ?? doc?.bodyMarkdown ?? "");
+      if (isArchivedSkillOrDoc(doc)) {
+        return {
+          content: [{
+            type: "text",
+            text: `sync_skill: channel skill "${a.doc_id}" is archived; refusing to overwrite local file.`,
+          }],
+          isError: true,
+        };
+      }
       // 4. Write the local mirror + version sidecar (node:fs, not Bun.write, for
       // Node compat; mkdir the cache dir first since writeFileSync won't auto-create).
       mkdirSync(dirname(mdPath), { recursive: true });
@@ -6389,13 +6598,28 @@ function isSkillDoc(doc: any): boolean {
   return kind === "skill" || kind === "channel_skill" || id.includes("skill") || title.includes("skill");
 }
 
+function isArchivedSkillOrDoc(doc: any): boolean {
+  if (!doc || typeof doc !== "object") return false;
+  if (doc.archived === true) return true;
+  const body = doc.body_markdown ?? doc.bodyMarkdown;
+  if (typeof body === "string") return body === "";
+  const summary = doc.body_summary ?? doc.bodySummary;
+  if (typeof summary === "string" && summary === "" && doc.archived !== false && doc.skill_meta === undefined && doc.skillMeta === undefined) {
+    return true;
+  }
+  return false;
+}
+
 function compactSkillDoc(doc: any) {
   const meta = doc?.skill_meta || doc?.skillMeta || {};
+  const archived = isArchivedSkillOrDoc(doc);
   return {
     doc_id: doc?.id ?? doc?.doc_id,
     title: doc?.title,
     kind: doc?.kind,
     level: doc?.level,
+    ...(typeof doc?.version === "number" ? { version: doc.version } : {}),
+    ...(archived ? { archived: true } : {}),
     updated_at: doc?.updatedAt ?? doc?.updated_at,
     name: meta.name,
     description: meta.description,

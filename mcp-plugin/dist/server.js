@@ -1349,6 +1349,224 @@ function validateUpsertChannelDocInput(args) {
     }
   };
 }
+var SAFE_PERSONAL_SKILL_SLUG_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/;
+var PERSONAL_SKILL_BODY_MAX_CHARS = 1e5;
+function derivePersonalSkillSlug(rawDocId, rawName) {
+  if (typeof rawDocId === "string" && rawDocId.trim()) {
+    const trimmed = rawDocId.trim();
+    if (SAFE_PERSONAL_SKILL_SLUG_RE.test(trimmed) && !trimmed.includes("..")) {
+      return trimmed;
+    }
+  }
+  return String(rawDocId || rawName).toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^[^a-z0-9]+/, "").replace(/[^a-z0-9]+$/, "").replace(/\.{2,}/g, "-").slice(0, 64) || "skill";
+}
+function validatePersonalSkillSlugInput(raw, toolName) {
+  const slug = typeof raw === "string" ? raw.trim() : "";
+  if (!slug || !SAFE_PERSONAL_SKILL_SLUG_RE.test(slug) || slug.includes("..") || EVIDENCE_CTRL_RE.test(slug) || EVIDENCE_SECRET_RE.test(slug)) {
+    return {
+      ok: false,
+      error: `${toolName} requires a valid personal skill slug (1..64 alphanumeric/._- chars starting with alphanumeric).`
+    };
+  }
+  return { ok: true, value: slug };
+}
+function validateLoadSkillInput(args) {
+  const a = args && typeof args === "object" && !Array.isArray(args) ? args : {};
+  const includeRevisions = a.include_revisions === true;
+  if (a.include_revisions !== undefined && typeof a.include_revisions !== "boolean") {
+    return { ok: false, error: "load_skill include_revisions must be a boolean when provided." };
+  }
+  const hasChat = typeof a.chat_id === "string" && a.chat_id.trim().length > 0;
+  const hasDoc = typeof a.doc_id === "string" && a.doc_id.trim().length > 0;
+  const hasName = typeof a.name === "string" && a.name.trim().length > 0;
+  const hasSkillId = typeof a.skill_id === "string" && a.skill_id.trim().length > 0;
+  if ((hasChat || hasDoc) && (hasName || hasSkillId)) {
+    return {
+      ok: false,
+      error: "load_skill target is ambiguous: pass (chat_id + doc_id) for a channel skill, (name) for a personal skill, or (skill_id) for a global skill."
+    };
+  }
+  if (hasName && hasSkillId) {
+    return {
+      ok: false,
+      error: "load_skill target is ambiguous: pass either name (personal skill) or skill_id (global skill), not both."
+    };
+  }
+  if (hasChat || hasDoc) {
+    if (!hasChat || !hasDoc) {
+      return { ok: false, error: "load_skill for a channel skill requires both chat_id and doc_id." };
+    }
+    const roomCheck = validateChannelDocRoomId(a.chat_id, "load_skill");
+    if (!roomCheck.ok)
+      return roomCheck;
+    const docCheck = validateChannelDocIdInput(a.doc_id, "load_skill");
+    if (!docCheck.ok)
+      return docCheck;
+    return {
+      ok: true,
+      value: { scope: "channel", chat_id: roomCheck.value, doc_id: docCheck.value, include_revisions: includeRevisions }
+    };
+  }
+  if (hasName) {
+    const slugCheck = validatePersonalSkillSlugInput(a.name, "load_skill");
+    if (!slugCheck.ok)
+      return slugCheck;
+    return {
+      ok: true,
+      value: { scope: "personal", name: slugCheck.value, include_revisions: includeRevisions }
+    };
+  }
+  if (includeRevisions) {
+    return {
+      ok: false,
+      error: "load_skill include_revisions is supported for personal skills (name) or channel skills (chat_id + doc_id), not built-in global skills."
+    };
+  }
+  const skillId = hasSkillId ? a.skill_id.trim() : undefined;
+  return { ok: true, value: { scope: "global", ...skillId ? { skill_id: skillId } : {} } };
+}
+function validateSaveSkillInput(args) {
+  const a = args && typeof args === "object" && !Array.isArray(args) ? args : {};
+  const rawName = typeof a.name === "string" ? a.name.trim() : "";
+  if (!rawName || rawName.length > 120 || EVIDENCE_CTRL_RE.test(rawName)) {
+    return { ok: false, error: "save_skill requires name (1..120 chars)." };
+  }
+  if (EVIDENCE_SECRET_RE.test(rawName)) {
+    return { ok: false, error: "save_skill rejected: name appears to contain a secret or token." };
+  }
+  if (a.archived !== undefined && typeof a.archived !== "boolean") {
+    return { ok: false, error: "save_skill archived must be a boolean when provided." };
+  }
+  const archived = a.archived === true;
+  let ifMatchVersion;
+  if (a.if_match_version !== undefined && a.if_match_version !== null) {
+    if (typeof a.if_match_version !== "number" || !Number.isSafeInteger(a.if_match_version) || a.if_match_version < 0 || a.if_match_version > 999999999) {
+      return { ok: false, error: "save_skill if_match_version must be an integer in 0..999999999." };
+    }
+    ifMatchVersion = a.if_match_version;
+  }
+  const hasChat = typeof a.chat_id === "string" && a.chat_id.trim().length > 0;
+  if (archived) {
+    if (ifMatchVersion === undefined || ifMatchVersion < 1) {
+      return {
+        ok: false,
+        error: "save_skill archived=true requires a positive integer if_match_version (>= 1) for non-destructive CAS archiving."
+      };
+    }
+    if (!hasChat) {
+      const pslug = typeof a.doc_id === "string" && a.doc_id.trim() ? validatePersonalSkillSlugInput(a.doc_id, "save_skill") : validatePersonalSkillSlugInput(derivePersonalSkillSlug(undefined, rawName), "save_skill");
+      if (!pslug.ok)
+        return pslug;
+      return {
+        ok: true,
+        value: { scope: "personal", mode: "archive", slug: pslug.value, if_match_version: ifMatchVersion }
+      };
+    }
+    const roomCheck2 = validateChannelDocRoomId(a.chat_id, "save_skill");
+    if (!roomCheck2.ok)
+      return roomCheck2;
+    const defaultDocId2 = `skill-${rawName.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 48) || "skill"}`;
+    const docCheck2 = validateChannelDocIdInput(typeof a.doc_id === "string" && a.doc_id.trim() ? a.doc_id : defaultDocId2, "save_skill");
+    if (!docCheck2.ok)
+      return docCheck2;
+    return {
+      ok: true,
+      value: { scope: "channel", mode: "archive", chat_id: roomCheck2.value, doc_id: docCheck2.value, if_match_version: ifMatchVersion }
+    };
+  }
+  const rawDesc = typeof a.description === "string" ? a.description.trim() : "";
+  if (!rawDesc) {
+    return {
+      ok: false,
+      error: "save_skill needs name + description (body is the skill markdown). Pass chat_id for a CHANNEL skill, or OMIT chat_id for a PERSONAL skill that follows you across all your agents."
+    };
+  }
+  if (EVIDENCE_SECRET_RE.test(rawDesc)) {
+    return { ok: false, error: "save_skill rejected: description appears to contain a secret or token." };
+  }
+  const rawBody = a.body === undefined || a.body === null ? "" : typeof a.body === "string" ? a.body : null;
+  if (rawBody === null) {
+    return { ok: false, error: "save_skill body must be a markdown string when provided." };
+  }
+  if (EVIDENCE_SECRET_RE.test(rawBody)) {
+    return {
+      ok: false,
+      error: "save_skill rejected: body appears to contain an API key, token, or private key."
+    };
+  }
+  const oneLine = (s, cap2 = 480) => String(s).replace(/\r?\n/g, " ").trim().slice(0, cap2);
+  const triggerLine = typeof a.trigger === "string" && a.trigger.trim() ? `
+trigger: ${oneLine(a.trigger, 80)}` : "";
+  const argHintLine = typeof a.argument_hint === "string" && a.argument_hint.trim() ? `
+argument-hint: ${JSON.stringify(oneLine(a.argument_hint, 160))}` : "";
+  const md = `---
+name: ${oneLine(rawName, 120)}
+description: ${oneLine(rawDesc, 480)}${triggerLine}${argHintLine}
+---
+
+${rawBody}`;
+  if (!hasChat) {
+    if (md.length > PERSONAL_SKILL_BODY_MAX_CHARS) {
+      return { ok: false, error: `save_skill personal skill markdown exceeds ${PERSONAL_SKILL_BODY_MAX_CHARS} chars.` };
+    }
+    if (typeof a.doc_id === "string" && a.doc_id.trim()) {
+      const explicitSlug = validatePersonalSkillSlugInput(a.doc_id, "save_skill");
+      if (!explicitSlug.ok)
+        return explicitSlug;
+      return {
+        ok: true,
+        value: {
+          scope: "personal",
+          mode: "save",
+          slug: explicitSlug.value,
+          name: rawName,
+          body_markdown: md,
+          ...ifMatchVersion !== undefined ? { if_match_version: ifMatchVersion } : {}
+        }
+      };
+    }
+    const derived = derivePersonalSkillSlug(undefined, rawName);
+    return {
+      ok: true,
+      value: {
+        scope: "personal",
+        mode: "save",
+        slug: derived,
+        name: rawName,
+        body_markdown: md,
+        ...ifMatchVersion !== undefined ? { if_match_version: ifMatchVersion } : {}
+      }
+    };
+  }
+  const roomCheck = validateChannelDocRoomId(a.chat_id, "save_skill");
+  if (!roomCheck.ok)
+    return roomCheck;
+  const defaultDocId = `skill-${rawName.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 48) || "skill"}`;
+  const docCheck = validateChannelDocIdInput(typeof a.doc_id === "string" && a.doc_id.trim() ? a.doc_id : defaultDocId, "save_skill");
+  if (!docCheck.ok)
+    return docCheck;
+  const level = a.level === undefined ? 3 : normalizeDocLevelValue(a.level);
+  if (level === null) {
+    return { ok: false, error: "save_skill level must be 1|2|3|4." };
+  }
+  const cap = channelDocBodyByteCap(level);
+  if (Buffer.byteLength(md, "utf8") > cap) {
+    return { ok: false, error: `save_skill markdown exceeds L${level} cap (${cap} UTF-8 bytes).` };
+  }
+  return {
+    ok: true,
+    value: {
+      scope: "channel",
+      mode: "save",
+      chat_id: roomCheck.value,
+      doc_id: docCheck.value,
+      name: rawName,
+      level,
+      body_markdown: md,
+      ...ifMatchVersion !== undefined ? { if_match_version: ifMatchVersion } : {}
+    }
+  };
+}
 
 // src/identity.ts
 function decideIdentity(i) {
@@ -5395,40 +5613,47 @@ var ALL_TOOL_DEFS = [
   },
   {
     name: "list_skills",
-    description: "List loadable skills: centrally-maintained GLOBAL skills (operating loops, platform rules) always, plus this CHANNEL's skill docs when chat_id is given. Load one with load_skill.",
+    description: "List loadable skills: centrally-maintained GLOBAL skills always, your cross-room PERSONAL skills (per-owner), plus a CHANNEL's skill docs when chat_id is given. Soft-archived tombstones are excluded by default (active_only=true); pass active_only=false to inspect archived skills too.",
     inputSchema: {
       type: "object",
       properties: {
-        chat_id: { type: "string", description: "Optional channel_id \u2014 also lists that channel's skill docs" }
+        chat_id: { type: "string", description: "Optional channel_id \u2014 also lists that channel's skill docs" },
+        active_only: { type: "boolean", description: "Exclude soft-archived tombstones (default: true). Pass false to include archived skills." }
       }
     }
   },
   {
     name: "load_skill",
-    description: "Load a skill's full text into context. GLOBAL skill: pass skill_id (default workspace-driven-eng). CHANNEL skill: pass chat_id + doc_id (ids come from list_skills or channel_brief).",
+    description: "Load a skill's full text (and optional revision history) into context. Three scopes: GLOBAL skill via skill_id (default workspace-driven-eng); PERSONAL skill via name (from list_skills.personal_skills); CHANNEL skill via chat_id + doc_id (from list_skills or channel_brief). Pass include_revisions=true on a personal or channel skill to inspect prior revisions for CAS restore.",
     inputSchema: {
       type: "object",
       properties: {
         skill_id: { type: "string", description: "Global skill id (default: workspace-driven-eng)" },
+        name: { type: "string", description: "Personal skill slug (per-owner, from list_skills.personal_skills)" },
         chat_id: { type: "string", description: "Channel id (for a channel skill, paired with doc_id)" },
-        doc_id: { type: "string", description: "Channel doc id to load as a skill (paired with chat_id)" }
+        doc_id: { type: "string", description: "Channel doc id to load as a skill (paired with chat_id)" },
+        include_revisions: { type: "boolean", description: "When true, also fetch revision history for a personal or channel skill" }
       }
     }
   },
   {
     name: "save_skill",
-    description: "Save/publish a reusable skill that AgentsChat persists + versions; you and others CONSUME it via load_skill/sync_skill in your own runtime. Two scopes: pass chat_id \u2192 CHANNEL skill (shared in that channel); OMIT chat_id \u2192 PERSONAL skill, namespaced to your owner and shared across ALL your agents (a flat name that follows you). Pass name + description + body (the markdown instructions). Reuse the same name/doc_id to update in place.",
+    description: "Save, CAS-update, or non-destructively archive a reusable skill. Two scopes: pass chat_id \u2192 CHANNEL skill (shared in that channel); OMIT chat_id \u2192 PERSONAL skill, namespaced to your owner and shared across ALL your agents (up to 50 active personal skills). Pass name + description + body to create/update (optional if_match_version CAS guard: 0 for create-only, positive integer for update-only). Pass archived=true with a positive if_match_version to soft-archive without deleting revision history.",
     inputSchema: {
       type: "object",
       properties: {
         chat_id: { type: "string", description: "Channel to save into (CHANNEL skill). OMIT for a PERSONAL skill (per-owner, follows you across agents)." },
         name: { type: "string", description: "Skill name (short)" },
-        description: { type: "string", description: "One line: what it does / when to use it" },
+        description: { type: "string", description: "One line: what it does / when to use it (required unless archived=true)" },
         body: { type: "string", description: "The skill content in markdown \u2014 the instructions an agent follows" },
-        doc_id: { type: "string", description: "Optional stable id/slug (default: a slug of name). Reuse to update." },
-        level: { type: "number", description: "CHANNEL only: doc tier 1-4 (default 3 = any member may write; 1-2 require channel admin)" }
+        trigger: { type: "string", description: "Optional slash trigger hint (e.g. '/deploy') stored in YAML frontmatter" },
+        argument_hint: { type: "string", description: "Optional argument hint (e.g. '[target]') stored in YAML frontmatter" },
+        doc_id: { type: "string", description: "Optional stable id/slug (default: a slug of name). Reuse to update or archive." },
+        level: { type: "number", description: "CHANNEL only: doc tier 1-4 (default 3 = any member may write; 1-2 require channel admin)" },
+        if_match_version: { type: "integer", minimum: 0, maximum: 999999999, description: "Optional CAS guard: 0 to create only if absent, positive version to update/archive without overwriting concurrent edits (required when archived=true)." },
+        archived: { type: "boolean", description: "Pass true with a positive if_match_version to non-destructively soft-archive (keeps revisions intact and frees active quota)." }
       },
-      required: ["name", "description"]
+      required: ["name"]
     }
   },
   {
@@ -7567,7 +7792,9 @@ var handleToolCall = async (request) => {
       }
     }
     if (name === "list_skills") {
-      const { chat_id } = args || {};
+      const { chat_id, active_only } = args || {};
+      const activeOnly = active_only !== false;
+      const activeQuery = activeOnly ? "?active_only=1" : "";
       const out = {
         global_skills: Object.entries(GLOBAL_SKILLS).map(([skill_id, skill]) => ({
           skill_id,
@@ -7578,27 +7805,111 @@ var handleToolCall = async (request) => {
       };
       if (chat_id) {
         try {
-          const r = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(chat_id)}/docs`, {
+          const r = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(chat_id)}/docs${activeQuery}`, {
             headers: { Authorization: `Bearer ${TOKEN}` }
           });
-          if (r.ok)
-            out.channel_skills = extractChannelDocsPayload(JSON.parse(await r.text())).filter(isSkillDoc).map(compactSkillDoc);
-          else
+          if (r.ok) {
+            out.channel_skills = extractChannelDocsPayload(JSON.parse(await r.text())).filter(isSkillDoc).filter((d) => !activeOnly || !isArchivedSkillOrDoc(d)).map(compactSkillDoc);
+          } else {
             out.channel_skills_error = `failed (${r.status})`;
+          }
         } catch (e) {
           out.channel_skills_error = `network/parse error: ${String(e?.message || e).slice(0, 120)}`;
         }
       }
       try {
-        const pr = await apiFetch(`${REST_URL}/api/skills`, { headers: { Authorization: `Bearer ${TOKEN}` } });
-        if (pr.ok)
-          out.personal_skills = JSON.parse(await pr.text()).skills || [];
+        const pr = await apiFetch(`${REST_URL}/api/skills${activeQuery}`, { headers: { Authorization: `Bearer ${TOKEN}` } });
+        if (pr.ok) {
+          const rawSkills = JSON.parse(await pr.text()).skills || [];
+          out.personal_skills = rawSkills.filter((s) => !activeOnly || s?.archived !== true);
+        } else {
+          out.personal_skills_error = `failed (${pr.status})`;
+        }
       } catch {}
       return { content: [{ type: "text", text: JSON.stringify(out) }] };
     }
     if (name === "load_skill") {
-      const { skill_id, chat_id, doc_id } = args || {};
-      if (chat_id && doc_id) {
+      const targetCheck = validateLoadSkillInput(args);
+      if (!targetCheck.ok) {
+        return { content: [{ type: "text", text: targetCheck.error }], isError: true };
+      }
+      const target = targetCheck.value;
+      if (target.scope === "personal") {
+        try {
+          const r = await apiFetch(`${REST_URL}/api/skills/${encodeURIComponent(target.name)}`, {
+            headers: { Authorization: `Bearer ${TOKEN}` }
+          });
+          const text = await r.text();
+          if (!r.ok) {
+            return { content: [{ type: "text", text: `load_skill (personal) failed (${r.status}): ${text.slice(0, 200)}` }], isError: true };
+          }
+          const doc = JSON.parse(text);
+          const body = String(doc?.body_markdown ?? "");
+          const version = doc?.version ?? "?";
+          const title = doc?.title || target.name;
+          const archived = doc?.archived === true || body === "";
+          const parsed = parseSkillFrontmatter(body);
+          const metadata = { ...parsed.metadata || {}, ...doc?.skill_meta || {} };
+          const metaLines = [
+            metadata.name ? `name: ${metadata.name}` : null,
+            metadata.description ? `description: ${metadata.description}` : null,
+            metadata.trigger ? `trigger: ${metadata.trigger}` : null,
+            metadata.argument_hint ?? metadata.argumentHint ? `argument-hint: ${metadata.argument_hint ?? metadata.argumentHint}` : null
+          ].filter(Boolean).join(`
+`);
+          let revisionsBlock = "";
+          if (target.include_revisions) {
+            const revR = await apiFetch(`${REST_URL}/api/skills/${encodeURIComponent(target.name)}/revisions`, {
+              headers: { Authorization: `Bearer ${TOKEN}` }
+            });
+            if (revR.ok) {
+              const revJson = JSON.parse(await revR.text());
+              revisionsBlock = `
+
+Revisions:
+${JSON.stringify(revJson?.revisions ?? [], null, 2)}`;
+            } else {
+              revisionsBlock = `
+
+Revisions: fetch failed (${revR.status})`;
+            }
+          }
+          if (archived) {
+            const hint = target.include_revisions ? `Restore by calling save_skill(name="${title}", doc_id="${target.name}", description=..., body=..., if_match_version=${version}).` : `Pass include_revisions=true to inspect prior snapshots for CAS restore (if_match_version=${version}).`;
+            return {
+              content: [{
+                type: "text",
+                text: `[ARCHIVED PERSONAL SKILL "${target.name}" (v${version})]
+${metaLines ? `
+Metadata:
+${metaLines}
+` : ""}
+${hint}${revisionsBlock}`
+              }]
+            };
+          }
+          return {
+            content: [{
+              type: "text",
+              text: [
+                `Personal skill loaded: "${target.name}" (v${version}).`,
+                metaLines ? `
+Metadata:
+${metaLines}` : "",
+                `
+# ${title}
+
+${parsed.body}${revisionsBlock}`
+              ].join(`
+`)
+            }]
+          };
+        } catch (e) {
+          return { content: [{ type: "text", text: `load_skill (personal) network/parse error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
+        }
+      }
+      if (target.scope === "channel") {
+        const { chat_id, doc_id, include_revisions } = target;
         try {
           const r = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(chat_id)}/docs/${encodeURIComponent(doc_id)}`, {
             headers: { Authorization: `Bearer ${TOKEN}` }
@@ -7608,11 +7919,13 @@ var handleToolCall = async (request) => {
             return { content: [{ type: "text", text: `load_skill (channel) failed (${r.status}): ${text.slice(0, 200)}` }], isError: true };
           }
           const doc = JSON.parse(text);
-          const body = doc?.body_markdown ?? doc?.bodyMarkdown ?? "";
+          const body = String(doc?.body_markdown ?? doc?.bodyMarkdown ?? "");
           const title = doc?.title || doc_id;
           const kind = doc?.kind || "unknown";
           const level = doc?.level ?? "?";
-          const parsed = parseSkillFrontmatter(String(body));
+          const version = doc?.version ?? "?";
+          const archived = isArchivedSkillOrDoc(doc);
+          const parsed = parseSkillFrontmatter(body);
           const metadata = { ...parsed.metadata || {}, ...doc?.skill_meta || doc?.skillMeta || {} };
           const metaLines = [
             metadata.name ? `name: ${metadata.name}` : null,
@@ -7621,25 +7934,57 @@ var handleToolCall = async (request) => {
             metadata.argument_hint ?? metadata.argumentHint ? `argument-hint: ${metadata.argument_hint ?? metadata.argumentHint}` : null
           ].filter(Boolean).join(`
 `);
+          let revisionsBlock = "";
+          if (include_revisions) {
+            const revR = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(chat_id)}/docs/${encodeURIComponent(doc_id)}/revisions`, {
+              headers: { Authorization: `Bearer ${TOKEN}` }
+            });
+            if (revR.ok) {
+              const revJson = JSON.parse(await revR.text());
+              const revs = Array.isArray(revJson) ? revJson : revJson?.revisions ?? [];
+              revisionsBlock = `
+
+Revisions:
+${JSON.stringify(revs, null, 2)}`;
+            } else {
+              revisionsBlock = `
+
+Revisions: fetch failed (${revR.status})`;
+            }
+          }
+          if (archived) {
+            const hint = include_revisions ? `Restore by calling save_skill(chat_id="${chat_id}", doc_id="${doc_id}", name=..., description=..., body=..., if_match_version=${version}).` : `Pass include_revisions=true to inspect prior snapshots for CAS restore (if_match_version=${version}).`;
+            return {
+              content: [{
+                type: "text",
+                text: `[ARCHIVED CHANNEL SKILL ${chat_id}/${doc_id} (L${level}, v${version})]
+${metaLines ? `
+Metadata:
+${metaLines}
+` : ""}
+${hint}${revisionsBlock}`
+              }]
+            };
+          }
           if (!String(kind).toLowerCase().includes("skill") && !String(doc_id).toLowerCase().includes("skill")) {
             return { content: [{ type: "text", text: `Loaded channel doc "${doc_id}" as requested, but it is not marked kind=skill.
 
 # ${title}
 
-${parsed.body}` }] };
+${parsed.body}${revisionsBlock}` }] };
           }
           return {
             content: [{
               type: "text",
               text: [
-                `Channel-specific skill loaded from ${chat_id}/${doc_id} (L${level}, kind=${kind}).`,
+                `Channel-specific skill loaded from ${chat_id}/${doc_id} (L${level}, kind=${kind}, v${version}).`,
                 metaLines ? `
 Metadata:
 ${metaLines}` : "",
                 `
 # ${title}
 
-${parsed.body}`
+${parsed.body}${revisionsBlock}`
               ].join(`
 `)
             }]
@@ -7648,7 +7993,7 @@ ${parsed.body}`
           return { content: [{ type: "text", text: `load_skill (channel) network/parse error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
         }
       }
-      const id = skill_id || DEFAULT_GLOBAL_SKILL_ID;
+      const id = target.skill_id || DEFAULT_GLOBAL_SKILL_ID;
       const skill = GLOBAL_SKILLS[id];
       if (!skill) {
         return { content: [{ type: "text", text: `Unknown global skill: ${id}` }], isError: true };
@@ -7711,56 +8056,108 @@ ${idx}` }] };
       }
     }
     if (name === "save_skill") {
-      const a = args || {};
-      if (!a.name || !a.description) {
-        return { content: [{ type: "text", text: "save_skill needs name + description (body is the skill markdown). Pass chat_id for a CHANNEL skill, or OMIT chat_id for a PERSONAL skill that follows you across all your agents." }], isError: true };
+      const validated = validateSaveSkillInput(args);
+      if (!validated.ok) {
+        return { content: [{ type: "text", text: validated.error }], isError: true };
       }
-      const oneLine = (s) => String(s).replace(/\r?\n/g, " ").slice(0, 480);
-      const md = `---
-name: ${oneLine(a.name)}
-description: ${oneLine(a.description)}
----
-
-${a.body || ""}`;
-      if (!a.chat_id) {
-        const pslug = String(a.doc_id || a.name).toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^[^a-z0-9]+/, "").replace(/[^a-z0-9]+$/, "").slice(0, 64) || "skill";
+      const v = validated.value;
+      if (v.scope === "personal") {
+        if (v.mode === "archive") {
+          try {
+            const r = await apiFetch(`${REST_URL}/api/skills/${encodeURIComponent(v.slug)}`, {
+              method: "DELETE",
+              headers: {
+                Authorization: `Bearer ${TOKEN}`,
+                "If-Match": String(v.if_match_version)
+              }
+            });
+            const text = await r.text();
+            if (!r.ok)
+              return { content: [{ type: "text", text: `save_skill (personal archive) failed (${r.status}): ${text.slice(0, 240)}` }], isError: true };
+            const resp = text.trim() ? JSON.parse(text) : {};
+            const nextVer = resp?.version ?? v.if_match_version + 1;
+            return {
+              content: [{
+                type: "text",
+                text: `Archived PERSONAL skill "${v.slug}" (v${nextVer}) \u2014 revision history preserved & active quota freed. Inspect history via load_skill(name="${v.slug}", include_revisions=true).`
+              }]
+            };
+          } catch (e) {
+            return { content: [{ type: "text", text: `save_skill (personal archive) network error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
+          }
+        }
         try {
-          const r = await apiFetch(`${REST_URL}/api/skills/${encodeURIComponent(pslug)}`, {
+          const headers = {
+            Authorization: `Bearer ${TOKEN}`,
+            "Content-Type": "application/json",
+            ...v.if_match_version !== undefined ? { "If-Match": String(v.if_match_version) } : {}
+          };
+          const r = await apiFetch(`${REST_URL}/api/skills/${encodeURIComponent(v.slug)}`, {
             method: "PUT",
-            headers: { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json" },
-            body: JSON.stringify({ body_markdown: md })
+            headers,
+            body: JSON.stringify({
+              body_markdown: v.body_markdown,
+              ...v.if_match_version !== undefined ? { if_match_version: v.if_match_version } : {}
+            })
           });
           const text = await r.text();
           if (!r.ok)
             return { content: [{ type: "text", text: `save_skill (personal) failed (${r.status}): ${text.slice(0, 240)}` }], isError: true };
           const resp = JSON.parse(text);
-          return { content: [{ type: "text", text: `Saved PERSONAL skill "${a.name}" as "${pslug}" (v${resp.version}) \u2014 shared across all your agents. Pull/refresh: sync_skill(name="${pslug}"); list: list_skills.` }] };
+          return { content: [{ type: "text", text: `Saved PERSONAL skill "${v.name}" as "${v.slug}" (v${resp.version}) \u2014 shared across all your agents. Load: load_skill(name="${v.slug}"); sync: sync_skill(name="${v.slug}"); list: list_skills.` }] };
         } catch (e) {
           return { content: [{ type: "text", text: `save_skill (personal) network error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
         }
       }
-      const slug = String(a.name).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 48) || "skill";
-      const docId = a.doc_id && String(a.doc_id).trim() || `skill-${slug}`;
-      const level = typeof a.level === "number" && a.level >= 1 && a.level <= 4 ? a.level : 3;
-      try {
-        let ifMatch = "0";
-        const cur = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(a.chat_id)}/docs/${encodeURIComponent(docId)}`, { headers: { Authorization: `Bearer ${TOKEN}` } });
-        if (cur.ok) {
-          const curDoc = await cur.json().catch(() => null);
-          if (curDoc && curDoc.version != null)
-            ifMatch = String(curDoc.version);
+      if (v.mode === "archive") {
+        try {
+          const r = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(v.chat_id)}/docs/${encodeURIComponent(v.doc_id)}`, {
+            method: "DELETE",
+            headers: {
+              Authorization: `Bearer ${TOKEN}`,
+              "If-Match": String(v.if_match_version)
+            }
+          });
+          const text = await r.text();
+          if (!r.ok) {
+            return { content: [{ type: "text", text: `save_skill (channel archive) failed (${r.status}): ${text.slice(0, 240)}` }], isError: true };
+          }
+          const etagVer = Number((r.headers.get("etag") ?? "").replace(/"/g, ""));
+          const parsed = text.trim() ? JSON.parse(text) : null;
+          const nextVer = parsed?.version ?? (Number.isSafeInteger(etagVer) && etagVer >= 1 ? etagVer : v.if_match_version + 1);
+          return {
+            content: [{
+              type: "text",
+              text: `Archived CHANNEL skill ${v.chat_id}/${v.doc_id} (v${nextVer}) \u2014 revision history preserved & active quota freed. Inspect history via load_skill(chat_id="${v.chat_id}", doc_id="${v.doc_id}", include_revisions=true).`
+            }]
+          };
+        } catch (e) {
+          return { content: [{ type: "text", text: `save_skill (channel archive) network error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
         }
-        const r = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(a.chat_id)}/docs/${encodeURIComponent(docId)}`, {
+      }
+      try {
+        let ifMatch = v.if_match_version !== undefined ? String(v.if_match_version) : "0";
+        if (v.if_match_version === undefined) {
+          const cur = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(v.chat_id)}/docs/${encodeURIComponent(v.doc_id)}`, {
+            headers: { Authorization: `Bearer ${TOKEN}` }
+          });
+          if (cur.ok) {
+            const curDoc = await cur.json().catch(() => null);
+            if (curDoc && curDoc.version != null)
+              ifMatch = String(curDoc.version);
+          }
+        }
+        const r = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(v.chat_id)}/docs/${encodeURIComponent(v.doc_id)}`, {
           method: "PUT",
           headers: { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json", "If-Match": ifMatch },
-          body: JSON.stringify({ kind: "channel_skill", level, title: a.name, body_markdown: md })
+          body: JSON.stringify({ kind: "channel_skill", level: v.level, title: v.name, body_markdown: v.body_markdown })
         });
         const text = await r.text();
         if (!r.ok) {
           return { content: [{ type: "text", text: `save_skill failed (${r.status}): ${text.slice(0, 240)}` }], isError: true };
         }
         const verb = ifMatch === "0" ? "Saved" : "Updated";
-        return { content: [{ type: "text", text: `${verb} skill "${a.name}" \u2192 ${a.chat_id}/${docId} (L${level}). Others load it with: load_skill(chat_id="${a.chat_id}", doc_id="${docId}") \u2014 discoverable via list_skills(chat_id="${a.chat_id}").` }] };
+        return { content: [{ type: "text", text: `${verb} skill "${v.name}" \u2192 ${v.chat_id}/${v.doc_id} (L${v.level}). Others load it with: load_skill(chat_id="${v.chat_id}", doc_id="${v.doc_id}") \u2014 discoverable via list_skills(chat_id="${v.chat_id}").` }] };
       } catch (e) {
         return { content: [{ type: "text", text: `save_skill network error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
       }
@@ -7771,32 +8168,56 @@ ${a.body || ""}`;
       const cacheDir = a.dir && String(a.dir).trim() || `${home}/.agentchat/skills`;
       const safe = (s) => String(s).replace(/[^A-Za-z0-9_.-]/g, "_");
       if (a.name && !a.chat_id) {
-        const pBase = `${cacheDir}/personal__${safe(a.name)}`;
+        const slugCheck = validatePersonalSkillSlugInput(a.name, "sync_skill");
+        if (!slugCheck.ok) {
+          return { content: [{ type: "text", text: slugCheck.error }], isError: true };
+        }
+        const pSlug = slugCheck.value;
+        const pBase = `${cacheDir}/personal__${safe(pSlug)}`;
         const pMd = `${pBase}.md`;
         const pMeta = `${pBase}.json`;
         try {
           const listR = await apiFetch(`${REST_URL}/api/skills`, { headers: { Authorization: `Bearer ${TOKEN}` } });
           if (!listR.ok)
             return { content: [{ type: "text", text: `sync_skill (personal): list failed (${listR.status})` }], isError: true };
-          const meta = (JSON.parse(await listR.text()).skills || []).find((s) => s.name === a.name);
+          const meta = (JSON.parse(await listR.text()).skills || []).find((s) => s.name === pSlug);
           if (!meta)
-            return { content: [{ type: "text", text: `sync_skill: personal skill "${a.name}" not found (save it with save_skill \u2014 no chat_id).` }], isError: true };
+            return { content: [{ type: "text", text: `sync_skill: personal skill "${pSlug}" not found (save it with save_skill \u2014 no chat_id).` }], isError: true };
+          if (meta.archived === true) {
+            return {
+              content: [{
+                type: "text",
+                text: `sync_skill: personal skill "${pSlug}" is soft-archived (v${meta.version ?? "?"}); refusing to overwrite local file with an empty tombstone. Inspect revisions via load_skill(name="${pSlug}", include_revisions=true).`
+              }],
+              isError: true
+            };
+          }
           const currentVersion = Number(meta.version ?? 0);
           let cachedVersion = null;
           try {
             cachedVersion = Number(JSON.parse(readFileSync11(pMeta, "utf8")).version);
           } catch {}
           if (cachedVersion !== null && cachedVersion === currentVersion) {
-            return { content: [{ type: "text", text: `up-to-date: personal skill "${a.name}" v${currentVersion} already at ${pMd} \u2014 no download. Read that file to run it.` }] };
+            return { content: [{ type: "text", text: `up-to-date: personal skill "${pSlug}" v${currentVersion} already at ${pMd} \u2014 no download. Read that file to run it.` }] };
           }
-          const bodyR = await apiFetch(`${REST_URL}/api/skills/${encodeURIComponent(a.name)}`, { headers: { Authorization: `Bearer ${TOKEN}` } });
+          const bodyR = await apiFetch(`${REST_URL}/api/skills/${encodeURIComponent(pSlug)}`, { headers: { Authorization: `Bearer ${TOKEN}` } });
           if (!bodyR.ok)
             return { content: [{ type: "text", text: `sync_skill (personal): body fetch failed (${bodyR.status})` }], isError: true };
           const doc = JSON.parse(await bodyR.text());
+          const body = String(doc?.body_markdown ?? "");
+          if (doc?.archived === true || !body.trim()) {
+            return {
+              content: [{
+                type: "text",
+                text: `sync_skill: personal skill "${pSlug}" is archived; refusing to overwrite local file.`
+              }],
+              isError: true
+            };
+          }
           mkdirSync4(dirname2(pMd), { recursive: true });
-          writeFileSync6(pMd, String(doc?.body_markdown ?? ""));
-          writeFileSync6(pMeta, JSON.stringify({ version: currentVersion, name: a.name, syncedAt: new Date().toISOString() }));
-          return { content: [{ type: "text", text: `synced personal skill "${a.name}" v${currentVersion} \u2192 ${pMd} (was ${cachedVersion === null ? "missing" : `stale v${cachedVersion}`}). Read that file to run it.` }] };
+          writeFileSync6(pMd, body);
+          writeFileSync6(pMeta, JSON.stringify({ version: currentVersion, name: pSlug, syncedAt: new Date().toISOString() }));
+          return { content: [{ type: "text", text: `synced personal skill "${pSlug}" v${currentVersion} \u2192 ${pMd} (was ${cachedVersion === null ? "missing" : `stale v${cachedVersion}`}). Read that file to run it.` }] };
         } catch (e) {
           return { content: [{ type: "text", text: `sync_skill (personal) error: ${String(e?.message || e).slice(0, 140)}` }], isError: true };
         }
@@ -7815,6 +8236,15 @@ ${a.body || ""}`;
         const meta = docs.find((d) => (d?.id ?? d?.doc_id) === a.doc_id);
         if (!meta)
           return { content: [{ type: "text", text: `sync_skill: skill "${a.doc_id}" not found in channel ${a.chat_id}` }], isError: true };
+        if (isArchivedSkillOrDoc(meta)) {
+          return {
+            content: [{
+              type: "text",
+              text: `sync_skill: channel skill "${a.doc_id}" is soft-archived (v${meta.version ?? "?"}); refusing to overwrite local file with an empty tombstone. Inspect revisions via load_skill(chat_id="${a.chat_id}", doc_id="${a.doc_id}", include_revisions=true).`
+            }],
+            isError: true
+          };
+        }
         const currentVersion = Number(meta.version ?? 0);
         let cachedVersion = null;
         try {
@@ -7828,6 +8258,15 @@ ${a.body || ""}`;
           return { content: [{ type: "text", text: `sync_skill: fetch body failed (${docR.status})` }], isError: true };
         const doc = JSON.parse(await docR.text());
         const body = String(doc?.body_markdown ?? doc?.bodyMarkdown ?? "");
+        if (isArchivedSkillOrDoc(doc)) {
+          return {
+            content: [{
+              type: "text",
+              text: `sync_skill: channel skill "${a.doc_id}" is archived; refusing to overwrite local file.`
+            }],
+            isError: true
+          };
+        }
         mkdirSync4(dirname2(mdPath), { recursive: true });
         writeFileSync6(mdPath, body);
         writeFileSync6(metaPath, JSON.stringify({ version: currentVersion, title: doc?.title, doc_id: a.doc_id, chat_id: a.chat_id, syncedAt: new Date().toISOString() }));
@@ -9657,13 +10096,30 @@ function isSkillDoc(doc) {
   const title = String(doc?.title || "").toLowerCase();
   return kind === "skill" || kind === "channel_skill" || id.includes("skill") || title.includes("skill");
 }
+function isArchivedSkillOrDoc(doc) {
+  if (!doc || typeof doc !== "object")
+    return false;
+  if (doc.archived === true)
+    return true;
+  const body = doc.body_markdown ?? doc.bodyMarkdown;
+  if (typeof body === "string")
+    return body === "";
+  const summary = doc.body_summary ?? doc.bodySummary;
+  if (typeof summary === "string" && summary === "" && doc.archived !== false && doc.skill_meta === undefined && doc.skillMeta === undefined) {
+    return true;
+  }
+  return false;
+}
 function compactSkillDoc(doc) {
   const meta = doc?.skill_meta || doc?.skillMeta || {};
+  const archived = isArchivedSkillOrDoc(doc);
   return {
     doc_id: doc?.id ?? doc?.doc_id,
     title: doc?.title,
     kind: doc?.kind,
     level: doc?.level,
+    ...typeof doc?.version === "number" ? { version: doc.version } : {},
+    ...archived ? { archived: true } : {},
     updated_at: doc?.updatedAt ?? doc?.updated_at,
     name: meta.name,
     description: meta.description,
