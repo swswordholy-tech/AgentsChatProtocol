@@ -9,9 +9,13 @@ const homes: string[] = [];
 let hub: ReturnType<typeof Bun.serve>;
 let BASE = "";
 let receivedPatches: Array<{ taskId: string; body: any }> = [];
+let legacyIgnoreAppend = false;
+let storedEvidenceByTask: Record<string, any[]> = {};
 
 beforeEach(() => {
   receivedPatches = [];
+  legacyIgnoreAppend = false;
+  storedEvidenceByTask = {};
 });
 
 beforeAll(() => {
@@ -24,21 +28,35 @@ beforeAll(() => {
       }
       const match = url.pathname.match(/^\/api\/okr\/tasks\/([^/]+)$/);
       if (req.method === "PATCH" && match) {
-        const body = await req.json();
+        const body = await req.json() as any;
         const taskId = decodeURIComponent(match[1]);
         receivedPatches.push({ taskId, body });
+        let nextEv = storedEvidenceByTask[taskId];
+        if (Array.isArray(body.evidence)) {
+          nextEv = body.evidence.map((ev: any) => ({
+            ...ev,
+            by: ev.by ?? "test-bot-okr",
+            at: ev.at ?? "2026-11-12T19:35:00.000Z",
+          }));
+          storedEvidenceByTask[taskId] = nextEv;
+        } else if (!legacyIgnoreAppend && Array.isArray(body.append_evidence)) {
+          const base = [...(nextEv ?? [])];
+          for (const ev of body.append_evidence) {
+            const idx = base.findIndex((item) => item.kind === ev.kind && item.ref === ev.ref);
+            const stamped = { ...ev, by: "test-bot-okr", at: "2026-11-12T19:36:00.000Z" };
+            if (idx >= 0) base[idx] = stamped;
+            else base.push(stamped);
+          }
+          nextEv = base;
+          storedEvidenceByTask[taskId] = nextEv;
+        }
         return Response.json({
           ok: true,
           task: {
             id: taskId,
             status: body.status ?? "doing",
-            evidence: Array.isArray(body.evidence) && body.evidence.length > 0
-              ? body.evidence.map((ev: any) => ({
-                  ...ev,
-                  by: "test-bot-okr",
-                  at: "2026-11-12T19:35:00.000Z",
-                }))
-              : undefined,
+            updated_at: "2026-11-12T19:36:00.000Z",
+            evidence: nextEv && nextEv.length > 0 ? nextEv : undefined,
           },
         });
       }
@@ -225,5 +243,93 @@ describe("MCP okr_update_task structured evidence", () => {
     const createdDmRaw = String(res.get(8)?.result?.content?.[0]?.text || "").replace(/^Created:\s*/, "");
     const createdDm = JSON.parse(createdDmRaw);
     expect(createdDm.loop_guard_hint).toBeUndefined();
+  });
+
+  test("supports atomic append_evidence + if_match_updated_at and falls back losslessly on legacy servers", async () => {
+    storedEvidenceByTask["task_ev_modern"] = [
+      { kind: "commit", ref: "aaa111", note: "initial", by: "peer", at: "2026-11-12T18:00:00.000Z" },
+    ];
+    const modern = await drive([
+      INIT,
+      INITED,
+      callTool(2, "load_tool_group", { group_name: "okr" }),
+      callTool(3, "okr_update_task", {
+        task_id: "task_ev_modern",
+        append_evidence: [{ kind: "probe", ref: " 19/19 pass ", note: " cas verified " }],
+        if_match_updated_at: " 2026-11-12T18:00:00.000Z ",
+      }),
+      callTool(4, "okr_update_task", {
+        task_id: "task_ev_modern",
+        evidence: [],
+        append_evidence: [{ kind: "doc", ref: "spec-1" }],
+      }),
+      callTool(5, "okr_update_task", {
+        task_id: "task_ev_modern",
+        append_evidence: [],
+      }),
+      callTool(6, "okr_update_task", {
+        task_id: "task_ev_modern",
+        append_evidence: [{ kind: "doc", ref: "agent_key_secret_987654321" }],
+      }),
+    ], 1500);
+
+    expect(modern.res.get(3)?.result?.isError).toBeUndefined();
+    expect(modern.res.get(4)?.result?.isError).toBe(true);
+    expect(modern.res.get(4)?.result?.content?.[0]?.text).toContain("cannot pass both evidence and append_evidence");
+    expect(modern.res.get(5)?.result?.isError).toBe(true);
+    expect(modern.res.get(5)?.result?.content?.[0]?.text).toContain("non-empty array");
+    expect(modern.res.get(6)?.result?.isError).toBe(true);
+    expect(modern.res.get(6)?.result?.content?.[0]?.text).toContain("appears to contain a secret");
+    expect(receivedPatches).toHaveLength(1);
+    expect(receivedPatches[0]).toEqual({
+      taskId: "task_ev_modern",
+      body: {
+        append_evidence: [{ kind: "probe", ref: "19/19 pass", note: "cas verified" }],
+        if_match_updated_at: "2026-11-12T18:00:00.000Z",
+      },
+    });
+  });
+
+  test("falls back losslessly when a legacy server ignores append_evidence without overwriting capped history", async () => {
+    legacyIgnoreAppend = true;
+    storedEvidenceByTask["task_ev_legacy"] = [
+      { kind: "commit", ref: "legacy-sha", note: "seed", by: "peer", at: "2026-11-12T18:00:00.000Z" },
+    ];
+    storedEvidenceByTask["task_ev_full"] = Array.from({ length: 10 }, (_, i) => ({
+      kind: "commit",
+      ref: `sha-${i}`,
+      by: "peer",
+      at: "2026-11-12T18:00:00.000Z",
+    }));
+
+    const legacy = await drive([
+      INIT,
+      INITED,
+      callTool(2, "load_tool_group", { group_name: "okr" }),
+      callTool(3, "okr_update_task", {
+        task_id: "task_ev_legacy",
+        status: "done",
+        append_evidence: [{ kind: "deploy", ref: "rev-00999", note: "live" }],
+      }),
+      callTool(4, "okr_update_task", {
+        task_id: "task_ev_full",
+        append_evidence: [{ kind: "probe", ref: "overflow" }],
+      }),
+    ], 1500);
+
+    expect(legacy.res.get(3)?.result?.isError).toBeUndefined();
+    expect(legacy.res.get(4)?.result?.isError).toBe(true);
+    expect(legacy.res.get(4)?.result?.content?.[0]?.text).toContain("evidence_cap_exceeded");
+    expect(receivedPatches).toHaveLength(3);
+    expect(receivedPatches[1]).toEqual({
+      taskId: "task_ev_legacy",
+      body: {
+        evidence: [
+          { kind: "commit", ref: "legacy-sha", note: "seed" },
+          { kind: "deploy", ref: "rev-00999", note: "live" },
+        ],
+        if_match_updated_at: "2026-11-12T19:36:00.000Z",
+      },
+    });
   });
 });

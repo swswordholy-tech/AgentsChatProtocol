@@ -85,7 +85,7 @@ const TASK_EVIDENCE_REF_MAX = 160;
 const TASK_EVIDENCE_NOTE_MAX = 200;
 const EVIDENCE_CTRL_RE = /[\u0000-\u001f\u007f]/;
 const EVIDENCE_SECRET_RE =
-  /(?:ac_[A-Za-z0-9_-]{16,}|eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+|(?:sk|rk)-(?:live-|test-|proj-|ant-)?[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|AIza[0-9A-Za-z_-]{30,}|AKIA[0-9A-Z]{16})/;
+  /(?:(?:ac|agent_key)_[A-Za-z0-9_-]{8,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+|(?:sk|rk)-(?:live-|test-|proj-|ant-)?[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{16,}|AIza[0-9A-Za-z_-]{20,}|AKIA[0-9A-Z]{16}|-----BEGIN [^-]*PRIVATE KEY-----)/;
 
 function isTaskEvidenceKind(v: unknown): v is TaskEvidenceKind {
   return typeof v === "string" && (TASK_EVIDENCE_KINDS as readonly string[]).includes(v);
@@ -173,6 +173,101 @@ export function validateTaskEvidenceInput(
     });
   }
   return { ok: true, value: out };
+}
+
+export function validateAppendTaskEvidenceInput(
+  raw: unknown,
+): { ok: true; value: TaskEvidenceInput[] } | { ok: false; error: string } {
+  if (!Array.isArray(raw) || raw.length === 0) {
+    return {
+      ok: false,
+      error: `append_evidence must be a non-empty array (1..${TASK_EVIDENCE_CAP} items)`,
+    };
+  }
+  return validateTaskEvidenceInput(raw);
+}
+
+export function validateTaskVersionToken(
+  raw: unknown,
+): { ok: true; value: string } | { ok: false; error: string } {
+  if (typeof raw !== "string") {
+    return { ok: false, error: "if_match_updated_at must be a non-empty string" };
+  }
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed.length > 64 || EVIDENCE_CTRL_RE.test(trimmed)) {
+    return {
+      ok: false,
+      error: "if_match_updated_at must be a valid non-empty timestamp token (<=64 chars)",
+    };
+  }
+  return { ok: true, value: trimmed };
+}
+
+export function responseIncludesAppendedEvidence(
+  taskRaw: unknown,
+  appended: ReadonlyArray<TaskEvidenceInput>,
+): boolean {
+  if (!taskRaw || typeof taskRaw !== "object") return false;
+  const evList = (taskRaw as Record<string, unknown>).evidence;
+  if (!Array.isArray(evList)) return false;
+  return appended.every((want) =>
+    evList.some((item) => {
+      if (!item || typeof item !== "object") return false;
+      const gotKind = (item as Record<string, unknown>).kind;
+      const gotRef = typeof (item as Record<string, unknown>).ref === "string"
+        ? ((item as Record<string, unknown>).ref as string).trim()
+        : "";
+      const gotNote = typeof (item as Record<string, unknown>).note === "string"
+        ? ((item as Record<string, unknown>).note as string).replace(/[\r\n\t]+/g, " ").trim()
+        : "";
+      return gotKind === want.kind && gotRef === want.ref && gotNote === (want.note ?? "");
+    }),
+  );
+}
+
+export function mergeLegacyTaskEvidence(
+  existingRaw: unknown,
+  appended: ReadonlyArray<TaskEvidenceInput>,
+): { ok: true; value: TaskEvidenceInput[] } | { ok: false; error: string } {
+  const merged: TaskEvidenceInput[] = [];
+  const indexByKey = new Map<string, number>();
+  if (Array.isArray(existingRaw)) {
+    for (const raw of existingRaw) {
+      if (!raw || typeof raw !== "object" || Array.isArray(raw)) continue;
+      const rawKind = (raw as Record<string, unknown>).kind;
+      const rawRef = (raw as Record<string, unknown>).ref;
+      const rawNote = (raw as Record<string, unknown>).note;
+      if (!isTaskEvidenceKind(rawKind) || typeof rawRef !== "string") continue;
+      const ref = rawRef.trim();
+      if (!ref || ref.length > TASK_EVIDENCE_REF_MAX || EVIDENCE_CTRL_RE.test(ref)) continue;
+      const note = typeof rawNote === "string"
+        ? rawNote.replace(/[\r\n\t]+/g, " ").trim()
+        : "";
+      if (note.length > TASK_EVIDENCE_NOTE_MAX || EVIDENCE_CTRL_RE.test(note)) continue;
+      const key = `${rawKind}:${ref}`;
+      if (indexByKey.has(key)) continue;
+      if (merged.length >= TASK_EVIDENCE_CAP) break;
+      indexByKey.set(key, merged.length);
+      merged.push({ kind: rawKind, ref, ...(note ? { note } : {}) });
+    }
+  }
+  for (const item of appended) {
+    const key = `${item.kind}:${item.ref}`;
+    const existingIdx = indexByKey.get(key);
+    if (existingIdx !== undefined) {
+      merged[existingIdx] = { ...item };
+    } else {
+      if (merged.length >= TASK_EVIDENCE_CAP) {
+        return {
+          ok: false,
+          error: `evidence_cap_exceeded (task already at ${TASK_EVIDENCE_CAP} items; refused to overwrite history)`,
+        };
+      }
+      indexByKey.set(key, merged.length);
+      merged.push({ ...item });
+    }
+  }
+  return { ok: true, value: merged };
 }
 
 export const CREATE_LOOP_MODES = ["okr_wake", "okr_watch", "prompt"] as const;

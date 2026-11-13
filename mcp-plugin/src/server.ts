@@ -49,8 +49,13 @@ import { normalizeTimestampForCursor } from "./timestamps.ts";
 import {
   CREATE_LOOP_MODES,
   TASK_EVIDENCE_KINDS,
+  type TaskEvidenceInput,
+  mergeLegacyTaskEvidence,
+  responseIncludesAppendedEvidence,
+  validateAppendTaskEvidenceInput,
   validateCreateLoopInput,
   validateTaskEvidenceInput,
+  validateTaskVersionToken,
   validateToolArgs,
 } from "./argcheck.ts";
 import { decideIdentity, shouldMigrateDevToken, validateIdentityProfile } from "./identity.ts";
@@ -2011,7 +2016,7 @@ const ALL_TOOL_DEFS = [
     },
     {
       name: "okr_update_task",
-      description: "Update a Task — change status, assignee, block/unblock, add blocker info, adjust dependencies, or record structured completion evidence. Caller must be the assignee, Objective owner, or admin. Reassign is owner/admin-only. Pass depends_on:[] to clear, or a new array to replace; server rejects cycles. Pass evidence:[{kind, ref, note?}] (max 10; [] to clear) so okr_wake automatically hands sanitized upstream receipts to dependent tasks.",
+      description: "Update a Task — change status, assignee, block/unblock, add blocker info, adjust dependencies, or record structured completion evidence. Caller must be the assignee, Objective owner, or admin. Reassign is owner/admin-only. Pass depends_on:[] to clear, or a new array to replace; server rejects cycles. Prefer append_evidence:[{kind, ref, note?}] (1..10 items, deduplicated without overwriting existing receipts) or pass evidence:[{kind, ref, note?}] (full replacement; [] to clear) plus optional if_match_updated_at CAS token.",
       inputSchema: {
         type: "object" as const,
         properties: {
@@ -2025,7 +2030,7 @@ const ALL_TOOL_DEFS = [
           evidence: {
             type: "array",
             maxItems: 10,
-            description: "Structured completion receipts (max 10; pass [] to clear). Automatically attached to downstream okr_wake handoffs when dependencies clear.",
+            description: "Full-replacement structured completion receipts (max 10; pass [] to clear). Mutually exclusive with append_evidence.",
             items: {
               type: "object",
               properties: {
@@ -2045,6 +2050,35 @@ const ALL_TOOL_DEFS = [
               },
               required: ["kind", "ref"],
             },
+          },
+          append_evidence: {
+            type: "array",
+            minItems: 1,
+            maxItems: 10,
+            description: "Atomically append/deduplicate structured completion receipts (1..10 items) without overwriting existing history; mutually exclusive with evidence.",
+            items: {
+              type: "object",
+              properties: {
+                kind: {
+                  type: "string",
+                  enum: [...TASK_EVIDENCE_KINDS],
+                  description: "Receipt kind: commit | deploy | probe | doc | external | rollout",
+                },
+                ref: {
+                  type: "string",
+                  description: "Commit SHA, deploy/build ID, test probe summary, doc ID, or external reference (<=160 chars, never secrets)",
+                },
+                note: {
+                  type: "string",
+                  description: "Optional concise context note (<=200 chars, never secrets)",
+                },
+              },
+              required: ["kind", "ref"],
+            },
+          },
+          if_match_updated_at: {
+            type: "string",
+            description: "Optional optimistic concurrency guard (task.updated_at). Rejects with 409 stale_task_version if the task changed concurrently.",
           },
         },
         required: ["task_id"],
@@ -5502,7 +5536,18 @@ const handleToolCall = async (request: any): Promise<any> => {
   }
 
   if (name === "okr_update_task") {
-    const { task_id, status, assignee, blocked_reason, blocker_agent, depends_on, due, evidence } = args as {
+    const {
+      task_id,
+      status,
+      assignee,
+      blocked_reason,
+      blocker_agent,
+      depends_on,
+      due,
+      evidence,
+      append_evidence,
+      if_match_updated_at,
+    } = args as {
       task_id: string;
       status?: string;
       assignee?: string;
@@ -5511,7 +5556,15 @@ const handleToolCall = async (request: any): Promise<any> => {
       depends_on?: string[];
       due?: string;
       evidence?: unknown;
+      append_evidence?: unknown;
+      if_match_updated_at?: unknown;
     };
+    if (evidence !== undefined && append_evidence !== undefined) {
+      return {
+        content: [{ type: "text", text: "okr_update_task invalid arguments: cannot pass both evidence and append_evidence" }],
+        isError: true,
+      };
+    }
     const patch: Record<string, unknown> = {};
     if (status) patch.status = status;
     if (assignee) patch.assignee = assignee;
@@ -5526,8 +5579,25 @@ const handleToolCall = async (request: any): Promise<any> => {
       }
       patch.evidence = evCheck.value;
     }
+    let validatedAppend: TaskEvidenceInput[] = [];
+    if (append_evidence !== undefined) {
+      const appCheck = validateAppendTaskEvidenceInput(append_evidence);
+      if (!appCheck.ok) {
+        return { content: [{ type: "text", text: `okr_update_task invalid append_evidence: ${appCheck.error}` }], isError: true };
+      }
+      validatedAppend = appCheck.value;
+      patch.append_evidence = appCheck.value;
+    }
+    if (if_match_updated_at !== undefined) {
+      const verCheck = validateTaskVersionToken(if_match_updated_at);
+      if (!verCheck.ok) {
+        return { content: [{ type: "text", text: `okr_update_task invalid if_match_updated_at: ${verCheck.error}` }], isError: true };
+      }
+      patch.if_match_updated_at = verCheck.value;
+    }
     try {
-      const r = await apiFetch(`${REST_URL}/api/okr/tasks/${encodeURIComponent(task_id)}`, {
+      const targetUrl = `${REST_URL}/api/okr/tasks/${encodeURIComponent(task_id)}`;
+      const r = await apiFetch(targetUrl, {
         method: "PATCH",
         headers: { "Content-Type": "application/json", "Authorization": `Bearer ${TOKEN}` },
         body: JSON.stringify(patch),
@@ -5535,6 +5605,33 @@ const handleToolCall = async (request: any): Promise<any> => {
       const text = await r.text();
       if (!r.ok) {
         return { content: [{ type: "text", text: `okr_update_task failed (${r.status}): ${text.slice(0, 160)}` }], isError: true };
+      }
+      if (validatedAppend.length > 0) {
+        let parsed: any = null;
+        try { parsed = JSON.parse(text); } catch {}
+        if (parsed?.ok === true && parsed?.task && !responseIncludesAppendedEvidence(parsed.task, validatedAppend)) {
+          const merged = mergeLegacyTaskEvidence(parsed.task.evidence, validatedAppend);
+          if (!merged.ok) {
+            return {
+              content: [{ type: "text", text: `okr_update_task append_evidence failed: ${merged.error}` }],
+              isError: true,
+            };
+          }
+          const fallbackBody: Record<string, unknown> = { evidence: merged.value };
+          if (typeof parsed.task.updated_at === "string" && parsed.task.updated_at.trim()) {
+            fallbackBody.if_match_updated_at = parsed.task.updated_at.trim();
+          }
+          const r2 = await apiFetch(targetUrl, {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json", "Authorization": `Bearer ${TOKEN}` },
+            body: JSON.stringify(fallbackBody),
+          });
+          const text2 = await r2.text();
+          if (!r2.ok) {
+            return { content: [{ type: "text", text: `okr_update_task failed (${r2.status}): ${text2.slice(0, 160)}` }], isError: true };
+          }
+          return { content: [{ type: "text", text: `Updated: ${text2}` }] };
+        }
       }
       return { content: [{ type: "text", text: `Updated: ${text}` }] };
     } catch (e: any) {

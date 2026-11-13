@@ -221,7 +221,7 @@ var TASK_EVIDENCE_CAP = 10;
 var TASK_EVIDENCE_REF_MAX = 160;
 var TASK_EVIDENCE_NOTE_MAX = 200;
 var EVIDENCE_CTRL_RE = /[\u0000-\u001f\u007f]/;
-var EVIDENCE_SECRET_RE = /(?:ac_[A-Za-z0-9_-]{16,}|eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+|(?:sk|rk)-(?:live-|test-|proj-|ant-)?[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|AIza[0-9A-Za-z_-]{30,}|AKIA[0-9A-Z]{16})/;
+var EVIDENCE_SECRET_RE = /(?:(?:ac|agent_key)_[A-Za-z0-9_-]{8,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+|(?:sk|rk)-(?:live-|test-|proj-|ant-)?[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{16,}|AIza[0-9A-Za-z_-]{20,}|AKIA[0-9A-Z]{16}|-----BEGIN [^-]*PRIVATE KEY-----)/;
 function isTaskEvidenceKind(v) {
   return typeof v === "string" && TASK_EVIDENCE_KINDS.includes(v);
 }
@@ -299,6 +299,88 @@ function validateTaskEvidenceInput(raw) {
     });
   }
   return { ok: true, value: out };
+}
+function validateAppendTaskEvidenceInput(raw) {
+  if (!Array.isArray(raw) || raw.length === 0) {
+    return {
+      ok: false,
+      error: `append_evidence must be a non-empty array (1..${TASK_EVIDENCE_CAP} items)`
+    };
+  }
+  return validateTaskEvidenceInput(raw);
+}
+function validateTaskVersionToken(raw) {
+  if (typeof raw !== "string") {
+    return { ok: false, error: "if_match_updated_at must be a non-empty string" };
+  }
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed.length > 64 || EVIDENCE_CTRL_RE.test(trimmed)) {
+    return {
+      ok: false,
+      error: "if_match_updated_at must be a valid non-empty timestamp token (<=64 chars)"
+    };
+  }
+  return { ok: true, value: trimmed };
+}
+function responseIncludesAppendedEvidence(taskRaw, appended) {
+  if (!taskRaw || typeof taskRaw !== "object")
+    return false;
+  const evList = taskRaw.evidence;
+  if (!Array.isArray(evList))
+    return false;
+  return appended.every((want) => evList.some((item) => {
+    if (!item || typeof item !== "object")
+      return false;
+    const gotKind = item.kind;
+    const gotRef = typeof item.ref === "string" ? item.ref.trim() : "";
+    const gotNote = typeof item.note === "string" ? item.note.replace(/[\r\n\t]+/g, " ").trim() : "";
+    return gotKind === want.kind && gotRef === want.ref && gotNote === (want.note ?? "");
+  }));
+}
+function mergeLegacyTaskEvidence(existingRaw, appended) {
+  const merged = [];
+  const indexByKey = new Map;
+  if (Array.isArray(existingRaw)) {
+    for (const raw of existingRaw) {
+      if (!raw || typeof raw !== "object" || Array.isArray(raw))
+        continue;
+      const rawKind = raw.kind;
+      const rawRef = raw.ref;
+      const rawNote = raw.note;
+      if (!isTaskEvidenceKind(rawKind) || typeof rawRef !== "string")
+        continue;
+      const ref = rawRef.trim();
+      if (!ref || ref.length > TASK_EVIDENCE_REF_MAX || EVIDENCE_CTRL_RE.test(ref))
+        continue;
+      const note = typeof rawNote === "string" ? rawNote.replace(/[\r\n\t]+/g, " ").trim() : "";
+      if (note.length > TASK_EVIDENCE_NOTE_MAX || EVIDENCE_CTRL_RE.test(note))
+        continue;
+      const key = `${rawKind}:${ref}`;
+      if (indexByKey.has(key))
+        continue;
+      if (merged.length >= TASK_EVIDENCE_CAP)
+        break;
+      indexByKey.set(key, merged.length);
+      merged.push({ kind: rawKind, ref, ...note ? { note } : {} });
+    }
+  }
+  for (const item of appended) {
+    const key = `${item.kind}:${item.ref}`;
+    const existingIdx = indexByKey.get(key);
+    if (existingIdx !== undefined) {
+      merged[existingIdx] = { ...item };
+    } else {
+      if (merged.length >= TASK_EVIDENCE_CAP) {
+        return {
+          ok: false,
+          error: `evidence_cap_exceeded (task already at ${TASK_EVIDENCE_CAP} items; refused to overwrite history)`
+        };
+      }
+      indexByKey.set(key, merged.length);
+      merged.push({ ...item });
+    }
+  }
+  return { ok: true, value: merged };
 }
 var CREATE_LOOP_MODES = ["okr_wake", "okr_watch", "prompt"];
 var LOOP_MIN_INTERVAL_MS = 60000;
@@ -4782,7 +4864,7 @@ var ALL_TOOL_DEFS = [
   },
   {
     name: "okr_update_task",
-    description: "Update a Task \u2014 change status, assignee, block/unblock, add blocker info, adjust dependencies, or record structured completion evidence. Caller must be the assignee, Objective owner, or admin. Reassign is owner/admin-only. Pass depends_on:[] to clear, or a new array to replace; server rejects cycles. Pass evidence:[{kind, ref, note?}] (max 10; [] to clear) so okr_wake automatically hands sanitized upstream receipts to dependent tasks.",
+    description: "Update a Task \u2014 change status, assignee, block/unblock, add blocker info, adjust dependencies, or record structured completion evidence. Caller must be the assignee, Objective owner, or admin. Reassign is owner/admin-only. Pass depends_on:[] to clear, or a new array to replace; server rejects cycles. Prefer append_evidence:[{kind, ref, note?}] (1..10 items, deduplicated without overwriting existing receipts) or pass evidence:[{kind, ref, note?}] (full replacement; [] to clear) plus optional if_match_updated_at CAS token.",
     inputSchema: {
       type: "object",
       properties: {
@@ -4796,7 +4878,7 @@ var ALL_TOOL_DEFS = [
         evidence: {
           type: "array",
           maxItems: 10,
-          description: "Structured completion receipts (max 10; pass [] to clear). Automatically attached to downstream okr_wake handoffs when dependencies clear.",
+          description: "Full-replacement structured completion receipts (max 10; pass [] to clear). Mutually exclusive with append_evidence.",
           items: {
             type: "object",
             properties: {
@@ -4816,6 +4898,35 @@ var ALL_TOOL_DEFS = [
             },
             required: ["kind", "ref"]
           }
+        },
+        append_evidence: {
+          type: "array",
+          minItems: 1,
+          maxItems: 10,
+          description: "Atomically append/deduplicate structured completion receipts (1..10 items) without overwriting existing history; mutually exclusive with evidence.",
+          items: {
+            type: "object",
+            properties: {
+              kind: {
+                type: "string",
+                enum: [...TASK_EVIDENCE_KINDS],
+                description: "Receipt kind: commit | deploy | probe | doc | external | rollout"
+              },
+              ref: {
+                type: "string",
+                description: "Commit SHA, deploy/build ID, test probe summary, doc ID, or external reference (<=160 chars, never secrets)"
+              },
+              note: {
+                type: "string",
+                description: "Optional concise context note (<=200 chars, never secrets)"
+              }
+            },
+            required: ["kind", "ref"]
+          }
+        },
+        if_match_updated_at: {
+          type: "string",
+          description: "Optional optimistic concurrency guard (task.updated_at). Rejects with 409 stale_task_version if the task changed concurrently."
         }
       },
       required: ["task_id"]
@@ -7940,7 +8051,24 @@ ${list}` }] };
       }
     }
     if (name === "okr_update_task") {
-      const { task_id, status, assignee, blocked_reason, blocker_agent, depends_on, due, evidence } = args;
+      const {
+        task_id,
+        status,
+        assignee,
+        blocked_reason,
+        blocker_agent,
+        depends_on,
+        due,
+        evidence,
+        append_evidence,
+        if_match_updated_at
+      } = args;
+      if (evidence !== undefined && append_evidence !== undefined) {
+        return {
+          content: [{ type: "text", text: "okr_update_task invalid arguments: cannot pass both evidence and append_evidence" }],
+          isError: true
+        };
+      }
       const patch = {};
       if (status)
         patch.status = status;
@@ -7961,8 +8089,25 @@ ${list}` }] };
         }
         patch.evidence = evCheck.value;
       }
+      let validatedAppend = [];
+      if (append_evidence !== undefined) {
+        const appCheck = validateAppendTaskEvidenceInput(append_evidence);
+        if (!appCheck.ok) {
+          return { content: [{ type: "text", text: `okr_update_task invalid append_evidence: ${appCheck.error}` }], isError: true };
+        }
+        validatedAppend = appCheck.value;
+        patch.append_evidence = appCheck.value;
+      }
+      if (if_match_updated_at !== undefined) {
+        const verCheck = validateTaskVersionToken(if_match_updated_at);
+        if (!verCheck.ok) {
+          return { content: [{ type: "text", text: `okr_update_task invalid if_match_updated_at: ${verCheck.error}` }], isError: true };
+        }
+        patch.if_match_updated_at = verCheck.value;
+      }
       try {
-        const r = await apiFetch(`${REST_URL}/api/okr/tasks/${encodeURIComponent(task_id)}`, {
+        const targetUrl = `${REST_URL}/api/okr/tasks/${encodeURIComponent(task_id)}`;
+        const r = await apiFetch(targetUrl, {
           method: "PATCH",
           headers: { "Content-Type": "application/json", Authorization: `Bearer ${TOKEN}` },
           body: JSON.stringify(patch)
@@ -7970,6 +8115,35 @@ ${list}` }] };
         const text = await r.text();
         if (!r.ok) {
           return { content: [{ type: "text", text: `okr_update_task failed (${r.status}): ${text.slice(0, 160)}` }], isError: true };
+        }
+        if (validatedAppend.length > 0) {
+          let parsed = null;
+          try {
+            parsed = JSON.parse(text);
+          } catch {}
+          if (parsed?.ok === true && parsed?.task && !responseIncludesAppendedEvidence(parsed.task, validatedAppend)) {
+            const merged = mergeLegacyTaskEvidence(parsed.task.evidence, validatedAppend);
+            if (!merged.ok) {
+              return {
+                content: [{ type: "text", text: `okr_update_task append_evidence failed: ${merged.error}` }],
+                isError: true
+              };
+            }
+            const fallbackBody = { evidence: merged.value };
+            if (typeof parsed.task.updated_at === "string" && parsed.task.updated_at.trim()) {
+              fallbackBody.if_match_updated_at = parsed.task.updated_at.trim();
+            }
+            const r2 = await apiFetch(targetUrl, {
+              method: "PATCH",
+              headers: { "Content-Type": "application/json", Authorization: `Bearer ${TOKEN}` },
+              body: JSON.stringify(fallbackBody)
+            });
+            const text2 = await r2.text();
+            if (!r2.ok) {
+              return { content: [{ type: "text", text: `okr_update_task failed (${r2.status}): ${text2.slice(0, 160)}` }], isError: true };
+            }
+            return { content: [{ type: "text", text: `Updated: ${text2}` }] };
+          }
         }
         return { content: [{ type: "text", text: `Updated: ${text}` }] };
       } catch (e) {
