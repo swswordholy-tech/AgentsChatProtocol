@@ -4,6 +4,7 @@ import {
   AgentChatREST,
   type ACMessage,
   type ChannelDocUpdatedMessage,
+  type ChannelWakeHealth,
   type CloudAgentAuditFeed,
   type OkrUpdatedMessage,
   type TaskAssignedMessage,
@@ -118,6 +119,72 @@ describe("AgentChatClient realtime collaboration WS events", () => {
       ]);
       await expect(rest.getCloudAgentAuditLogs("ac_secret_key")).rejects.toThrow("Invalid cloud agent ID");
       await expect(rest.getCloudAgentAuditLogs("../escape")).rejects.toThrow("Invalid cloud agent ID");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("AgentChatREST.getChannelWakeHealth validates channel IDs, attaches bearer token, and parses historical wake counts", async () => {
+    const originalFetch = globalThis.fetch;
+    const seen: Array<{ url: string; auth: string | null; cacheControl: string | null }> = [];
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      const headers = new Headers(init?.headers);
+      seen.push({
+        url,
+        auth: headers.get("authorization"),
+        cacheControl: headers.get("cache-control"),
+      });
+      const payload: ChannelWakeHealth = {
+        channel_id: "edbb8180-4356-4dab-9d75-bc9fe6f26194",
+        observation_only: true,
+        counts: {
+          total_cloud_agents: 2,
+          ok: 1,
+          auth_required: 1,
+          timeout: 0,
+          error: 0,
+          unobserved: 0,
+        },
+        agents: [
+          {
+            agent_id: "antigravity-cloud-agent-7987c5",
+            name: "AGY Cloud Agent",
+            runtime: "agy",
+            cloud_status: "active",
+            last_wake_status: "auth_required",
+            last_wake_at: "2026-11-13T12:30:00.000Z",
+            last_duration_ms: 4200,
+          },
+          {
+            agent_id: "codex-staff-engineer-ca7590",
+            name: "Codex Staff Engineer",
+            runtime: "codex",
+            cloud_status: "active",
+            last_wake_status: "ok",
+            last_wake_at: "2026-11-13T12:35:00.000Z",
+            last_duration_ms: 14100,
+          },
+        ],
+      };
+      return Response.json(payload, { status: 200 });
+    }) as typeof fetch;
+
+    try {
+      const rest = new AgentChatREST({ baseUrl: "https://agents-chat.com", bearerToken: "member-jwt-456" });
+      const health = await rest.getChannelWakeHealth("edbb8180-4356-4dab-9d75-bc9fe6f26194");
+      expect(health.observation_only).toBe(true);
+      expect(health.counts.auth_required).toBe(1);
+      expect(health.agents[0]?.last_wake_status).toBe("auth_required");
+      expect(seen).toEqual([
+        {
+          url: "https://agents-chat.com/api/channels/edbb8180-4356-4dab-9d75-bc9fe6f26194/wake-health",
+          auth: "Bearer member-jwt-456",
+          cacheControl: "no-store",
+        },
+      ]);
+      await expect(rest.getChannelWakeHealth("ac_secret_key")).rejects.toThrow("Invalid channel ID");
+      await expect(rest.getChannelWakeHealth("../escape")).rejects.toThrow("Invalid channel ID");
     } finally {
       globalThis.fetch = originalFetch;
     }

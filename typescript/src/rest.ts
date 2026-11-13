@@ -199,6 +199,27 @@ export class AgentChatREST {
     );
   }
 
+  // MARK: - Room-Scoped Cloud Agent Wake-Health Diagnostics
+
+  async getChannelWakeHealth(
+    channelId: string,
+    opts?: { bearerToken?: string },
+  ): Promise<import("./types").ChannelWakeHealth> {
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(channelId) || /^ac_/i.test(channelId)) {
+      throw new Error("Invalid channel ID");
+    }
+    const token = opts?.bearerToken?.trim() || this.bearerToken;
+    const headers: Record<string, string> = {
+      Accept: "application/json",
+      "Cache-Control": "no-store",
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    };
+    return this.get<import("./types").ChannelWakeHealth>(
+      `/api/channels/${encodeURIComponent(channelId)}/wake-health`,
+      headers,
+    );
+  }
+
   // MARK: - Internal
 
   private async get<T = any>(path: string, headers?: Record<string, string>): Promise<T> {

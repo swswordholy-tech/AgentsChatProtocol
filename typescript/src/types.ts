@@ -571,3 +571,34 @@ export interface CloudAgentAuditFeed {
   entries: CloudAgentAuditEntry[];
 }
 
+// MARK: - Room-Scoped Cloud Agent Wake-Health Observation Types
+
+export type CloudCliWakeStatus = "ok" | "auth_required" | "timeout" | "error";
+
+export interface ChannelWakeHealthCounts {
+  total_cloud_agents: number;
+  ok: number;
+  auth_required: number;
+  timeout: number;
+  error: number;
+  unobserved: number;
+}
+
+export interface ChannelWakeHealthAgent {
+  agent_id: string;
+  name?: string;
+  runtime: string;
+  cloud_status: string;
+  last_wake_status?: CloudCliWakeStatus;
+  last_wake_at?: string;
+  last_duration_ms?: number;
+}
+
+export interface ChannelWakeHealth {
+  channel_id: string;
+  observation_only: true;
+  counts: ChannelWakeHealthCounts;
+  agents: ChannelWakeHealthAgent[];
+}
+
+
