@@ -3,6 +3,7 @@ import {
   AgentChatClient,
   AgentChatREST,
   type ACMessage,
+  type ChannelBrief,
   type ChannelDocUpdatedMessage,
   type ChannelWakeHealth,
   type CloudAgentAuditFeed,
@@ -234,6 +235,95 @@ describe("AgentChatClient realtime collaboration WS events", () => {
         "https://agents-chat.com/api/loops/mine",
       ]);
       await expect(rest.getChannelLoops("ac_secret_key")).rejects.toThrow("Invalid channel ID");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("getChannelBrief fetches 1-RTT room capability and readiness brief with no-store auth headers and rejects unsafe IDs", async () => {
+    const originalFetch = globalThis.fetch;
+    let capturedUrl = "";
+    let capturedHeaders: Record<string, string> = {};
+
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      capturedUrl = String(input);
+      capturedHeaders = (init?.headers as Record<string, string>) ?? {};
+      const payload: ChannelBrief = {
+        channel_id: "edbb8180-4356-4dab-9d75-bc9fe6f26194",
+        channel: {
+          id: "edbb8180-4356-4dab-9d75-bc9fe6f26194",
+          name: "AgentChatDev",
+          type: "group",
+          topic: "MCP multi-agent sprint",
+          member_count: 5,
+        },
+        agents: [
+          {
+            id: "codex-staff-engineer-ca7590",
+            name: "Codex Staff Engineer",
+            capabilities: ["typescript", "server"],
+            online: true,
+          },
+        ],
+        skills_summary: {
+          channel_skills: [
+            {
+              doc_id: "sprint-sop",
+              skill_meta: { name: "sprint-sop", description: "Zero-overlap sprint rules" },
+              version: 2,
+              load_hint: 'agentschat_read_channel_doc(channel_id="edbb8180-4356-4dab-9d75-bc9fe6f26194", doc_id="sprint-sop")',
+            },
+          ],
+          personal_skills: [],
+        },
+        okr_summary: {
+          active_objective_count: 2,
+          total_task_count: 6,
+          ready_for_me_count: 1,
+          doing_for_me_count: 0,
+        },
+        loop_summary: {
+          active_loop_count: 2,
+          my_active_loop_count: 1,
+          okr_wake_objective_ids: ["obj_1"],
+          okr_watch_objective_ids: ["obj_1"],
+          unarmed_objective_ids: ["obj_2"],
+        },
+        wake_health_summary: {
+          observation_only: true,
+          counts: {
+            total_cloud_agents: 2,
+            ok: 1,
+            auth_required: 1,
+            timeout: 0,
+            error: 0,
+            unobserved: 0,
+          },
+          attention_agents: [
+            {
+              agent_id: "agy-cloud-01",
+              runtime: "agy",
+              cloud_status: "active",
+              last_wake_status: "auth_required",
+            },
+          ],
+        },
+      };
+      return Response.json(payload, { status: 200 });
+    }) as typeof fetch;
+
+    try {
+      const rest = new AgentChatREST({ baseUrl: "https://agents-chat.com", bearerToken: "member-jwt-brief" });
+      const brief = await rest.getChannelBrief("edbb8180-4356-4dab-9d75-bc9fe6f26194");
+      expect(capturedUrl).toBe("https://agents-chat.com/api/channels/edbb8180-4356-4dab-9d75-bc9fe6f26194/brief");
+      expect(capturedHeaders.Authorization).toBe("Bearer member-jwt-brief");
+      expect(capturedHeaders["Cache-Control"]).toBe("no-store");
+      expect(brief.skills_summary?.channel_skills[0]?.doc_id).toBe("sprint-sop");
+      expect(brief.wake_health_summary?.counts.auth_required).toBe(1);
+      expect(brief.wake_health_summary?.attention_agents[0]?.agent_id).toBe("agy-cloud-01");
+
+      await expect(rest.getChannelBrief("ac_secret_leak")).rejects.toThrow("Invalid channel ID");
+      await expect(rest.getChannelBrief("../escape")).rejects.toThrow("Invalid channel ID");
     } finally {
       globalThis.fetch = originalFetch;
     }

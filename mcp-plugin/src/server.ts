@@ -5017,6 +5017,25 @@ const handleToolCall = async (request: any): Promise<any> => {
       okr_watch_objective_ids?: string[];
       unarmed_objective_ids?: string[];
     };
+    wake_health_summary?: {
+      observation_only?: boolean;
+      counts?: {
+        total_cloud_agents: number;
+        ok: number;
+        auth_required: number;
+        timeout: number;
+        error: number;
+        unobserved: number;
+      };
+      attention_agents?: Array<{
+        agent_id: string;
+        name?: string;
+        runtime: string;
+        cloud_status: string;
+        last_wake_status?: string;
+        last_wake_at?: string;
+      }>;
+    };
   } | null> {
     if (!chatId || !TOKEN) return null;
     try {
@@ -5066,12 +5085,13 @@ const handleToolCall = async (request: any): Promise<any> => {
         return r.ok ? await r.json() as any : null;
       } catch { return null; }
     };
-    const [membersData, docsData, okrData, loopsData, personalSkillsData, mcpCtx] = await Promise.all([
+    const [membersData, docsData, okrData, loopsData, personalSkillsData, wakeHealthData, mcpCtx] = await Promise.all([
       get(`/api/channels/${encodeURIComponent(chatId)}/members`),
       get(`/api/channels/${encodeURIComponent(chatId)}/docs?active_only=1`),
       get(`/api/channels/${encodeURIComponent(chatId)}/okr_snapshot`),
       get(`/api/loops?channel_id=${encodeURIComponent(chatId)}`),
       get(`/api/skills?active_only=1`),
+      get(`/api/channels/${encodeURIComponent(chatId)}/wake-health`),
       fetchMcpChannelContext(chatId),
     ]);
     // membersData === null means the /members read FAILED (most often a 403 because
@@ -5403,6 +5423,65 @@ const handleToolCall = async (request: any): Promise<any> => {
       tool_count: g.tools.length,
       loaded: loadedToolGroups.has(g.name),
     }));
+    const rawWakeSummary =
+      wakeHealthData?.observation_only === true && wakeHealthData?.counts
+        ? {
+            observation_only: true as const,
+            counts: wakeHealthData.counts,
+            attention_agents: Array.isArray(wakeHealthData.agents) ? wakeHealthData.agents : [],
+          }
+        : mcpCtx?.wake_health_summary?.observation_only === true && mcpCtx?.wake_health_summary?.counts
+          ? {
+              observation_only: true as const,
+              counts: mcpCtx.wake_health_summary.counts,
+              attention_agents: Array.isArray(mcpCtx.wake_health_summary.attention_agents)
+                ? mcpCtx.wake_health_summary.attention_agents
+                : [],
+            }
+          : null;
+    const wakeHealthSummary =
+      rawWakeSummary && typeof rawWakeSummary.counts?.total_cloud_agents === "number"
+        ? {
+            observation_only: true as const,
+            counts: {
+              total_cloud_agents: Number(rawWakeSummary.counts.total_cloud_agents) || 0,
+              ok: Number(rawWakeSummary.counts.ok) || 0,
+              auth_required: Number(rawWakeSummary.counts.auth_required) || 0,
+              timeout: Number(rawWakeSummary.counts.timeout) || 0,
+              error: Number(rawWakeSummary.counts.error) || 0,
+              unobserved: Number(rawWakeSummary.counts.unobserved) || 0,
+            },
+            attention_agents: rawWakeSummary.attention_agents
+              .filter((a: any) => {
+                const aid = typeof a?.agent_id === "string" ? a.agent_id.trim() : "";
+                if (!aid || isHumanPiiHandle(aid) || /^(?:ac_|sk-)/i.test(aid)) return false;
+                const cloudStatus = String(a?.cloud_status || "active");
+                const wakeStatus = typeof a?.last_wake_status === "string" ? a.last_wake_status : "";
+                return (
+                  cloudStatus !== "active" ||
+                  wakeStatus === "auth_required" ||
+                  wakeStatus === "timeout" ||
+                  wakeStatus === "error"
+                );
+              })
+              .slice(0, 16)
+              .map((a: any) => {
+                const rawName = typeof a?.name === "string" ? a.name.trim() : "";
+                const safeName =
+                  rawName && !isHumanPiiHandle(rawName) && !/\b(?:ac_|sk-)[A-Za-z0-9_-]{8,}\b/i.test(rawName)
+                    ? rawName
+                    : undefined;
+                return {
+                  agent_id: String(a.agent_id).trim(),
+                  ...(safeName ? { name: safeName } : {}),
+                  runtime: String(a.runtime || "unknown"),
+                  cloud_status: String(a.cloud_status || "unknown"),
+                  ...(typeof a.last_wake_status === "string" ? { last_wake_status: a.last_wake_status } : {}),
+                  ...(typeof a.last_wake_at === "string" ? { last_wake_at: a.last_wake_at } : {}),
+                };
+              }),
+          }
+        : null;
     return JSON.stringify({
       channel: chatId,
       ...(mcpCtx?.channel?.name && mcpCtx.channel.name !== chatId ? { channel_name: String(mcpCtx.channel.name) } : {}),
@@ -5416,6 +5495,7 @@ const handleToolCall = async (request: any): Promise<any> => {
       okr_objectives: objectives,
       ...(okrSummary ? { okr_summary: okrSummary } : {}),
       ...(loopSummary ? { loop_summary: loopSummary } : {}),
+      ...(wakeHealthSummary ? { wake_health_summary: wakeHealthSummary } : {}),
       skills,
       ...(personalSkills.length > 0 ? { personal_skills: personalSkills } : {}),
       ...(activeTaskLinkedDocs.length > 0 ? { active_task_linked_docs: activeTaskLinkedDocs } : {}),

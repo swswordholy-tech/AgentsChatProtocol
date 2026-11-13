@@ -631,4 +631,91 @@ export interface RoomLoopsFeed {
   total: number;
 }
 
+// MARK: - Single-RTT Room Capability & Readiness Brief (/api/channels/:id/brief)
+
+export interface ChannelWakeHealthSummary {
+  observation_only: true;
+  counts: ChannelWakeHealthCounts;
+  attention_agents: ChannelWakeHealthAgent[];
+}
+
+export interface ChannelBriefPeer {
+  id: string;
+  name?: string;
+  capabilities?: string[];
+  online?: boolean;
+}
+
+export interface ChannelBriefDocItem {
+  id: string;
+  title: string;
+  kind: string;
+  level: number;
+  body_summary?: string;
+  version?: number;
+  updated_at?: string;
+  updated_by?: string;
+  archived?: boolean;
+  skill_meta?: {
+    name?: string;
+    description?: string;
+    trigger?: string;
+    argument_hint?: string;
+  };
+}
+
+export interface ChannelBriefSkillsSummary {
+  channel_skills: Array<{
+    doc_id: string;
+    skill_meta: NonNullable<ChannelBriefDocItem["skill_meta"]>;
+    version?: number;
+    load_hint: string;
+  }>;
+  personal_skills: Array<{
+    name: string;
+    skill_meta: NonNullable<ChannelBriefDocItem["skill_meta"]>;
+    version?: number;
+    load_hint: string;
+  }>;
+}
+
+export interface ChannelBriefOkrSummary {
+  active_objective_count: number;
+  total_task_count: number;
+  ready_for_me_count: number;
+  doing_for_me_count?: number;
+  blocked_for_me_count?: number;
+  ready_task_count?: number;
+  doing_task_count?: number;
+  blocked_task_count?: number;
+}
+
+export interface ChannelBriefLoopSummary {
+  active_loop_count: number;
+  my_active_loop_count: number;
+  okr_wake_objective_ids: string[];
+  okr_watch_objective_ids: string[];
+  unarmed_objective_ids: string[];
+}
+
+export interface ChannelBrief {
+  channel_id: string;
+  channel: {
+    id: string;
+    name?: string;
+    type?: string;
+    topic?: string;
+    consensus_rule?: string;
+    archived?: boolean;
+    member_count?: number;
+  } | null;
+  agents: ChannelBriefPeer[];
+  docs_summary?: ChannelBriefDocItem[];
+  skills_summary?: ChannelBriefSkillsSummary;
+  personal_skills_unavailable?: boolean;
+  okr_summary?: ChannelBriefOkrSummary;
+  loop_summary?: ChannelBriefLoopSummary | null;
+  wake_health_summary?: ChannelWakeHealthSummary | null;
+}
+
 

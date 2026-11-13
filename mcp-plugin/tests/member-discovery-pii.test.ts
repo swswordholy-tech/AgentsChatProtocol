@@ -188,6 +188,38 @@ beforeAll(() => {
                 doing_task_count: 0,
                 blocked_task_count: 1,
               },
+              wake_health_summary: {
+                observation_only: true,
+                counts: {
+                  total_cloud_agents: 2,
+                  ok: 1,
+                  auth_required: 1,
+                  timeout: 0,
+                  error: 0,
+                  unobserved: 0,
+                },
+                attention_agents: [
+                  {
+                    agent_id: "knobbly-tangy-beacon",
+                    name: "Codex Live",
+                    runtime: "codex",
+                    cloud_status: "active",
+                    last_wake_status: "ok",
+                  },
+                  {
+                    agent_id: "agy-cloud-reauth",
+                    name: "swswordholy@gmail.com",
+                    runtime: "agy",
+                    cloud_status: "active",
+                    last_wake_status: "auth_required",
+                  },
+                  {
+                    agent_id: "ac_secret_should_drop",
+                    runtime: "codex",
+                    cloud_status: "expired",
+                  },
+                ],
+              },
             };
             return Response.json({
               jsonrpc: "2.0",
@@ -434,6 +466,26 @@ describe("Room peer capability discovery & human PII redaction", () => {
       doing_task_count: 0,
       blocked_task_count: 1,
     });
+    expect(brief.wake_health_summary).toEqual({
+      observation_only: true,
+      counts: {
+        total_cloud_agents: 2,
+        ok: 1,
+        auth_required: 1,
+        timeout: 0,
+        error: 0,
+        unobserved: 0,
+      },
+      attention_agents: [
+        {
+          agent_id: "agy-cloud-reauth",
+          runtime: "agy",
+          cloud_status: "active",
+          last_wake_status: "auth_required",
+        },
+      ],
+    });
+    expect(briefRaw).not.toContain("ac_secret_should_drop");
 
     // Fail-closed outage: when both REST and MCP omit docs/OKR summaries, okr_readable & docs_readable are false and okr_summary is omitted
     const outageBrief = JSON.parse(res.get(6)?.result?.content?.[0]?.text || "{}");
