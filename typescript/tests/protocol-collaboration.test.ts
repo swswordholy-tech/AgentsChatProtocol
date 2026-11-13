@@ -1888,4 +1888,139 @@ describe("AgentChatClient realtime collaboration WS events", () => {
       globalThis.fetch = originalFetch;
     }
   });
+
+  test("getMyLoops(?agent_id/include_owned), createOkrWatchLoop, delegated createLoop(agent_id), and getChannelOkrSnapshot loop_summary work end-to-end", async () => {
+    const originalFetch = globalThis.fetch;
+    const seen: Array<{ url: string; method: string; headers: Record<string, string>; body?: any }> = [];
+
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      const method = init?.method ?? "GET";
+      const headers: Record<string, string> = {};
+      if (init?.headers) {
+        for (const [k, v] of Object.entries(init.headers as Record<string, string>)) {
+          headers[k.toLowerCase()] = String(v);
+        }
+      }
+      const body = init?.body ? JSON.parse(String(init.body)) : undefined;
+      seen.push({ url, method, headers, body });
+
+      if (url.includes("/api/loops/mine")) {
+        return Response.json({
+          loops: [
+            {
+              loop_id: "loop_owned_1",
+              agent_id: "codex-cloud-01",
+              channel_id: "room-dev",
+              prompt: "okr:obj_29",
+              interval_ms: 300_000,
+              next_tick_ms: 1700000300000,
+              last_tick_at: null,
+              created_at: 1700000000000,
+              status: "active",
+              mode: "okr_wake",
+              objective_id: "obj_29",
+            },
+          ],
+          total: 1,
+        });
+      }
+      if (url.endsWith("/api/loops/okr-watch") && method === "POST") {
+        return Response.json({
+          ok: true,
+          deduplicated: true,
+          loop_id: "loop_watch_29",
+          mode: "okr_watch",
+          objective_id: body.objective_id,
+          watch_idle: Boolean(body.watch_idle),
+          watch_supply: Boolean(body.watch_supply),
+          stall_minutes: body.stall_minutes ?? 30,
+        });
+      }
+      if (url.endsWith("/api/loops") && method === "POST") {
+        return Response.json({
+          ok: true,
+          deduplicated: false,
+          loop_id: "loop_wake_29",
+          mode: body.mode,
+          objective_id: body.objective_id,
+        });
+      }
+      if (url.includes("/api/channels/room-dev/okr_snapshot")) {
+        return Response.json({
+          channel_id: "room-dev",
+          objectives: [],
+          krs: [],
+          tasks: [],
+          include_archived: true,
+          loop_summary: {
+            active_loop_count: 2,
+            my_active_loop_count: 1,
+            okr_wake_objective_ids: ["obj_29"],
+            okr_watch_objective_ids: ["obj_29"],
+            unarmed_objective_ids: [],
+          },
+        });
+      }
+      return Response.json({ ok: true });
+    }) as typeof fetch;
+
+    try {
+      const rest = new AgentChatREST({ baseUrl: "https://agents-chat.com", bearerToken: "owner-jwt-29" });
+
+      const mine = await rest.getMyLoops({ agent_id: "codex-cloud-01", include_owned: true });
+      expect(mine.total).toBe(1);
+      expect(mine.loops[0]?.agent_id).toBe("codex-cloud-01");
+      expect(seen[0]?.url).toContain("/api/loops/mine?agent_id=codex-cloud-01&include_owned=1");
+      expect(seen[0]?.headers["cache-control"]).toBe("no-store");
+
+      const watchRes = await rest.createOkrWatchLoop({
+        channel_id: "room-dev",
+        objective_id: "obj_29",
+        agent_id: "codex-cloud-01",
+        interval_ms: 300_000,
+        watch_idle: true,
+        watch_supply: false,
+        stall_minutes: 25,
+      });
+      expect(watchRes.deduplicated).toBe(true);
+      expect(watchRes.loop_id).toBe("loop_watch_29");
+      expect(seen[1]?.body).toEqual({
+        channel_id: "room-dev",
+        objective_id: "obj_29",
+        agent_id: "codex-cloud-01",
+        interval_ms: 300_000,
+        watch_idle: true,
+        watch_supply: false,
+        stall_minutes: 25,
+      });
+
+      const delegatedWake = await rest.createLoop({
+        channel_id: "room-dev",
+        agent_id: "codex-cloud-01",
+        mode: "okr_wake",
+        interval: "5m",
+        objective_id: "obj_29",
+      });
+      expect(delegatedWake.loop_id).toBe("loop_wake_29");
+      expect(seen[2]?.body.agent_id).toBe("codex-cloud-01");
+
+      const snap = await rest.getChannelOkrSnapshot("room-dev", { include_archived: true });
+      expect(snap.loop_summary?.active_loop_count).toBe(2);
+      expect(seen[3]?.headers["cache-control"]).toBe("no-store");
+
+      await expect(rest.getMyLoops({ agent_id: "ac_live_secret" })).rejects.toThrow("Invalid agent ID");
+      await expect(
+        rest.createOkrWatchLoop({ channel_id: "arena-1", objective_id: "obj_29" }),
+      ).rejects.toThrow("Invalid channel ID");
+      await expect(
+        rest.createOkrWatchLoop({ channel_id: "room-dev", objective_id: "bad" }),
+      ).rejects.toThrow("Invalid objective ID");
+      await expect(
+        rest.createOkrWatchLoop({ channel_id: "room-dev", objective_id: "obj_29", stall_minutes: 2 }),
+      ).rejects.toThrow("Invalid loop stall_minutes");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
 });

@@ -89,6 +89,7 @@ export type {
   CreateOkrKrInput,
   CreateOkrObjectiveInput,
   CreateOkrTaskInput,
+  CreateOkrWatchLoopInput,
   CreateRoomLoopInput,
   DeleteAgentMemoryResponse,
   DiscoverableChannelSummary,

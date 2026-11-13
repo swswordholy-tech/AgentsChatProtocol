@@ -368,14 +368,36 @@ export class AgentChatREST {
     );
   }
 
-  async getMyLoops(opts?: { bearerToken?: string }): Promise<import("./types").RoomLoopsFeed> {
+  async getMyLoops(opts?: {
+    agent_id?: string;
+    include_owned?: boolean;
+    bearerToken?: string;
+  }): Promise<import("./types").RoomLoopsFeed> {
+    const params = new URLSearchParams();
+    if (opts?.agent_id !== undefined) {
+      const safeAgent = opts.agent_id.trim();
+      if (
+        !safeAgent ||
+        safeAgent.length > 128 ||
+        /[/\\?#&\s\u0000-\u001F]/.test(safeAgent) ||
+        safeAgent.includes("..") ||
+        /^(?:ac_|agent_key_|sk[-_]|gh[pousr]_|github_pat_|AIza|eyJ)/i.test(safeAgent)
+      ) {
+        throw new Error("Invalid agent ID");
+      }
+      params.set("agent_id", safeAgent);
+    }
+    if (opts?.include_owned) {
+      params.set("include_owned", "1");
+    }
+    const qs = params.toString();
     const token = opts?.bearerToken?.trim() || this.bearerToken;
     const headers: Record<string, string> = {
       Accept: "application/json",
       "Cache-Control": "no-store",
       ...(token ? { Authorization: `Bearer ${token}` } : {}),
     };
-    return this.get<import("./types").RoomLoopsFeed>("/api/loops/mine", headers);
+    return this.get<import("./types").RoomLoopsFeed>(`/api/loops/mine${qs ? `?${qs}` : ""}`, headers);
   }
 
   // MARK: - Single-RTT Room Capability & Readiness Brief (/api/channels/:id/brief)
@@ -808,6 +830,20 @@ export class AgentChatREST {
     ) {
       throw new Error("Invalid loop stall_minutes");
     }
+    let safeDelegatedAgent: string | undefined;
+    if (input.agent_id !== undefined) {
+      const trimmedAgent = input.agent_id.trim();
+      if (
+        !trimmedAgent ||
+        trimmedAgent.length > 128 ||
+        /[/\\?#&\s\u0000-\u001F]/.test(trimmedAgent) ||
+        trimmedAgent.includes("..") ||
+        /^(?:ac_|agent_key_|sk[-_]|gh[pousr]_|github_pat_|AIza|eyJ)/i.test(trimmedAgent)
+      ) {
+        throw new Error("Invalid agent ID");
+      }
+      safeDelegatedAgent = trimmedAgent;
+    }
     const token = opts?.bearerToken?.trim() || this.bearerToken;
     const headers: Record<string, string> = {
       Accept: "application/json",
@@ -817,6 +853,7 @@ export class AgentChatREST {
     const body: Record<string, unknown> = {
       channel_id: channelId,
       mode,
+      ...(safeDelegatedAgent !== undefined ? { agent_id: safeDelegatedAgent } : {}),
       ...(input.interval !== undefined ? { interval: input.interval } : {}),
       ...(input.interval_ms !== undefined ? { interval_ms: input.interval_ms } : {}),
       ...(input.prompt !== undefined ? { prompt: input.prompt } : {}),
@@ -828,6 +865,66 @@ export class AgentChatREST {
       ...(input.stall_minutes !== undefined ? { stall_minutes: input.stall_minutes } : {}),
     };
     return this.post<import("./types").RoomLoopMutationResponse>("/api/loops", body, headers);
+  }
+
+  async createOkrWatchLoop(
+    input: import("./types").CreateOkrWatchLoopInput,
+    opts?: { bearerToken?: string },
+  ): Promise<import("./types").RoomLoopMutationResponse> {
+    const channelId = input?.channel_id?.trim() ?? "";
+    if (
+      !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(channelId) ||
+      channelId.startsWith("arena-") ||
+      /^(?:ac_|agent_key_|sk[-_]|gh[pousr]_|github_pat_|AIza|eyJ)/i.test(channelId)
+    ) {
+      throw new Error("Invalid channel ID");
+    }
+    const objectiveId = input?.objective_id?.trim() ?? "";
+    if (!/^[A-Za-z0-9_-]{6,80}$/.test(objectiveId) || /^ac_/i.test(objectiveId)) {
+      throw new Error("Invalid objective ID");
+    }
+    let safeAgent: string | undefined;
+    if (input.agent_id !== undefined) {
+      const trimmedAgent = input.agent_id.trim();
+      if (
+        !trimmedAgent ||
+        trimmedAgent.length > 128 ||
+        /[/\\?#&\s\u0000-\u001F]/.test(trimmedAgent) ||
+        trimmedAgent.includes("..") ||
+        /^(?:ac_|agent_key_|sk[-_]|gh[pousr]_|github_pat_|AIza|eyJ)/i.test(trimmedAgent)
+      ) {
+        throw new Error("Invalid agent ID");
+      }
+      safeAgent = trimmedAgent;
+    }
+    if (
+      input.interval_ms !== undefined &&
+      (!Number.isInteger(input.interval_ms) || input.interval_ms < 60_000 || input.interval_ms > 86_400_000)
+    ) {
+      throw new Error("interval_ms must be an integer between 60000 and 86400000");
+    }
+    if (
+      input.stall_minutes !== undefined &&
+      (!Number.isInteger(input.stall_minutes) || input.stall_minutes < 5 || input.stall_minutes > 1440)
+    ) {
+      throw new Error("Invalid loop stall_minutes");
+    }
+    const token = opts?.bearerToken?.trim() || input.bearerToken?.trim() || this.bearerToken;
+    const headers: Record<string, string> = {
+      Accept: "application/json",
+      "Cache-Control": "no-store",
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    };
+    const body: Record<string, unknown> = {
+      channel_id: channelId,
+      objective_id: objectiveId,
+      ...(safeAgent !== undefined ? { agent_id: safeAgent } : {}),
+      ...(input.interval_ms !== undefined ? { interval_ms: input.interval_ms } : {}),
+      ...(input.watch_idle !== undefined ? { watch_idle: Boolean(input.watch_idle) } : {}),
+      ...(input.watch_supply !== undefined ? { watch_supply: Boolean(input.watch_supply) } : {}),
+      ...(input.stall_minutes !== undefined ? { stall_minutes: input.stall_minutes } : {}),
+    };
+    return this.post<import("./types").RoomLoopMutationResponse>("/api/loops/okr-watch", body, headers);
   }
 
   async pauseLoop(
@@ -1431,7 +1528,10 @@ export class AgentChatREST {
     const qs = opts?.include_archived ? "?include_archived=true" : "";
     return this.get<import("./types").ChannelOkrSnapshotResponse>(
       `/api/channels/${encodeURIComponent(safeChannel)}/okr_snapshot${qs}`,
-      this.authHeaders(opts?.bearerToken),
+      {
+        "Cache-Control": "no-store",
+        ...(this.authHeaders(opts?.bearerToken) ?? {}),
+      },
     );
   }
 

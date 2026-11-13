@@ -949,6 +949,7 @@ export interface ArchivePersonalSkillResponse {
 
 export interface CreateRoomLoopInput {
   channel_id: string;
+  agent_id?: string;
   mode?: RoomLoopMode;
   interval?: string;
   interval_ms?: number;
@@ -961,10 +962,28 @@ export interface CreateRoomLoopInput {
   stall_minutes?: number;
 }
 
+export interface CreateOkrWatchLoopInput {
+  channel_id: string;
+  objective_id: string;
+  agent_id?: string;
+  interval_ms?: number;
+  watch_idle?: boolean;
+  watch_supply?: boolean;
+  stall_minutes?: number;
+  bearerToken?: string;
+}
+
 export interface RoomLoopMutationResponse {
   ok?: boolean;
+  deduplicated?: boolean;
+  mode?: RoomLoopMode;
+  objective_id?: string;
+  watch_idle?: boolean;
+  watch_supply?: boolean;
+  stall_minutes?: number;
   loop?: RoomLoopScheduleItem;
   loop_id?: string;
+  stopped?: string;
   status?: RoomLoopStatus | "stopped";
 }
 
@@ -1223,6 +1242,7 @@ export interface ChannelOkrSnapshotResponse {
   tasks: OkrTaskItem[];
   include_archived?: boolean;
   loops?: RoomLoopScheduleItem[];
+  loop_summary?: ChannelBriefLoopSummary;
   note?: string;
 }
 
