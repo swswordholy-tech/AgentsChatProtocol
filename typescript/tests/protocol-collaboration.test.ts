@@ -1579,4 +1579,124 @@ describe("AgentChatClient realtime collaboration WS events", () => {
       globalThis.fetch = originalFetch;
     }
   });
+
+  test("3-layer WorkspaceGraph parent_id/contains contract plus getMe, listMyIdentities, listOwnedAgents, and optional-agent myChannels work end-to-end", async () => {
+    const originalFetch = globalThis.fetch;
+    const seen: Array<{ url: string; method: string; headers: Record<string, string> }> = [];
+
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      const method = init?.method ?? "GET";
+      const headers: Record<string, string> = {};
+      if (init?.headers) {
+        for (const [k, v] of Object.entries(init.headers as Record<string, string>)) {
+          headers[k.toLowerCase()] = String(v);
+        }
+      }
+      seen.push({ url, method, headers });
+
+      if (url.endsWith("/api/workspace/graph?scope=agent&id=codex-cloud-01")) {
+        return Response.json({
+          scope: { type: "agent", id: "codex-cloud-01" },
+          nodes: [
+            { type: "objective", id: "obj_root", title: "Q4 Reliability", status: "active" },
+            { type: "objective", id: "obj_child", title: "Sprint 27", status: "active", parent_id: "obj_root" },
+            { type: "task", id: "task_leaf", title: "Ship graph hierarchy", owner: "codex-cloud-01", ready: true },
+          ],
+          edges: [
+            { from: ["objective", "obj_root"], to: ["objective", "obj_child"], type: "contains" },
+            { from: ["objective", "obj_child"], to: ["task", "task_leaf"], type: "contains" },
+          ],
+          sections: [{ id: "okr", title: "OKR", summary: { active_objectives: 2, active_tasks: 1, ready_tasks: 1 } }],
+          as_of: "2026-11-14T03:30:00.000Z",
+          note: "3-layer hierarchy",
+        });
+      }
+      if (url.endsWith("/api/channels/mine")) {
+        return Response.json({
+          channels: [
+            { id: "room-dev", name: "AgentChatDev", type: "group", role: "admin", member_count: 6 },
+            { id: "dm-123", type: "direct", peer_id: "codex-cloud-01", peer_name: "Codex Staff" },
+          ],
+        });
+      }
+      if (url.endsWith("/api/channels/mine?agent_id=codex-cloud-01")) {
+        return Response.json({
+          channels: [{ id: "room-dev", name: "AgentChatDev", type: "group", role: "member", member_count: 6 }],
+        });
+      }
+      if (url.endsWith("/api/account/me")) {
+        return Response.json({
+          id: "owner@example.com",
+          name: "Owner",
+          type: "human",
+          privateMode: false,
+          agents: [{ id: "codex-cloud-01", name: "Codex Staff", type: "agent", claimedAt: "2026-11-01T00:00:00Z" }],
+        });
+      }
+      if (url.endsWith("/api/account/me/identities")) {
+        return Response.json({
+          identities: [
+            { id: "owner@example.com", name: "Owner", type: "human", avatar_url: null, is_self: true },
+            {
+              id: "codex-cloud-01",
+              name: "Codex Staff",
+              type: "agent",
+              avatar_url: null,
+              is_self: false,
+              online: true,
+              in_welcome: true,
+              claimed_at: "2026-11-01T00:00:00Z",
+            },
+          ],
+        });
+      }
+      if (url.endsWith("/api/account/owner%40example.com/agents")) {
+        return Response.json({
+          agents: [{ agentId: "codex-cloud-01", ownerId: "owner@example.com", claimedAt: "2026-11-01T00:00:00Z" }],
+        });
+      }
+      return Response.json({ ok: true });
+    }) as typeof fetch;
+
+    try {
+      const rest = new AgentChatREST({ baseUrl: "https://agents-chat.com", bearerToken: "owner-jwt-27" });
+
+      const graph = await rest.getWorkspaceGraph("agent", "codex-cloud-01");
+      expect(graph.nodes.find((n) => n.id === "obj_child")?.parent_id).toBe("obj_root");
+      expect(graph.edges[0]).toEqual({
+        from: ["objective", "obj_root"],
+        to: ["objective", "obj_child"],
+        type: "contains",
+      });
+      expect(graph.note).toBe("3-layer hierarchy");
+
+      const selfRooms = await rest.myChannels();
+      expect(selfRooms).toHaveLength(2);
+      expect(selfRooms[1]?.peer_name).toBe("Codex Staff");
+      expect(seen[1]?.headers["authorization"]).toBe("Bearer owner-jwt-27");
+      expect(seen[1]?.headers["cache-control"]).toBe("no-store");
+
+      const childRooms = await rest.myChannels("codex-cloud-01");
+      expect(childRooms).toHaveLength(1);
+      expect(childRooms[0]?.id).toBe("room-dev");
+
+      const me = await rest.getMe();
+      expect(me.agents?.[0]?.id).toBe("codex-cloud-01");
+
+      const identities = await rest.listMyIdentities();
+      expect(identities.identities).toHaveLength(2);
+      expect(identities.identities[1]?.online).toBe(true);
+
+      const owned = await rest.listOwnedAgents("owner@example.com");
+      expect(owned.agents[0]?.agentId).toBe("codex-cloud-01");
+
+      await expect(rest.myChannels("ac_live_secret_token_value")).rejects.toThrow("Invalid agent ID");
+      await expect(rest.myChannels("../escape")).rejects.toThrow("Invalid agent ID");
+      await expect(rest.listOwnedAgents("sk-live-secret-token")).rejects.toThrow("Invalid owner ID");
+      await expect(rest.listOwnedAgents("../escape")).rejects.toThrow("Invalid owner ID");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
 });

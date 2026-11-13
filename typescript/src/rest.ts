@@ -229,9 +229,70 @@ export class AgentChatREST {
     return data.channels;
   }
 
-  async myChannels(agentId: string): Promise<any[]> {
-    const data = await this.get<{ channels: any[] }>(`/api/channels/mine?agent_id=${encodeURIComponent(agentId)}`);
+  async myChannels(
+    agentId?: string,
+    opts?: { bearerToken?: string },
+  ): Promise<import("./types").MyChannelSummaryItem[]> {
+    let qs = "";
+    if (agentId !== undefined) {
+      const trimmed = agentId.trim();
+      if (
+        !trimmed ||
+        trimmed.length > 160 ||
+        /[/\\?#&\s\u0000-\u001F]/.test(trimmed) ||
+        trimmed.includes("..") ||
+        /^(?:ac_|agent_key_|sk[-_]|gh[pousr]_|github_pat_|AIza|eyJ)/i.test(trimmed)
+      ) {
+        throw new Error("Invalid agent ID");
+      }
+      qs = `?agent_id=${encodeURIComponent(trimmed)}`;
+    }
+    const data = await this.get<{ channels: import("./types").MyChannelSummaryItem[] }>(
+      `/api/channels/mine${qs}`,
+      {
+        "Cache-Control": "no-store",
+        ...(this.authHeaders(opts?.bearerToken) ?? {}),
+      },
+    );
     return data.channels;
+  }
+
+  async getMe(opts?: { bearerToken?: string }): Promise<import("./types").AccountMeResponse> {
+    return this.get<import("./types").AccountMeResponse>("/api/account/me", {
+      "Cache-Control": "no-store",
+      ...(this.authHeaders(opts?.bearerToken) ?? {}),
+    });
+  }
+
+  async listMyIdentities(opts?: { bearerToken?: string }): Promise<import("./types").AccountIdentitiesResponse> {
+    return this.get<import("./types").AccountIdentitiesResponse>("/api/account/me/identities", {
+      "Cache-Control": "no-store",
+      ...(this.authHeaders(opts?.bearerToken) ?? {}),
+    });
+  }
+
+  async listOwnedAgents(
+    ownerId: string,
+    opts?: { bearerToken?: string },
+  ): Promise<import("./types").OwnedAgentsListResponse> {
+    const trimmed = typeof ownerId === "string" ? ownerId.trim() : "";
+    if (
+      !trimmed ||
+      trimmed.length > 160 ||
+      /[/\\?#&\s\u0000-\u001F]/.test(trimmed) ||
+      trimmed === "." ||
+      trimmed.includes("..") ||
+      /^(?:ac_|agent_key_|sk[-_]|gh[pousr]_|github_pat_|AIza|eyJ)/i.test(trimmed)
+    ) {
+      throw new Error("Invalid owner ID");
+    }
+    return this.get<import("./types").OwnedAgentsListResponse>(
+      `/api/account/${encodeURIComponent(trimmed)}/agents`,
+      {
+        "Cache-Control": "no-store",
+        ...(this.authHeaders(opts?.bearerToken) ?? {}),
+      },
+    );
   }
 
   // MARK: - Owner-Scoped Cloud Agent Forensic Security Audit

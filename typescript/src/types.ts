@@ -773,6 +773,7 @@ export interface WorkspaceGraphNode {
   level?: number;
   kind?: string;
   owner?: string;
+  parent_id?: string;
   ready?: boolean;
   evidence_count?: number;
 }
@@ -799,6 +800,7 @@ export interface WorkspaceGraph {
   as_of?: string;
   since?: string;
   referenced_unchanged_ids?: string[];
+  note?: string;
 }
 
 // MARK: - Room Consensus Proposals (/api/channels/:id/proposals)
@@ -1584,5 +1586,73 @@ export interface RecoverCloudAgentInput {
 
 export interface RecoverCloudAgentResponse {
   ok: boolean;
+  [key: string]: unknown;
+}
+
+export interface AccountOwnedAgentProfile {
+  id: string;
+  name?: string;
+  type?: "agent" | "human" | (string & {});
+  status?: string;
+  avatarUrl?: string | null;
+  privateMode?: boolean;
+  private_mode?: boolean;
+  privateModeAllowOwner?: boolean;
+  private_mode_allow_owner?: boolean;
+  claimedAt?: string | null;
+  [key: string]: unknown;
+}
+
+export interface AccountMeResponse {
+  id: string;
+  name?: string;
+  type?: "human" | "agent" | (string & {});
+  avatarUrl?: string | null;
+  privateMode?: boolean;
+  private_mode?: boolean;
+  privateModeAllowOwner?: boolean;
+  private_mode_allow_owner?: boolean;
+  agents?: AccountOwnedAgentProfile[];
+  [key: string]: unknown;
+}
+
+export interface AccountIdentityItem {
+  id: string;
+  name: string;
+  type: "human" | "agent" | (string & {});
+  avatar_url: string | null;
+  is_self: boolean;
+  online?: boolean;
+  in_welcome?: boolean;
+  claimed_at?: string | null;
+}
+
+export interface AccountIdentitiesResponse {
+  identities: AccountIdentityItem[];
+}
+
+export interface OwnedAgentLinkItem {
+  agentId: string;
+  ownerId?: string;
+  claimedAt?: string | null;
+  [key: string]: unknown;
+}
+
+export interface OwnedAgentsListResponse {
+  agents: OwnedAgentLinkItem[];
+}
+
+export interface MyChannelSummaryItem {
+  id: string;
+  name?: string;
+  type?: ChannelType;
+  visibility?: "public" | "private" | (string & {});
+  member_count?: number;
+  topic?: string;
+  role?: ChannelRole | (string & {});
+  last_message_at?: string | number | null;
+  peer_id?: string;
+  peer_name?: string;
+  peer_avatar_url?: string | null;
   [key: string]: unknown;
 }
