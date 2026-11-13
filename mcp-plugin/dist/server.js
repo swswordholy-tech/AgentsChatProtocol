@@ -7111,20 +7111,24 @@ ${results}` }] };
       const allDocs = docsData ? extractChannelDocsPayload(docsData) : [];
       const skills = allDocs.filter(isSkillDoc).map((d) => ({ doc_id: d.id, title: d.title }));
       const docs = allDocs.filter((d) => !isSkillDoc(d)).slice(0, 10).map((d) => ({ doc_id: d.id, title: d.title, kind: d.kind }));
-      const activeRawObjectives = (okrData?.objectives || []).filter((o) => !o.archived && o.id);
+      const activeRawObjectives = (okrData?.objectives || []).filter((o) => !o.archived && o.id && String(o.status || "active").toLowerCase() === "active");
       const visibleObjectiveIdSet = new Set(activeRawObjectives.map((o) => String(o.id)));
+      const snapshotLoopSummary = okrData?.loop_summary && typeof okrData.loop_summary === "object" ? okrData.loop_summary : null;
+      const hasSnapshotLoopSummary = Boolean(snapshotLoopSummary && (Array.isArray(snapshotLoopSummary.okr_wake_objective_ids) || Array.isArray(snapshotLoopSummary.okr_watch_objective_ids) || Array.isArray(snapshotLoopSummary.unarmed_objective_ids)));
       const hasMcpLoopSummary = Boolean(mcpCtx?.loop_summary && typeof mcpCtx.loop_summary === "object");
       const hasRestLoopsArray = Array.isArray(loopsData?.loops);
-      const loopCoverageKnown = hasMcpLoopSummary || hasRestLoopsArray;
+      const loopCoverageKnown = hasMcpLoopSummary || hasSnapshotLoopSummary || hasRestLoopsArray;
       const wakeSet = new Set;
       const watchSet = new Set;
-      if (hasMcpLoopSummary) {
-        for (const rawId of mcpCtx?.loop_summary?.okr_wake_objective_ids || []) {
+      for (const summarySource of [mcpCtx?.loop_summary, snapshotLoopSummary]) {
+        if (!summarySource)
+          continue;
+        for (const rawId of summarySource.okr_wake_objective_ids || []) {
           const id = String(rawId || "");
           if (visibleObjectiveIdSet.has(id))
             wakeSet.add(id);
         }
-        for (const rawId of mcpCtx?.loop_summary?.okr_watch_objective_ids || []) {
+        for (const rawId of summarySource.okr_watch_objective_ids || []) {
           const id = String(rawId || "");
           if (visibleObjectiveIdSet.has(id))
             watchSet.add(id);
@@ -7154,11 +7158,11 @@ ${results}` }] };
         };
       });
       const loopSummary = loopCoverageKnown ? {
-        active_loop_count: typeof mcpCtx?.loop_summary?.active_loop_count === "number" ? mcpCtx.loop_summary.active_loop_count : activeRestLoops.length,
-        ...typeof mcpCtx?.loop_summary?.my_active_loop_count === "number" ? { my_active_loop_count: mcpCtx.loop_summary.my_active_loop_count } : AGENT_ID && hasRestLoopsArray ? { my_active_loop_count: activeRestLoops.filter((l) => l?.agent_id === AGENT_ID).length } : {},
+        active_loop_count: typeof mcpCtx?.loop_summary?.active_loop_count === "number" ? mcpCtx.loop_summary.active_loop_count : typeof snapshotLoopSummary?.active_loop_count === "number" ? snapshotLoopSummary.active_loop_count : activeRestLoops.length,
+        ...typeof mcpCtx?.loop_summary?.my_active_loop_count === "number" ? { my_active_loop_count: mcpCtx.loop_summary.my_active_loop_count } : typeof snapshotLoopSummary?.my_active_loop_count === "number" ? { my_active_loop_count: snapshotLoopSummary.my_active_loop_count } : AGENT_ID && hasRestLoopsArray ? { my_active_loop_count: activeRestLoops.filter((l) => l?.agent_id === AGENT_ID).length } : {},
         okr_wake_objective_ids: [...wakeSet],
         okr_watch_objective_ids: [...watchSet],
-        unarmed_objective_ids: activeRawObjectives.map((o) => String(o.id)).filter((id) => !wakeSet.has(id) && !watchSet.has(id))
+        unarmed_objective_ids: activeRawObjectives.map((o) => String(o.id)).filter((id) => !wakeSet.has(id))
       } : null;
       const toolGroups = TOOL_GROUPS.map((g) => ({
         name: g.name,

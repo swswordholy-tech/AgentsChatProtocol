@@ -98,23 +98,27 @@ beforeAll(() => {
       if (req.method === "GET" && u.pathname === "/api/channels/chan-okr-guarded/okr_snapshot") {
         return Response.json({
           objectives: [
-            { id: "obj_armed_1", title: "Armed Objective", archived: false },
-            { id: "obj_unarmed_2", title: "Unarmed Objective", archived: false },
+            { id: "obj_armed_1", title: "Armed Objective", status: "active", archived: false },
+            { id: "obj_unarmed_2", title: "Unarmed Objective", status: "active", archived: false },
+            { id: "obj_watch_only_3", title: "Watch Only Objective", status: "active", archived: false },
+            { id: "obj_done_4", title: "Done Objective", status: "done", archived: false },
           ],
           tasks: [
             { id: "t1", objective_id: "obj_armed_1", status: "doing" },
             { id: "t2", objective_id: "obj_unarmed_2", status: "todo" },
+            { id: "t3", objective_id: "obj_watch_only_3", status: "todo" },
           ],
+          loop_summary: {
+            active_loop_count: 3,
+            my_active_loop_count: 2,
+            okr_wake_objective_ids: ["obj_armed_1", "obj_foreign_secret"],
+            okr_watch_objective_ids: ["obj_watch_only_3", "obj_foreign_secret"],
+            unarmed_objective_ids: ["obj_unarmed_2", "obj_watch_only_3"],
+          },
         });
       }
       if (req.method === "GET" && u.pathname === "/api/loops" && u.searchParams.get("channel_id") === "chan-okr-guarded") {
-        return Response.json({
-          loops: [
-            { loop_id: "l-wake", channel_id: "chan-okr-guarded", mode: "okr_wake", objective_id: "obj_armed_1", status: "active", paused: false },
-            { loop_id: "l-foreign", channel_id: "chan-okr-guarded", mode: "okr_watch", objective_id: "obj_foreign_secret", status: "active", paused: false },
-            { loop_id: "l-paused", channel_id: "chan-okr-guarded", mode: "okr_wake", objective_id: "obj_unarmed_2", status: "paused", paused: true },
-          ],
-        });
+        return Response.json({ error: "REST /api/loops degraded; okr_snapshot.loop_summary fallback should still succeed" }, { status: 503 });
       }
       if (req.method === "POST" && u.pathname === "/mcp") {
         const rpc = (await req.json().catch(() => ({}))) as any;
@@ -349,12 +353,20 @@ describe("Room peer capability discovery & human PII redaction", () => {
         okr_wake_armed: false,
         okr_watch_armed: false,
       },
+      {
+        id: "obj_watch_only_3",
+        title: "Watch Only Objective",
+        open_tasks: 1,
+        okr_wake_armed: false,
+        okr_watch_armed: true,
+      },
     ]);
     expect(guarded.loop_summary).toMatchObject({
-      active_loop_count: 2,
+      active_loop_count: 3,
+      my_active_loop_count: 2,
       okr_wake_objective_ids: ["obj_armed_1"],
-      okr_watch_objective_ids: [],
-      unarmed_objective_ids: ["obj_unarmed_2"],
+      okr_watch_objective_ids: ["obj_watch_only_3"],
+      unarmed_objective_ids: ["obj_unarmed_2", "obj_watch_only_3"],
     });
   });
 });
