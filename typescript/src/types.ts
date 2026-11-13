@@ -850,5 +850,17 @@ export interface VoteChannelProposalResponse {
   vote_result: ChannelProposalVoteSummary;
 }
 
+export interface DiscoverableChannelSummary {
+  id: string;
+  name?: string;
+  type?: ChannelType;
+  member_count?: number;
+  online_agent_count?: number;
+  capabilities?: string[];
+  topic?: string;
+  created_at?: string | number;
+}
+
+
 
 

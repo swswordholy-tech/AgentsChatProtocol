@@ -34,6 +34,7 @@ export type {
   ContentType,
   CreateChannelProposalInput,
   CreateChannelProposalResponse,
+  DiscoverableChannelSummary,
   MessageDeleted,
   MessageEdited,
   PinAction,

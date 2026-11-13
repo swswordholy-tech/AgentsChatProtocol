@@ -1249,10 +1249,10 @@ const TOOL_GROUPS: ToolGroupMeta[] = [
   },
   {
     name: "notifications",
-    summary: "Low-latency collaboration signals and channel metadata updates.",
-    tags: ["presence", "collaboration"],
-    estimated_tokens: 850,
-    tools: ["send_typing", "set_status", "set_topic", "propose", "vote"],
+    summary: "Low-latency collaboration signals, channel metadata updates, and room proposal/consensus voting.",
+    tags: ["presence", "collaboration", "proposals"],
+    estimated_tokens: 950,
+    tools: ["send_typing", "set_status", "set_topic", "list_proposals", "propose", "vote"],
   },
   {
     name: "forward_search",
@@ -1598,11 +1598,24 @@ const ALL_TOOL_DEFS = [
       },
     },
     {
-      name: "vote",
-      description: "Cast a vote on a proposal (approve, reject, or abstain).",
+      name: "list_proposals",
+      description: "List room proposals and current consensus vote tallies in a channel.",
       inputSchema: {
         type: "object" as const,
         properties: {
+          chat_id: { type: "string", description: "The channel_id to inspect proposals in" },
+          status: { type: "string", enum: ["all", "pending", "passed", "rejected"], description: "Optional status filter (default: all)" },
+        },
+        required: ["chat_id"],
+      },
+    },
+    {
+      name: "vote",
+      description: "Cast a vote on a proposal (approve, reject, or abstain). Pass chat_id for synchronous REST vote tally, with automatic WebSocket fallback.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          chat_id: { type: "string", description: "Optional channel_id for synchronous REST vote tally (falls back to WebSocket if omitted)" },
           proposal_id: { type: "string", description: "ID of the proposal to vote on" },
           decision: { type: "string", enum: ["approve", "reject", "abstain"], description: "Your vote decision" },
           reason: { type: "string", description: "Optional reason for your vote" },
@@ -1612,7 +1625,7 @@ const ALL_TOOL_DEFS = [
     },
     {
       name: "propose",
-      description: "Create a new proposal for agents to vote on.",
+      description: "Create a new proposal for agents to vote on (REST-first with synchronous confirmation and automatic WebSocket fallback).",
       inputSchema: {
         type: "object" as const,
         properties: {
@@ -1621,6 +1634,7 @@ const ALL_TOOL_DEFS = [
           content: { type: "string", description: "Proposal description/body" },
           code_diff: { type: "string", description: "Optional code diff for code review proposals" },
           consensus_rule: { type: "string", enum: ["majority", "super_majority", "unanimous"], description: "Voting rule (default: majority)" },
+          expires_at: { type: "string", description: "Optional ISO-8601 expiration timestamp" },
         },
         required: ["chat_id", "title", "content"],
       },
@@ -1855,10 +1869,11 @@ const ALL_TOOL_DEFS = [
     },
     {
       name: "list_channels",
-      description: "Browse PUBLIC channels (discovery) — NOT your membership list. Shows name, member count, and topic. For the channels you've actually joined (including DMs), use list_my_channels instead.",
+      description: "Browse PUBLIC channels (discovery) — NOT your membership list. Shows name, member count, live online agents, capabilities, and topic. For the channels you've actually joined (including DMs), use list_my_channels instead.",
       inputSchema: {
         type: "object" as const,
         properties: {
+          query: { type: "string", description: "Optional search keyword matching channel name, topic, or online agent capabilities" },
           limit: { type: "number", description: "Max results (default 50)" },
         },
       },
@@ -2941,55 +2956,276 @@ function redactCloudAgentDisplayName(name: string): string {
   return redactParticipantPii(safe).slice(0, 128);
 }
 
+function projectWakeHealthPayload(channelId: string, data: any): { channel_id: string; observation_only: true; agents: any[]; summary: Record<string, number>; untrusted: true } | null {
+  if (!data || data.channel_id !== channelId || data.observation_only !== true || !Array.isArray(data.agents)) {
+    return null;
+  }
+  const agents = data.agents.map((item: any) => {
+    if (!item || typeof item.agent_id !== "string" || !/^[\w.-]{1,128}$/.test(item.agent_id) || isHumanPiiHandle(item.agent_id)) return null;
+    const rawStatus = item.wake?.status ?? item.last_wake_status;
+    const rawAt = item.wake?.last_wake_at ?? item.last_wake_at;
+    const rawDur = item.wake?.last_duration_ms ?? item.last_duration_ms;
+    const validWake = rawStatus === "ok" || rawStatus === "auth_required" || rawStatus === "timeout" || rawStatus === "error";
+    const wake = validWake && typeof rawAt === "string" && Number.isSafeInteger(rawDur) && rawDur >= 0
+      ? { status: rawStatus, last_wake_at: rawAt, last_duration_ms: rawDur }
+      : null;
+    return {
+      agent_id: item.agent_id,
+      ...(typeof item.name === "string" && item.name ? { name: redactCloudAgentDisplayName(item.name) } : {}),
+      runtime: String(item.runtime || "unknown").slice(0, 32),
+      cloud_status: String(item.cloud_status || "unknown").slice(0, 32),
+      wake,
+    };
+  }).filter(Boolean).slice(0, 64) as any[];
+  const summary = { total: agents.length, ok: 0, auth_required: 0, timeout: 0, error: 0, unobserved: 0 };
+  for (const agent of agents) {
+    if (agent.wake) summary[agent.wake.status as "ok" | "auth_required" | "timeout" | "error"]++;
+    else summary.unobserved++;
+  }
+  return { channel_id: channelId, observation_only: true, agents, summary, untrusted: true };
+}
+
 HANDLERS.set("cloud_agent_wake_health", async (args) => {
-  const channelId = String(args?.channel_id || "");
-  if (!channelId) return { content: [{ type: "text", text: "cloud_agent_wake_health needs channel_id." }], isError: true };
+  const channelId = String(args?.channel_id || "").trim();
+  if (!channelId || /[\x00-\x1f\x7f]/.test(channelId)) {
+    return { content: [{ type: "text", text: "cloud_agent_wake_health needs channel_id." }], isError: true };
+  }
+  const reqHeaders = {
+    "Authorization": `Bearer ${TOKEN}`,
+    ...(AGENT_ID ? { "X-Agent-Id": AGENT_ID } : {}),
+  };
   try {
     const r = await apiFetch(`${REST_URL}/mcp`, {
       method: "POST",
-      headers: {
-        "Authorization": `Bearer ${TOKEN}`,
-        "Content-Type": "application/json",
-        ...(AGENT_ID ? { "X-Agent-Id": AGENT_ID } : {}),
-      },
+      headers: { ...reqHeaders, "Content-Type": "application/json" },
       body: JSON.stringify({
         jsonrpc: "2.0", id: 1, method: "tools/call",
         params: { name: "agentschat_cloud_agent_wake_health", arguments: { channel_id: channelId } },
       }),
     }, 5000, true);
+    let rpcErrorCode: unknown = null;
+    let rpcErrorMsg = "";
+    if (r.ok) {
+      const rpc = await r.json() as any;
+      if (!rpc?.error && !rpc?.result?.isError) {
+        let data = rpc?.result?.structuredContent;
+        if (!data && typeof rpc?.result?.content?.[0]?.text === "string") data = JSON.parse(rpc.result.content[0].text);
+        const projected = projectWakeHealthPayload(channelId, data);
+        if (!projected) return { content: [{ type: "text", text: "cloud_agent_wake_health returned an invalid response" }], isError: true };
+        return { content: [{ type: "text", text: JSON.stringify(projected) }] };
+      }
+      rpcErrorCode = rpc?.error?.code ?? "remote_error";
+      rpcErrorMsg = typeof rpc?.error?.message === "string" ? rpc.error.message : "";
+    }
+    // Fallback to REST /api/channels/:id/cloud-wake-health when /mcp predates the tool (-32601/-32602 Unknown tool or 404/405).
+    const canFallback = (!r.ok && (r.status === 404 || r.status === 405)) ||
+      ((rpcErrorCode === -32601 || rpcErrorCode === -32602) && !/denied|forbidden|invalid cloud wake health/i.test(rpcErrorMsg));
+    if (canFallback) {
+      const restRes = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(channelId)}/cloud-wake-health`, {
+        headers: reqHeaders,
+      }, 5000, true);
+      if (restRes.ok) {
+        const projected = projectWakeHealthPayload(channelId, await restRes.json());
+        if (projected) return { content: [{ type: "text", text: JSON.stringify(projected) }] };
+      }
+    }
     if (!r.ok) return { content: [{ type: "text", text: `cloud_agent_wake_health failed (${r.status})` }], isError: true };
-    const rpc = await r.json() as any;
-    if (rpc?.error || rpc?.result?.isError) {
-      return { content: [{ type: "text", text: `cloud_agent_wake_health failed (${rpc?.error?.code ?? "remote_error"})` }], isError: true };
-    }
-    let data = rpc?.result?.structuredContent;
-    if (!data && typeof rpc?.result?.content?.[0]?.text === "string") data = JSON.parse(rpc.result.content[0].text);
-    if (!data || data.channel_id !== channelId || data.observation_only !== true || !Array.isArray(data.agents)) {
-      return { content: [{ type: "text", text: "cloud_agent_wake_health returned an invalid response" }], isError: true };
-    }
-    const agents = data.agents.map((item: any) => {
-      if (!item || typeof item.agent_id !== "string" || !/^[\w.-]{1,128}$/.test(item.agent_id) || isHumanPiiHandle(item.agent_id)) return null;
-      const status = item.wake?.status;
-      const validWake = status === "ok" || status === "auth_required" || status === "timeout" || status === "error";
-      const wake = validWake && typeof item.wake.last_wake_at === "string" && Number.isSafeInteger(item.wake.last_duration_ms) && item.wake.last_duration_ms >= 0
-        ? { status, last_wake_at: item.wake.last_wake_at, last_duration_ms: item.wake.last_duration_ms }
-        : null;
-      return {
-        agent_id: item.agent_id,
-        ...(typeof item.name === "string" && item.name ? { name: redactCloudAgentDisplayName(item.name) } : {}),
-        runtime: String(item.runtime || "unknown").slice(0, 32),
-        cloud_status: String(item.cloud_status || "unknown").slice(0, 32),
-        wake,
-      };
-    }).filter(Boolean).slice(0, 64) as any[];
-    const summary = { total: agents.length, ok: 0, auth_required: 0, timeout: 0, error: 0, unobserved: 0 };
-    for (const agent of agents) {
-      if (agent.wake) summary[agent.wake.status as "ok" | "auth_required" | "timeout" | "error"]++;
-      else summary.unobserved++;
-    }
-    return { content: [{ type: "text", text: JSON.stringify({ channel_id: channelId, observation_only: true, agents, summary, untrusted: true }) }] };
+    const safeDetail = rpcErrorMsg ? `: ${redactSecrets(redactParticipantPii(rpcErrorMsg)).slice(0, 80)}` : "";
+    return { content: [{ type: "text", text: `cloud_agent_wake_health failed (${rpcErrorCode}${safeDetail})` }], isError: true };
   } catch (e: any) {
     return { content: [{ type: "text", text: `cloud_agent_wake_health error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
+  }
+});
+
+function sanitizeProposalItem(p: any): any {
+  if (!p || typeof p !== "object") return null;
+  const votes = Array.isArray(p.votes)
+    ? p.votes.map((v: any) => ({
+        voter_id: typeof v?.voter_id === "string" ? redactParticipantPii(v.voter_id) : "unknown",
+        voter_type: v?.voter_type === "human" ? "human" : "agent",
+        decision: v?.decision,
+        ...(typeof v?.reason === "string" && v.reason ? { reason: redactSecrets(redactParticipantPii(v.reason)).slice(0, 500) } : {}),
+      }))
+    : [];
+  return {
+    id: String(p.id || ""),
+    channel_id: String(p.channel_id || ""),
+    sender_id: typeof p.sender_id === "string" ? redactParticipantPii(p.sender_id) : "unknown",
+    title: typeof p.title === "string" ? redactSecrets(p.title).slice(0, 500) : "",
+    content: typeof p.content === "string" ? redactSecrets(p.content).slice(0, 4000) : "",
+    ...(typeof p.code_diff === "string" ? { code_diff: redactSecrets(p.code_diff).slice(0, 8000) } : {}),
+    consensus_rule: p.consensus_rule || "majority",
+    ...(typeof p.expires_at === "string" && p.expires_at ? { expires_at: p.expires_at } : {}),
+    timestamp: String(p.timestamp || ""),
+    status: String(p.status || "pending"),
+    total_voters: typeof p.total_voters === "number" ? p.total_voters : 1,
+    votes,
+    ...(p.vote_result && typeof p.vote_result === "object" ? { vote_result: p.vote_result } : {}),
+  };
+}
+
+HANDLERS.set("list_proposals", async (args) => {
+  const chatId = String(args?.chat_id || "").trim();
+  const statusFilter = String(args?.status || "all").trim().toLowerCase();
+  if (!chatId || /[\x00-\x1f\x7f]/.test(chatId)) {
+    return { content: [{ type: "text", text: "list_proposals needs chat_id." }], isError: true };
+  }
+  if (!["all", "pending", "passed", "rejected"].includes(statusFilter)) {
+    return { content: [{ type: "text", text: "list_proposals status must be all, pending, passed, or rejected." }], isError: true };
+  }
+  try {
+    const r = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(chatId)}/proposals`, {
+      headers: {
+        "Authorization": `Bearer ${TOKEN}`,
+        ...(AGENT_ID ? { "X-Agent-Id": AGENT_ID } : {}),
+      },
+    });
+    const text = await r.text();
+    if (!r.ok) {
+      return { content: [{ type: "text", text: `list_proposals failed (${r.status}): ${redactSecrets(text).slice(0, 180)}` }], isError: true };
+    }
+    const body = JSON.parse(text) as any;
+    let proposals = (Array.isArray(body?.proposals) ? body.proposals : []).map(sanitizeProposalItem).filter(Boolean);
+    if (statusFilter !== "all") {
+      proposals = proposals.filter((p: any) => p.status === statusFilter);
+    }
+    return { content: [{ type: "text", text: JSON.stringify({ channel_id: chatId, count: proposals.length, proposals, untrusted: true }) }] };
+  } catch (e: any) {
+    return { content: [{ type: "text", text: `list_proposals error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
+  }
+});
+
+HANDLERS.set("propose", async (args) => {
+  const { chat_id, title, content, code_diff, consensus_rule, expires_at } = (args || {}) as any;
+  const chatId = typeof chat_id === "string" ? chat_id.trim() : "";
+  if (!chatId || /[\x00-\x1f\x7f]/.test(chatId) || typeof title !== "string" || !title.trim() || typeof content !== "string") {
+    return { content: [{ type: "text", text: "Error: chat_id, non-empty title, and content (strings) required" }], isError: true };
+  }
+  const rule = consensus_rule || "majority";
+  if (!["majority", "super_majority", "unanimous"].includes(rule)) {
+    return { content: [{ type: "text", text: "Error: consensus_rule must be majority, super_majority, or unanimous" }], isError: true };
+  }
+  const proposalId = crypto.randomUUID();
+  const effectiveExpiresAt = typeof expires_at === "string" && expires_at.trim()
+    ? expires_at.trim()
+    : new Date(Date.now() + 86400_000).toISOString();
+  if (TOKEN) {
+    try {
+      const r = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(chatId)}/proposals`, {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${TOKEN}`,
+          "Content-Type": "application/json",
+          ...(AGENT_ID ? { "X-Agent-Id": AGENT_ID } : {}),
+        },
+        body: JSON.stringify({
+          id: proposalId,
+          ...(AGENT_ID ? { sender_id: AGENT_ID } : {}),
+          title,
+          content,
+          ...(typeof code_diff === "string" ? { code_diff } : {}),
+          consensus_rule: rule,
+          expires_at: effectiveExpiresAt,
+        }),
+      });
+      if (r.ok) {
+        const data = await r.json() as any;
+        const proposal = sanitizeProposalItem(data?.proposal ?? data);
+        return { content: [{ type: "text", text: JSON.stringify({ ok: true, transport: "rest", proposal }) }] };
+      }
+      if (r.status !== 404 && r.status !== 405 && r.status !== 501) {
+        const errText = await r.text();
+        return { content: [{ type: "text", text: `propose failed (${r.status}): ${redactSecrets(errText).slice(0, 180)}` }], isError: true };
+      }
+    } catch {
+      // Network/pre-deploy fallback to WebSocket below when open.
+    }
+  }
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({
+      type: "proposal", id: proposalId, channel_id: chatId,
+      sender_id: AGENT_ID, title, content, code_diff,
+      consensus_rule: rule,
+      expires_at: effectiveExpiresAt,
+      timestamp: new Date().toISOString(),
+    }));
+    return { content: [{ type: "text", text: `Proposal '${title}' dispatched (client-generated ID ${proposalId.slice(0, 8)}); server may reject — verify via next inbound event` }] };
+  }
+  return { content: [{ type: "text", text: "Not connected" }], isError: true };
+});
+
+HANDLERS.set("vote", async (args) => {
+  const { chat_id, channel_id, proposal_id, decision, reason } = (args || {}) as any;
+  if (typeof proposal_id !== "string" || !proposal_id.trim() || typeof decision !== "string") {
+    return { content: [{ type: "text", text: "Error: proposal_id and decision (strings) required" }], isError: true };
+  }
+  if (!["approve", "reject", "abstain"].includes(decision)) {
+    return { content: [{ type: "text", text: "Error: decision must be approve, reject, or abstain" }], isError: true };
+  }
+  const chatId = typeof chat_id === "string" && chat_id.trim()
+    ? chat_id.trim()
+    : (typeof channel_id === "string" && channel_id.trim() ? channel_id.trim() : "");
+  if (chatId && !/[\x00-\x1f\x7f]/.test(chatId) && TOKEN) {
+    try {
+      const r = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(chatId)}/proposals/${encodeURIComponent(proposal_id.trim())}/votes`, {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${TOKEN}`,
+          "Content-Type": "application/json",
+          ...(AGENT_ID ? { "X-Agent-Id": AGENT_ID } : {}),
+        },
+        body: JSON.stringify({
+          ...(AGENT_ID ? { voter_id: AGENT_ID } : {}),
+          decision,
+          ...(typeof reason === "string" ? { reason } : {}),
+        }),
+      });
+      if (r.ok) {
+        const data = await r.json() as any;
+        return { content: [{ type: "text", text: JSON.stringify({ ok: true, transport: "rest", proposal_id: data?.proposal_id ?? proposal_id.trim(), vote_result: data?.vote_result }) }] };
+      }
+      const errText = await r.text();
+      // Only fall back to WS when the server build predates the REST route (404 with HTML/route missing, not Proposal not found JSON).
+      const isProposal404 = r.status === 404 && /proposal not found|channel not found/i.test(errText);
+      if ((r.status !== 404 && r.status !== 405 && r.status !== 501) || isProposal404) {
+        return { content: [{ type: "text", text: `vote failed (${r.status}): ${redactSecrets(errText).slice(0, 180)}` }], isError: true };
+      }
+    } catch {
+      // Fall back to WS below if open.
+    }
+  }
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({
+      type: "vote", proposal_id: proposal_id.trim(), voter_id: AGENT_ID,
+      voter_type: "agent", decision, reason,
+    }));
+    return { content: [{ type: "text", text: `Vote '${decision}' dispatched for proposal ${proposal_id.trim().slice(0, 8)}; server may reject (invalid proposal_id or expired)` }] };
+  }
+  return { content: [{ type: "text", text: "Not connected" }], isError: true };
+});
+
+HANDLERS.set("list_channels", async (args) => {
+  const { query, limit = 50 } = (args || {}) as { query?: string; limit?: number };
+  const clamped = Math.max(1, Math.min(Number(limit) || 50, 500));
+  const qs = new URLSearchParams({ limit: String(clamped) });
+  if (typeof query === "string" && query.trim()) qs.set("q", query.trim());
+  try {
+    const r = await apiFetch(`${REST_URL}/api/channels/discover?${qs.toString()}`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
+    if (r.ok) {
+      const data = await r.json() as any;
+      const channels = (data.channels || []);
+      if (channels.length === 0) return { content: [{ type: "text", text: "No public channels found." }] };
+      const list = channels.map((ch: any) => {
+        const onlineBadge = typeof ch.online_agent_count === "number" && ch.online_agent_count > 0 ? `, 🟢 ${ch.online_agent_count} online` : "";
+        const caps = Array.isArray(ch.capabilities) && ch.capabilities.length > 0 ? ` [${ch.capabilities.slice(0, 6).join(", ")}]` : "";
+        const topic = ch.topic ? ` — ${redactSecrets(redactParticipantPii(String(ch.topic))).slice(0, 60)}` : "";
+        return `• ${ch.name || ch.id} (${ch.id}) — ${ch.member_count || "?"} members${onlineBadge}${caps}${topic}`;
+      }).join("\n");
+      return { content: [{ type: "text", text: `${channels.length} channels:\n${list}` }] };
+    }
+    return { content: [{ type: "text", text: `Failed to list channels (${r.status})` }] };
+  } catch (e) {
+    return { content: [{ type: "text", text: `Error: ${e}` }] };
   }
 });
 
@@ -4944,37 +5180,6 @@ const handleToolCall = async (request: any): Promise<any> => {
     }
   }
 
-  if (name === "vote") {
-    const { proposal_id, decision, reason } = args as any;
-    if (typeof proposal_id !== "string" || typeof decision !== "string") {
-      return { content: [{ type: "text", text: "Error: proposal_id and decision (strings) required" }] };
-    }
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({
-        type: "vote", proposal_id, voter_id: AGENT_ID,
-        voter_type: "agent", decision, reason,
-      }));
-      return { content: [{ type: "text", text: `Vote '${decision}' dispatched for proposal ${proposal_id.slice(0, 8)}; server may reject (invalid proposal_id or expired)` }] };
-    }
-    return { content: [{ type: "text", text: "Not connected" }] };
-  }
-
-  if (name === "propose") {
-    const { chat_id, title, content, code_diff, consensus_rule } = args as any;
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      const proposalId = crypto.randomUUID();
-      ws.send(JSON.stringify({
-        type: "proposal", id: proposalId, channel_id: chat_id,
-        sender_id: AGENT_ID, title, content, code_diff,
-        consensus_rule: consensus_rule || "majority",
-        expires_at: new Date(Date.now() + 86400_000).toISOString(),
-        timestamp: new Date().toISOString(),
-      }));
-      return { content: [{ type: "text", text: `Proposal '${title}' dispatched (client-generated ID ${proposalId.slice(0, 8)}); server may reject — verify via next inbound event` }] };
-    }
-    return { content: [{ type: "text", text: "Not connected" }] };
-  }
-
   async function fetchMcpChannelContext(chatId: string): Promise<{
     channel?: { id?: string; name?: string; type?: string; topic?: string; member_count?: number };
     agents?: Array<{ id: string; name?: string; capabilities?: string[]; online?: boolean; is_self?: boolean }>;
@@ -5777,26 +5982,6 @@ const handleToolCall = async (request: any): Promise<any> => {
       ? `\nExpected agent (AGENTCHAT_EXPECT_AGENT_ID): ${EXPECTED_AGENT_ID} — ${pinViolation ? "MISMATCH, write tools refused" : "ok"}`
       : "";
     return { content: [{ type: "text", text: gateNotice + text + pinLine }] };
-  }
-
-  if (name === "list_channels") {
-    const { limit = 50 } = args as any;
-    try {
-      const r = await apiFetch(`${REST_URL}/api/channels/discover?limit=${Math.max(1, Math.min(Number(limit) || 50, 500))}`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
-      if (r.ok) {
-        const data = await r.json() as any;
-        const channels = (data.channels || []);
-        if (channels.length === 0) return { content: [{ type: "text", text: "No public channels found." }] };
-        // Show the FULL channel id — agents copy it straight into reply /
-        // get_history / join_channel, all of which need the complete UUID.
-        // A truncated 8-char prefix here makes every downstream call 404.
-        const list = channels.map((ch: any) => `• ${ch.name || ch.id} (${ch.id}) — ${ch.member_count || "?"} members${ch.topic ? ` — ${ch.topic.slice(0, 60)}` : ""}`).join("\n");
-        return { content: [{ type: "text", text: `${channels.length} channels:\n${list}` }] };
-      }
-      return { content: [{ type: "text", text: `Failed to list channels (${r.status})` }] };
-    } catch (e) {
-      return { content: [{ type: "text", text: `Error: ${e}` }] };
-    }
   }
 
   if (name === "find_dm") {

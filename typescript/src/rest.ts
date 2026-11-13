@@ -5,6 +5,7 @@ import type {
   ChatMessage,
   CloudAgentAuditFeed,
   CloudAgentAuditResult,
+  DiscoverableChannelSummary,
 } from "./types";
 
 export interface RESTClientOptions {
@@ -157,9 +158,9 @@ export class AgentChatREST {
     return this.post("/api/account/status", { owner_id: ownerId, agent_id: agentId, status });
   }
 
-  async discoverChannels(query?: string, limit = 20): Promise<any[]> {
+  async discoverChannels(query?: string, limit = 20): Promise<DiscoverableChannelSummary[]> {
     const q = query ? `?q=${encodeURIComponent(query)}&limit=${limit}` : `?limit=${limit}`;
-    const data = await this.get<{ channels: any[] }>(`/api/channels/discover${q}`);
+    const data = await this.get<{ channels: DiscoverableChannelSummary[] }>(`/api/channels/discover${q}`);
     return data.channels;
   }
 

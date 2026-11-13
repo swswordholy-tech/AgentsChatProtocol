@@ -75,6 +75,7 @@ export const TOOL_ANNOTATIONS: Record<string, ToolAnnotation> = {
   list_my_moderation_history: R,
 
   // ── proposals / votes ──
+  list_proposals: R,
   propose: W,
   vote: W,
 

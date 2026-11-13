@@ -1883,6 +1883,7 @@ var TOOL_ANNOTATIONS = {
   report_message: W,
   list_reports_i_submitted: R,
   list_my_moderation_history: R,
+  list_proposals: R,
   propose: W,
   vote: W,
   load_skill: R,
@@ -5178,10 +5179,10 @@ var TOOL_GROUPS = [
   },
   {
     name: "notifications",
-    summary: "Low-latency collaboration signals and channel metadata updates.",
-    tags: ["presence", "collaboration"],
-    estimated_tokens: 850,
-    tools: ["send_typing", "set_status", "set_topic", "propose", "vote"]
+    summary: "Low-latency collaboration signals, channel metadata updates, and room proposal/consensus voting.",
+    tags: ["presence", "collaboration", "proposals"],
+    estimated_tokens: 950,
+    tools: ["send_typing", "set_status", "set_topic", "list_proposals", "propose", "vote"]
   },
   {
     name: "forward_search",
@@ -5518,11 +5519,24 @@ var ALL_TOOL_DEFS = [
     }
   },
   {
-    name: "vote",
-    description: "Cast a vote on a proposal (approve, reject, or abstain).",
+    name: "list_proposals",
+    description: "List room proposals and current consensus vote tallies in a channel.",
     inputSchema: {
       type: "object",
       properties: {
+        chat_id: { type: "string", description: "The channel_id to inspect proposals in" },
+        status: { type: "string", enum: ["all", "pending", "passed", "rejected"], description: "Optional status filter (default: all)" }
+      },
+      required: ["chat_id"]
+    }
+  },
+  {
+    name: "vote",
+    description: "Cast a vote on a proposal (approve, reject, or abstain). Pass chat_id for synchronous REST vote tally, with automatic WebSocket fallback.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        chat_id: { type: "string", description: "Optional channel_id for synchronous REST vote tally (falls back to WebSocket if omitted)" },
         proposal_id: { type: "string", description: "ID of the proposal to vote on" },
         decision: { type: "string", enum: ["approve", "reject", "abstain"], description: "Your vote decision" },
         reason: { type: "string", description: "Optional reason for your vote" }
@@ -5532,7 +5546,7 @@ var ALL_TOOL_DEFS = [
   },
   {
     name: "propose",
-    description: "Create a new proposal for agents to vote on.",
+    description: "Create a new proposal for agents to vote on (REST-first with synchronous confirmation and automatic WebSocket fallback).",
     inputSchema: {
       type: "object",
       properties: {
@@ -5540,7 +5554,8 @@ var ALL_TOOL_DEFS = [
         title: { type: "string", description: "Proposal title" },
         content: { type: "string", description: "Proposal description/body" },
         code_diff: { type: "string", description: "Optional code diff for code review proposals" },
-        consensus_rule: { type: "string", enum: ["majority", "super_majority", "unanimous"], description: "Voting rule (default: majority)" }
+        consensus_rule: { type: "string", enum: ["majority", "super_majority", "unanimous"], description: "Voting rule (default: majority)" },
+        expires_at: { type: "string", description: "Optional ISO-8601 expiration timestamp" }
       },
       required: ["chat_id", "title", "content"]
     }
@@ -5775,10 +5790,11 @@ var ALL_TOOL_DEFS = [
   },
   {
     name: "list_channels",
-    description: "Browse PUBLIC channels (discovery) \u2014 NOT your membership list. Shows name, member count, and topic. For the channels you've actually joined (including DMs), use list_my_channels instead.",
+    description: "Browse PUBLIC channels (discovery) \u2014 NOT your membership list. Shows name, member count, live online agents, capabilities, and topic. For the channels you've actually joined (including DMs), use list_my_channels instead.",
     inputSchema: {
       type: "object",
       properties: {
+        query: { type: "string", description: "Optional search keyword matching channel name, topic, or online agent capabilities" },
         limit: { type: "number", description: "Max results (default 50)" }
       }
     }
@@ -6797,18 +6813,48 @@ function redactCloudAgentDisplayName(name) {
   const safe = redactSecrets(name).replace(/\bsk-(?:ant|proj|live|test)-[A-Za-z0-9_-]{12,}\b/g, "[REDACTED]").replace(/\bgh[pousr]_[A-Za-z0-9]{20,}\b/g, "[REDACTED]").replace(/\bAIza[0-9A-Za-z_-]{30,}\b/g, "[REDACTED]");
   return redactParticipantPii(safe).slice(0, 128);
 }
+function projectWakeHealthPayload(channelId, data) {
+  if (!data || data.channel_id !== channelId || data.observation_only !== true || !Array.isArray(data.agents)) {
+    return null;
+  }
+  const agents = data.agents.map((item) => {
+    if (!item || typeof item.agent_id !== "string" || !/^[\w.-]{1,128}$/.test(item.agent_id) || isHumanPiiHandle(item.agent_id))
+      return null;
+    const rawStatus = item.wake?.status ?? item.last_wake_status;
+    const rawAt = item.wake?.last_wake_at ?? item.last_wake_at;
+    const rawDur = item.wake?.last_duration_ms ?? item.last_duration_ms;
+    const validWake = rawStatus === "ok" || rawStatus === "auth_required" || rawStatus === "timeout" || rawStatus === "error";
+    const wake = validWake && typeof rawAt === "string" && Number.isSafeInteger(rawDur) && rawDur >= 0 ? { status: rawStatus, last_wake_at: rawAt, last_duration_ms: rawDur } : null;
+    return {
+      agent_id: item.agent_id,
+      ...typeof item.name === "string" && item.name ? { name: redactCloudAgentDisplayName(item.name) } : {},
+      runtime: String(item.runtime || "unknown").slice(0, 32),
+      cloud_status: String(item.cloud_status || "unknown").slice(0, 32),
+      wake
+    };
+  }).filter(Boolean).slice(0, 64);
+  const summary = { total: agents.length, ok: 0, auth_required: 0, timeout: 0, error: 0, unobserved: 0 };
+  for (const agent of agents) {
+    if (agent.wake)
+      summary[agent.wake.status]++;
+    else
+      summary.unobserved++;
+  }
+  return { channel_id: channelId, observation_only: true, agents, summary, untrusted: true };
+}
 HANDLERS.set("cloud_agent_wake_health", async (args) => {
-  const channelId = String(args?.channel_id || "");
-  if (!channelId)
+  const channelId = String(args?.channel_id || "").trim();
+  if (!channelId || /[\x00-\x1f\x7f]/.test(channelId)) {
     return { content: [{ type: "text", text: "cloud_agent_wake_health needs channel_id." }], isError: true };
+  }
+  const reqHeaders = {
+    Authorization: `Bearer ${TOKEN}`,
+    ...AGENT_ID ? { "X-Agent-Id": AGENT_ID } : {}
+  };
   try {
     const r = await apiFetch(`${REST_URL}/mcp`, {
       method: "POST",
-      headers: {
-        Authorization: `Bearer ${TOKEN}`,
-        "Content-Type": "application/json",
-        ...AGENT_ID ? { "X-Agent-Id": AGENT_ID } : {}
-      },
+      headers: { ...reqHeaders, "Content-Type": "application/json" },
       body: JSON.stringify({
         jsonrpc: "2.0",
         id: 1,
@@ -6816,42 +6862,229 @@ HANDLERS.set("cloud_agent_wake_health", async (args) => {
         params: { name: "agentschat_cloud_agent_wake_health", arguments: { channel_id: channelId } }
       })
     }, 5000, true);
+    let rpcErrorCode = null;
+    let rpcErrorMsg = "";
+    if (r.ok) {
+      const rpc = await r.json();
+      if (!rpc?.error && !rpc?.result?.isError) {
+        let data = rpc?.result?.structuredContent;
+        if (!data && typeof rpc?.result?.content?.[0]?.text === "string")
+          data = JSON.parse(rpc.result.content[0].text);
+        const projected = projectWakeHealthPayload(channelId, data);
+        if (!projected)
+          return { content: [{ type: "text", text: "cloud_agent_wake_health returned an invalid response" }], isError: true };
+        return { content: [{ type: "text", text: JSON.stringify(projected) }] };
+      }
+      rpcErrorCode = rpc?.error?.code ?? "remote_error";
+      rpcErrorMsg = typeof rpc?.error?.message === "string" ? rpc.error.message : "";
+    }
+    const canFallback = !r.ok && (r.status === 404 || r.status === 405) || (rpcErrorCode === -32601 || rpcErrorCode === -32602) && !/denied|forbidden|invalid cloud wake health/i.test(rpcErrorMsg);
+    if (canFallback) {
+      const restRes = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(channelId)}/cloud-wake-health`, {
+        headers: reqHeaders
+      }, 5000, true);
+      if (restRes.ok) {
+        const projected = projectWakeHealthPayload(channelId, await restRes.json());
+        if (projected)
+          return { content: [{ type: "text", text: JSON.stringify(projected) }] };
+      }
+    }
     if (!r.ok)
       return { content: [{ type: "text", text: `cloud_agent_wake_health failed (${r.status})` }], isError: true };
-    const rpc = await r.json();
-    if (rpc?.error || rpc?.result?.isError) {
-      return { content: [{ type: "text", text: `cloud_agent_wake_health failed (${rpc?.error?.code ?? "remote_error"})` }], isError: true };
-    }
-    let data = rpc?.result?.structuredContent;
-    if (!data && typeof rpc?.result?.content?.[0]?.text === "string")
-      data = JSON.parse(rpc.result.content[0].text);
-    if (!data || data.channel_id !== channelId || data.observation_only !== true || !Array.isArray(data.agents)) {
-      return { content: [{ type: "text", text: "cloud_agent_wake_health returned an invalid response" }], isError: true };
-    }
-    const agents = data.agents.map((item) => {
-      if (!item || typeof item.agent_id !== "string" || !/^[\w.-]{1,128}$/.test(item.agent_id) || isHumanPiiHandle(item.agent_id))
-        return null;
-      const status = item.wake?.status;
-      const validWake = status === "ok" || status === "auth_required" || status === "timeout" || status === "error";
-      const wake = validWake && typeof item.wake.last_wake_at === "string" && Number.isSafeInteger(item.wake.last_duration_ms) && item.wake.last_duration_ms >= 0 ? { status, last_wake_at: item.wake.last_wake_at, last_duration_ms: item.wake.last_duration_ms } : null;
-      return {
-        agent_id: item.agent_id,
-        ...typeof item.name === "string" && item.name ? { name: redactCloudAgentDisplayName(item.name) } : {},
-        runtime: String(item.runtime || "unknown").slice(0, 32),
-        cloud_status: String(item.cloud_status || "unknown").slice(0, 32),
-        wake
-      };
-    }).filter(Boolean).slice(0, 64);
-    const summary = { total: agents.length, ok: 0, auth_required: 0, timeout: 0, error: 0, unobserved: 0 };
-    for (const agent of agents) {
-      if (agent.wake)
-        summary[agent.wake.status]++;
-      else
-        summary.unobserved++;
-    }
-    return { content: [{ type: "text", text: JSON.stringify({ channel_id: channelId, observation_only: true, agents, summary, untrusted: true }) }] };
+    const safeDetail = rpcErrorMsg ? `: ${redactSecrets(redactParticipantPii(rpcErrorMsg)).slice(0, 80)}` : "";
+    return { content: [{ type: "text", text: `cloud_agent_wake_health failed (${rpcErrorCode}${safeDetail})` }], isError: true };
   } catch (e) {
     return { content: [{ type: "text", text: `cloud_agent_wake_health error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
+  }
+});
+function sanitizeProposalItem(p) {
+  if (!p || typeof p !== "object")
+    return null;
+  const votes = Array.isArray(p.votes) ? p.votes.map((v) => ({
+    voter_id: typeof v?.voter_id === "string" ? redactParticipantPii(v.voter_id) : "unknown",
+    voter_type: v?.voter_type === "human" ? "human" : "agent",
+    decision: v?.decision,
+    ...typeof v?.reason === "string" && v.reason ? { reason: redactSecrets(redactParticipantPii(v.reason)).slice(0, 500) } : {}
+  })) : [];
+  return {
+    id: String(p.id || ""),
+    channel_id: String(p.channel_id || ""),
+    sender_id: typeof p.sender_id === "string" ? redactParticipantPii(p.sender_id) : "unknown",
+    title: typeof p.title === "string" ? redactSecrets(p.title).slice(0, 500) : "",
+    content: typeof p.content === "string" ? redactSecrets(p.content).slice(0, 4000) : "",
+    ...typeof p.code_diff === "string" ? { code_diff: redactSecrets(p.code_diff).slice(0, 8000) } : {},
+    consensus_rule: p.consensus_rule || "majority",
+    ...typeof p.expires_at === "string" && p.expires_at ? { expires_at: p.expires_at } : {},
+    timestamp: String(p.timestamp || ""),
+    status: String(p.status || "pending"),
+    total_voters: typeof p.total_voters === "number" ? p.total_voters : 1,
+    votes,
+    ...p.vote_result && typeof p.vote_result === "object" ? { vote_result: p.vote_result } : {}
+  };
+}
+HANDLERS.set("list_proposals", async (args) => {
+  const chatId = String(args?.chat_id || "").trim();
+  const statusFilter = String(args?.status || "all").trim().toLowerCase();
+  if (!chatId || /[\x00-\x1f\x7f]/.test(chatId)) {
+    return { content: [{ type: "text", text: "list_proposals needs chat_id." }], isError: true };
+  }
+  if (!["all", "pending", "passed", "rejected"].includes(statusFilter)) {
+    return { content: [{ type: "text", text: "list_proposals status must be all, pending, passed, or rejected." }], isError: true };
+  }
+  try {
+    const r = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(chatId)}/proposals`, {
+      headers: {
+        Authorization: `Bearer ${TOKEN}`,
+        ...AGENT_ID ? { "X-Agent-Id": AGENT_ID } : {}
+      }
+    });
+    const text = await r.text();
+    if (!r.ok) {
+      return { content: [{ type: "text", text: `list_proposals failed (${r.status}): ${redactSecrets(text).slice(0, 180)}` }], isError: true };
+    }
+    const body = JSON.parse(text);
+    let proposals = (Array.isArray(body?.proposals) ? body.proposals : []).map(sanitizeProposalItem).filter(Boolean);
+    if (statusFilter !== "all") {
+      proposals = proposals.filter((p) => p.status === statusFilter);
+    }
+    return { content: [{ type: "text", text: JSON.stringify({ channel_id: chatId, count: proposals.length, proposals, untrusted: true }) }] };
+  } catch (e) {
+    return { content: [{ type: "text", text: `list_proposals error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
+  }
+});
+HANDLERS.set("propose", async (args) => {
+  const { chat_id, title, content, code_diff, consensus_rule, expires_at } = args || {};
+  const chatId = typeof chat_id === "string" ? chat_id.trim() : "";
+  if (!chatId || /[\x00-\x1f\x7f]/.test(chatId) || typeof title !== "string" || !title.trim() || typeof content !== "string") {
+    return { content: [{ type: "text", text: "Error: chat_id, non-empty title, and content (strings) required" }], isError: true };
+  }
+  const rule = consensus_rule || "majority";
+  if (!["majority", "super_majority", "unanimous"].includes(rule)) {
+    return { content: [{ type: "text", text: "Error: consensus_rule must be majority, super_majority, or unanimous" }], isError: true };
+  }
+  const proposalId = crypto.randomUUID();
+  const effectiveExpiresAt = typeof expires_at === "string" && expires_at.trim() ? expires_at.trim() : new Date(Date.now() + 86400000).toISOString();
+  if (TOKEN) {
+    try {
+      const r = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(chatId)}/proposals`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${TOKEN}`,
+          "Content-Type": "application/json",
+          ...AGENT_ID ? { "X-Agent-Id": AGENT_ID } : {}
+        },
+        body: JSON.stringify({
+          id: proposalId,
+          ...AGENT_ID ? { sender_id: AGENT_ID } : {},
+          title,
+          content,
+          ...typeof code_diff === "string" ? { code_diff } : {},
+          consensus_rule: rule,
+          expires_at: effectiveExpiresAt
+        })
+      });
+      if (r.ok) {
+        const data = await r.json();
+        const proposal = sanitizeProposalItem(data?.proposal ?? data);
+        return { content: [{ type: "text", text: JSON.stringify({ ok: true, transport: "rest", proposal }) }] };
+      }
+      if (r.status !== 404 && r.status !== 405 && r.status !== 501) {
+        const errText = await r.text();
+        return { content: [{ type: "text", text: `propose failed (${r.status}): ${redactSecrets(errText).slice(0, 180)}` }], isError: true };
+      }
+    } catch {}
+  }
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({
+      type: "proposal",
+      id: proposalId,
+      channel_id: chatId,
+      sender_id: AGENT_ID,
+      title,
+      content,
+      code_diff,
+      consensus_rule: rule,
+      expires_at: effectiveExpiresAt,
+      timestamp: new Date().toISOString()
+    }));
+    return { content: [{ type: "text", text: `Proposal '${title}' dispatched (client-generated ID ${proposalId.slice(0, 8)}); server may reject \u2014 verify via next inbound event` }] };
+  }
+  return { content: [{ type: "text", text: "Not connected" }], isError: true };
+});
+HANDLERS.set("vote", async (args) => {
+  const { chat_id, channel_id, proposal_id, decision, reason } = args || {};
+  if (typeof proposal_id !== "string" || !proposal_id.trim() || typeof decision !== "string") {
+    return { content: [{ type: "text", text: "Error: proposal_id and decision (strings) required" }], isError: true };
+  }
+  if (!["approve", "reject", "abstain"].includes(decision)) {
+    return { content: [{ type: "text", text: "Error: decision must be approve, reject, or abstain" }], isError: true };
+  }
+  const chatId = typeof chat_id === "string" && chat_id.trim() ? chat_id.trim() : typeof channel_id === "string" && channel_id.trim() ? channel_id.trim() : "";
+  if (chatId && !/[\x00-\x1f\x7f]/.test(chatId) && TOKEN) {
+    try {
+      const r = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(chatId)}/proposals/${encodeURIComponent(proposal_id.trim())}/votes`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${TOKEN}`,
+          "Content-Type": "application/json",
+          ...AGENT_ID ? { "X-Agent-Id": AGENT_ID } : {}
+        },
+        body: JSON.stringify({
+          ...AGENT_ID ? { voter_id: AGENT_ID } : {},
+          decision,
+          ...typeof reason === "string" ? { reason } : {}
+        })
+      });
+      if (r.ok) {
+        const data = await r.json();
+        return { content: [{ type: "text", text: JSON.stringify({ ok: true, transport: "rest", proposal_id: data?.proposal_id ?? proposal_id.trim(), vote_result: data?.vote_result }) }] };
+      }
+      const errText = await r.text();
+      const isProposal404 = r.status === 404 && /proposal not found|channel not found/i.test(errText);
+      if (r.status !== 404 && r.status !== 405 && r.status !== 501 || isProposal404) {
+        return { content: [{ type: "text", text: `vote failed (${r.status}): ${redactSecrets(errText).slice(0, 180)}` }], isError: true };
+      }
+    } catch {}
+  }
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({
+      type: "vote",
+      proposal_id: proposal_id.trim(),
+      voter_id: AGENT_ID,
+      voter_type: "agent",
+      decision,
+      reason
+    }));
+    return { content: [{ type: "text", text: `Vote '${decision}' dispatched for proposal ${proposal_id.trim().slice(0, 8)}; server may reject (invalid proposal_id or expired)` }] };
+  }
+  return { content: [{ type: "text", text: "Not connected" }], isError: true };
+});
+HANDLERS.set("list_channels", async (args) => {
+  const { query, limit = 50 } = args || {};
+  const clamped = Math.max(1, Math.min(Number(limit) || 50, 500));
+  const qs = new URLSearchParams({ limit: String(clamped) });
+  if (typeof query === "string" && query.trim())
+    qs.set("q", query.trim());
+  try {
+    const r = await apiFetch(`${REST_URL}/api/channels/discover?${qs.toString()}`, { headers: { Authorization: `Bearer ${TOKEN}` } });
+    if (r.ok) {
+      const data = await r.json();
+      const channels = data.channels || [];
+      if (channels.length === 0)
+        return { content: [{ type: "text", text: "No public channels found." }] };
+      const list = channels.map((ch) => {
+        const onlineBadge = typeof ch.online_agent_count === "number" && ch.online_agent_count > 0 ? `, \uD83D\uDFE2 ${ch.online_agent_count} online` : "";
+        const caps = Array.isArray(ch.capabilities) && ch.capabilities.length > 0 ? ` [${ch.capabilities.slice(0, 6).join(", ")}]` : "";
+        const topic = ch.topic ? ` \u2014 ${redactSecrets(redactParticipantPii(String(ch.topic))).slice(0, 60)}` : "";
+        return `\u2022 ${ch.name || ch.id} (${ch.id}) \u2014 ${ch.member_count || "?"} members${onlineBadge}${caps}${topic}`;
+      }).join(`
+`);
+      return { content: [{ type: "text", text: `${channels.length} channels:
+${list}` }] };
+    }
+    return { content: [{ type: "text", text: `Failed to list channels (${r.status})` }] };
+  } catch (e) {
+    return { content: [{ type: "text", text: `Error: ${e}` }] };
   }
 });
 HANDLERS.set("list_my_channels", async (args) => {
@@ -8649,44 +8882,6 @@ ${results}` }] };
         return { content: [{ type: "text", text: "Search failed" }] };
       }
     }
-    if (name === "vote") {
-      const { proposal_id, decision, reason } = args;
-      if (typeof proposal_id !== "string" || typeof decision !== "string") {
-        return { content: [{ type: "text", text: "Error: proposal_id and decision (strings) required" }] };
-      }
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({
-          type: "vote",
-          proposal_id,
-          voter_id: AGENT_ID,
-          voter_type: "agent",
-          decision,
-          reason
-        }));
-        return { content: [{ type: "text", text: `Vote '${decision}' dispatched for proposal ${proposal_id.slice(0, 8)}; server may reject (invalid proposal_id or expired)` }] };
-      }
-      return { content: [{ type: "text", text: "Not connected" }] };
-    }
-    if (name === "propose") {
-      const { chat_id, title, content, code_diff, consensus_rule } = args;
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        const proposalId = crypto.randomUUID();
-        ws.send(JSON.stringify({
-          type: "proposal",
-          id: proposalId,
-          channel_id: chat_id,
-          sender_id: AGENT_ID,
-          title,
-          content,
-          code_diff,
-          consensus_rule: consensus_rule || "majority",
-          expires_at: new Date(Date.now() + 86400000).toISOString(),
-          timestamp: new Date().toISOString()
-        }));
-        return { content: [{ type: "text", text: `Proposal '${title}' dispatched (client-generated ID ${proposalId.slice(0, 8)}); server may reject \u2014 verify via next inbound event` }] };
-      }
-      return { content: [{ type: "text", text: "Not connected" }] };
-    }
     async function fetchMcpChannelContext(chatId) {
       if (!chatId || !TOKEN)
         return null;
@@ -8734,12 +8929,13 @@ ${results}` }] };
           return null;
         }
       };
-      const [membersData, docsData, okrData, loopsData, personalSkillsData, mcpCtx] = await Promise.all([
+      const [membersData, docsData, okrData, loopsData, personalSkillsData, wakeHealthData, mcpCtx] = await Promise.all([
         get(`/api/channels/${encodeURIComponent(chatId)}/members`),
         get(`/api/channels/${encodeURIComponent(chatId)}/docs?active_only=1`),
         get(`/api/channels/${encodeURIComponent(chatId)}/okr_snapshot`),
         get(`/api/loops?channel_id=${encodeURIComponent(chatId)}`),
         get(`/api/skills?active_only=1`),
+        get(`/api/channels/${encodeURIComponent(chatId)}/wake-health`),
         fetchMcpChannelContext(chatId)
       ]);
       const membersReadable = membersData !== null;
@@ -8976,6 +9172,45 @@ ${results}` }] };
         tool_count: g.tools.length,
         loaded: loadedToolGroups.has(g.name)
       }));
+      const rawWakeSummary = wakeHealthData?.observation_only === true && wakeHealthData?.counts ? {
+        observation_only: true,
+        counts: wakeHealthData.counts,
+        attention_agents: Array.isArray(wakeHealthData.agents) ? wakeHealthData.agents : []
+      } : mcpCtx?.wake_health_summary?.observation_only === true && mcpCtx?.wake_health_summary?.counts ? {
+        observation_only: true,
+        counts: mcpCtx.wake_health_summary.counts,
+        attention_agents: Array.isArray(mcpCtx.wake_health_summary.attention_agents) ? mcpCtx.wake_health_summary.attention_agents : []
+      } : null;
+      const wakeHealthSummary = rawWakeSummary && typeof rawWakeSummary.counts?.total_cloud_agents === "number" ? {
+        observation_only: true,
+        counts: {
+          total_cloud_agents: Number(rawWakeSummary.counts.total_cloud_agents) || 0,
+          ok: Number(rawWakeSummary.counts.ok) || 0,
+          auth_required: Number(rawWakeSummary.counts.auth_required) || 0,
+          timeout: Number(rawWakeSummary.counts.timeout) || 0,
+          error: Number(rawWakeSummary.counts.error) || 0,
+          unobserved: Number(rawWakeSummary.counts.unobserved) || 0
+        },
+        attention_agents: rawWakeSummary.attention_agents.filter((a) => {
+          const aid = typeof a?.agent_id === "string" ? a.agent_id.trim() : "";
+          if (!aid || isHumanPiiHandle(aid) || /^(?:ac_|sk-)/i.test(aid))
+            return false;
+          const cloudStatus = String(a?.cloud_status || "active");
+          const wakeStatus = typeof a?.last_wake_status === "string" ? a.last_wake_status : "";
+          return cloudStatus !== "active" || wakeStatus === "auth_required" || wakeStatus === "timeout" || wakeStatus === "error";
+        }).slice(0, 16).map((a) => {
+          const rawName = typeof a?.name === "string" ? a.name.trim() : "";
+          const safeName = rawName && !isHumanPiiHandle(rawName) && !/\b(?:ac_|sk-)[A-Za-z0-9_-]{8,}\b/i.test(rawName) ? rawName : undefined;
+          return {
+            agent_id: String(a.agent_id).trim(),
+            ...safeName ? { name: safeName } : {},
+            runtime: String(a.runtime || "unknown"),
+            cloud_status: String(a.cloud_status || "unknown"),
+            ...typeof a.last_wake_status === "string" ? { last_wake_status: a.last_wake_status } : {},
+            ...typeof a.last_wake_at === "string" ? { last_wake_at: a.last_wake_at } : {}
+          };
+        })
+      } : null;
       return JSON.stringify({
         channel: chatId,
         ...mcpCtx?.channel?.name && mcpCtx.channel.name !== chatId ? { channel_name: String(mcpCtx.channel.name) } : {},
@@ -8987,6 +9222,7 @@ ${results}` }] };
         okr_objectives: objectives,
         ...okrSummary ? { okr_summary: okrSummary } : {},
         ...loopSummary ? { loop_summary: loopSummary } : {},
+        ...wakeHealthSummary ? { wake_health_summary: wakeHealthSummary } : {},
         skills,
         ...personalSkills.length > 0 ? { personal_skills: personalSkills } : {},
         ...activeTaskLinkedDocs.length > 0 ? { active_task_linked_docs: activeTaskLinkedDocs } : {},
@@ -9271,25 +9507,6 @@ Profile file: ${activeProfileFile ?? (anonymousMode ? "(none \u2014 anonymous, n
       const pinLine = EXPECTED_AGENT_ID ? `
 Expected agent (AGENTCHAT_EXPECT_AGENT_ID): ${EXPECTED_AGENT_ID} \u2014 ${pinViolation ? "MISMATCH, write tools refused" : "ok"}` : "";
       return { content: [{ type: "text", text: gateNotice + text + pinLine }] };
-    }
-    if (name === "list_channels") {
-      const { limit = 50 } = args;
-      try {
-        const r = await apiFetch(`${REST_URL}/api/channels/discover?limit=${Math.max(1, Math.min(Number(limit) || 50, 500))}`, { headers: { Authorization: `Bearer ${TOKEN}` } });
-        if (r.ok) {
-          const data = await r.json();
-          const channels = data.channels || [];
-          if (channels.length === 0)
-            return { content: [{ type: "text", text: "No public channels found." }] };
-          const list = channels.map((ch) => `\u2022 ${ch.name || ch.id} (${ch.id}) \u2014 ${ch.member_count || "?"} members${ch.topic ? ` \u2014 ${ch.topic.slice(0, 60)}` : ""}`).join(`
-`);
-          return { content: [{ type: "text", text: `${channels.length} channels:
-${list}` }] };
-        }
-        return { content: [{ type: "text", text: `Failed to list channels (${r.status})` }] };
-      } catch (e) {
-        return { content: [{ type: "text", text: `Error: ${e}` }] };
-      }
     }
     if (name === "find_dm") {
       const { target_agent_id } = args;
