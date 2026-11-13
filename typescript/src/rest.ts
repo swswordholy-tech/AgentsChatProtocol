@@ -63,7 +63,7 @@ export class AgentChatREST {
   }
 
   async getAgent(agentId: string): Promise<AgentCard> {
-    return this.get(`/api/agents/${agentId}`);
+    return this.get(`/api/agents/${encodeURIComponent(agentId)}`);
   }
 
   async discover(capabilities: string[] = [], limit = 20): Promise<AgentCard[]> {
@@ -77,7 +77,9 @@ export class AgentChatREST {
   // MARK: - Channels
 
   async getChannels(agentId: string): Promise<StoredChannel[]> {
-    const data = await this.get<{ channels: StoredChannel[] }>(`/api/channels?agent_id=${agentId}`);
+    const data = await this.get<{ channels: StoredChannel[] }>(
+      `/api/channels?agent_id=${encodeURIComponent(agentId)}`,
+    );
     return data.channels;
   }
 
@@ -87,13 +89,19 @@ export class AgentChatREST {
     const params = new URLSearchParams({ limit: String(limit) });
     if (before) params.set("before", before);
     if (after) params.set("after", after);
-    const data = await this.get<{ messages: StoredMessage[] }>(`/api/channels/${channelId}/messages?${params}`);
+    const data = await this.get<{ messages: StoredMessage[] }>(
+      `/api/channels/${encodeURIComponent(channelId)}/messages?${params}`,
+    );
     return data.messages;
   }
 
   /** Send a message via REST (no WebSocket needed) */
   async sendMessage(channelId: string, senderId: string, content: string, senderType = "agent"): Promise<{ ok: boolean; id: string }> {
-    return this.post(`/api/channels/${channelId}/messages`, { sender_id: senderId, content, sender_type: senderType });
+    return this.post(`/api/channels/${encodeURIComponent(channelId)}/messages`, {
+      sender_id: senderId,
+      content,
+      sender_type: senderType,
+    });
   }
 
   // MARK: - Search
@@ -113,12 +121,69 @@ export class AgentChatREST {
 
   // MARK: - Webhooks
 
-  async registerWebhook(channelId: string, url: string): Promise<{ ok: boolean }> {
-    return this.post("/api/webhooks", { channel_id: channelId, url });
+  private assertWebhookTarget(channelId: string, rawUrl: string): { channelId: string; url: string } {
+    const safeChannel = channelId?.trim() ?? "";
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(safeChannel) || /^(?:ac_|sk[-_])/i.test(safeChannel)) {
+      throw new Error("Invalid channel ID");
+    }
+    const trimmedUrl = rawUrl?.trim() ?? "";
+    let parsed: URL;
+    try {
+      parsed = new URL(trimmedUrl);
+    } catch {
+      throw new Error("Invalid webhook URL");
+    }
+    if (!["http:", "https:"].includes(parsed.protocol)) {
+      throw new Error("Webhook URL must use http(s)");
+    }
+    if (parsed.username || parsed.password) {
+      throw new Error("Webhook URL must not contain credentials");
+    }
+    const host = parsed.hostname.replace(/^\[|\]$/g, "").toLowerCase();
+    if (
+      !host ||
+      host === "localhost" ||
+      host.endsWith(".localhost") ||
+      host.endsWith(".local") ||
+      host.endsWith(".internal") ||
+      host === "::1" ||
+      host === "0.0.0.0" ||
+      /^127\./.test(host) ||
+      /^10\./.test(host) ||
+      /^192\.168\./.test(host) ||
+      /^169\.254\./.test(host) ||
+      /^172\.(1[6-9]|2\d|3[01])\./.test(host) ||
+      /^::ffff:(127\.|10\.|192\.168\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.)/.test(host)
+    ) {
+      throw new Error("Webhook host not allowed");
+    }
+    return { channelId: safeChannel, url: trimmedUrl };
   }
 
-  async removeWebhook(channelId: string, url: string): Promise<{ ok: boolean }> {
-    return this.del("/api/webhooks", { channel_id: channelId, url });
+  async registerWebhook(
+    channelId: string,
+    url: string,
+    opts?: { bearerToken?: string },
+  ): Promise<{ ok: boolean }> {
+    const target = this.assertWebhookTarget(channelId, url);
+    return this.post(
+      "/api/webhooks",
+      { channel_id: target.channelId, url: target.url },
+      this.authHeaders(opts?.bearerToken),
+    );
+  }
+
+  async removeWebhook(
+    channelId: string,
+    url: string,
+    opts?: { bearerToken?: string },
+  ): Promise<{ ok: boolean }> {
+    const target = this.assertWebhookTarget(channelId, url);
+    return this.del(
+      "/api/webhooks",
+      { channel_id: target.channelId, url: target.url },
+      this.authHeaders(opts?.bearerToken),
+    );
   }
 
   // MARK: - Agent Registration
@@ -1257,6 +1322,58 @@ export class AgentChatREST {
     );
   }
 
+  // MARK: - Room Threads & OKR Snapshot (/api/channels/:id/threads & /okr_snapshot)
+
+  async getChannelThreads(
+    channelId: string,
+    opts?: { bearerToken?: string },
+  ): Promise<import("./types").ChannelThreadsResponse> {
+    const safeChannel = channelId?.trim() ?? "";
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(safeChannel) || /^(?:ac_|sk[-_])/i.test(safeChannel)) {
+      throw new Error("Invalid channel ID");
+    }
+    const raw = await this.get<{ channel_id?: unknown; threads?: unknown }>(
+      `/api/channels/${encodeURIComponent(safeChannel)}/threads`,
+      this.authHeaders(opts?.bearerToken),
+    );
+    const seen = new Set<string>();
+    const threads: import("./types").ChannelThreadSummaryItem[] = [];
+    if (Array.isArray(raw?.threads)) {
+      for (const item of raw.threads) {
+        if (!item || typeof item !== "object") continue;
+        const rec = item as Record<string, unknown>;
+        const parentId = typeof rec.parent_id === "string" ? rec.parent_id.trim() : "";
+        if (!parentId || /[\x00-\x1f\x7f]/.test(parentId) || seen.has(parentId)) continue;
+        const replyCount =
+          typeof rec.reply_count === "number" && Number.isFinite(rec.reply_count) && rec.reply_count >= 0
+            ? Math.trunc(rec.reply_count)
+            : 0;
+        const lastReplyAt = typeof rec.last_reply_at === "string" ? rec.last_reply_at.trim() : "";
+        seen.add(parentId);
+        threads.push({ parent_id: parentId, reply_count: replyCount, last_reply_at: lastReplyAt });
+      }
+    }
+    return {
+      channel_id: typeof raw?.channel_id === "string" && raw.channel_id.trim() ? raw.channel_id.trim() : safeChannel,
+      threads,
+    };
+  }
+
+  async getChannelOkrSnapshot(
+    channelId: string,
+    opts?: { include_archived?: boolean; bearerToken?: string },
+  ): Promise<import("./types").ChannelOkrSnapshotResponse> {
+    const safeChannel = channelId?.trim() ?? "";
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(safeChannel) || /^(?:ac_|sk[-_])/i.test(safeChannel)) {
+      throw new Error("Invalid channel ID");
+    }
+    const qs = opts?.include_archived ? "?include_archived=true" : "";
+    return this.get<import("./types").ChannelOkrSnapshotResponse>(
+      `/api/channels/${encodeURIComponent(safeChannel)}/okr_snapshot${qs}`,
+      this.authHeaders(opts?.bearerToken),
+    );
+  }
+
   // MARK: - Internal
 
   private async get<T = any>(path: string, headers?: Record<string, string>): Promise<T> {
@@ -1319,10 +1436,19 @@ export class AgentChatREST {
     return res.json();
   }
 
-  private async del<T = any>(path: string, body: Record<string, unknown>): Promise<T> {
+  private async del<T = any>(
+    path: string,
+    body: Record<string, unknown>,
+    headers?: Record<string, string>,
+  ): Promise<T> {
+    const mergedHeaders: Record<string, string> = {
+      "Content-Type": "application/json",
+      ...(this.bearerToken ? { Authorization: `Bearer ${this.bearerToken}` } : {}),
+      ...(headers ?? {}),
+    };
     const res = await fetch(`${this.baseUrl}${path}`, {
       method: "DELETE",
-      headers: { "Content-Type": "application/json" },
+      headers: mergedHeaders,
       body: JSON.stringify(body),
     });
     if (!res.ok) {

@@ -931,4 +931,81 @@ describe("AgentChatClient realtime collaboration WS events", () => {
       globalThis.fetch = originalFetch;
     }
   });
+
+  test("registerWebhook/removeWebhook send Bearer auth + SSRF guards, and getChannelThreads/getChannelOkrSnapshot work end-to-end", async () => {
+    const originalFetch = globalThis.fetch;
+    const calls: Array<{ url: string; method: string; headers: Record<string, string>; body?: any }> = [];
+
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      const method = init?.method ?? "GET";
+      const headers = (init?.headers as Record<string, string>) ?? {};
+      const body = init?.body ? JSON.parse(String(init.body)) : undefined;
+      calls.push({ url, method, headers, body });
+
+      if (url.endsWith("/api/webhooks") && (method === "POST" || method === "DELETE")) {
+        if (!headers.Authorization) {
+          return Response.json({ error: "Authentication required" }, { status: 401 });
+        }
+        return Response.json({ ok: true }, { status: method === "POST" ? 201 : 200 });
+      }
+      if (url.endsWith("/api/channels/room-dev/threads") && method === "GET") {
+        return Response.json({
+          channel_id: "room-dev",
+          threads: [
+            { parent_id: "msg-101", reply_count: 3, last_reply_at: "2026-11-13T17:40:00.000Z" },
+            { parent_id: "msg-101", reply_count: 99, last_reply_at: "2026-11-13T17:41:00.000Z" },
+            { parent_id: "bad\u0000id", reply_count: 1, last_reply_at: "2026-11-13T17:42:00.000Z" },
+          ],
+        });
+      }
+      if (url.endsWith("/api/channels/room-dev/okr_snapshot?include_archived=true") && method === "GET") {
+        return Response.json({
+          channel_id: "room-dev",
+          objectives: [{ id: "obj_1", title: "Ship Sprint 22", owner: "bot_1", horizon: "week", status: "active" }],
+          krs: [],
+          tasks: [],
+          include_archived: true,
+        });
+      }
+      if (url.includes("/api/channels?agent_id=bot%2Fslash")) {
+        return Response.json({ channels: [] });
+      }
+      return Response.json({ ok: true });
+    }) as typeof fetch;
+
+    try {
+      const rest = new AgentChatREST({ baseUrl: "https://agents-chat.com", bearerToken: "wh-jwt-token" });
+
+      const reg = await rest.registerWebhook("room-dev", "https://hooks.example.com/agentchat");
+      expect(reg.ok).toBe(true);
+      expect(calls[0]?.headers.Authorization).toBe("Bearer wh-jwt-token");
+
+      const rem = await rest.removeWebhook("room-dev", "https://hooks.example.com/agentchat");
+      expect(rem.ok).toBe(true);
+      expect(calls[1]?.method).toBe("DELETE");
+      expect(calls[1]?.headers.Authorization).toBe("Bearer wh-jwt-token");
+
+      const threads = await rest.getChannelThreads("room-dev");
+      expect(threads.threads).toEqual([
+        { parent_id: "msg-101", reply_count: 3, last_reply_at: "2026-11-13T17:40:00.000Z" },
+      ]);
+
+      const snap = await rest.getChannelOkrSnapshot("room-dev", { include_archived: true });
+      expect(snap.objectives[0]?.id).toBe("obj_1");
+
+      await rest.getChannels("bot/slash");
+      expect(calls.some((c) => c.url.endsWith("/api/channels?agent_id=bot%2Fslash"))).toBe(true);
+
+      await expect(rest.registerWebhook("room-dev", "http://169.254.169.254/latest/meta-data")).rejects.toThrow(
+        "Webhook host not allowed",
+      );
+      await expect(rest.removeWebhook("room-dev", "https://user:pass@hooks.example.com/x")).rejects.toThrow(
+        "Webhook URL must not contain credentials",
+      );
+      await expect(rest.getChannelThreads("ac_leaked_token")).rejects.toThrow("Invalid channel ID");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
 });

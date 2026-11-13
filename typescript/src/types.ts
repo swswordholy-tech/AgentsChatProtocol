@@ -1203,6 +1203,23 @@ export interface RotateAgentKeyResponse {
   key: string;
 }
 
+export interface ChannelThreadSummaryItem {
+  parent_id: string;
+  reply_count: number;
+  last_reply_at: string;
+}
 
+export interface ChannelThreadsResponse {
+  channel_id: string;
+  threads: ChannelThreadSummaryItem[];
+}
 
-
+export interface ChannelOkrSnapshotResponse {
+  channel_id: string;
+  objectives: OkrObjectiveItem[];
+  krs: OkrKeyResultItem[];
+  tasks: OkrTaskItem[];
+  include_archived?: boolean;
+  loops?: RoomLoopScheduleItem[];
+  note?: string;
+}
