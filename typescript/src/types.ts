@@ -561,9 +561,12 @@ export type OkrUpdatedHandler = (data: OkrUpdatedMessage) => void | Promise<void
 export type TaskAssignedHandler = (data: TaskAssignedMessage) => void | Promise<void>;
 export type ChannelDocUpdatedHandler = (data: ChannelDocUpdatedMessage) => void | Promise<void>;
 
-export interface StreamChannelEventsOptions {
+export interface IterateChannelEventsOptions {
   signal?: AbortSignal;
   bearerToken?: string;
+}
+
+export interface StreamChannelEventsOptions extends IterateChannelEventsOptions {
   onEvent: (event: Record<string, unknown>) => void | Promise<void>;
 }
 

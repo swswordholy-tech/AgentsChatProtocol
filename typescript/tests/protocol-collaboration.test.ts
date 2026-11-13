@@ -2532,4 +2532,111 @@ describe("AgentChatClient realtime collaboration WS events", () => {
       globalThis.fetch = originalFetch;
     }
   });
+
+  test("AgentChatREST iterateChannelEvents yields live SSE frames with immediate mid-read AbortSignal wakeup and no-store supervision detail/join/join-request guards", async () => {
+    const originalFetch = globalThis.fetch;
+    const seen: Array<{ url: string; method: string; headers: Record<string, string> }> = [];
+    let readerCancelled = false;
+
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      const method = (init?.method ?? "GET").toUpperCase();
+      const headers: Record<string, string> = {};
+      if (init?.headers) {
+        new Headers(init.headers).forEach((v, k) => {
+          headers[k.toLowerCase()] = v;
+        });
+      }
+      seen.push({ url, method, headers });
+
+      if (url.endsWith("/api/channels/room-supervised/stream")) {
+        const enc = new TextEncoder();
+        let step = 0;
+        const stream = new ReadableStream<Uint8Array>({
+          pull(controller) {
+            step++;
+            if (step === 1) {
+              controller.enqueue(enc.encode(': keepalive\r\n\r\ndata: {"type":"message","id":"m1"}\r\n\r\ndata: {"type":"thread_'));
+              return;
+            }
+            if (step === 2) {
+              controller.enqueue(enc.encode('reply","id":"r1"}\n\n'));
+              return;
+            }
+            // Step 3 intentionally hangs to prove AbortSignal wakes pending reader.read() immediately
+            return new Promise<void>(() => {});
+          },
+          cancel() {
+            readerCancelled = true;
+          },
+        });
+        return new Response(stream, {
+          status: 200,
+          headers: { "Content-Type": "text/event-stream" },
+        });
+      }
+      if (url.endsWith("/api/channels/room-supervised/detail")) {
+        return Response.json({
+          id: "room-supervised",
+          name: "Supervised War Room",
+          type: "project",
+          visibility: "private",
+          topic: "Live supervision",
+          member_count: 3,
+          read_only: true,
+          created_at: "2026-11-14T00:00:00Z",
+        });
+      }
+      if (url.endsWith("/api/channels/room-supervised/join")) {
+        return Response.json({ ok: true, channel_id: "room-supervised", joined: true });
+      }
+      if (url.endsWith("/api/channels/room-supervised/join-request")) {
+        return Response.json({ ok: true, status: "pending" });
+      }
+      return Response.json({ ok: true });
+    }) as typeof fetch;
+
+    try {
+      const rest = new AgentChatREST({ baseUrl: "https://agents-chat.com", bearerToken: "tok_stream_34" });
+      const ac = new AbortController();
+      const collected: Array<Record<string, unknown>> = [];
+
+      for await (const evt of rest.iterateChannelEvents("room-supervised", { signal: ac.signal })) {
+        collected.push(evt);
+        if (collected.length === 2) {
+          setTimeout(() => ac.abort(), 5);
+        }
+      }
+
+      expect(collected).toEqual([
+        { type: "message", id: "m1" },
+        { type: "thread_reply", id: "r1" },
+      ]);
+      expect(readerCancelled).toBe(true);
+      expect(seen[0]?.headers["cache-control"]).toBe("no-store");
+      expect(seen[0]?.headers.authorization).toBe("Bearer tok_stream_34");
+
+      const detail = await rest.getChannelDetail("room-supervised");
+      expect(detail.read_only).toBe(true);
+      expect(seen[1]?.headers["cache-control"]).toBe("no-store");
+
+      await rest.joinChannel("room-supervised");
+      expect(seen[2]?.headers["cache-control"]).toBe("no-store");
+
+      const reqJoin = await rest.requestChannelJoin("room-supervised", { message: "Owner joining war room" });
+      expect(reqJoin.status).toBe("pending");
+      expect(seen[3]?.headers["cache-control"]).toBe("no-store");
+
+      const beforeSecret = seen.length;
+      await expect(
+        rest.requestChannelJoin("room-supervised", { message: "Key agent_key_secret_987654321" }),
+      ).rejects.toThrow("credentials");
+      await expect(
+        rest.requestChannelJoin("room-supervised", { message: "PAT github_pat_1234567890abcdefghijklm" }),
+      ).rejects.toThrow("credentials");
+      expect(seen.length).toBe(beforeSecret);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
 });

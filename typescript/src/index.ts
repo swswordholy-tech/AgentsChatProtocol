@@ -212,6 +212,7 @@ export type {
   SearchMessagesOptions,
   SendMessageOptions,
   SenderType,
+  IterateChannelEventsOptions,
   StreamChannelEventsOptions,
   ThreadReply,
   ThreadUpdate,

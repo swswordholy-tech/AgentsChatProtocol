@@ -973,28 +973,30 @@ export class AgentChatREST {
 
   // MARK: - Realtime Channel SSE Stream (/api/channels/:id/stream)
 
-  async streamChannelEvents(
+  async *iterateChannelEvents(
     channelId: string,
-    opts: import("./types").StreamChannelEventsOptions,
-  ): Promise<void> {
-    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(channelId) || /^(?:ac_|sk-)/i.test(channelId)) {
+    opts?: import("./types").IterateChannelEventsOptions,
+  ): AsyncGenerator<Record<string, unknown>, void, unknown> {
+    const safeChannel = channelId?.trim() ?? "";
+    if (
+      !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(safeChannel) ||
+      safeChannel.includes("..") ||
+      /^(?:ac_|agent_key_|sk[-_])/i.test(safeChannel)
+    ) {
       throw new Error("Invalid channel ID");
     }
-    if (!opts || typeof opts.onEvent !== "function") {
-      throw new Error("Invalid SSE onEvent callback");
-    }
-    const token = opts.bearerToken?.trim() || this.bearerToken;
+    const token = opts?.bearerToken?.trim() || this.bearerToken;
     const headers: Record<string, string> = {
       Accept: "text/event-stream",
       "Cache-Control": "no-store",
       ...(token ? { Authorization: `Bearer ${token}` } : {}),
     };
     const res = await fetch(
-      `${this.baseUrl}/api/channels/${encodeURIComponent(channelId)}/stream`,
+      `${this.baseUrl}/api/channels/${encodeURIComponent(safeChannel)}/stream`,
       {
         method: "GET",
         headers,
-        ...(opts.signal ? { signal: opts.signal } : {}),
+        ...(opts?.signal ? { signal: opts.signal } : {}),
       },
     );
     if (!res.ok) {
@@ -1005,9 +1007,10 @@ export class AgentChatREST {
 
     const reader = res.body.getReader();
     const decoder = new TextDecoder("utf-8");
+    const maxBufferChars = 262_144;
     let buffer = "";
 
-    const dispatchBlock = async (block: string) => {
+    const parseBlock = (block: string): Record<string, unknown> | null => {
       const dataLines: string[] = [];
       for (const rawLine of block.split(/\r?\n/)) {
         if (!rawLine || rawLine.startsWith(":")) continue;
@@ -1015,24 +1018,43 @@ export class AgentChatREST {
           dataLines.push(rawLine.slice(5).replace(/^ /, ""));
         }
       }
-      if (dataLines.length === 0) return;
+      if (dataLines.length === 0) return null;
       const payload = dataLines.join("\n").trim();
-      if (!payload) return;
-      let parsed: unknown;
+      if (!payload) return null;
       try {
-        parsed = JSON.parse(payload);
+        const parsed = JSON.parse(payload);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          return parsed as Record<string, unknown>;
+        }
       } catch {
-        return;
+        return null;
       }
-      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-        await opts.onEvent(parsed as Record<string, unknown>);
-      }
+      return null;
     };
+
+    let abortWakeup: (() => void) | null = null;
+    const onAbort = () => {
+      abortWakeup?.();
+      void reader.cancel().catch(() => {});
+    };
+    opts?.signal?.addEventListener("abort", onAbort, { once: true });
 
     try {
       while (true) {
-        if (opts.signal?.aborted) break;
-        const { value, done } = await reader.read();
+        if (opts?.signal?.aborted) break;
+        const readResult = await new Promise<{ done: boolean; value?: Uint8Array } | null>((resolve, reject) => {
+          abortWakeup = () => resolve(null);
+          reader.read().then(
+            (r) => resolve(r),
+            (err) => {
+              if (opts?.signal?.aborted) resolve(null);
+              else reject(err);
+            },
+          );
+        });
+        abortWakeup = null;
+        if (!readResult || opts?.signal?.aborted) break;
+        const { value, done } = readResult;
         if (value) {
           buffer += decoder.decode(value, { stream: !done });
         } else if (done) {
@@ -1042,17 +1064,36 @@ export class AgentChatREST {
         while ((sepMatch = /\r?\n\r?\n/.exec(buffer)) !== null) {
           const block = buffer.slice(0, sepMatch.index);
           buffer = buffer.slice(sepMatch.index + sepMatch[0].length);
-          await dispatchBlock(block);
+          const evt = parseBlock(block);
+          if (evt) yield evt;
+          if (opts?.signal?.aborted) break;
+        }
+        if (buffer.length > maxBufferChars) {
+          buffer = "";
         }
         if (done) {
-          if (buffer.trim()) {
-            await dispatchBlock(buffer);
+          if (buffer.trim() && !opts?.signal?.aborted) {
+            const evt = parseBlock(buffer);
+            if (evt) yield evt;
           }
           break;
         }
       }
     } finally {
+      opts?.signal?.removeEventListener("abort", onAbort);
       await reader.cancel().catch(() => {});
+    }
+  }
+
+  async streamChannelEvents(
+    channelId: string,
+    opts: import("./types").StreamChannelEventsOptions,
+  ): Promise<void> {
+    if (!opts || typeof opts.onEvent !== "function") {
+      throw new Error("Invalid SSE onEvent callback");
+    }
+    for await (const evt of this.iterateChannelEvents(channelId, opts)) {
+      await opts.onEvent(evt);
     }
   }
 
@@ -2312,7 +2353,7 @@ export class AgentChatREST {
     return this.post<import("./types").ChannelJoinResponse>(
       `/api/channels/${encodeURIComponent(safeChannel)}/join`,
       body,
-      this.authHeaders(opts?.bearerToken),
+      { "Cache-Control": "no-store", ...this.authHeaders(opts?.bearerToken) },
     );
   }
 
@@ -2335,7 +2376,7 @@ export class AgentChatREST {
     return this.post<import("./types").ChannelLeaveResponse>(
       `/api/channels/${encodeURIComponent(safeChannel)}/leave`,
       body,
-      this.authHeaders(opts?.bearerToken),
+      { "Cache-Control": "no-store", ...this.authHeaders(opts?.bearerToken) },
     );
   }
 
@@ -2349,7 +2390,7 @@ export class AgentChatREST {
     }
     return this.get<import("./types").ChannelDetailResponse>(
       `/api/channels/${encodeURIComponent(safeChannel)}/detail`,
-      this.authHeaders(opts?.bearerToken),
+      { "Cache-Control": "no-store", ...this.authHeaders(opts?.bearerToken) },
     );
   }
 
@@ -2363,7 +2404,7 @@ export class AgentChatREST {
       /[\x00-\x1f\x7f/\\]/.test(trimmed) ||
       trimmed === "." ||
       trimmed === ".." ||
-      /^(?:ac_|sk[-_]|ghp_|eyJ[A-Za-z0-9_-]+\.)/i.test(trimmed)
+      /^(?:ac_|agent_key_|sk[-_]|ghp_|eyJ[A-Za-z0-9_-]+\.)/i.test(trimmed)
     ) {
       throw new Error(`Invalid ${label}`);
     }
@@ -2383,7 +2424,7 @@ export class AgentChatREST {
     return this.post<import("./types").ChannelInviteMutationResponse>(
       `/api/channels/${encodeURIComponent(safeChannel)}/invite`,
       { agent_id: safeTarget },
-      this.authHeaders(opts?.bearerToken),
+      { "Cache-Control": "no-store", ...this.authHeaders(opts?.bearerToken) },
     );
   }
 
@@ -2397,7 +2438,7 @@ export class AgentChatREST {
     }
     return this.get<import("./types").ChannelOutgoingInvitesResponse>(
       `/api/channels/${encodeURIComponent(safeChannel)}/invites`,
-      this.authHeaders(opts?.bearerToken),
+      { "Cache-Control": "no-store", ...this.authHeaders(opts?.bearerToken) },
     );
   }
 
@@ -2406,7 +2447,7 @@ export class AgentChatREST {
   ): Promise<import("./types").AccountIncomingInvitesResponse> {
     return this.get<import("./types").AccountIncomingInvitesResponse>(
       "/api/account/me/invites",
-      this.authHeaders(opts?.bearerToken),
+      { "Cache-Control": "no-store", ...this.authHeaders(opts?.bearerToken) },
     );
   }
 
@@ -2427,7 +2468,7 @@ export class AgentChatREST {
     return this.post<{ ok: boolean }>(
       `/api/channels/${encodeURIComponent(safeChannel)}/invites/${encodeURIComponent(safeTarget)}/${action}`,
       {},
-      this.authHeaders(opts?.bearerToken),
+      { "Cache-Control": "no-store", ...this.authHeaders(opts?.bearerToken) },
     );
   }
 
@@ -2445,7 +2486,10 @@ export class AgentChatREST {
       if (cleaned.length > 500) {
         throw new Error("Join request message exceeds 500 chars");
       }
-      if (/(?:ac_[A-Za-z0-9_-]{12,}|sk-[A-Za-z0-9_-]{12,}|ghp_[A-Za-z0-9]{16,}|eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.)/.test(cleaned)) {
+      if (
+        this.containsMemorySecretShape(cleaned) ||
+        /(?:ac_[A-Za-z0-9_-]{12,}|agent_key_[A-Za-z0-9_-]{8,}|sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9]{16,}|xox[baprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.)/.test(cleaned)
+      ) {
         throw new Error("Join request message must not contain credentials");
       }
       if (cleaned) body.message = cleaned;
@@ -2460,7 +2504,7 @@ export class AgentChatREST {
     return this.post<import("./types").RequestChannelJoinResponse>(
       `/api/channels/${encodeURIComponent(safeChannel)}/join-request`,
       body,
-      this.authHeaders(opts?.bearerToken),
+      { "Cache-Control": "no-store", ...this.authHeaders(opts?.bearerToken) },
     );
   }
 
@@ -2475,7 +2519,7 @@ export class AgentChatREST {
     return this.del<{ ok: boolean }>(
       `/api/channels/${encodeURIComponent(safeChannel)}/join-request`,
       {},
-      this.authHeaders(opts?.bearerToken),
+      { "Cache-Control": "no-store", ...this.authHeaders(opts?.bearerToken) },
     );
   }
 
@@ -2489,7 +2533,7 @@ export class AgentChatREST {
     }
     return this.get<import("./types").ChannelJoinRequestsResponse>(
       `/api/channels/${encodeURIComponent(safeChannel)}/join-requests`,
-      this.authHeaders(opts?.bearerToken),
+      { "Cache-Control": "no-store", ...this.authHeaders(opts?.bearerToken) },
     );
   }
 
@@ -2498,7 +2542,7 @@ export class AgentChatREST {
   ): Promise<import("./types").ManagedChannelJoinRequestsResponse> {
     return this.get<import("./types").ManagedChannelJoinRequestsResponse>(
       "/api/join-requests/mine",
-      this.authHeaders(opts?.bearerToken),
+      { "Cache-Control": "no-store", ...this.authHeaders(opts?.bearerToken) },
     );
   }
 
@@ -2519,7 +2563,7 @@ export class AgentChatREST {
     return this.post<{ ok: boolean }>(
       `/api/channels/${encodeURIComponent(safeChannel)}/join-requests/${encodeURIComponent(safeAccount)}/${action}`,
       {},
-      this.authHeaders(opts?.bearerToken),
+      { "Cache-Control": "no-store", ...this.authHeaders(opts?.bearerToken) },
     );
   }
 
