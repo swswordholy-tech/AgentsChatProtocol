@@ -1260,3 +1260,276 @@ export function validateOkrReparentObjectiveInput(
   }
   return { ok: true, value: { objective_id: objectiveId, body } };
 }
+
+export const CHANNEL_DOC_KINDS = [
+  "topic",
+  "rules",
+  "roles",
+  "context",
+  "deep_dive",
+  "skill",
+  "channel_skill",
+] as const;
+
+export type ChannelDocKindInput = (typeof CHANNEL_DOC_KINDS)[number];
+
+const SAFE_CHANNEL_DOC_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
+
+function normalizeDocLevelValue(level: unknown): 1 | 2 | 3 | 4 | null {
+  if (typeof level === "number" && Number.isInteger(level) && level >= 1 && level <= 4) {
+    return level as 1 | 2 | 3 | 4;
+  }
+  if (typeof level === "string") {
+    const m = level.trim().match(/^(?:L)?([1-4])$/i);
+    if (m) return Number(m[1]) as 1 | 2 | 3 | 4;
+  }
+  return null;
+}
+
+function validateChannelDocRoomId(
+  raw: unknown,
+  toolName: string,
+): { ok: true; value: string } | { ok: false; error: string } {
+  const chatId = typeof raw === "string" ? raw.trim() : "";
+  if (
+    !chatId ||
+    !OKR_DOC_CHANNEL_ID_RE.test(chatId) ||
+    /^dm-/i.test(chatId) ||
+    chatId === "direct" ||
+    chatId.includes("..") ||
+    EVIDENCE_CTRL_RE.test(chatId)
+  ) {
+    return { ok: false, error: `${toolName} requires a valid non-DM room chat_id (1..80 chars).` };
+  }
+  if (EVIDENCE_SECRET_RE.test(chatId)) {
+    return { ok: false, error: `${toolName} chat_id rejected: appears to contain a secret or token.` };
+  }
+  return { ok: true, value: chatId };
+}
+
+export function validateChannelDocIdInput(
+  raw: unknown,
+  toolName = "channel_doc",
+): { ok: true; value: string } | { ok: false; error: string } {
+  const docId = typeof raw === "string" ? raw.trim() : "";
+  if (!docId || !SAFE_CHANNEL_DOC_ID_RE.test(docId) || EVIDENCE_CTRL_RE.test(docId)) {
+    return { ok: false, error: `${toolName} doc_id must match ^[A-Za-z0-9_-]{1,64}$.` };
+  }
+  if (EVIDENCE_SECRET_RE.test(docId)) {
+    return { ok: false, error: `${toolName} doc_id rejected: appears to contain a secret or token.` };
+  }
+  return { ok: true, value: docId };
+}
+
+export interface ValidatedListChannelDocsInput {
+  chat_id: string;
+  level?: 1 | 2 | 3 | 4;
+  active_only?: boolean;
+}
+
+export function validateListChannelDocsInput(
+  args: unknown,
+): { ok: true; value: ValidatedListChannelDocsInput } | { ok: false; error: string } {
+  const a = args && typeof args === "object" && !Array.isArray(args)
+    ? (args as Record<string, unknown>)
+    : {};
+  const roomCheck = validateChannelDocRoomId(a.chat_id, "list_channel_docs");
+  if (!roomCheck.ok) return roomCheck;
+  const out: ValidatedListChannelDocsInput = { chat_id: roomCheck.value };
+  if (a.level !== undefined && a.level !== null) {
+    const lvl = normalizeDocLevelValue(a.level);
+    if (lvl === null) {
+      return { ok: false, error: "list_channel_docs failed: level must be 1|2|3|4" };
+    }
+    out.level = lvl;
+  }
+  if (a.active_only !== undefined && a.active_only !== null) {
+    if (typeof a.active_only !== "boolean") {
+      return { ok: false, error: "list_channel_docs active_only must be a boolean." };
+    }
+    out.active_only = a.active_only;
+  }
+  return { ok: true, value: out };
+}
+
+export interface ValidatedArchiveChannelDocInput {
+  chat_id: string;
+  doc_id: string;
+  expected_version: number;
+}
+
+export function validateArchiveChannelDocInput(
+  args: unknown,
+  toolName = "archive_channel_doc",
+): { ok: true; value: ValidatedArchiveChannelDocInput } | { ok: false; error: string } {
+  const a = args && typeof args === "object" && !Array.isArray(args)
+    ? (args as Record<string, unknown>)
+    : {};
+  const roomCheck = validateChannelDocRoomId(a.chat_id, toolName);
+  if (!roomCheck.ok) return roomCheck;
+  const docCheck = validateChannelDocIdInput(a.doc_id, toolName);
+  if (!docCheck.ok) return docCheck;
+  if (
+    typeof a.expected_version !== "number" ||
+    !Number.isSafeInteger(a.expected_version) ||
+    a.expected_version < 1 ||
+    a.expected_version > 999_999_999
+  ) {
+    return {
+      ok: false,
+      error: `${toolName} requires expected_version as a positive integer (1..999999999) for If-Match CAS.`,
+    };
+  }
+  return {
+    ok: true,
+    value: {
+      chat_id: roomCheck.value,
+      doc_id: docCheck.value,
+      expected_version: a.expected_version,
+    },
+  };
+}
+
+export type ValidatedUpsertChannelDocResult =
+  | {
+      mode: "archive";
+      chat_id: string;
+      doc_id: string;
+      expected_version: number;
+    }
+  | {
+      mode: "upsert";
+      chat_id: string;
+      doc_id: string;
+      expected_version: number;
+      body: {
+        title: string;
+        kind: ChannelDocKindInput;
+        level: 1 | 2 | 3 | 4;
+        body_markdown: string;
+      };
+    };
+
+function channelDocBodyByteCap(level: 1 | 2 | 3 | 4): number {
+  switch (level) {
+    case 1:
+      return 16_384;
+    case 2:
+      return 131_072;
+    case 3:
+      return 524_288;
+    case 4:
+      return 921_600;
+  }
+}
+
+function hasValidSkillFrontmatter(markdown: string): boolean {
+  if (!markdown.startsWith("---\n") && !markdown.startsWith("---\r\n")) return false;
+  const normalized = markdown.replace(/\r\n/g, "\n");
+  const endIdx = normalized.indexOf("\n---", 4);
+  if (endIdx < 0) return false;
+  const header = normalized.slice(4, endIdx);
+  let hasName = false;
+  let hasDesc = false;
+  for (const line of header.split("\n")) {
+    const colon = line.indexOf(":");
+    if (colon <= 0) continue;
+    const key = line.slice(0, colon).trim().toLowerCase();
+    let val = line.slice(colon + 1).trim();
+    if (
+      val.length >= 2 &&
+      ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'")))
+    ) {
+      val = val.slice(1, -1).trim();
+    }
+    if (key === "name" && val.length > 0 && val.length <= 160) hasName = true;
+    if (key === "description" && val.length > 0 && val.length <= 500) hasDesc = true;
+  }
+  return hasName && hasDesc;
+}
+
+export function validateUpsertChannelDocInput(
+  args: unknown,
+): { ok: true; value: ValidatedUpsertChannelDocResult } | { ok: false; error: string } {
+  const a = args && typeof args === "object" && !Array.isArray(args)
+    ? (args as Record<string, unknown>)
+    : {};
+  if (a.archived !== undefined && typeof a.archived !== "boolean") {
+    return { ok: false, error: "upsert_channel_doc archived must be a boolean when provided." };
+  }
+  if (a.archived === true) {
+    const archCheck = validateArchiveChannelDocInput(a, "upsert_channel_doc");
+    if (!archCheck.ok) return archCheck;
+    return { ok: true, value: { mode: "archive", ...archCheck.value } };
+  }
+  const roomCheck = validateChannelDocRoomId(a.chat_id, "upsert_channel_doc");
+  if (!roomCheck.ok) return roomCheck;
+  const docCheck = validateChannelDocIdInput(a.doc_id, "upsert_channel_doc");
+  if (!docCheck.ok) return docCheck;
+  if (
+    typeof a.expected_version !== "number" ||
+    !Number.isSafeInteger(a.expected_version) ||
+    a.expected_version < 0 ||
+    a.expected_version > 999_999_999
+  ) {
+    return {
+      ok: false,
+      error: "upsert_channel_doc expected_version must be an integer in 0..999999999.",
+    };
+  }
+  const title = typeof a.title === "string" ? a.title.trim() : "";
+  if (!title || title.length > 120 || EVIDENCE_CTRL_RE.test(title)) {
+    return { ok: false, error: "upsert_channel_doc requires a non-empty title (<=120 chars)." };
+  }
+  if (EVIDENCE_SECRET_RE.test(title)) {
+    return { ok: false, error: "upsert_channel_doc rejected: title appears to contain a secret or token." };
+  }
+  if (typeof a.kind !== "string" || !(CHANNEL_DOC_KINDS as readonly string[]).includes(a.kind)) {
+    return {
+      ok: false,
+      error: `upsert_channel_doc kind must be one of ${CHANNEL_DOC_KINDS.join(" | ")}.`,
+    };
+  }
+  const kind = a.kind as ChannelDocKindInput;
+  const level = a.level === undefined ? 3 : normalizeDocLevelValue(a.level);
+  if (level === null) {
+    return { ok: false, error: "upsert_channel_doc failed: level must be 1|2|3|4" };
+  }
+  if (typeof a.body_markdown !== "string" || !a.body_markdown.trim()) {
+    return { ok: false, error: "upsert_channel_doc requires a non-empty body_markdown." };
+  }
+  if (EVIDENCE_SECRET_RE.test(a.body_markdown)) {
+    return {
+      ok: false,
+      error: "upsert_channel_doc rejected: body_markdown appears to contain an API key, token, or private key.",
+    };
+  }
+  const cap = channelDocBodyByteCap(level);
+  if (Buffer.byteLength(a.body_markdown, "utf8") > cap) {
+    return {
+      ok: false,
+      error: `upsert_channel_doc body_markdown exceeds L${level} cap (${cap} UTF-8 bytes).`,
+    };
+  }
+  if ((kind === "skill" || kind === "channel_skill") && !hasValidSkillFrontmatter(a.body_markdown)) {
+    return {
+      ok: false,
+      error: "upsert_channel_doc skill/channel_skill requires YAML frontmatter with single-line name and description.",
+    };
+  }
+  return {
+    ok: true,
+    value: {
+      mode: "upsert",
+      chat_id: roomCheck.value,
+      doc_id: docCheck.value,
+      expected_version: a.expected_version,
+      body: {
+        title,
+        kind,
+        level,
+        body_markdown: a.body_markdown,
+      },
+    },
+  };
+}

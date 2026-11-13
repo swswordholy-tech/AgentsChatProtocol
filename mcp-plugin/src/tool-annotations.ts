@@ -120,6 +120,7 @@ export const TOOL_ANNOTATIONS: Record<string, ToolAnnotation> = {
   list_channel_docs: R,
   get_channel_doc: R,
   upsert_channel_doc: W,
+  archive_channel_doc: W,
   list_channel_doc_revisions: R,
 };
 

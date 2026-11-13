@@ -48,13 +48,17 @@ import { computeReconnectDelay } from "./reconnect.ts";
 import { normalizeTimestampForCursor } from "./timestamps.ts";
 import {
   CREATE_LOOP_MODES,
+  CHANNEL_DOC_KINDS,
   TASK_EVIDENCE_KINDS,
   type TaskEvidenceInput,
   mergeLegacyTaskEvidence,
   responseIncludesAppendedEvidence,
   validateAppendTaskEvidenceInput,
+  validateArchiveChannelDocInput,
+  validateChannelDocIdInput,
   validateCreateLoopInput,
   validateDeleteMemoryInput,
+  validateListChannelDocsInput,
   validateListLoopsInput,
   validateOkrAddKrInput,
   validateOkrArchiveObjectiveInput,
@@ -73,6 +77,7 @@ import {
   validateTaskEvidenceInput,
   validateTaskVersionToken,
   validateToolArgs,
+  validateUpsertChannelDocInput,
 } from "./argcheck.ts";
 import { decideIdentity, shouldMigrateDevToken, validateIdentityProfile } from "./identity.ts";
 import { projectProfileSelector } from "./profile-selection.ts";
@@ -1254,13 +1259,14 @@ const TOOL_GROUPS: ToolGroupMeta[] = [
   },
   {
     name: "channel_docs",
-    summary: "Channel documentation: rules, roles, context and deep-dive notes.",
-    tags: ["docs", "context"],
-    estimated_tokens: 900,
+    summary: "Channel documentation & shared room skills: rules, roles, context, deep-dive notes, non-destructive CAS archiving, and revision history.",
+    tags: ["docs", "context", "skills"],
+    estimated_tokens: 1050,
     tools: [
       "list_channel_docs",
       "get_channel_doc",
       "upsert_channel_doc",
+      "archive_channel_doc",
       "list_channel_doc_revisions",
     ],
   },
@@ -2408,12 +2414,13 @@ const ALL_TOOL_DEFS = [
     },
     {
       name: "list_channel_docs",
-      description: "List documentation entries for a channel. Returns lightweight metadata and summaries, not full bodies.",
+      description: "List documentation and shared skill entries for a channel. Pass active_only=true to omit soft-archived tombstones. Returns lightweight metadata and summaries, not full bodies.",
       inputSchema: {
         type: "object" as const,
         properties: {
           chat_id: { type: "string", description: "The channel_id" },
           level: { type: "number", description: "Optional level filter (1-4)" },
+          active_only: { type: "boolean", description: "When true, omit soft-archived tombstones (bodyMarkdown === '')" },
         },
         required: ["chat_id"],
       },
@@ -2432,24 +2439,38 @@ const ALL_TOOL_DEFS = [
     },
     {
       name: "upsert_channel_doc",
-      description: "Create or update a channel doc. Use If-Match style version semantics via expected_version.",
+      description: "Create, update, or revive a channel doc or shared room skill (kind='skill'|'channel_skill' requires YAML frontmatter with name and description), or pass archived=true with positive expected_version to soft-archive non-destructively. Never include secrets.",
       inputSchema: {
         type: "object" as const,
         properties: {
           chat_id: { type: "string", description: "The channel_id" },
-          doc_id: { type: "string", description: "The doc id" },
-          title: { type: "string", description: "Doc title" },
-          kind: { type: "string", enum: ["topic", "rules", "roles", "context", "deep_dive"], description: "Doc semantic kind" },
-          level: { type: "number", enum: [1, 2, 3, 4], description: "Disclosure level" },
-          body_markdown: { type: "string", description: "Markdown body" },
-          expected_version: { type: "number", description: "Use 0 to create, or the current version to update" },
+          doc_id: { type: "string", description: "The doc id (1..64 ASCII letters, digits, _ or -)" },
+          title: { type: "string", description: "Doc title (required unless archived=true)" },
+          kind: { type: "string", enum: [...CHANNEL_DOC_KINDS], description: "Doc semantic kind (required unless archived=true)" },
+          level: { type: "number", enum: [1, 2, 3, 4], description: "Disclosure level (default 3; L1/L2 require moderator)" },
+          body_markdown: { type: "string", description: "Markdown body (required unless archived=true)" },
+          expected_version: { type: "number", description: "Use 0 to create, or the current positive version to update/archive (If-Match CAS)" },
+          archived: { type: "boolean", description: "Optional: pass true with positive expected_version to non-destructively soft-archive while preserving revisions[]" },
         },
-        required: ["chat_id", "doc_id", "title", "kind", "level", "body_markdown", "expected_version"],
+        required: ["chat_id", "doc_id", "expected_version"],
+      },
+    },
+    {
+      name: "archive_channel_doc",
+      description: "Non-destructively soft-archive a channel doc or room skill via DELETE with If-Match CAS (preserving full revisions[] history and freeing the 20-doc / 3-L1 active room quota). L1/L2 require moderator/admin; L3/L4 allow moderator/admin or the last author / owner family.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          chat_id: { type: "string", description: "The channel_id" },
+          doc_id: { type: "string", description: "The doc id (1..64 ASCII letters, digits, _ or -)" },
+          expected_version: { type: "number", minimum: 1, description: "Current positive document version for If-Match optimistic concurrency" },
+        },
+        required: ["chat_id", "doc_id", "expected_version"],
       },
     },
     {
       name: "list_channel_doc_revisions",
-      description: "List revisions for a channel doc to inspect edit history.",
+      description: "List retained historical revisions for a channel doc (including soft-archived tombstones) to inspect or restore prior versions.",
       inputSchema: {
         type: "object" as const,
         properties: {
@@ -5592,13 +5613,14 @@ const handleToolCall = async (request: any): Promise<any> => {
   }
 
   if (name === "list_channel_docs") {
-    const { chat_id, level } = args as { chat_id: string; level?: number | string };
-    const qs = new URLSearchParams();
-    const normalizedLevel = normalizeChannelDocLevel(level);
-    if (level !== undefined && normalizedLevel === null) {
-      return { content: [{ type: "text", text: "list_channel_docs failed: level must be 1|2|3|4" }], isError: true };
+    const check = validateListChannelDocsInput(args);
+    if (!check.ok) {
+      return { content: [{ type: "text", text: check.error }], isError: true };
     }
-    if (normalizedLevel !== null) qs.set("level", String(normalizedLevel));
+    const { chat_id, level: normalizedLevel, active_only } = check.value;
+    const qs = new URLSearchParams();
+    if (normalizedLevel !== undefined) qs.set("level", String(normalizedLevel));
+    if (active_only === true) qs.set("active_only", "1");
     const url = `${REST_URL}/api/channels/${encodeURIComponent(chat_id)}/docs${qs.toString() ? `?${qs}` : ""}`;
     try {
       const r = await apiFetch(url, { headers: { "Authorization": `Bearer ${TOKEN}` } });
@@ -5613,9 +5635,17 @@ const handleToolCall = async (request: any): Promise<any> => {
   }
 
   if (name === "get_channel_doc") {
-    const { chat_id, doc_id } = args as { chat_id: string; doc_id: string };
+    const { chat_id, doc_id } = (args ?? {}) as { chat_id?: unknown; doc_id?: unknown };
+    const listCheck = validateListChannelDocsInput({ chat_id });
+    if (!listCheck.ok) {
+      return { content: [{ type: "text", text: listCheck.error.replace("list_channel_docs", "get_channel_doc") }], isError: true };
+    }
+    const docCheck = validateChannelDocIdInput(doc_id, "get_channel_doc");
+    if (!docCheck.ok) {
+      return { content: [{ type: "text", text: docCheck.error }], isError: true };
+    }
     try {
-      const r = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(chat_id)}/docs/${encodeURIComponent(doc_id)}`, {
+      const r = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(listCheck.value.chat_id)}/docs/${encodeURIComponent(docCheck.value)}`, {
         headers: { "Authorization": `Bearer ${TOKEN}` },
       });
       const text = await r.text();
@@ -5629,32 +5659,47 @@ const handleToolCall = async (request: any): Promise<any> => {
   }
 
   if (name === "upsert_channel_doc") {
-    const { chat_id, doc_id, title, kind, level, body_markdown, expected_version } = args as {
-      chat_id: string;
-      doc_id: string;
-      title: string;
-      kind: string;
-      level: number | string;
-      body_markdown: string;
-      expected_version: number;
-    };
-    const normalizedLevel = normalizeChannelDocLevel(level);
-    if (normalizedLevel === null) {
-      return { content: [{ type: "text", text: "upsert_channel_doc failed: level must be 1|2|3|4" }], isError: true };
+    const check = validateUpsertChannelDocInput(args);
+    if (!check.ok) {
+      return { content: [{ type: "text", text: check.error }], isError: true };
     }
+    const parsed = check.value;
     try {
-      const r = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(chat_id)}/docs/${encodeURIComponent(doc_id)}`, {
-        method: "PUT",
-        headers: {
-          "Content-Type": "application/json",
-          "Authorization": `Bearer ${TOKEN}`,
-          "If-Match": String(expected_version),
-        },
-        body: JSON.stringify({ title, kind, level: normalizedLevel, body_markdown }),
-      });
+      const r = parsed.mode === "archive"
+        ? await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(parsed.chat_id)}/docs/${encodeURIComponent(parsed.doc_id)}`, {
+            method: "DELETE",
+            headers: {
+              "Authorization": `Bearer ${TOKEN}`,
+              "If-Match": String(parsed.expected_version),
+            },
+          })
+        : await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(parsed.chat_id)}/docs/${encodeURIComponent(parsed.doc_id)}`, {
+            method: "PUT",
+            headers: {
+              "Content-Type": "application/json",
+              "Authorization": `Bearer ${TOKEN}`,
+              "If-Match": String(parsed.expected_version),
+            },
+            body: JSON.stringify(parsed.body),
+          });
       const text = await r.text();
       if (!r.ok) {
         return { content: [{ type: "text", text: `upsert_channel_doc failed (${r.status}): ${text.slice(0, 240)}` }], isError: true };
+      }
+      if (parsed.mode === "archive" && !text.trim()) {
+        const etagVer = Number((r.headers.get("etag") ?? "").replace(/"/g, ""));
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              ok: true,
+              archived: true,
+              chat_id: parsed.chat_id,
+              doc_id: parsed.doc_id,
+              ...(Number.isSafeInteger(etagVer) && etagVer >= 1 ? { version: etagVer } : {}),
+            }),
+          }],
+        };
       }
       return { content: [{ type: "text", text }] };
     } catch (e: any) {
@@ -5662,10 +5707,54 @@ const handleToolCall = async (request: any): Promise<any> => {
     }
   }
 
-  if (name === "list_channel_doc_revisions") {
-    const { chat_id, doc_id } = args as { chat_id: string; doc_id: string };
+  if (name === "archive_channel_doc") {
+    const check = validateArchiveChannelDocInput(args);
+    if (!check.ok) {
+      return { content: [{ type: "text", text: check.error }], isError: true };
+    }
+    const { chat_id, doc_id, expected_version } = check.value;
     try {
-      const r = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(chat_id)}/docs/${encodeURIComponent(doc_id)}/revisions`, {
+      const r = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(chat_id)}/docs/${encodeURIComponent(doc_id)}`, {
+        method: "DELETE",
+        headers: {
+          "Authorization": `Bearer ${TOKEN}`,
+          "If-Match": String(expected_version),
+        },
+      });
+      const text = await r.text();
+      if (!r.ok) {
+        return { content: [{ type: "text", text: `archive_channel_doc failed (${r.status}): ${text.slice(0, 240)}` }], isError: true };
+      }
+      const normalized = text.trim()
+        ? text
+        : (() => {
+            const etagVer = Number((r.headers.get("etag") ?? "").replace(/"/g, ""));
+            return JSON.stringify({
+              ok: true,
+              archived: true,
+              chat_id,
+              doc_id,
+              ...(Number.isSafeInteger(etagVer) && etagVer >= 1 ? { version: etagVer } : {}),
+            });
+          })();
+      return { content: [{ type: "text", text: normalized }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `archive_channel_doc network error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
+    }
+  }
+
+  if (name === "list_channel_doc_revisions") {
+    const { chat_id, doc_id } = (args ?? {}) as { chat_id?: unknown; doc_id?: unknown };
+    const listCheck = validateListChannelDocsInput({ chat_id });
+    if (!listCheck.ok) {
+      return { content: [{ type: "text", text: listCheck.error.replace("list_channel_docs", "list_channel_doc_revisions") }], isError: true };
+    }
+    const docCheck = validateChannelDocIdInput(doc_id, "list_channel_doc_revisions");
+    if (!docCheck.ok) {
+      return { content: [{ type: "text", text: docCheck.error }], isError: true };
+    }
+    try {
+      const r = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(listCheck.value.chat_id)}/docs/${encodeURIComponent(docCheck.value)}/revisions`, {
         headers: { "Authorization": `Bearer ${TOKEN}` },
       });
       const text = await r.text();
