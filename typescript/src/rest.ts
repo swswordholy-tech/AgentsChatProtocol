@@ -121,12 +121,31 @@ export class AgentChatREST {
 
   // MARK: - Webhooks
 
+  private isPrivateIpv4Host(ipv4: string): boolean {
+    return (
+      ipv4 === "0.0.0.0" ||
+      /^0\./.test(ipv4) ||
+      /^127\./.test(ipv4) ||
+      /^10\./.test(ipv4) ||
+      /^192\.168\./.test(ipv4) ||
+      /^169\.254\./.test(ipv4) ||
+      /^172\.(1[6-9]|2\d|3[01])\./.test(ipv4) ||
+      /^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(ipv4)
+    );
+  }
+
   private assertWebhookTarget(channelId: string, rawUrl: string): { channelId: string; url: string } {
     const safeChannel = channelId?.trim() ?? "";
     if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(safeChannel) || /^(?:ac_|sk[-_])/i.test(safeChannel)) {
       throw new Error("Invalid channel ID");
     }
     const trimmedUrl = rawUrl?.trim() ?? "";
+    if (!trimmedUrl || trimmedUrl.length > 1024 || /[\u0000-\u001F]/.test(trimmedUrl)) {
+      throw new Error("Invalid webhook URL");
+    }
+    if (this.containsMemorySecretShape(trimmedUrl)) {
+      throw new Error("Webhook URL must not contain secrets");
+    }
     let parsed: URL;
     try {
       parsed = new URL(trimmedUrl);
@@ -140,21 +159,32 @@ export class AgentChatREST {
       throw new Error("Webhook URL must not contain credentials");
     }
     const host = parsed.hostname.replace(/^\[|\]$/g, "").toLowerCase();
-    if (
+    let blockedHost =
       !host ||
       host === "localhost" ||
       host.endsWith(".localhost") ||
       host.endsWith(".local") ||
       host.endsWith(".internal") ||
       host === "::1" ||
-      host === "0.0.0.0" ||
-      /^127\./.test(host) ||
-      /^10\./.test(host) ||
-      /^192\.168\./.test(host) ||
-      /^169\.254\./.test(host) ||
-      /^172\.(1[6-9]|2\d|3[01])\./.test(host) ||
-      /^::ffff:(127\.|10\.|192\.168\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.)/.test(host)
-    ) {
+      host === "::" ||
+      this.isPrivateIpv4Host(host) ||
+      /^f[cd][0-9a-f]{0,2}:/.test(host) ||
+      /^fe[89ab][0-9a-f]:/.test(host);
+    if (!blockedHost && host.startsWith("::ffff:")) {
+      const rest = host.slice(7);
+      if (this.isPrivateIpv4Host(rest)) {
+        blockedHost = true;
+      } else {
+        const hexMatch = rest.match(/^([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+        if (hexMatch) {
+          const hi = parseInt(hexMatch[1]!, 16);
+          const lo = parseInt(hexMatch[2]!, 16);
+          const mappedIpv4 = `${(hi >> 8) & 0xff}.${hi & 0xff}.${(lo >> 8) & 0xff}.${lo & 0xff}`;
+          if (this.isPrivateIpv4Host(mappedIpv4)) blockedHost = true;
+        }
+      }
+    }
+    if (blockedHost) {
       throw new Error("Webhook host not allowed");
     }
     return { channelId: safeChannel, url: trimmedUrl };
@@ -230,12 +260,20 @@ export class AgentChatREST {
   }
 
   async myChannels(
-    agentId?: string,
-    opts?: { bearerToken?: string },
+    agentIdOrQuery?: string | import("./types").MyChannelsQuery,
+    opts?: { include_owned?: boolean; bearerToken?: string },
   ): Promise<import("./types").MyChannelSummaryItem[]> {
-    let qs = "";
-    if (agentId !== undefined) {
-      const trimmed = agentId.trim();
+    const queryObj =
+      agentIdOrQuery !== undefined && typeof agentIdOrQuery === "object" && agentIdOrQuery !== null
+        ? agentIdOrQuery
+        : undefined;
+    const rawAgentId = typeof agentIdOrQuery === "string" ? agentIdOrQuery : queryObj?.agent_id;
+    const includeOwned = queryObj?.include_owned ?? opts?.include_owned;
+    const bearerToken = queryObj?.bearerToken ?? opts?.bearerToken;
+
+    const params = new URLSearchParams();
+    if (rawAgentId !== undefined) {
+      const trimmed = rawAgentId.trim();
       if (
         !trimmed ||
         trimmed.length > 160 ||
@@ -245,13 +283,17 @@ export class AgentChatREST {
       ) {
         throw new Error("Invalid agent ID");
       }
-      qs = `?agent_id=${encodeURIComponent(trimmed)}`;
+      params.set("agent_id", trimmed);
     }
+    if (includeOwned === true) {
+      params.set("include_owned", "1");
+    }
+    const qs = params.size > 0 ? `?${params.toString()}` : "";
     const data = await this.get<{ channels: import("./types").MyChannelSummaryItem[] }>(
       `/api/channels/mine${qs}`,
       {
         "Cache-Control": "no-store",
-        ...(this.authHeaders(opts?.bearerToken) ?? {}),
+        ...(this.authHeaders(bearerToken) ?? {}),
       },
     );
     return data.channels;
@@ -1794,6 +1836,126 @@ export class AgentChatREST {
     return this.get<import("./types").ChannelMembersResponse>(
       `/api/channels/${encodeURIComponent(safeChannel)}/members${suffix}`,
       this.authHeaders(opts?.bearerToken),
+    );
+  }
+
+  async getChannelCollaborationRoster(
+    channelId: string,
+    opts?: { limit?: number; bearerToken?: string },
+  ): Promise<import("./types").ChannelCollaborationRosterResponse> {
+    const safeChannel = typeof channelId === "string" ? channelId.trim() : "";
+    if (
+      !safeChannel ||
+      !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(safeChannel) ||
+      safeChannel.includes("..") ||
+      /^(?:ac_|agent_key_|sk[-_]|gh[pousr]_|github_pat_|AIza|eyJ)/i.test(safeChannel)
+    ) {
+      throw new Error("Invalid channel ID");
+    }
+    const qs = new URLSearchParams({ view: "collaboration" });
+    if (opts?.limit !== undefined) {
+      if (!Number.isFinite(opts.limit) || opts.limit < 1) {
+        throw new Error("Invalid roster limit");
+      }
+      qs.set("limit", String(Math.min(1000, Math.max(1, Math.trunc(opts.limit)))));
+    }
+    return this.get<import("./types").ChannelCollaborationRosterResponse>(
+      `/api/channels/${encodeURIComponent(safeChannel)}/members?${qs.toString()}`,
+      {
+        "Cache-Control": "no-store",
+        ...(this.authHeaders(opts?.bearerToken) ?? {}),
+      },
+    );
+  }
+
+  async createStoryArtifact(
+    input: import("./types").CreateStoryArtifactInput,
+    opts?: { bearerToken?: string },
+  ): Promise<import("./types").CreateStoryArtifactResponse> {
+    const safeChannel = typeof input?.channel_id === "string" ? input.channel_id.trim() : "";
+    if (
+      !safeChannel ||
+      !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(safeChannel) ||
+      safeChannel.includes("..") ||
+      /^(?:ac_|agent_key_|sk[-_]|gh[pousr]_|github_pat_|AIza|eyJ)/i.test(safeChannel)
+    ) {
+      throw new Error("Invalid channel ID");
+    }
+    if (/^(?:dm-|direct(?:$|[-_:]))/i.test(safeChannel)) {
+      throw new Error("Story artifacts cannot be generated from direct message channels");
+    }
+    const validStoryTypes = ["debug_war_room", "agent_debate", "build_log", "brainstorm"];
+    if (!validStoryTypes.includes(input?.story_type)) {
+      throw new Error("Invalid story_type");
+    }
+    if (!Array.isArray(input?.message_ids)) {
+      throw new Error("message_ids must be an array of 3 to 8 message IDs");
+    }
+    const seenIds = new Set<string>();
+    const cleanMessageIds: string[] = [];
+    for (const rawId of input.message_ids) {
+      const id = typeof rawId === "string" ? rawId.trim() : "";
+      if (
+        !id ||
+        id.length > 128 ||
+        /[\u0000-\u001F\s/\\?#&]/.test(id) ||
+        id.includes("..") ||
+        this.containsMemorySecretShape(id)
+      ) {
+        throw new Error("Invalid message ID in message_ids");
+      }
+      if (!seenIds.has(id)) {
+        seenIds.add(id);
+        cleanMessageIds.push(id);
+      }
+    }
+    if (cleanMessageIds.length < 3 || cleanMessageIds.length > 8) {
+      throw new Error("message_ids must contain between 3 and 8 unique message IDs");
+    }
+    const body: Record<string, unknown> = {
+      channel_id: safeChannel,
+      message_ids: cleanMessageIds,
+      story_type: input.story_type,
+    };
+    for (const field of ["title", "summary", "outcome"] as const) {
+      const val = input[field];
+      if (val !== undefined) {
+        if (typeof val !== "string" || val.length > 500) {
+          throw new Error(`Invalid story ${field}`);
+        }
+        if (this.containsMemorySecretShape(val)) {
+          throw new Error(`Story ${field} must not contain secrets`);
+        }
+        const trimmed = val.trim();
+        if (trimmed) body[field] = trimmed;
+      }
+    }
+    if (input.qr_target !== undefined) {
+      const qr = typeof input.qr_target === "string" ? input.qr_target.trim() : "";
+      if (!qr || qr.length > 512 || /[\u0000-\u001F]/.test(qr)) {
+        throw new Error("Invalid story qr_target");
+      }
+      if (this.containsMemorySecretShape(qr)) {
+        throw new Error("Story qr_target must not contain secrets");
+      }
+      let parsedQr: URL;
+      try {
+        parsedQr = new URL(qr);
+      } catch {
+        throw new Error("Invalid story qr_target");
+      }
+      if (parsedQr.protocol !== "https:") {
+        throw new Error("Story qr_target must use https://");
+      }
+      body.qr_target = qr;
+    }
+    return this.post<import("./types").CreateStoryArtifactResponse>(
+      "/api/stories/artifact",
+      body,
+      {
+        "Cache-Control": "no-store",
+        ...(this.authHeaders(opts?.bearerToken) ?? {}),
+      },
     );
   }
 

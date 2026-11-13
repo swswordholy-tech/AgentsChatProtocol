@@ -2132,4 +2132,148 @@ describe("AgentChatClient realtime collaboration WS events", () => {
       globalThis.fetch = originalFetch;
     }
   });
+
+  test("REST myChannels(include_owned), getChannelCollaborationRoster, createStoryArtifact, and hardened webhook SSRF/secret guards work end-to-end", async () => {
+    const seen: Array<{ url: string; method: string; headers: Record<string, string>; body?: any }> = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      const method = init?.method ?? "GET";
+      const headers: Record<string, string> = {};
+      if (init?.headers) {
+        for (const [k, v] of Object.entries(init.headers as Record<string, string>)) {
+          headers[k.toLowerCase()] = v;
+        }
+      }
+      const body = typeof init?.body === "string" ? JSON.parse(init.body) : undefined;
+      seen.push({ url, method, headers, body });
+
+      if (url.endsWith("/api/channels/mine?include_owned=1") && method === "GET") {
+        return Response.json({
+          channels: [
+            {
+              id: "room-priv-31",
+              name: "Private Bot Sprint",
+              type: "group",
+              visibility: "private",
+              delegated_via_agent_id: "codex-cloud-01",
+              delegated_read_only: true,
+            },
+          ],
+        });
+      }
+      if (url.endsWith("/api/channels/room-priv-31/members?view=collaboration&limit=25") && method === "GET") {
+        return Response.json({
+          members: [
+            {
+              agent_id: "codex-cloud-01",
+              member_ref: "mr_" + "a".repeat(64),
+              type: "agent",
+              display_name: "Codex Cloud",
+              role: "member",
+              online: true,
+              capabilities: ["typescript", "security-audit"],
+              is_self: false,
+              can_mention: true,
+              can_kick: true,
+              can_set_coordinator: true,
+              ownership_scope: "owned",
+              cloud_health: {
+                runtime_type: "codex",
+                status: "active",
+                auth_mode: "subscription",
+                subscription_pending: false,
+                last_wake_status: "ok",
+                last_duration_ms: 4200,
+                last_wake_at: "2026-11-13T20:45:00Z",
+              },
+            },
+          ],
+          viewer: { role: "admin", is_member: true, can_kick: true, can_set_coordinator: true },
+          coordinator_ref: "mr_" + "a".repeat(64),
+          source: "collaboration",
+        });
+      }
+      if (url.endsWith("/api/stories/artifact") && method === "POST") {
+        return Response.json({
+          artifact_id: "story_abc12345",
+          cover_png_url: null,
+          full_story_png_url: null,
+          story_json: {
+            id: "story_abc12345",
+            channel: { id: body.channel_id, name: "AgentChatDev" },
+            source_message_ids: body.message_ids,
+            story_type: body.story_type,
+            title: body.title,
+            summary: body.summary,
+            outcome: body.outcome,
+            cast: [{ id: "codex-cloud-01", name: "Codex", role: "Auditor" }],
+            turns: [],
+            created_by_agent_id: "spinning-midnight-tunicate",
+            created_by_account_id: "human:a1b2c3d4",
+            created_at: "2026-11-13T20:48:00Z",
+            qr_target: body.qr_target ?? "https://agents-chat.com/lobby?blueprint=cross-review",
+            watermark: "Powered by AgentsChat · agents-chat.com/lobby?blueprint=cross-review",
+          },
+          blueprint_id: "cross-review",
+          blueprint_url: "https://agents-chat.com/lobby?blueprint=cross-review",
+          suggested_captions: { x: "Shipped!", threads: "Shipped!", wechat: "Shipped!", tiktok_hook: "Shipped!" },
+          caption_blocked: { x: false, threads: false, wechat: false, tiktok_hook: false },
+          rendering_status: "pending",
+        });
+      }
+      return Response.json({ ok: true });
+    }) as typeof fetch;
+
+    try {
+      const rest = new AgentChatREST({ baseUrl: "https://agents-chat.com", bearerToken: "owner-jwt-31" });
+
+      const ownedChs = await rest.myChannels({ include_owned: true });
+      expect(ownedChs[0]?.delegated_via_agent_id).toBe("codex-cloud-01");
+      expect(ownedChs[0]?.delegated_read_only).toBe(true);
+      expect(seen[0]?.headers["cache-control"]).toBe("no-store");
+
+      const roster = await rest.getChannelCollaborationRoster("room-priv-31", { limit: 25 });
+      expect(roster.source).toBe("collaboration");
+      expect(roster.members[0]?.cloud_health?.last_wake_status).toBe("ok");
+      expect(seen[1]?.headers["cache-control"]).toBe("no-store");
+
+      const story = await rest.createStoryArtifact({
+        channel_id: "room-dev",
+        message_ids: ["msg-1", "msg-2", "msg-1", "msg-3"],
+        story_type: "debug_war_room",
+        title: "Zero-leak cross-pod convergence",
+        summary: "Four agents fixed cross-pod SSE revocation in 6 minutes.",
+        outcome: "All 191 tests green.",
+        qr_target: "https://agents-chat.com/lobby?blueprint=cross-review",
+      });
+      expect(story.artifact_id).toBe("story_abc12345");
+      expect(seen[2]?.body.message_ids).toEqual(["msg-1", "msg-2", "msg-3"]);
+
+      // Validation & SSRF/secret guards
+      await expect(
+        rest.createStoryArtifact({ channel_id: "dm-secret", message_ids: ["m1", "m2", "m3"], story_type: "build_log" }),
+      ).rejects.toThrow("direct message");
+      await expect(
+        rest.createStoryArtifact({ channel_id: "room-dev", message_ids: ["m1", "m2"], story_type: "build_log" }),
+      ).rejects.toThrow("between 3 and 8");
+      await expect(
+        rest.createStoryArtifact({
+          channel_id: "room-dev",
+          message_ids: ["m1", "m2", "m3"],
+          story_type: "build_log",
+          title: "Leak ac_live_secret_token_123456",
+        }),
+      ).rejects.toThrow("secrets");
+      await expect(rest.registerWebhook("room-dev", "http://[fd00::1]:8080/hook")).rejects.toThrow("Webhook host not allowed");
+      await expect(rest.registerWebhook("room-dev", "http://[fe80::1]/hook")).rejects.toThrow("Webhook host not allowed");
+      await expect(rest.registerWebhook("room-dev", "http://100.64.0.5/hook")).rejects.toThrow("Webhook host not allowed");
+      await expect(rest.registerWebhook("room-dev", "http://[::ffff:127.0.0.1]/hook")).rejects.toThrow("Webhook host not allowed");
+      await expect(
+        rest.registerWebhook("room-dev", "https://hooks.example.com/cb?token=ac_live_secret_123456"),
+      ).rejects.toThrow("secrets");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
 });

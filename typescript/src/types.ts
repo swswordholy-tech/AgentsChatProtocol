@@ -1441,7 +1441,8 @@ export interface ChannelDetailResponse {
   member_count: number;
   members?: string[];
   roles?: Record<string, string>;
-  created_by: string;
+  created_by?: string | null;
+  read_only?: boolean;
   created_at: string;
 }
 
@@ -1741,7 +1742,7 @@ export interface MyChannelSummaryItem {
   id: string;
   name?: string;
   type?: ChannelType;
-  visibility?: "public" | "private" | (string & {});
+  visibility?: "public" | "private" | "invite-only" | (string & {});
   member_count?: number;
   topic?: string;
   role?: ChannelRole | (string & {});
@@ -1749,7 +1750,124 @@ export interface MyChannelSummaryItem {
   peer_id?: string;
   peer_name?: string;
   peer_avatar_url?: string | null;
+  delegated_via_agent_id?: string;
+  delegated_read_only?: boolean;
   [key: string]: unknown;
+}
+
+export interface MyChannelsQuery {
+  agent_id?: string;
+  include_owned?: boolean;
+  bearerToken?: string;
+}
+
+export type CollaborationOwnershipScope = "owned" | "unclaimed" | "external";
+
+export interface CollaborationOwnedCloudHealth {
+  runtime_type: string;
+  status: "active" | "provisioning" | "expired" | "disabled" | (string & {});
+  auth_mode: "managed" | "byok" | "subscription" | (string & {});
+  subscription_pending: boolean;
+  last_wake_status: CloudCliWakeStatus | null;
+  last_duration_ms: number | null;
+  last_wake_at: string | null;
+}
+
+export interface ChannelCollaborationMemberItem {
+  agent_id: string;
+  member_ref: string;
+  type: "agent" | "user" | "unknown";
+  display_name: string;
+  role: ChannelRole;
+  online: boolean;
+  capabilities: string[];
+  is_self: boolean;
+  can_mention: boolean;
+  can_kick: boolean;
+  can_set_coordinator: boolean;
+  ownership_scope?: CollaborationOwnershipScope;
+  cloud_health?: CollaborationOwnedCloudHealth;
+}
+
+export interface ChannelCollaborationViewerPermissions {
+  role: ChannelRole;
+  is_member: boolean;
+  can_kick: boolean;
+  can_set_coordinator: boolean;
+}
+
+export interface ChannelCollaborationRosterResponse {
+  members: ChannelCollaborationMemberItem[];
+  viewer: ChannelCollaborationViewerPermissions;
+  coordinator_ref: string | null;
+  source: "collaboration";
+}
+
+export type StoryArtifactType = "debug_war_room" | "agent_debate" | "build_log" | "brainstorm";
+
+export interface StoryCastMember {
+  id: string;
+  name: string;
+  role: string;
+  avatar_url?: string;
+}
+
+export interface StoryTurnItem {
+  message_id: string;
+  order: number;
+  speaker_id: string;
+  speaker_name: string;
+  speaker_avatar_url?: string;
+  content: string;
+  created_at: string;
+  kind: "message";
+}
+
+export interface StorySuggestedCaptions {
+  x: string;
+  threads: string;
+  wechat: string;
+  tiktok_hook: string;
+}
+
+export interface StoryArtifactBundle {
+  id: string;
+  channel: { id: string; name?: string };
+  source_message_ids: string[];
+  story_type: StoryArtifactType;
+  title: string;
+  summary: string;
+  outcome?: string;
+  cast: StoryCastMember[];
+  turns: StoryTurnItem[];
+  created_by_agent_id: string;
+  created_by_account_id: string;
+  created_at: string;
+  qr_target: string;
+  watermark: string;
+}
+
+export interface CreateStoryArtifactInput {
+  channel_id: string;
+  message_ids: string[];
+  story_type: StoryArtifactType;
+  title?: string;
+  summary?: string;
+  outcome?: string;
+  qr_target?: string;
+}
+
+export interface CreateStoryArtifactResponse {
+  artifact_id: string;
+  cover_png_url: string | null;
+  full_story_png_url: string | null;
+  story_json: StoryArtifactBundle;
+  blueprint_id: string;
+  blueprint_url: string;
+  suggested_captions: StorySuggestedCaptions;
+  caption_blocked: Record<"x" | "threads" | "wechat" | "tiktok_hook", boolean>;
+  rendering_status: "pending" | "ready" | (string & {});
+  rendering_note?: string;
 }
 
 export interface CloudAgentScheduledLoopItem {
