@@ -1056,6 +1056,35 @@ function validateListLoopsInput(args) {
   return { ok: true, value: out };
 }
 var SAFE_MEMORY_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/;
+function validateLoadMemoryInput(args) {
+  const a = args && typeof args === "object" && !Array.isArray(args) ? args : {};
+  const out = {};
+  if (a.name !== undefined && a.name !== null) {
+    if (typeof a.name !== "string") {
+      return { ok: false, error: "load_memory name must be a string." };
+    }
+    const trimmed = a.name.trim();
+    if (trimmed) {
+      if (!SAFE_MEMORY_NAME_RE.test(trimmed) || trimmed.includes("..") || EVIDENCE_CTRL_RE.test(trimmed) || EVIDENCE_SECRET_RE.test(trimmed)) {
+        return {
+          ok: false,
+          error: "load_memory name must be 1..64 alphanumeric/._- chars starting with alphanumeric."
+        };
+      }
+      out.name = trimmed;
+    }
+  }
+  if (a.include_revisions !== undefined && a.include_revisions !== null) {
+    if (typeof a.include_revisions !== "boolean") {
+      return { ok: false, error: "load_memory include_revisions must be a boolean." };
+    }
+    if (a.include_revisions && !out.name) {
+      return { ok: false, error: "load_memory include_revisions requires a specific memory name." };
+    }
+    out.include_revisions = a.include_revisions;
+  }
+  return { ok: true, value: out };
+}
 function validateDeleteMemoryInput(args) {
   const a = args && typeof args === "object" && !Array.isArray(args) ? args : {};
   const name = typeof a.name === "string" ? a.name.trim() : "";
@@ -5658,11 +5687,12 @@ var ALL_TOOL_DEFS = [
   },
   {
     name: "load_memory",
-    description: "Restore YOUR persisted memory (keyed by your agent_id; same key \u2192 same memory across restarts). Call ONCE at the start of a fresh session. NO args \u2192 your memory INDEX (each doc's name + one-line description, no bodies) \u2014 scan it, then load what you need. With name \u2192 that doc's full body. IDEMPOTENT: if you've ALREADY loaded your memory this session (it's in your context), do NOT call again \u2014 re-loading only duplicates context. After a compaction that dropped it, call again to restore.",
+    description: "Restore YOUR persisted memory (keyed by your agent_id; same key \u2192 same memory across restarts). Call ONCE at the start of a fresh session. NO args \u2192 your memory INDEX (each doc's name + one-line description, no bodies) \u2014 scan it, then load what you need. With name \u2192 that doc's full body (pass include_revisions=true to also inspect prior revision snapshots for CAS rollback). IDEMPOTENT: if you've ALREADY loaded your memory this session (it's in your context), do NOT call again \u2014 re-loading only duplicates context. After a compaction that dropped it, call again to restore.",
     inputSchema: {
       type: "object",
       properties: {
-        name: { type: "string", description: "A specific memory doc to load in full (omit to get the lean index of all your memory docs)" }
+        name: { type: "string", description: "A specific memory doc to load in full (omit to get the lean index of all your memory docs)" },
+        include_revisions: { type: "boolean", description: "When loading a specific memory doc by name, also fetch prior revision snapshots from /api/memory/:name/revisions for inspection or CAS restore via save_memory(..., if_match_version)." }
       }
     }
   },
@@ -8030,7 +8060,11 @@ Loaded as global skill "${id}".` }] };
       }
     }
     if (name === "load_memory") {
-      const a = args || {};
+      const validated = validateLoadMemoryInput(args);
+      if (!validated.ok) {
+        return { content: [{ type: "text", text: validated.error }], isError: true };
+      }
+      const a = validated.value;
       try {
         const path = a.name ? `/api/memory/${encodeURIComponent(a.name)}` : `/api/memory`;
         const r = await apiFetch(`${REST_URL}${path}`, { headers: { Authorization: `Bearer ${TOKEN}` } });
@@ -8039,9 +8073,28 @@ Loaded as global skill "${id}".` }] };
           return { content: [{ type: "text", text: `load_memory failed (${r.status}): ${text.slice(0, 240)}` }], isError: true };
         const resp = JSON.parse(text);
         if (a.name) {
+          let revisionsBlock = "";
+          if (a.include_revisions) {
+            const revR = await apiFetch(`${REST_URL}/api/memory/${encodeURIComponent(a.name)}/revisions`, {
+              headers: { Authorization: `Bearer ${TOKEN}` }
+            });
+            if (revR.ok) {
+              const revJson = JSON.parse(await revR.text());
+              const revs = Array.isArray(revJson) ? revJson : revJson?.revisions ?? [];
+              const truncBadge = revJson?.revisions_truncated ? " (truncated)" : "";
+              revisionsBlock = `
+
+Revisions${truncBadge} (restore via save_memory(name="${resp.name}", body=..., if_match_version=${resp.version})):
+${JSON.stringify(revs, null, 2)}`;
+            } else {
+              revisionsBlock = `
+
+Revisions: fetch failed (${revR.status})`;
+            }
+          }
           return { content: [{ type: "text", text: `# memory: ${resp.name} (v${resp.version})
 
-${resp.body_markdown || ""}` }] };
+${resp.body_markdown || ""}${revisionsBlock}` }] };
         }
         const items = Array.isArray(resp.memories) ? resp.memories : [];
         if (items.length === 0)

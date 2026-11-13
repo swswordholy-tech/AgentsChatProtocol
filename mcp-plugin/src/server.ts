@@ -60,6 +60,7 @@ import {
   validateDeleteMemoryInput,
   validateListChannelDocsInput,
   validateListLoopsInput,
+  validateLoadMemoryInput,
   validateOkrAddKrInput,
   validateOkrArchiveObjectiveInput,
   validateOkrLinkedChannelDocsInput,
@@ -1766,11 +1767,12 @@ const ALL_TOOL_DEFS = [
     },
     {
       name: "load_memory",
-      description: "Restore YOUR persisted memory (keyed by your agent_id; same key → same memory across restarts). Call ONCE at the start of a fresh session. NO args → your memory INDEX (each doc's name + one-line description, no bodies) — scan it, then load what you need. With name → that doc's full body. IDEMPOTENT: if you've ALREADY loaded your memory this session (it's in your context), do NOT call again — re-loading only duplicates context. After a compaction that dropped it, call again to restore.",
+      description: "Restore YOUR persisted memory (keyed by your agent_id; same key → same memory across restarts). Call ONCE at the start of a fresh session. NO args → your memory INDEX (each doc's name + one-line description, no bodies) — scan it, then load what you need. With name → that doc's full body (pass include_revisions=true to also inspect prior revision snapshots for CAS rollback). IDEMPOTENT: if you've ALREADY loaded your memory this session (it's in your context), do NOT call again — re-loading only duplicates context. After a compaction that dropped it, call again to restore.",
       inputSchema: {
         type: "object" as const,
         properties: {
           name: { type: "string", description: "A specific memory doc to load in full (omit to get the lean index of all your memory docs)" },
+          include_revisions: { type: "boolean", description: "When loading a specific memory doc by name, also fetch prior revision snapshots from /api/memory/:name/revisions for inspection or CAS restore via save_memory(..., if_match_version)." },
         },
       },
     },
@@ -4357,7 +4359,11 @@ const handleToolCall = async (request: any): Promise<any> => {
   }
 
   if (name === "load_memory") {
-    const a = (args || {}) as { name?: string };
+    const validated = validateLoadMemoryInput(args);
+    if (!validated.ok) {
+      return { content: [{ type: "text", text: validated.error }], isError: true };
+    }
+    const a = validated.value;
     try {
       const path = a.name ? `/api/memory/${encodeURIComponent(a.name)}` : `/api/memory`;
       const r = await apiFetch(`${REST_URL}${path}`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
@@ -4365,7 +4371,21 @@ const handleToolCall = async (request: any): Promise<any> => {
       if (!r.ok) return { content: [{ type: "text", text: `load_memory failed (${r.status}): ${text.slice(0, 240)}` }], isError: true };
       const resp = JSON.parse(text);
       if (a.name) {
-        return { content: [{ type: "text", text: `# memory: ${resp.name} (v${resp.version})\n\n${resp.body_markdown || ""}` }] };
+        let revisionsBlock = "";
+        if (a.include_revisions) {
+          const revR = await apiFetch(`${REST_URL}/api/memory/${encodeURIComponent(a.name)}/revisions`, {
+            headers: { "Authorization": `Bearer ${TOKEN}` },
+          });
+          if (revR.ok) {
+            const revJson = JSON.parse(await revR.text());
+            const revs = Array.isArray(revJson) ? revJson : (revJson?.revisions ?? []);
+            const truncBadge = revJson?.revisions_truncated ? " (truncated)" : "";
+            revisionsBlock = `\n\nRevisions${truncBadge} (restore via save_memory(name="${resp.name}", body=..., if_match_version=${resp.version})):\n${JSON.stringify(revs, null, 2)}`;
+          } else {
+            revisionsBlock = `\n\nRevisions: fetch failed (${revR.status})`;
+          }
+        }
+        return { content: [{ type: "text", text: `# memory: ${resp.name} (v${resp.version})\n\n${resp.body_markdown || ""}${revisionsBlock}` }] };
       }
       const items = Array.isArray(resp.memories) ? resp.memories : [];
       if (items.length === 0) return { content: [{ type: "text", text: "No stored memory yet. Use save_memory to persist your context (e.g. an 'index' doc + finer docs)." }] };

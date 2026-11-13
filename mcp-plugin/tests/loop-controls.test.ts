@@ -25,7 +25,15 @@ let malformedLoopsVerification = false;
 let omitCreatedLoopOnVerify = false;
 let forceDeduplicatedCreate = false;
 let extraLoops: any[] = [];
-const memoryStore = new Map<string, { version: number; body_markdown: string; description?: string }>();
+const memoryStore = new Map<
+  string,
+  {
+    version: number;
+    body_markdown: string;
+    description?: string;
+    revisions: Array<{ version: number; description: string; bytes: number; body_markdown: string; updated_at: string }>;
+  }
+>();
 
 beforeEach(() => {
   currentLoop = { ...runningLoop };
@@ -124,7 +132,32 @@ beforeAll(() => {
         return Response.json({ ok: true, stopped: "loop-1" });
       }
       if (url.pathname.startsWith("/api/memory/")) {
+        const memRevMatch = url.pathname.match(/^\/api\/memory\/([^/]+)\/revisions$/);
+        if (memRevMatch && req.method === "GET") {
+          const slug = decodeURIComponent(memRevMatch[1]);
+          const existing = memoryStore.get(slug);
+          if (!existing) return Response.json({ error: "not_found" }, { status: 404 });
+          return Response.json(
+            { name: slug, revisions: existing.revisions },
+            { headers: { ETag: `"${existing.version}"` } },
+          );
+        }
         const memName = decodeURIComponent(url.pathname.slice("/api/memory/".length));
+        if (req.method === "GET") {
+          const existing = memoryStore.get(memName);
+          if (!existing) return Response.json({ error: "not_found" }, { status: 404 });
+          return Response.json(
+            {
+              name: memName,
+              version: existing.version,
+              description: existing.description ?? "",
+              bytes: existing.body_markdown.length,
+              updated_at: "2026-11-13T11:30:00Z",
+              body_markdown: existing.body_markdown,
+            },
+            { headers: { ETag: `"${existing.version}"` } },
+          );
+        }
         if (req.method === "PUT") {
           const body = await req.json() as any;
           const existing = memoryStore.get(memName);
@@ -138,7 +171,24 @@ beforeAll(() => {
             }
           }
           const nextVer = (existing?.version ?? 0) + 1;
-          memoryStore.set(memName, { version: nextVer, body_markdown: body.body_markdown, description: body.description });
+          const revisions = existing
+            ? [
+                ...existing.revisions,
+                {
+                  version: existing.version,
+                  description: existing.description ?? "",
+                  bytes: existing.body_markdown.length,
+                  body_markdown: existing.body_markdown,
+                  updated_at: "2026-11-13T11:25:00Z",
+                },
+              ]
+            : [];
+          memoryStore.set(memName, {
+            version: nextVer,
+            body_markdown: body.body_markdown,
+            description: body.description,
+            revisions,
+          });
           return Response.json({
             ok: true,
             name: memName,
@@ -569,5 +619,29 @@ describe("MCP loop controls", () => {
 
     const idempotentJson = JSON.parse(res.get(11)?.result?.content?.[0]?.text || "null");
     expect(idempotentJson).toEqual({ ok: true, name: "sprint-note", deleted: false });
+  });
+
+  test("load_memory supports include_revisions for checkpoint history inspection and CAS rollback", async () => {
+    const { res } = await drive([
+      INIT,
+      INITED,
+      callTool(2, "load_memory", { include_revisions: true }),
+      callTool(3, "save_memory", { name: "index", body: "# Index v1\n- key fact", description: "v1 index", if_match_version: 0 }),
+      callTool(4, "save_memory", { name: "index", body: "# Index v2\n- updated fact", description: "v2 index", if_match_version: 1 }),
+      callTool(5, "load_memory", { name: "index", include_revisions: true }),
+    ]);
+
+    expect(res.get(2)?.result?.isError).toBe(true);
+    expect(res.get(2)?.result?.content?.[0]?.text || "").toContain("include_revisions requires a specific memory name");
+
+    expect(res.get(3)?.result?.isError).toBeUndefined();
+    expect(res.get(4)?.result?.isError).toBeUndefined();
+
+    expect(res.get(5)?.result?.isError).toBeUndefined();
+    const loaded = res.get(5)?.result?.content?.[0]?.text || "";
+    expect(loaded).toContain("# memory: index (v2)");
+    expect(loaded).toContain("# Index v2");
+    expect(loaded).toContain('restore via save_memory(name="index", body=..., if_match_version=2)');
+    expect(loaded).toContain("# Index v1");
   });
 });

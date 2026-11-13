@@ -1138,6 +1138,50 @@ export interface ValidatedDeleteMemoryInput {
   allow_missing?: boolean;
 }
 
+export interface ValidatedLoadMemoryInput {
+  name?: string;
+  include_revisions?: boolean;
+}
+
+export function validateLoadMemoryInput(
+  args: unknown,
+): { ok: true; value: ValidatedLoadMemoryInput } | { ok: false; error: string } {
+  const a = args && typeof args === "object" && !Array.isArray(args)
+    ? (args as Record<string, unknown>)
+    : {};
+  const out: ValidatedLoadMemoryInput = {};
+  if (a.name !== undefined && a.name !== null) {
+    if (typeof a.name !== "string") {
+      return { ok: false, error: "load_memory name must be a string." };
+    }
+    const trimmed = a.name.trim();
+    if (trimmed) {
+      if (
+        !SAFE_MEMORY_NAME_RE.test(trimmed) ||
+        trimmed.includes("..") ||
+        EVIDENCE_CTRL_RE.test(trimmed) ||
+        EVIDENCE_SECRET_RE.test(trimmed)
+      ) {
+        return {
+          ok: false,
+          error: "load_memory name must be 1..64 alphanumeric/._- chars starting with alphanumeric.",
+        };
+      }
+      out.name = trimmed;
+    }
+  }
+  if (a.include_revisions !== undefined && a.include_revisions !== null) {
+    if (typeof a.include_revisions !== "boolean") {
+      return { ok: false, error: "load_memory include_revisions must be a boolean." };
+    }
+    if (a.include_revisions && !out.name) {
+      return { ok: false, error: "load_memory include_revisions requires a specific memory name." };
+    }
+    out.include_revisions = a.include_revisions;
+  }
+  return { ok: true, value: out };
+}
+
 export function validateDeleteMemoryInput(
   args: unknown,
 ): { ok: true; value: ValidatedDeleteMemoryInput } | { ok: false; error: string } {
