@@ -312,6 +312,106 @@ export class AgentChatREST {
     );
   }
 
+  // MARK: - Room Consensus Proposals (/api/channels/:id/proposals)
+
+  async listChannelProposals(
+    channelId: string,
+    opts?: { limit?: number; bearerToken?: string },
+  ): Promise<import("./types").ChannelProposalsFeed> {
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(channelId) || /^(?:ac_|sk-)/i.test(channelId)) {
+      throw new Error("Invalid channel ID");
+    }
+    const params = new URLSearchParams();
+    if (opts?.limit !== undefined) {
+      if (!Number.isFinite(opts.limit)) throw new Error("Invalid proposals limit");
+      params.set("limit", String(Math.max(1, Math.min(100, Math.trunc(opts.limit)))));
+    }
+    const qs = params.toString();
+    const token = opts?.bearerToken?.trim() || this.bearerToken;
+    const headers: Record<string, string> = {
+      Accept: "application/json",
+      "Cache-Control": "no-store",
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    };
+    return this.get<import("./types").ChannelProposalsFeed>(
+      `/api/channels/${encodeURIComponent(channelId)}/proposals${qs ? `?${qs}` : ""}`,
+      headers,
+    );
+  }
+
+  async createChannelProposal(
+    channelId: string,
+    input: import("./types").CreateChannelProposalInput,
+    opts?: { bearerToken?: string },
+  ): Promise<import("./types").CreateChannelProposalResponse> {
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(channelId) || /^(?:ac_|sk-)/i.test(channelId)) {
+      throw new Error("Invalid channel ID");
+    }
+    const title = input?.title?.trim() ?? "";
+    if (!title || title.length > 500) {
+      throw new Error("Invalid proposal title");
+    }
+    if (input.consensus_rule && !["majority", "super_majority", "unanimous"].includes(input.consensus_rule)) {
+      throw new Error("Invalid consensus rule");
+    }
+    if (input.expires_at !== undefined && input.expires_at !== "" && Number.isNaN(Date.parse(input.expires_at))) {
+      throw new Error("Invalid proposal expires_at timestamp");
+    }
+    const token = opts?.bearerToken?.trim() || this.bearerToken;
+    const headers: Record<string, string> = {
+      Accept: "application/json",
+      "Cache-Control": "no-store",
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    };
+    const body: Record<string, unknown> = {
+      title,
+      ...(input.id !== undefined ? { id: input.id } : {}),
+      ...(input.sender_id !== undefined ? { sender_id: input.sender_id } : {}),
+      ...(input.content !== undefined ? { content: input.content } : {}),
+      ...(input.code_diff !== undefined ? { code_diff: input.code_diff } : {}),
+      ...(input.consensus_rule !== undefined ? { consensus_rule: input.consensus_rule } : {}),
+      ...(input.expires_at !== undefined ? { expires_at: input.expires_at } : {}),
+    };
+    return this.post<import("./types").CreateChannelProposalResponse>(
+      `/api/channels/${encodeURIComponent(channelId)}/proposals`,
+      body,
+      headers,
+    );
+  }
+
+  async voteChannelProposal(
+    channelId: string,
+    proposalId: string,
+    input: import("./types").VoteChannelProposalInput,
+    opts?: { bearerToken?: string },
+  ): Promise<import("./types").VoteChannelProposalResponse> {
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(channelId) || /^(?:ac_|sk-)/i.test(channelId)) {
+      throw new Error("Invalid channel ID");
+    }
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(proposalId) || /^(?:ac_|sk-)/i.test(proposalId)) {
+      throw new Error("Invalid proposal ID");
+    }
+    if (!input || !["approve", "reject", "abstain"].includes(input.decision)) {
+      throw new Error("Invalid vote decision");
+    }
+    const token = opts?.bearerToken?.trim() || this.bearerToken;
+    const headers: Record<string, string> = {
+      Accept: "application/json",
+      "Cache-Control": "no-store",
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    };
+    const body: Record<string, unknown> = {
+      decision: input.decision,
+      ...(input.voter_id !== undefined ? { voter_id: input.voter_id } : {}),
+      ...(input.reason !== undefined ? { reason: input.reason } : {}),
+    };
+    return this.post<import("./types").VoteChannelProposalResponse>(
+      `/api/channels/${encodeURIComponent(channelId)}/proposals/${encodeURIComponent(proposalId)}/votes`,
+      body,
+      headers,
+    );
+  }
+
   // MARK: - Internal
 
   private async get<T = any>(path: string, headers?: Record<string, string>): Promise<T> {
@@ -330,10 +430,19 @@ export class AgentChatREST {
     return res.json();
   }
 
-  private async post<T = any>(path: string, body: Record<string, unknown>): Promise<T> {
+  private async post<T = any>(
+    path: string,
+    body: Record<string, unknown>,
+    headers?: Record<string, string>,
+  ): Promise<T> {
+    const mergedHeaders: Record<string, string> = {
+      "Content-Type": "application/json",
+      ...(this.bearerToken ? { Authorization: `Bearer ${this.bearerToken}` } : {}),
+      ...(headers ?? {}),
+    };
     const res = await fetch(`${this.baseUrl}${path}`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: mergedHeaders,
       body: JSON.stringify(body),
     });
     if (!res.ok) {

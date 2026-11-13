@@ -156,7 +156,7 @@ export interface ProposalMessage {
   content: string;
   code_diff?: string;
   consensus_rule: ConsensusRule;
-  expires_at: string;
+  expires_at?: string;
   timestamp: string;
 }
 
@@ -533,6 +533,8 @@ export type ACMessage =
 
 // Handler types
 export type MessageHandler = (msg: ChatMessage) => void | Promise<void>;
+export type ProposalHandler = (proposal: ProposalMessage) => void | Promise<void>;
+export type VoteHandler = (vote: VoteMessage) => void | Promise<void>;
 export type VoteResultHandler = (result: VoteResult) => void | Promise<void>;
 export type PresenceHandler = (presence: AgentPresence) => void | Promise<void>;
 export type ErrorHandler = (code: number, message: string) => void;
@@ -777,5 +779,76 @@ export interface WorkspaceGraph {
   since?: string;
   referenced_unchanged_ids?: string[];
 }
+
+// MARK: - Room Consensus Proposals (/api/channels/:id/proposals)
+
+export type ChannelProposalStatus = "pending" | "passed" | "rejected" | "expired";
+
+export interface ChannelProposalVoteItem {
+  voter_id: string;
+  voter_type?: SenderType;
+  decision: VoteDecision;
+  reason?: string;
+  created_at?: string;
+}
+
+export interface ChannelProposalVoteSummary {
+  passed: boolean;
+  is_complete?: boolean;
+  approve_count: number;
+  reject_count: number;
+  abstain_count: number;
+  total_voters: number;
+}
+
+export interface ChannelProposalItem {
+  id: string;
+  channel_id: string;
+  sender_id: string;
+  title: string;
+  content: string;
+  code_diff?: string;
+  consensus_rule: ConsensusRule;
+  expires_at?: string;
+  timestamp: string;
+  status: ChannelProposalStatus;
+  total_voters: number;
+  votes: ChannelProposalVoteItem[];
+  vote_result: ChannelProposalVoteSummary;
+}
+
+export interface ChannelProposalsFeed {
+  channel_id: string;
+  proposals: ChannelProposalItem[];
+}
+
+export interface CreateChannelProposalInput {
+  id?: string;
+  sender_id?: string;
+  title: string;
+  content?: string;
+  code_diff?: string;
+  consensus_rule?: ConsensusRule;
+  expires_at?: string;
+}
+
+export interface CreateChannelProposalResponse {
+  ok?: boolean;
+  proposal: ChannelProposalItem;
+}
+
+export interface VoteChannelProposalInput {
+  voter_id?: string;
+  decision: VoteDecision;
+  reason?: string;
+}
+
+export interface VoteChannelProposalResponse {
+  ok?: boolean;
+  proposal_id: string;
+  status?: ChannelProposalStatus;
+  vote_result: ChannelProposalVoteSummary;
+}
+
 
 

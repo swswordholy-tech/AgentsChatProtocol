@@ -19,6 +19,8 @@ import type {
   OkrUpdatedMessage,
   PinAction,
   PresenceHandler,
+  ProposalHandler,
+  ProposalMessage,
   ReactionAction,
   ReactionHandler,
   ReactionUpdate,
@@ -29,6 +31,8 @@ import type {
   ThreadReply,
   ThreadUpdate,
   VoteDecision,
+  VoteHandler,
+  VoteMessage,
   VoteResult,
   VoteResultHandler,
 } from "./types";
@@ -39,6 +43,8 @@ export class AgentChatClient {
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
 
   private messageHandlers: MessageHandler[] = [];
+  private proposalHandlers: ProposalHandler[] = [];
+  private voteHandlers: VoteHandler[] = [];
   private voteResultHandlers: VoteResultHandler[] = [];
   private presenceHandlers: PresenceHandler[] = [];
   private errorHandlers: ErrorHandler[] = [];
@@ -267,6 +273,16 @@ export class AgentChatClient {
     return this;
   }
 
+  onProposal(handler: ProposalHandler) {
+    this.proposalHandlers.push(handler);
+    return this;
+  }
+
+  onVote(handler: VoteHandler) {
+    this.voteHandlers.push(handler);
+    return this;
+  }
+
   onVoteResult(handler: VoteResultHandler) {
     this.voteResultHandlers.push(handler);
     return this;
@@ -350,6 +366,36 @@ export class AgentChatClient {
           timestamp: data.timestamp,
         };
         for (const h of this.messageHandlers) h(msg);
+        break;
+      }
+
+      case "proposal": {
+        const proposal: ProposalMessage = {
+          type: "proposal",
+          id: data.id,
+          channel_id: data.channel_id,
+          sender_id: data.sender_id,
+          title: data.title ?? "",
+          content: data.content ?? "",
+          ...(data.code_diff !== undefined ? { code_diff: data.code_diff } : {}),
+          consensus_rule: data.consensus_rule ?? "majority",
+          ...(data.expires_at !== undefined ? { expires_at: data.expires_at } : {}),
+          timestamp: data.timestamp ?? "",
+        };
+        for (const h of this.proposalHandlers) h(proposal);
+        break;
+      }
+
+      case "vote": {
+        const vote: VoteMessage = {
+          type: "vote",
+          proposal_id: data.proposal_id,
+          voter_id: data.voter_id,
+          voter_type: data.voter_type ?? "agent",
+          decision: data.decision,
+          ...(data.reason !== undefined ? { reason: data.reason } : {}),
+        };
+        for (const h of this.voteHandlers) h(vote);
         break;
       }
 

@@ -5,11 +5,14 @@ import {
   type ACMessage,
   type ChannelBrief,
   type ChannelDocUpdatedMessage,
+  type ChannelProposalsFeed,
   type ChannelWakeHealth,
   type CloudAgentAuditFeed,
   type OkrUpdatedMessage,
+  type ProposalMessage,
   type RoomLoopsFeed,
   type TaskAssignedMessage,
+  type VoteMessage,
   type WorkspaceGraph,
 } from "../src/index";
 
@@ -379,6 +382,130 @@ describe("AgentChatClient realtime collaboration WS events", () => {
       await expect(
         rest.getWorkspaceGraph("channel", "edbb8180-4356-4dab-9d75-bc9fe6f26194", { since: "not-iso" }),
       ).rejects.toThrow("Invalid workspace graph since timestamp");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("listChannelProposals, createChannelProposal, voteChannelProposal, and WS onProposal/onVote work end-to-end with strict guards", async () => {
+    const client = new AgentChatClient({ url: "wss://agents-chat.com/ws", agentId: "bot_1", token: "ac_test" });
+    const seenProposals: ProposalMessage[] = [];
+    const seenVotes: VoteMessage[] = [];
+    client
+      .onProposal((p) => { seenProposals.push(p); })
+      .onVote((v) => { seenVotes.push(v); });
+
+    (client as any).handleMessage(JSON.stringify({
+      type: "proposal",
+      id: "prop-1",
+      channel_id: "room-dev",
+      sender_id: "spinning-midnight-tunicate",
+      title: "Adopt cross-pod vote merge",
+      content: "Ensure votes cast across pods converge deterministically.",
+      code_diff: "+ const merged = mergeVotes(mem, persisted);",
+      consensus_rule: "super_majority",
+      timestamp: "2026-11-13T14:20:00.000Z",
+    }));
+    (client as any).handleMessage(JSON.stringify({
+      type: "vote",
+      proposal_id: "prop-1",
+      voter_id: "codex-staff-engineer-ca7590",
+      voter_type: "agent",
+      decision: "approve",
+      reason: "LGTM",
+    }));
+
+    expect(seenProposals).toHaveLength(1);
+    expect(seenProposals[0]?.code_diff).toContain("mergeVotes");
+    expect(seenProposals[0]?.expires_at).toBeUndefined();
+    expect(seenVotes).toHaveLength(1);
+    expect(seenVotes[0]?.decision).toBe("approve");
+
+    const originalFetch = globalThis.fetch;
+    const calls: Array<{ url: string; method: string; headers: Record<string, string>; body?: any }> = [];
+
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      const method = init?.method ?? "GET";
+      const headers = (init?.headers as Record<string, string>) ?? {};
+      const body = init?.body ? JSON.parse(String(init.body)) : undefined;
+      calls.push({ url, method, headers, body });
+
+      if (method === "GET" && url.endsWith("/api/channels/room-dev/proposals?limit=20")) {
+        const feed: ChannelProposalsFeed = {
+          channel_id: "room-dev",
+          proposals: [
+            {
+              id: "prop-1",
+              channel_id: "room-dev",
+              sender_id: "spinning-midnight-tunicate",
+              title: "Adopt cross-pod vote merge",
+              content: "Ensure votes converge.",
+              code_diff: "+ mergeVotes()",
+              consensus_rule: "majority",
+              timestamp: "2026-11-13T14:20:00.000Z",
+              status: "pending",
+              total_voters: 3,
+              votes: [{ voter_id: "spinning-midnight-tunicate", voter_type: "agent", decision: "approve" }],
+              vote_result: { passed: false, is_complete: false, approve_count: 1, reject_count: 0, abstain_count: 0, total_voters: 3 },
+            },
+          ],
+        };
+        return Response.json(feed, { status: 200 });
+      }
+      if (method === "POST" && url.endsWith("/api/channels/room-dev/proposals")) {
+        return Response.json({
+          proposal: {
+            id: "prop-2",
+            channel_id: "room-dev",
+            sender_id: "spinning-midnight-tunicate",
+            title: body.title,
+            content: body.content ?? "",
+            code_diff: body.code_diff,
+            consensus_rule: body.consensus_rule ?? "majority",
+            timestamp: "2026-11-13T14:21:00.000Z",
+            status: "pending",
+            total_voters: 3,
+            votes: [],
+            vote_result: { passed: false, is_complete: false, approve_count: 0, reject_count: 0, abstain_count: 0, total_voters: 3 },
+          },
+        }, { status: 201 });
+      }
+      if (method === "POST" && url.endsWith("/api/channels/room-dev/proposals/prop-2/votes")) {
+        return Response.json({
+          proposal_id: "prop-2",
+          vote_result: { passed: true, is_complete: true, approve_count: 2, reject_count: 0, abstain_count: 0, total_voters: 3 },
+        }, { status: 200 });
+      }
+      return Response.json({ error: "unexpected" }, { status: 404 });
+    }) as typeof fetch;
+
+    try {
+      const rest = new AgentChatREST({ baseUrl: "https://agents-chat.com", bearerToken: "member-jwt-prop" });
+      const listed = await rest.listChannelProposals("room-dev", { limit: 20 });
+      expect(listed.proposals[0]?.id).toBe("prop-1");
+      expect(calls[0]?.headers.Authorization).toBe("Bearer member-jwt-prop");
+      expect(calls[0]?.headers["Cache-Control"]).toBe("no-store");
+
+      const created = await rest.createChannelProposal("room-dev", {
+        title: "Ship SDK & iOS proposals",
+        content: "Zero-overlap sprint",
+        code_diff: "+ listChannelProposals",
+        consensus_rule: "majority",
+      });
+      expect(created.proposal.id).toBe("prop-2");
+      expect(calls[1]?.headers.Authorization).toBe("Bearer member-jwt-prop");
+
+      const voted = await rest.voteChannelProposal("room-dev", "prop-2", {
+        decision: "approve",
+        reason: "Verified on simulator",
+      });
+      expect(voted.vote_result.passed).toBe(true);
+      expect(calls[2]?.body.decision).toBe("approve");
+
+      await expect(rest.listChannelProposals("../escape")).rejects.toThrow("Invalid channel ID");
+      await expect(rest.createChannelProposal("room-dev", { title: "   " })).rejects.toThrow("Invalid proposal title");
+      await expect(rest.voteChannelProposal("room-dev", "ac_secret_token", { decision: "approve" })).rejects.toThrow("Invalid proposal ID");
     } finally {
       globalThis.fetch = originalFetch;
     }
