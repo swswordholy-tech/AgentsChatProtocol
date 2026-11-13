@@ -8116,36 +8116,50 @@ ${list}` }] };
         if (!r.ok) {
           return { content: [{ type: "text", text: `okr_update_task failed (${r.status}): ${text.slice(0, 160)}` }], isError: true };
         }
-        if (validatedAppend.length > 0) {
-          let parsed = null;
+        let finalText = text;
+        let parsed = null;
+        try {
+          parsed = JSON.parse(text);
+        } catch {}
+        if (validatedAppend.length > 0 && parsed?.ok === true && parsed?.task && !responseIncludesAppendedEvidence(parsed.task, validatedAppend)) {
+          const merged = mergeLegacyTaskEvidence(parsed.task.evidence, validatedAppend);
+          if (!merged.ok) {
+            return {
+              content: [{ type: "text", text: `okr_update_task append_evidence failed: ${merged.error}` }],
+              isError: true
+            };
+          }
+          const fallbackBody = { evidence: merged.value };
+          if (typeof parsed.task.updated_at === "string" && parsed.task.updated_at.trim()) {
+            fallbackBody.if_match_updated_at = parsed.task.updated_at.trim();
+          }
+          const r2 = await apiFetch(targetUrl, {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json", Authorization: `Bearer ${TOKEN}` },
+            body: JSON.stringify(fallbackBody)
+          });
+          const text2 = await r2.text();
+          if (!r2.ok) {
+            return { content: [{ type: "text", text: `okr_update_task failed (${r2.status}): ${text2.slice(0, 160)}` }], isError: true };
+          }
+          finalText = text2;
+          parsed = null;
           try {
-            parsed = JSON.parse(text);
+            parsed = JSON.parse(text2);
           } catch {}
-          if (parsed?.ok === true && parsed?.task && !responseIncludesAppendedEvidence(parsed.task, validatedAppend)) {
-            const merged = mergeLegacyTaskEvidence(parsed.task.evidence, validatedAppend);
-            if (!merged.ok) {
-              return {
-                content: [{ type: "text", text: `okr_update_task append_evidence failed: ${merged.error}` }],
-                isError: true
-              };
-            }
-            const fallbackBody = { evidence: merged.value };
-            if (typeof parsed.task.updated_at === "string" && parsed.task.updated_at.trim()) {
-              fallbackBody.if_match_updated_at = parsed.task.updated_at.trim();
-            }
-            const r2 = await apiFetch(targetUrl, {
-              method: "PATCH",
-              headers: { "Content-Type": "application/json", Authorization: `Bearer ${TOKEN}` },
-              body: JSON.stringify(fallbackBody)
-            });
-            const text2 = await r2.text();
-            if (!r2.ok) {
-              return { content: [{ type: "text", text: `okr_update_task failed (${r2.status}): ${text2.slice(0, 160)}` }], isError: true };
-            }
-            return { content: [{ type: "text", text: `Updated: ${text2}` }] };
+        }
+        if (patch.status === "done" && parsed?.ok === true && parsed?.task && Array.isArray(parsed.task.contributes_to)) {
+          const krIds = parsed.task.contributes_to.filter((id) => typeof id === "string" && id.trim().length > 0).map((id) => id.trim());
+          if (krIds.length > 0) {
+            parsed.kr_progress_hint = {
+              contributes_to: krIds,
+              recommended_tool: "okr_set_kr_progress",
+              note: `Task marked done; remember to report quantitative progress for linked KR(s): ${krIds.join(", ")}.`
+            };
+            finalText = JSON.stringify(parsed);
           }
         }
-        return { content: [{ type: "text", text: `Updated: ${text}` }] };
+        return { content: [{ type: "text", text: `Updated: ${finalText}` }] };
       } catch (e) {
         return { content: [{ type: "text", text: `okr_update_task network error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
       }

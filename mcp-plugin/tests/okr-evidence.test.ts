@@ -11,11 +11,13 @@ let BASE = "";
 let receivedPatches: Array<{ taskId: string; body: any }> = [];
 let legacyIgnoreAppend = false;
 let storedEvidenceByTask: Record<string, any[]> = {};
+let storedContributesByTask: Record<string, string[]> = {};
 
 beforeEach(() => {
   receivedPatches = [];
   legacyIgnoreAppend = false;
   storedEvidenceByTask = {};
+  storedContributesByTask = {};
 });
 
 beforeAll(() => {
@@ -56,6 +58,7 @@ beforeAll(() => {
             id: taskId,
             status: body.status ?? "doing",
             updated_at: "2026-11-12T19:36:00.000Z",
+            contributes_to: storedContributesByTask[taskId],
             evidence: nextEv && nextEv.length > 0 ? nextEv : undefined,
           },
         });
@@ -330,6 +333,35 @@ describe("MCP okr_update_task structured evidence", () => {
         ],
         if_match_updated_at: "2026-11-12T19:36:00.000Z",
       },
+    });
+  });
+
+  test("attaches kr_progress_hint when marking a task done with linked contributes_to KRs", async () => {
+    storedContributesByTask["task_with_kr"] = ["kr_alpha", "kr_beta"];
+    const out = await drive([
+      INIT,
+      INITED,
+      callTool(2, "load_tool_group", { group_name: "okr" }),
+      callTool(3, "okr_update_task", {
+        task_id: "task_with_kr",
+        status: "doing",
+      }),
+      callTool(4, "okr_update_task", {
+        task_id: "task_with_kr",
+        status: "done",
+      }),
+    ], 1500);
+
+    const doingRaw = String(out.res.get(3)?.result?.content?.[0]?.text || "").replace(/^Updated:\s*/, "");
+    const doingParsed = JSON.parse(doingRaw);
+    expect(doingParsed.kr_progress_hint).toBeUndefined();
+
+    const doneRaw = String(out.res.get(4)?.result?.content?.[0]?.text || "").replace(/^Updated:\s*/, "");
+    const doneParsed = JSON.parse(doneRaw);
+    expect(doneParsed.kr_progress_hint).toEqual({
+      contributes_to: ["kr_alpha", "kr_beta"],
+      recommended_tool: "okr_set_kr_progress",
+      note: "Task marked done; remember to report quantitative progress for linked KR(s): kr_alpha, kr_beta.",
     });
   });
 });
