@@ -6,7 +6,44 @@ import type {
   CloudAgentAuditFeed,
   CloudAgentAuditResult,
   DiscoverableChannelSummary,
+  ParsedSseFramesResult,
 } from "./types";
+
+export function parseSseFrames(buffer: string, maxBufferChars = 262_144): ParsedSseFramesResult {
+  const events: Record<string, unknown>[] = [];
+  if (typeof buffer !== "string" || !buffer) {
+    return { events, rest: "" };
+  }
+  let rest = buffer;
+  let sepMatch: RegExpExecArray | null;
+  while ((sepMatch = /\r?\n\r?\n/.exec(rest)) !== null) {
+    const block = rest.slice(0, sepMatch.index);
+    rest = rest.slice(sepMatch.index + sepMatch[0].length);
+    const dataLines: string[] = [];
+    for (const rawLine of block.split(/\r?\n/)) {
+      if (!rawLine || rawLine.startsWith(":")) continue;
+      if (rawLine.startsWith("data:")) {
+        dataLines.push(rawLine.slice(5).replace(/^ /, ""));
+      }
+    }
+    if (dataLines.length === 0) continue;
+    const payload = dataLines.join("\n").trim();
+    if (!payload) continue;
+    try {
+      const parsed = JSON.parse(payload);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        events.push(parsed as Record<string, unknown>);
+      }
+    } catch {
+      // Ignore malformed SSE blocks without poisoning subsequent frames
+    }
+  }
+  const safeCap = Number.isFinite(maxBufferChars) && maxBufferChars > 0 ? Math.floor(maxBufferChars) : 262_144;
+  if (rest.length > safeCap) {
+    rest = "";
+  }
+  return { events, rest };
+}
 
 export interface RESTClientOptions {
   baseUrl: string; // e.g. "http://localhost:8080"
@@ -1010,28 +1047,6 @@ export class AgentChatREST {
     const maxBufferChars = 262_144;
     let buffer = "";
 
-    const parseBlock = (block: string): Record<string, unknown> | null => {
-      const dataLines: string[] = [];
-      for (const rawLine of block.split(/\r?\n/)) {
-        if (!rawLine || rawLine.startsWith(":")) continue;
-        if (rawLine.startsWith("data:")) {
-          dataLines.push(rawLine.slice(5).replace(/^ /, ""));
-        }
-      }
-      if (dataLines.length === 0) return null;
-      const payload = dataLines.join("\n").trim();
-      if (!payload) return null;
-      try {
-        const parsed = JSON.parse(payload);
-        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-          return parsed as Record<string, unknown>;
-        }
-      } catch {
-        return null;
-      }
-      return null;
-    };
-
     let abortWakeup: (() => void) | null = null;
     const onAbort = () => {
       abortWakeup?.();
@@ -1060,21 +1075,19 @@ export class AgentChatREST {
         } else if (done) {
           buffer += decoder.decode();
         }
-        let sepMatch: RegExpExecArray | null;
-        while ((sepMatch = /\r?\n\r?\n/.exec(buffer)) !== null) {
-          const block = buffer.slice(0, sepMatch.index);
-          buffer = buffer.slice(sepMatch.index + sepMatch[0].length);
-          const evt = parseBlock(block);
-          if (evt) yield evt;
+        const parsed = parseSseFrames(buffer, maxBufferChars);
+        buffer = parsed.rest;
+        for (const evt of parsed.events) {
           if (opts?.signal?.aborted) break;
-        }
-        if (buffer.length > maxBufferChars) {
-          buffer = "";
+          yield evt;
         }
         if (done) {
           if (buffer.trim() && !opts?.signal?.aborted) {
-            const evt = parseBlock(buffer);
-            if (evt) yield evt;
+            const flushed = parseSseFrames(`${buffer}\n\n`, maxBufferChars);
+            for (const evt of flushed.events) {
+              if (opts?.signal?.aborted) break;
+              yield evt;
+            }
           }
           break;
         }

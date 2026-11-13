@@ -2639,4 +2639,93 @@ describe("AgentChatClient realtime collaboration WS events", () => {
       globalThis.fetch = originalFetch;
     }
   });
+
+  test("parseSseFrames pure parser & full OkrUpdated/TaskAssigned/OkrThreadOpened WS event contracts", async () => {
+    const { parseSseFrames: parseFrames } = await import("../src/index");
+    const chunk1 = parseFrames(
+      ': keepalive\r\n\r\nevent: message\r\ndata: {"type":"okr_updated","kind":"kr_progress","objective_id":"obj_35","kr_id":"kr_1","current":1,"discussion_channel_id":"room-dev"}\r\n\r\ndata: {"type":"okr_updated",',
+    );
+    expect(chunk1.events).toEqual([
+      {
+        type: "okr_updated",
+        kind: "kr_progress",
+        objective_id: "obj_35",
+        kr_id: "kr_1",
+        current: 1,
+        discussion_channel_id: "room-dev",
+      },
+    ]);
+    expect(chunk1.rest).toBe('data: {"type":"okr_updated",');
+
+    const chunk2 = parseFrames(
+      `${chunk1.rest}"kind":"comment_added","objective_id":"obj_35","task_id":"task_1","author":"codex-bot"}\n\ndata: not-json\n\ndata: [1,2,3]\n\n`,
+    );
+    expect(chunk2.events).toEqual([
+      {
+        type: "okr_updated",
+        kind: "comment_added",
+        objective_id: "obj_35",
+        task_id: "task_1",
+        author: "codex-bot",
+      },
+    ]);
+    expect(chunk2.rest).toBe("");
+
+    // Over-cap buffer protection resets runaway unterminated buffer cleanly
+    const capped = parseFrames("data: " + "x".repeat(512), 128);
+    expect(capped.events).toEqual([]);
+    expect(capped.rest).toBe("");
+
+    // AgentChatClient dispatches all extended OkrUpdatedMessage, TaskAssignedMessage (single-PATCH reassign+done), and OkrThreadOpenedMessage frames
+    const client = new AgentChatClient({ url: "ws://127.0.0.1:9999/ws", agentId: "sdk-agent-35" });
+    const okrUpdates: OkrUpdatedMessage[] = [];
+    const assigned: TaskAssignedMessage[] = [];
+    const openedThreads: Array<Record<string, unknown>> = [];
+
+    client
+      .onOkrUpdated((m) => { okrUpdates.push(m); })
+      .onTaskAssigned((m) => { assigned.push(m); })
+      .onOkrThreadOpened((m) => { openedThreads.push(m as unknown as Record<string, unknown>); });
+
+    const dispatch = (frame: Record<string, unknown>) =>
+      (client as unknown as { handleMessage: (raw: string) => void }).handleMessage(JSON.stringify(frame));
+
+    dispatch({
+      type: "okr_updated",
+      kind: "kr_progress",
+      objective_id: "obj_35",
+      kr_id: "kr_35",
+      current: 1,
+      discussion_channel_id: "room-dev",
+    });
+    dispatch({
+      type: "task_assigned",
+      kind: "task_update",
+      task_id: "task_35",
+      objective_id: "obj_35",
+      status: "done",
+      discussion_channel_id: "room-dev",
+    });
+    dispatch({
+      type: "okr_thread_opened",
+      target_type: "objective",
+      target_id: "obj_35",
+      channel_id: "room-dev",
+      opened_by: "spinning-midnight-tunicate",
+    });
+
+    expect(okrUpdates[0]?.current).toBe(1);
+    expect(okrUpdates[0]?.kind).toBe("kr_progress");
+    expect(assigned[0]?.status).toBe("done");
+    expect(assigned[0]?.discussion_channel_id).toBe("room-dev");
+    expect(openedThreads).toEqual([
+      {
+        type: "okr_thread_opened",
+        target_type: "objective",
+        target_id: "obj_35",
+        channel_id: "room-dev",
+        opened_by: "spinning-midnight-tunicate",
+      },
+    ]);
+  });
 });

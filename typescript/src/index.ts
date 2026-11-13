@@ -1,5 +1,5 @@
 export { AgentChatClient } from "./client";
-export { AgentChatREST, type RESTClientOptions } from "./rest";
+export { AgentChatREST, parseSseFrames, type RESTClientOptions } from "./rest";
 export type {
   // Data types
   A2AAgentCard,
@@ -237,7 +237,9 @@ export type {
   EditHandler,
   ErrorHandler,
   MessageHandler,
+  OkrThreadOpenedHandler,
   OkrUpdatedHandler,
+  ParsedSseFramesResult,
   PinUpdateHandler,
   PresenceHandler,
   ProposalHandler,
@@ -251,6 +253,8 @@ export type {
   ACMessage,
   ChannelDocKind,
   ChannelDocUpdatedMessage,
+  OkrThreadOpenedMessage,
+  OkrUpdatedKind,
   OkrUpdatedMessage,
   TaskAssignedMessage,
   AuthMessage,

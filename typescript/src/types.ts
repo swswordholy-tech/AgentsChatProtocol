@@ -445,19 +445,39 @@ export type ChannelDocKind =
   | "decision";
 export type ChannelDocLevel = 1 | 2 | 3 | 4;
 
+export type OkrUpdatedKind =
+  | "objective_created"
+  | "objective_updated"
+  | "kr_added"
+  | "kr_updated"
+  | "kr_progress"
+  | "task_update"
+  | "task_assign"
+  | "task_progress"
+  | "task_comment"
+  | "comment_added"
+  | "links_set"
+  | "reparent"
+  | "archived"
+  | "unarchived"
+  | "transferred"
+  | (string & {});
+
 export interface OkrUpdatedMessage {
   type: "okr_updated";
-  kind: string;
+  kind: OkrUpdatedKind;
   objective_id: string;
   channel_id?: string;
   discussion_channel_id?: string;
   task_id?: string;
   kr_id?: string;
+  current?: number;
   updated_kr_ids?: string[];
   title?: string;
   status?: string;
   owner?: string;
   actor_id?: string;
+  author?: string;
   from?: string;
   to?: string;
   parent_id?: string | null;
@@ -468,10 +488,20 @@ export interface TaskAssignedMessage {
   type: "task_assigned";
   task_id: string;
   objective_id: string;
-  title: string;
-  assignee: string;
+  title?: string;
+  assignee?: string;
+  kind?: string;
+  status?: string;
   channel_id?: string;
   discussion_channel_id?: string;
+}
+
+export interface OkrThreadOpenedMessage {
+  type: "okr_thread_opened";
+  target_type: "objective" | "kr" | "task" | (string & {});
+  target_id: string;
+  channel_id: string;
+  opened_by: string;
 }
 
 export interface ChannelDocUpdatedMessage {
@@ -542,6 +572,7 @@ export type ACMessage =
   | TaskVerifiedMessage
   | OkrUpdatedMessage
   | TaskAssignedMessage
+  | OkrThreadOpenedMessage
   | ChannelDocUpdatedMessage;
 
 // Handler types
@@ -559,7 +590,13 @@ export type EditHandler = (data: MessageEdited) => void | Promise<void>;
 export type DeleteHandler = (data: MessageDeleted) => void | Promise<void>;
 export type OkrUpdatedHandler = (data: OkrUpdatedMessage) => void | Promise<void>;
 export type TaskAssignedHandler = (data: TaskAssignedMessage) => void | Promise<void>;
+export type OkrThreadOpenedHandler = (data: OkrThreadOpenedMessage) => void | Promise<void>;
 export type ChannelDocUpdatedHandler = (data: ChannelDocUpdatedMessage) => void | Promise<void>;
+
+export interface ParsedSseFramesResult {
+  events: Record<string, unknown>[];
+  rest: string;
+}
 
 export interface IterateChannelEventsOptions {
   signal?: AbortSignal;

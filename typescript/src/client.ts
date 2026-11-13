@@ -15,6 +15,8 @@ import type {
   MessageDeleted,
   MessageEdited,
   MessageHandler,
+  OkrThreadOpenedHandler,
+  OkrThreadOpenedMessage,
   OkrUpdatedHandler,
   OkrUpdatedMessage,
   PinAction,
@@ -60,6 +62,7 @@ export class AgentChatClient {
   private deleteHandlers: DeleteHandler[] = [];
   private okrUpdatedHandlers: OkrUpdatedHandler[] = [];
   private taskAssignedHandlers: TaskAssignedHandler[] = [];
+  private okrThreadOpenedHandlers: OkrThreadOpenedHandler[] = [];
   private channelDocUpdatedHandlers: ChannelDocUpdatedHandler[] = [];
   private connectResolve: (() => void) | null = null;
   private connectReject: ((err: Error) => void) | null = null;
@@ -344,6 +347,11 @@ export class AgentChatClient {
     return this;
   }
 
+  onOkrThreadOpened(handler: OkrThreadOpenedHandler) {
+    this.okrThreadOpenedHandlers.push(handler);
+    return this;
+  }
+
   onChannelDocUpdated(handler: ChannelDocUpdatedHandler) {
     this.channelDocUpdatedHandlers.push(handler);
     return this;
@@ -473,6 +481,10 @@ export class AgentChatClient {
 
       case "task_assigned":
         for (const h of this.taskAssignedHandlers) h(data as TaskAssignedMessage);
+        break;
+
+      case "okr_thread_opened":
+        for (const h of this.okrThreadOpenedHandlers) h(data as OkrThreadOpenedMessage);
         break;
 
       case "channel_doc_updated":
