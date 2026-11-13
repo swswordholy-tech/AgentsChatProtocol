@@ -1,9 +1,15 @@
 // AgentsChat REST API client — HTTP queries for history, channels, agents
 
-import type { AgentCard, ChatMessage } from "./types";
+import type {
+  AgentCard,
+  ChatMessage,
+  CloudAgentAuditFeed,
+  CloudAgentAuditResult,
+} from "./types";
 
 export interface RESTClientOptions {
   baseUrl: string; // e.g. "http://localhost:8080"
+  bearerToken?: string;
 }
 
 interface HealthResponse {
@@ -35,9 +41,11 @@ interface StoredMessage {
 
 export class AgentChatREST {
   private baseUrl: string;
+  private bearerToken?: string;
 
   constructor(options: RESTClientOptions) {
     this.baseUrl = options.baseUrl.replace(/\/$/, "");
+    this.bearerToken = options.bearerToken?.trim() || undefined;
   }
 
   // MARK: - Health
@@ -160,10 +168,48 @@ export class AgentChatREST {
     return data.channels;
   }
 
+  // MARK: - Owner-Scoped Cloud Agent Forensic Security Audit
+
+  async getCloudAgentAuditLogs(
+    agentId: string,
+    opts?: { limit?: number; result?: CloudAgentAuditResult; bearerToken?: string },
+  ): Promise<CloudAgentAuditFeed> {
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/.test(agentId) || /^ac_/i.test(agentId)) {
+      throw new Error("Invalid cloud agent ID");
+    }
+    const params = new URLSearchParams();
+    if (opts?.limit !== undefined) {
+      if (!Number.isFinite(opts.limit)) throw new Error("Invalid audit limit");
+      params.set("limit", String(Math.max(1, Math.min(50, Math.trunc(opts.limit)))));
+    }
+    if (opts?.result !== undefined) {
+      if (!["ok", "denied", "error"].includes(opts.result)) throw new Error("Invalid audit result filter");
+      params.set("result", opts.result);
+    }
+    const qs = params.toString();
+    const token = opts?.bearerToken?.trim() || this.bearerToken;
+    const headers: Record<string, string> = {
+      Accept: "application/json",
+      "Cache-Control": "no-store",
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    };
+    return this.get<CloudAgentAuditFeed>(
+      `/api/cloud-agents/${encodeURIComponent(agentId)}/audit${qs ? `?${qs}` : ""}`,
+      headers,
+    );
+  }
+
   // MARK: - Internal
 
-  private async get<T = any>(path: string): Promise<T> {
-    const res = await fetch(`${this.baseUrl}${path}`);
+  private async get<T = any>(path: string, headers?: Record<string, string>): Promise<T> {
+    const mergedHeaders: Record<string, string> = {
+      ...(this.bearerToken ? { Authorization: `Bearer ${this.bearerToken}` } : {}),
+      ...(headers ?? {}),
+    };
+    const res = await fetch(
+      `${this.baseUrl}${path}`,
+      Object.keys(mergedHeaders).length > 0 ? { headers: mergedHeaders } : undefined,
+    );
     if (!res.ok) {
       const error = await res.json().catch(() => ({ message: res.statusText }));
       throw new Error(`HTTP ${res.status}: ${error.message ?? error.error ?? res.statusText}`);

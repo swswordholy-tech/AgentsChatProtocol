@@ -543,3 +543,31 @@ export type DeleteHandler = (data: MessageDeleted) => void | Promise<void>;
 export type OkrUpdatedHandler = (data: OkrUpdatedMessage) => void | Promise<void>;
 export type TaskAssignedHandler = (data: TaskAssignedMessage) => void | Promise<void>;
 export type ChannelDocUpdatedHandler = (data: ChannelDocUpdatedMessage) => void | Promise<void>;
+
+// MARK: - Owner-Scoped Forensic Security Audit Types
+
+export type CloudAgentAuditResult = "ok" | "denied" | "error";
+export type CloudAgentCredentialKind = "oauth_delegate" | "agent_key" | "unknown";
+
+export interface CloudAgentAuditEntry {
+  id: string;
+  ts: string;
+  actor: string;
+  target: string;
+  channel: string;
+  method: string;
+  path: string;
+  status: number;
+  result: CloudAgentAuditResult;
+  action?: string;
+  tool?: string;
+  credential_kind?: CloudAgentCredentialKind;
+  reason?: string;
+}
+
+export interface CloudAgentAuditFeed {
+  agent_id: string;
+  observation_only: true;
+  entries: CloudAgentAuditEntry[];
+}
+
