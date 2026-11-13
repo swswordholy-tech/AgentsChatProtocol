@@ -650,4 +650,87 @@ describe("AgentChatClient realtime collaboration WS events", () => {
       globalThis.fetch = originalFetch;
     }
   });
+
+  test("Personal Skills CAS/revisions & Room Loop governance REST methods enforce safe slugs, If-Match headers, and interval bounds", async () => {
+    const originalFetch = globalThis.fetch;
+    const calls: Array<{ url: string; method: string; headers: Record<string, string>; body?: any }> = [];
+
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      const method = init?.method || "GET";
+      const headers = (init?.headers as Record<string, string>) ?? {};
+      const body = typeof init?.body === "string" ? JSON.parse(init.body) : undefined;
+      calls.push({ url, method, headers, body });
+
+      if (url.endsWith("/api/skills?active_only=true")) {
+        return Response.json({ skills: [{ name: "deploy-sop", version: 2, archived: false }] });
+      }
+      if (url.endsWith("/api/skills/deploy-sop") && method === "GET") {
+        return Response.json({ name: "deploy-sop", version: 2, body_markdown: "---\nname: deploy-sop\ndescription: SOP\n---\nSteps" });
+      }
+      if (url.endsWith("/api/skills/deploy-sop/revisions")) {
+        return Response.json({ revisions: [{ version: 1, body_markdown: "v1" }] });
+      }
+      if (url.endsWith("/api/skills/deploy-sop") && method === "PUT") {
+        return Response.json({ ok: true, name: "deploy-sop", version: 3, archived: false });
+      }
+      if (url.endsWith("/api/skills/deploy-sop") && method === "DELETE") {
+        return Response.json({ ok: true, name: "deploy-sop", version: 4, archived: true });
+      }
+      return Response.json({ ok: true, status: "active" });
+    }) as typeof fetch;
+
+    try {
+      const rest = new AgentChatREST({ baseUrl: "https://agents-chat.com", bearerToken: "owner-jwt-999" });
+
+      const list = await rest.listPersonalSkills({ active_only: true });
+      expect(list.skills[0]?.name).toBe("deploy-sop");
+
+      const detail = await rest.getPersonalSkill("deploy-sop");
+      expect(detail.version).toBe(2);
+
+      const revs = await rest.getPersonalSkillRevisions("deploy-sop");
+      expect(revs.revisions[0]?.version).toBe(1);
+
+      const saved = await rest.savePersonalSkill("deploy-sop", {
+        body_markdown: "---\nname: deploy-sop\ndescription: SOP v3\n---\nUpdated",
+        if_match_version: 2,
+      });
+      expect(saved.version).toBe(3);
+      expect(calls.find((c) => c.method === "PUT")?.headers["If-Match"]).toBe('"2"');
+
+      const archived = await rest.archivePersonalSkill("deploy-sop", 3);
+      expect(archived.archived).toBe(true);
+      expect(calls.find((c) => c.method === "DELETE")?.headers["If-Match"]).toBe('"3"');
+
+      await rest.createLoop({
+        channel_id: "room-dev",
+        mode: "okr_watch",
+        interval: "15m",
+        objective_id: "obj_1",
+        watch_idle: true,
+        stall_minutes: 30,
+      });
+      await rest.pauseLoop("loop-1");
+      await rest.resumeLoop("loop-1");
+      await rest.setLoopInterval("loop-1", 900_000);
+      await rest.stopLoop("loop-1");
+
+      expect(calls.slice(-5).map((c) => `${c.method} ${new URL(c.url).pathname}`)).toEqual([
+        "POST /api/loops",
+        "POST /api/loops/loop-1/pause",
+        "POST /api/loops/loop-1/resume",
+        "POST /api/loops/loop-1/interval",
+        "POST /api/loops/loop-1/stop",
+      ]);
+
+      await expect(rest.getPersonalSkill("UPPERCASE")).rejects.toThrow("Invalid personal skill name");
+      await expect(rest.getPersonalSkill("ac_secret_token")).rejects.toThrow("Invalid personal skill name");
+      await expect(rest.archivePersonalSkill("deploy-sop", 0)).rejects.toThrow("Invalid personal skill expectedVersion");
+      await expect(rest.setLoopInterval("loop-1", 10_000)).rejects.toThrow("Invalid loop interval_ms");
+      await expect(rest.createLoop({ channel_id: "room-dev", mode: "okr_watch", stall_minutes: 2 })).rejects.toThrow("Invalid loop stall_minutes");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
 });

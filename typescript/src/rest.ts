@@ -532,6 +532,254 @@ export class AgentChatREST {
     }
   }
 
+  // MARK: - Personal Skills Library (/api/skills)
+
+  private assertSkillName(name: string): string {
+    const trimmed = name.trim();
+    if (!/^[a-z0-9][a-z0-9_-]{0,63}$/.test(trimmed) || /^(?:ac_|sk[-_])/i.test(trimmed)) {
+      throw new Error("Invalid personal skill name");
+    }
+    return trimmed;
+  }
+
+  private assertLoopId(loopId: string): string {
+    const trimmed = loopId.trim();
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(trimmed) || /^(?:ac_|sk[-_])/i.test(trimmed)) {
+      throw new Error("Invalid loop ID");
+    }
+    return trimmed;
+  }
+
+  async listPersonalSkills(
+    opts?: { active_only?: boolean; bearerToken?: string },
+  ): Promise<import("./types").PersonalSkillsListResponse> {
+    const token = opts?.bearerToken?.trim() || this.bearerToken;
+    const headers: Record<string, string> = {
+      Accept: "application/json",
+      "Cache-Control": "no-store",
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    };
+    const qs = opts?.active_only ? "?active_only=true" : "";
+    return this.get<import("./types").PersonalSkillsListResponse>(`/api/skills${qs}`, headers);
+  }
+
+  async getPersonalSkill(
+    name: string,
+    opts?: { bearerToken?: string },
+  ): Promise<import("./types").PersonalSkillDetail> {
+    const safeName = this.assertSkillName(name);
+    const token = opts?.bearerToken?.trim() || this.bearerToken;
+    const headers: Record<string, string> = {
+      Accept: "application/json",
+      "Cache-Control": "no-store",
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    };
+    return this.get<import("./types").PersonalSkillDetail>(
+      `/api/skills/${encodeURIComponent(safeName)}`,
+      headers,
+    );
+  }
+
+  async getPersonalSkillRevisions(
+    name: string,
+    opts?: { bearerToken?: string },
+  ): Promise<import("./types").PersonalSkillRevisionsResponse> {
+    const safeName = this.assertSkillName(name);
+    const token = opts?.bearerToken?.trim() || this.bearerToken;
+    const headers: Record<string, string> = {
+      Accept: "application/json",
+      "Cache-Control": "no-store",
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    };
+    return this.get<import("./types").PersonalSkillRevisionsResponse>(
+      `/api/skills/${encodeURIComponent(safeName)}/revisions`,
+      headers,
+    );
+  }
+
+  async savePersonalSkill(
+    name: string,
+    input: import("./types").SavePersonalSkillInput,
+    opts?: { bearerToken?: string },
+  ): Promise<import("./types").SavePersonalSkillResponse> {
+    const safeName = this.assertSkillName(name);
+    if (!input?.body_markdown || typeof input.body_markdown !== "string" || !input.body_markdown.trim()) {
+      throw new Error("Invalid personal skill body_markdown");
+    }
+    if (
+      input.if_match_version !== undefined &&
+      (!Number.isSafeInteger(input.if_match_version) || input.if_match_version < 0)
+    ) {
+      throw new Error("Invalid personal skill if_match_version");
+    }
+    const token = opts?.bearerToken?.trim() || this.bearerToken;
+    const headers: Record<string, string> = {
+      Accept: "application/json",
+      "Cache-Control": "no-store",
+      "Content-Type": "application/json",
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...(input.if_match_version !== undefined ? { "If-Match": `"${input.if_match_version}"` } : {}),
+    };
+    const res = await fetch(`${this.baseUrl}/api/skills/${encodeURIComponent(safeName)}`, {
+      method: "PUT",
+      headers,
+      body: JSON.stringify({
+        body_markdown: input.body_markdown,
+        ...(input.if_match_version !== undefined ? { if_match_version: input.if_match_version } : {}),
+      }),
+    });
+    if (!res.ok) {
+      const error = await res.json().catch(() => ({ message: res.statusText }));
+      throw new Error(`HTTP ${res.status}: ${error.message ?? error.error ?? res.statusText}`);
+    }
+    return res.json();
+  }
+
+  async archivePersonalSkill(
+    name: string,
+    expectedVersion: number,
+    opts?: { bearerToken?: string },
+  ): Promise<import("./types").ArchivePersonalSkillResponse> {
+    const safeName = this.assertSkillName(name);
+    if (!Number.isSafeInteger(expectedVersion) || expectedVersion < 1) {
+      throw new Error("Invalid personal skill expectedVersion");
+    }
+    const token = opts?.bearerToken?.trim() || this.bearerToken;
+    const headers: Record<string, string> = {
+      Accept: "application/json",
+      "Cache-Control": "no-store",
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      "If-Match": `"${expectedVersion}"`,
+    };
+    const res = await fetch(`${this.baseUrl}/api/skills/${encodeURIComponent(safeName)}`, {
+      method: "DELETE",
+      headers,
+    });
+    if (!res.ok) {
+      const error = await res.json().catch(() => ({ message: res.statusText }));
+      throw new Error(`HTTP ${res.status}: ${error.message ?? error.error ?? res.statusText}`);
+    }
+    return res.json();
+  }
+
+  // MARK: - Room Loop Governance (/api/loops)
+
+  async createLoop(
+    input: import("./types").CreateRoomLoopInput,
+    opts?: { bearerToken?: string },
+  ): Promise<import("./types").RoomLoopMutationResponse> {
+    const channelId = input?.channel_id?.trim() ?? "";
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(channelId) || /^(?:ac_|sk-)/i.test(channelId)) {
+      throw new Error("Invalid channel ID");
+    }
+    const mode = input.mode ?? "prompt";
+    if (!["prompt", "okr_wake", "okr_watch"].includes(mode)) {
+      throw new Error("Invalid loop mode");
+    }
+    if (
+      input.stall_minutes !== undefined &&
+      (!Number.isInteger(input.stall_minutes) || input.stall_minutes < 5 || input.stall_minutes > 1440)
+    ) {
+      throw new Error("Invalid loop stall_minutes");
+    }
+    const token = opts?.bearerToken?.trim() || this.bearerToken;
+    const headers: Record<string, string> = {
+      Accept: "application/json",
+      "Cache-Control": "no-store",
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    };
+    const body: Record<string, unknown> = {
+      channel_id: channelId,
+      mode,
+      ...(input.interval !== undefined ? { interval: input.interval } : {}),
+      ...(input.interval_ms !== undefined ? { interval_ms: input.interval_ms } : {}),
+      ...(input.prompt !== undefined ? { prompt: input.prompt } : {}),
+      ...(input.objective_id !== undefined ? { objective_id: input.objective_id } : {}),
+      ...(input.target_agent_id !== undefined ? { target_agent_id: input.target_agent_id } : {}),
+      ...(input.target_agents !== undefined ? { target_agents: input.target_agents } : {}),
+      ...(input.watch_idle !== undefined ? { watch_idle: input.watch_idle } : {}),
+      ...(input.watch_supply !== undefined ? { watch_supply: input.watch_supply } : {}),
+      ...(input.stall_minutes !== undefined ? { stall_minutes: input.stall_minutes } : {}),
+    };
+    return this.post<import("./types").RoomLoopMutationResponse>("/api/loops", body, headers);
+  }
+
+  async pauseLoop(
+    loopId: string,
+    opts?: { bearerToken?: string },
+  ): Promise<import("./types").RoomLoopMutationResponse> {
+    const safeId = this.assertLoopId(loopId);
+    const token = opts?.bearerToken?.trim() || this.bearerToken;
+    const headers: Record<string, string> = {
+      Accept: "application/json",
+      "Cache-Control": "no-store",
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    };
+    return this.post<import("./types").RoomLoopMutationResponse>(
+      `/api/loops/${encodeURIComponent(safeId)}/pause`,
+      {},
+      headers,
+    );
+  }
+
+  async resumeLoop(
+    loopId: string,
+    opts?: { bearerToken?: string },
+  ): Promise<import("./types").RoomLoopMutationResponse> {
+    const safeId = this.assertLoopId(loopId);
+    const token = opts?.bearerToken?.trim() || this.bearerToken;
+    const headers: Record<string, string> = {
+      Accept: "application/json",
+      "Cache-Control": "no-store",
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    };
+    return this.post<import("./types").RoomLoopMutationResponse>(
+      `/api/loops/${encodeURIComponent(safeId)}/resume`,
+      {},
+      headers,
+    );
+  }
+
+  async stopLoop(
+    loopId: string,
+    opts?: { bearerToken?: string },
+  ): Promise<import("./types").RoomLoopMutationResponse> {
+    const safeId = this.assertLoopId(loopId);
+    const token = opts?.bearerToken?.trim() || this.bearerToken;
+    const headers: Record<string, string> = {
+      Accept: "application/json",
+      "Cache-Control": "no-store",
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    };
+    return this.post<import("./types").RoomLoopMutationResponse>(
+      `/api/loops/${encodeURIComponent(safeId)}/stop`,
+      {},
+      headers,
+    );
+  }
+
+  async setLoopInterval(
+    loopId: string,
+    intervalMs: number,
+    opts?: { bearerToken?: string },
+  ): Promise<import("./types").RoomLoopMutationResponse> {
+    const safeId = this.assertLoopId(loopId);
+    if (!Number.isInteger(intervalMs) || intervalMs < 60_000 || intervalMs > 86_400_000) {
+      throw new Error("Invalid loop interval_ms");
+    }
+    const token = opts?.bearerToken?.trim() || this.bearerToken;
+    const headers: Record<string, string> = {
+      Accept: "application/json",
+      "Cache-Control": "no-store",
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    };
+    return this.post<import("./types").RoomLoopMutationResponse>(
+      `/api/loops/${encodeURIComponent(safeId)}/interval`,
+      { interval_ms: intervalMs },
+      headers,
+    );
+  }
+
   // MARK: - Internal
 
   private async get<T = any>(path: string, headers?: Record<string, string>): Promise<T> {

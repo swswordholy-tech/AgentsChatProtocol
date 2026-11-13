@@ -615,7 +615,7 @@ export interface ChannelWakeHealth {
 
 // MARK: - Room & Caller Autonomous Loop Schedule Types
 
-export type RoomLoopMode = "okr_wake" | "okr_watch";
+export type RoomLoopMode = "prompt" | "okr_wake" | "okr_watch";
 export type RoomLoopStatus = "active" | "paused";
 
 export interface RoomLoopScheduleItem {
@@ -875,4 +875,84 @@ export interface ChannelPinsResponse {
   channel_id: string;
   pinned_messages: string[];
 }
+
+// MARK: - Personal Skills Library (/api/skills) & Room Loop Governance (/api/loops)
+
+export interface PersonalSkillMeta {
+  name: string;
+  description: string;
+  trigger?: string;
+}
+
+export interface PersonalSkillSummary {
+  name: string;
+  title?: string;
+  description?: string;
+  skill_meta?: PersonalSkillMeta;
+  version: number;
+  archived?: boolean;
+  updated_at?: string;
+}
+
+export interface PersonalSkillDetail extends PersonalSkillSummary {
+  body_markdown: string;
+}
+
+export interface PersonalSkillsListResponse {
+  skills: PersonalSkillSummary[];
+}
+
+export interface PersonalSkillRevision {
+  version: number;
+  title?: string;
+  description?: string;
+  body_markdown: string;
+  updated_at?: string;
+}
+
+export interface PersonalSkillRevisionsResponse {
+  name?: string;
+  revisions: PersonalSkillRevision[];
+}
+
+export interface SavePersonalSkillInput {
+  body_markdown: string;
+  if_match_version?: number;
+}
+
+export interface SavePersonalSkillResponse {
+  ok?: boolean;
+  name: string;
+  version: number;
+  archived?: boolean;
+}
+
+export interface ArchivePersonalSkillResponse {
+  ok?: boolean;
+  name?: string;
+  version: number;
+  archived: true;
+}
+
+export interface CreateRoomLoopInput {
+  channel_id: string;
+  mode?: RoomLoopMode;
+  interval?: string;
+  interval_ms?: number;
+  prompt?: string;
+  objective_id?: string;
+  target_agent_id?: string;
+  target_agents?: string[];
+  watch_idle?: boolean;
+  watch_supply?: boolean;
+  stall_minutes?: number;
+}
+
+export interface RoomLoopMutationResponse {
+  ok?: boolean;
+  loop?: RoomLoopScheduleItem;
+  loop_id?: string;
+  status?: RoomLoopStatus | "stopped";
+}
+
 
