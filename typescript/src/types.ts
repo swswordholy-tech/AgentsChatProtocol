@@ -1444,6 +1444,17 @@ export interface ChannelOkrSnapshotResponse {
   note?: string;
 }
 
+export interface ChannelOkrSnapshotSummary {
+  channel_id: string;
+  active_objective_ids: string[];
+  unarmed_objective_ids: string[];
+  total_krs: number;
+  completed_krs: number;
+  ready_task_ids: string[];
+  waiting_task_ids: string[];
+  unresolved_edge_count: number;
+}
+
 // MARK: - Machine-Readable A2A / MCP Capability Discovery & Room Membership
 
 export interface A2AAgentSkill {

@@ -5,6 +5,7 @@ import {
   computeLocalTaskActionability,
   isValidCollaborationRoster,
   resolveInheritedObjectiveChannel,
+  summarizeChannelOkrSnapshot,
   summarizeWorkspaceGraphReadiness,
   type ACMessage,
   type ChannelBrief,
@@ -3122,6 +3123,79 @@ describe("AgentChatClient realtime collaboration WS events", () => {
         await expect(rest.listTaskComments(badId)).rejects.toThrow("Invalid task ID");
         await expect(rest.listObjectives({ owner: badId })).rejects.toThrow("Invalid OKR owner");
       }
+      expect(fetchCalls).toBe(0);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("summarizeChannelOkrSnapshot aggregates 3-layer inherited sub-Objectives, filters foreign overrides, and getChannelOkrSnapshot/listCloudAgentLoopObjectives block secret/PII/DM IDs", async () => {
+    const summary = summarizeChannelOkrSnapshot({
+      channel_id: "room-dev",
+      objectives: [
+        { id: "obj_root", status: "active", archived: false, discussion_channel_id: "room-dev" },
+        { id: "obj_sub", status: "active", archived: false, parent_id: "obj_root" },
+        { id: "obj_leaf", status: "active", archived: false, parent_id: "obj_sub" },
+        { id: "obj_foreign_child", status: "active", archived: false, parent_id: "obj_root", discussion_channel_id: "secret-thread" },
+        { id: "obj_archived_root", status: "done", archived: true, discussion_channel_id: "room-dev" },
+        { id: "obj_under_archived", status: "active", archived: false, parent_id: "obj_archived_root" },
+      ],
+      krs: [
+        { id: "kr_1", objective_id: "obj_leaf", metric_type: "bool", current: 1, target: 1 },
+        { id: "kr_2", objective_id: "obj_sub", metric_type: "count", current: 1, target: 3 },
+        { id: "kr_foreign", objective_id: "obj_foreign_child", metric_type: "bool", current: 1, target: 1 },
+      ],
+      tasks: [
+        { id: "t_ready", objective_id: "obj_leaf", status: "todo", ready: true },
+        { id: "t_wait", objective_id: "obj_sub", status: "todo", depends_on: ["t_ready"], unresolved_depends_on: ["t_ready"] },
+        { id: "t_foreign", objective_id: "obj_foreign_child", status: "todo", ready: true },
+      ],
+      loop_summary: {
+        active_loop_count: 1,
+        my_active_loop_count: 1,
+        okr_wake_objective_ids: ["obj_root"],
+        okr_watch_objective_ids: [],
+        unarmed_objective_ids: ["obj_sub", "obj_leaf", "obj_foreign_child", "ac_live_secret"],
+      },
+    });
+    expect(summary).toEqual({
+      channel_id: "room-dev",
+      active_objective_ids: ["obj_root", "obj_sub", "obj_leaf"],
+      unarmed_objective_ids: ["obj_sub", "obj_leaf"],
+      total_krs: 2,
+      completed_krs: 1,
+      ready_task_ids: ["t_ready"],
+      waiting_task_ids: ["t_wait"],
+      unresolved_edge_count: 1,
+    });
+
+    // Degraded note or DM channel snapshots return null
+    expect(summarizeChannelOkrSnapshot({ channel_id: "room-dev", objectives: [], tasks: [], note: "degraded" })).toBeNull();
+    expect(summarizeChannelOkrSnapshot({ channel_id: "dm-private", objectives: [], tasks: [] })).toBeNull();
+
+    const originalFetch = globalThis.fetch;
+    let fetchCalls = 0;
+    globalThis.fetch = (async () => {
+      fetchCalls += 1;
+      return Response.json({ channel_id: "room-dev", objectives: [], krs: [], tasks: [] });
+    }) as unknown as typeof fetch;
+
+    try {
+      const rest = new AgentChatREST({ baseUrl: "https://agents-chat.com", bearerToken: "tok_40" });
+      for (const badId of [
+        "agent_key_secret",
+        "ghp_secret123",
+        "github_pat_abc",
+        "AIzaSyKey123",
+        "eyJhbGciOiJIUzI1NiJ9.payload.sig",
+        "owner@example.com",
+        "13800138000",
+        "room..escape",
+      ]) {
+        await expect(rest.getChannelOkrSnapshot(badId)).rejects.toThrow("Invalid channel ID");
+        await expect(rest.listCloudAgentLoopObjectives("codex-cloud-01", badId)).rejects.toThrow("Invalid channel ID");
+      }
+      await expect(rest.listCloudAgentLoopObjectives("codex-cloud-01", "dm-private")).rejects.toThrow("Invalid channel ID");
       expect(fetchCalls).toBe(0);
     } finally {
       globalThis.fetch = originalFetch;

@@ -6,6 +6,7 @@ export {
   isValidCollaborationRoster,
   parseSseFrames,
   resolveInheritedObjectiveChannel,
+  summarizeChannelOkrSnapshot,
   summarizeWorkspaceGraphReadiness,
   type RESTClientOptions,
 } from "./rest";
@@ -72,6 +73,7 @@ export type {
   ChannelDocsListResponse,
   ChannelDocSummaryItem,
   ChannelOkrSnapshotResponse,
+  ChannelOkrSnapshotSummary,
   ChannelPinsResponse,
   ChannelProposalItem,
   ChannelProposalsFeed,

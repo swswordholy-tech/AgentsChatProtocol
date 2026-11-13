@@ -380,6 +380,141 @@ export function computeLocalTaskActionability(
   return { ready_task_ids, waiting_task_ids, unresolved_edge_count };
 }
 
+export function summarizeChannelOkrSnapshot(
+  raw: unknown,
+): import("./types").ChannelOkrSnapshotSummary | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const snap = raw as Record<string, unknown>;
+  if (snap.note !== undefined) return null;
+  if (!safeNonDmChannelId(snap.channel_id)) return null;
+  const channelId = snap.channel_id;
+  if (!Array.isArray(snap.objectives) || !Array.isArray(snap.tasks)) return null;
+  if (snap.objectives.length > 500 || snap.tasks.length > 1000) return null;
+
+  const includeArchived = snap.include_archived === true;
+  const rawObjs = snap.objectives.filter(
+    (o: unknown): o is Record<string, unknown> =>
+      Boolean(o) && typeof o === "object" && !Array.isArray(o) && safeGraphId((o as Record<string, unknown>).id),
+  );
+  const byId = new Map<string, Record<string, unknown>>();
+  for (const o of rawObjs) {
+    const id = o.id as string;
+    if (!byId.has(id)) byId.set(id, o);
+  }
+
+  const hasArchivedAncestor = (startId: string): boolean => {
+    let cur = byId.get(startId);
+    const seen = new Set<string>();
+    let hops = 0;
+    while (cur && hops <= 8) {
+      const id = cur.id as string;
+      if (seen.has(id)) return true;
+      seen.add(id);
+      if (cur.archived === true) return true;
+      const parentId = typeof cur.parent_id === "string" ? cur.parent_id.trim() : "";
+      if (!parentId || !safeGraphId(parentId)) return false;
+      cur = byId.get(parentId);
+      hops += 1;
+    }
+    return hops > 8;
+  };
+
+  const inheritableNodes: import("./types").InheritableObjectiveChannelNode[] = rawObjs.map((o) => ({
+    id: o.id as string,
+    discussion_channel_id: typeof o.discussion_channel_id === "string" ? o.discussion_channel_id : null,
+    parent_id: typeof o.parent_id === "string" ? o.parent_id : null,
+  }));
+
+  const visibleObjectiveIds = new Set<string>();
+  const active_objective_ids: string[] = [];
+  for (const o of rawObjs) {
+    const id = o.id as string;
+    if (visibleObjectiveIds.has(id)) continue;
+    if (!includeArchived && hasArchivedAncestor(id)) continue;
+    if (resolveInheritedObjectiveChannel(id, inheritableNodes) !== channelId) continue;
+    visibleObjectiveIds.add(id);
+    if (o.status === "active" && o.archived !== true) {
+      active_objective_ids.push(id);
+    }
+  }
+
+  const activeSet = new Set(active_objective_ids);
+  const loopSummary =
+    snap.loop_summary && typeof snap.loop_summary === "object" && !Array.isArray(snap.loop_summary)
+      ? (snap.loop_summary as Record<string, unknown>)
+      : null;
+  const unarmed_objective_ids = Array.isArray(loopSummary?.unarmed_objective_ids)
+    ? [
+        ...new Set(
+          (loopSummary!.unarmed_objective_ids as unknown[]).filter(
+            (id: unknown): id is string => safeGraphId(id) && activeSet.has(id),
+          ),
+        ),
+      ]
+    : [];
+
+  let total_krs = 0;
+  let completed_krs = 0;
+  if (Array.isArray(snap.krs) && snap.krs.length <= 1000) {
+    const seenKrIds = new Set<string>();
+    for (const kr of snap.krs) {
+      if (!kr || typeof kr !== "object" || Array.isArray(kr)) continue;
+      const k = kr as Record<string, unknown>;
+      if (!safeGraphId(k.id) || seenKrIds.has(k.id)) continue;
+      if (typeof k.objective_id !== "string" || !visibleObjectiveIds.has(k.objective_id)) continue;
+      if (
+        typeof k.discussion_channel_id === "string" &&
+        k.discussion_channel_id.trim() !== "" &&
+        k.discussion_channel_id.trim() !== channelId
+      ) {
+        continue;
+      }
+      seenKrIds.add(k.id);
+      total_krs += 1;
+      const current = typeof k.current === "number" && Number.isFinite(k.current) ? k.current : NaN;
+      const target = typeof k.target === "number" && Number.isFinite(k.target) ? k.target : NaN;
+      if (Number.isFinite(current) && Number.isFinite(target)) {
+        if (target > 0 ? current >= target : k.metric_type === "bool" && current === target) {
+          completed_krs += 1;
+        }
+      }
+    }
+  }
+
+  const visibleTasks: import("./types").LocalTaskActionabilityInputItem[] = [];
+  for (const rawTask of snap.tasks) {
+    if (!rawTask || typeof rawTask !== "object" || Array.isArray(rawTask)) continue;
+    const t = rawTask as Record<string, unknown>;
+    if (!safeGraphId(t.id)) continue;
+    const taskChan = typeof t.discussion_channel_id === "string" ? t.discussion_channel_id.trim() : "";
+    const objId = typeof t.objective_id === "string" ? t.objective_id : "";
+    if (taskChan !== channelId && (taskChan !== "" || !visibleObjectiveIds.has(objId))) {
+      continue;
+    }
+    visibleTasks.push({
+      id: t.id,
+      status: typeof t.status === "string" ? t.status : "todo",
+      ready: typeof t.ready === "boolean" ? t.ready : undefined,
+      depends_on: Array.isArray(t.depends_on)
+        ? t.depends_on.filter((d: unknown): d is string => typeof d === "string")
+        : null,
+      unresolved_depends_on: Array.isArray(t.unresolved_depends_on)
+        ? t.unresolved_depends_on.filter((d: unknown): d is string => typeof d === "string")
+        : null,
+    });
+  }
+
+  const actionability = computeLocalTaskActionability(visibleTasks);
+  return {
+    channel_id: channelId,
+    active_objective_ids,
+    unarmed_objective_ids,
+    total_krs,
+    completed_krs,
+    ...actionability,
+  };
+}
+
 export interface RESTClientOptions {
   baseUrl: string; // e.g. "http://localhost:8080"
   bearerToken?: string;
@@ -2572,8 +2707,15 @@ export class AgentChatREST {
     channelId: string,
     opts?: { include_archived?: boolean; bearerToken?: string },
   ): Promise<import("./types").ChannelOkrSnapshotResponse> {
-    const safeChannel = channelId?.trim() ?? "";
-    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(safeChannel) || /^(?:ac_|sk[-_])/i.test(safeChannel)) {
+    const safeChannel = typeof channelId === "string" ? channelId.trim() : "";
+    if (
+      !safeChannel ||
+      safeChannel.includes("..") ||
+      !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(safeChannel) ||
+      CREDENTIAL_PREFIX_RE.test(safeChannel) ||
+      EMAIL_ID_RE.test(safeChannel) ||
+      PHONE_ID_RE.test(safeChannel)
+    ) {
       throw new Error("Invalid channel ID");
     }
     const qs = opts?.include_archived ? "?include_archived=true" : "";
@@ -3528,9 +3670,13 @@ export class AgentChatREST {
     const trimmedChannel = typeof channelId === "string" ? channelId.trim() : "";
     if (
       !trimmedChannel ||
+      trimmedChannel.includes("..") ||
       !/^[A-Za-z0-9_][A-Za-z0-9_-]{0,127}$/.test(trimmedChannel) ||
       trimmedChannel.startsWith("arena-") ||
-      /^(?:ac_|agent_key_|sk[-_]|gh[pousr]_|github_pat_|AIza|eyJ)/i.test(trimmedChannel)
+      DM_OR_DIRECT_CHANNEL_RE.test(trimmedChannel) ||
+      CREDENTIAL_PREFIX_RE.test(trimmedChannel) ||
+      EMAIL_ID_RE.test(trimmedChannel) ||
+      PHONE_ID_RE.test(trimmedChannel)
     ) {
       throw new Error("Invalid channel ID");
     }
