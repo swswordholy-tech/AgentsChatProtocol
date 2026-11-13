@@ -473,6 +473,14 @@ function validateCreateLoopInput(args) {
     ...intervalMs !== undefined ? { interval_ms: intervalMs } : interval ? { interval } : {},
     ...targetAgents ? { target_agents: targetAgents } : {}
   };
+  if (a.stall_minutes !== undefined && a.stall_minutes !== null) {
+    if (mode !== "okr_watch") {
+      return { ok: false, error: 'create_loop stall_minutes is only supported when mode="okr_watch".' };
+    }
+    if (typeof a.stall_minutes !== "number" || !Number.isSafeInteger(a.stall_minutes) || a.stall_minutes < 5 || a.stall_minutes > 1440) {
+      return { ok: false, error: "create_loop stall_minutes must be an integer in 5..1440." };
+    }
+  }
   if (mode === "okr_wake" || mode === "okr_watch") {
     const objectiveId = typeof a.objective_id === "string" ? a.objective_id.trim() : "";
     if (!SAFE_OBJECTIVE_ID_RE.test(objectiveId)) {
@@ -484,6 +492,8 @@ function validateCreateLoopInput(args) {
         out.watch_idle = a.watch_idle;
       if (typeof a.watch_supply === "boolean")
         out.watch_supply = a.watch_supply;
+      if (typeof a.stall_minutes === "number")
+        out.stall_minutes = a.stall_minutes;
     }
     return { ok: true, value: out };
   }
@@ -896,6 +906,62 @@ function validateOkrArchiveObjectiveInput(args) {
   }
   return { ok: true, value: { objective_id: objectiveId, body } };
 }
+function validateListLoopsInput(args) {
+  const a = args && typeof args === "object" && !Array.isArray(args) ? args : {};
+  const out = {};
+  if (a.channel_id !== undefined && a.channel_id !== null) {
+    const cid = typeof a.channel_id === "string" ? a.channel_id.trim() : "";
+    if (!SAFE_CHANNEL_OR_LOOP_ID_RE.test(cid) || cid.includes("..") || EVIDENCE_SECRET_RE.test(cid)) {
+      return { ok: false, error: "list_loops channel_id must be a valid channel identifier." };
+    }
+    out.channel_id = cid;
+  }
+  if (a.status !== undefined && a.status !== null) {
+    if (a.status !== "active" && a.status !== "paused") {
+      return { ok: false, error: "list_loops status must be one of: active, paused." };
+    }
+    out.status = a.status;
+  }
+  if (a.mode !== undefined && a.mode !== null) {
+    if (typeof a.mode !== "string" || !CREATE_LOOP_MODES.includes(a.mode)) {
+      return { ok: false, error: "list_loops mode must be one of: okr_wake, okr_watch, prompt." };
+    }
+    out.mode = a.mode;
+  }
+  if (a.objective_id !== undefined && a.objective_id !== null) {
+    const oid = typeof a.objective_id === "string" ? a.objective_id.trim() : "";
+    if (!SAFE_OBJECTIVE_ID_RE.test(oid) || EVIDENCE_SECRET_RE.test(oid)) {
+      return { ok: false, error: "list_loops objective_id must be a valid objective identifier." };
+    }
+    out.objective_id = oid;
+  }
+  return { ok: true, value: out };
+}
+var SAFE_MEMORY_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/;
+function validateDeleteMemoryInput(args) {
+  const a = args && typeof args === "object" && !Array.isArray(args) ? args : {};
+  const name = typeof a.name === "string" ? a.name.trim() : "";
+  if (!name || !SAFE_MEMORY_NAME_RE.test(name) || name.includes("..") || EVIDENCE_CTRL_RE.test(name) || EVIDENCE_SECRET_RE.test(name)) {
+    return {
+      ok: false,
+      error: "delete_memory requires a valid memory name (1..64 alphanumeric/._- chars starting with alphanumeric)."
+    };
+  }
+  const out = { name };
+  if (a.if_match_version !== undefined && a.if_match_version !== null) {
+    if (typeof a.if_match_version !== "number" || !Number.isSafeInteger(a.if_match_version) || a.if_match_version < 1 || a.if_match_version > 1e6) {
+      return { ok: false, error: "delete_memory if_match_version must be an integer in 1..1000000." };
+    }
+    out.if_match_version = a.if_match_version;
+  }
+  if (a.allow_missing !== undefined && a.allow_missing !== null) {
+    if (typeof a.allow_missing !== "boolean") {
+      return { ok: false, error: "delete_memory allow_missing must be a boolean." };
+    }
+    out.allow_missing = a.allow_missing;
+  }
+  return { ok: true, value: out };
+}
 
 // src/identity.ts
 function decideIdentity(i) {
@@ -1190,6 +1256,7 @@ var TOOL_ANNOTATIONS = {
   sync_skill: R,
   load_memory: R,
   save_memory: W,
+  delete_memory: D,
   load_tool_group: R,
   invoke_extended_tool: W,
   hidden_identity_join: W,
@@ -4410,7 +4477,8 @@ var CORE_TOOL_NAMES = new Set([
   "channel_brief",
   "okr_list",
   "load_memory",
-  "save_memory"
+  "save_memory",
+  "delete_memory"
 ]);
 var META_TOOL_NAMES = new Set([
   "list_tool_groups",
@@ -4984,15 +5052,29 @@ var ALL_TOOL_DEFS = [
   },
   {
     name: "save_memory",
-    description: "Persist a memory doc under YOUR agent_id so a future fresh instance (same key) restores it via load_memory. Pass name (slug) + body (freeform markdown \u2014 your notes/state/lessons) + optional description (one-line index hook; auto-summarized if omitted). Reuse the same name to update in place (version bumps). 256KB/doc, 20 docs/agent. Tip: keep a lean top-level 'index' doc pointing to finer docs (progressive disclosure \u2014 load the index first, expand on demand).",
+    description: "Persist a memory doc under YOUR agent_id so a future fresh instance (same key) restores it via load_memory. Pass name (slug) + body (freeform markdown \u2014 your notes/state/lessons) + optional description (one-line index hook; auto-summarized if omitted) + optional if_match_version CAS guard. Reuse the same name to update in place (version bumps). 256KB/doc, 20 docs/agent. Tip: keep a lean top-level 'index' doc pointing to finer docs (progressive disclosure \u2014 load the index first, expand on demand), and call delete_memory on obsolete sprint notes to free slots.",
     inputSchema: {
       type: "object",
       properties: {
         name: { type: "string", description: "Memory doc name/slug (e.g. 'index', 'context', 'lessons'). Reuse to update." },
         body: { type: "string", description: "The memory content in markdown (freeform)." },
-        description: { type: "string", description: "Optional one-line index hook; auto-summarized from body if omitted." }
+        description: { type: "string", description: "Optional one-line index hook; auto-summarized from body if omitted." },
+        if_match_version: { type: "integer", minimum: 0, maximum: 1e6, description: "Optional CAS guard: pass 0 to create only if absent, or current version integer to avoid overwriting concurrent updates." }
       },
       required: ["name", "body"]
+    }
+  },
+  {
+    name: "delete_memory",
+    description: "Delete an obsolete persistent working-memory doc under YOUR agent_id to free up the 20-doc per-agent cap after a sprint finishes. Supports optional if_match_version (>= 1) optimistic concurrency guard and allow_missing=true for idempotent cleanup.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "Memory doc name/slug to delete (1..64 safe chars)" },
+        if_match_version: { type: "integer", minimum: 1, maximum: 1e6, description: "Optional CAS guard: delete only if stored note matches this exact version" },
+        allow_missing: { type: "boolean", description: "When true, return { ok: true, deleted: false } instead of an error if the note is already absent" }
+      },
+      required: ["name"]
     }
   },
   {
@@ -5103,15 +5185,24 @@ var ALL_TOOL_DEFS = [
           description: "Optional @target agent handles (max 12) for group loops"
         },
         watch_idle: { type: "boolean", description: "okr_watch only: also alert when all tasks sit idle in todo with zero doing" },
-        watch_supply: { type: "boolean", description: "okr_watch only: also alert when all tasks are done (task-supply exhausted)" }
+        watch_supply: { type: "boolean", description: "okr_watch only: also alert when all tasks are done (task-supply exhausted)" },
+        stall_minutes: { type: "integer", minimum: 5, maximum: 1440, description: "okr_watch only: base silent stall threshold in minutes (integer 5..1440, default 5)" }
       },
       required: ["channel_id", "mode"]
     }
   },
   {
     name: "list_loops",
-    description: "List YOUR /loop records (server-side scheduler). Use after creating a loop to VERIFY it registered \u2014 slash replies are filtered off your context, so creation is otherwise blind. Shows loop_id, channel, interval, mode (okr_wake/okr_watch/static), next tick.",
-    inputSchema: { type: "object", properties: {} }
+    description: "List YOUR /loop records (server-side scheduler). Use after creating a loop to VERIFY it registered \u2014 slash replies are filtered off your context, so creation is otherwise blind. Supports optional channel_id, status (active|paused), mode (okr_wake|okr_watch|prompt), and objective_id filters.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        channel_id: { type: "string", description: "Optional channel_id filter" },
+        status: { type: "string", enum: ["active", "paused"], description: "Optional status filter (active or paused)" },
+        mode: { type: "string", enum: [...CREATE_LOOP_MODES], description: "Optional mode filter (okr_wake, okr_watch, or prompt)" },
+        objective_id: { type: "string", description: "Optional target objective_id filter" }
+      }
+    }
   },
   {
     name: "pause_loop",
@@ -5838,6 +5929,7 @@ HANDLERS.set("create_loop", async (args) => {
             ...Array.isArray(loop.target_agents) ? { target_agents: loop.target_agents } : {},
             ...typeof loop.watch_idle === "boolean" ? { watch_idle: loop.watch_idle } : {},
             ...typeof loop.watch_supply === "boolean" ? { watch_supply: loop.watch_supply } : {},
+            ...typeof loop.stall_minutes === "number" ? { stall_minutes: loop.stall_minutes } : {},
             status: paused ? "paused" : loop.status || (active ? "active" : "unknown"),
             paused,
             next_tick_ms: paused ? null : loop.next_tick_ms ?? null
@@ -5951,6 +6043,49 @@ HANDLERS.set("stop_loop", async (args) => {
     };
   } catch (e) {
     return { content: [{ type: "text", text: `stop_loop error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
+  }
+});
+HANDLERS.set("delete_memory", async (args) => {
+  const checked = validateDeleteMemoryInput(args);
+  if (!checked.ok) {
+    return { content: [{ type: "text", text: checked.error }], isError: true };
+  }
+  try {
+    const qs = checked.value.if_match_version !== undefined ? `?if_match_version=${checked.value.if_match_version}` : "";
+    const r = await apiFetch(`${REST_URL}/api/memory/${encodeURIComponent(checked.value.name)}${qs}`, {
+      method: "DELETE",
+      headers: { Authorization: `Bearer ${TOKEN}` }
+    });
+    const text = await r.text();
+    if (!r.ok) {
+      return {
+        content: [{ type: "text", text: `delete_memory failed (${r.status}): ${text.slice(0, 240)}` }],
+        isError: true
+      };
+    }
+    const resp = JSON.parse(text);
+    const deleted = Boolean(resp?.deleted);
+    if (!deleted && !checked.value.allow_missing) {
+      return {
+        content: [{
+          type: "text",
+          text: `delete_memory: memory "${checked.value.name}" does not exist (pass allow_missing=true for idempotent cleanup).`
+        }],
+        isError: true
+      };
+    }
+    return {
+      content: [{
+        type: "text",
+        text: JSON.stringify({
+          ok: true,
+          name: typeof resp?.name === "string" && resp.name ? resp.name : checked.value.name,
+          deleted
+        })
+      }]
+    };
+  } catch (e) {
+    return { content: [{ type: "text", text: `delete_memory network error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
   }
 });
 function redactCloudAgentDisplayName(name) {
@@ -7077,11 +7212,18 @@ Loaded as global skill "${id}".` }] };
       if (!a.name || !a.body) {
         return { content: [{ type: "text", text: "save_memory needs name (slug) + body (markdown). Optional description (one-line index hook)." }], isError: true };
       }
+      if (a.if_match_version !== undefined && a.if_match_version !== null && (!Number.isSafeInteger(a.if_match_version) || a.if_match_version < 0 || a.if_match_version > 1e6)) {
+        return { content: [{ type: "text", text: "save_memory if_match_version must be an integer in 0..1000000." }], isError: true };
+      }
       try {
         const r = await apiFetch(`${REST_URL}/api/memory/${encodeURIComponent(a.name)}`, {
           method: "PUT",
           headers: { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json" },
-          body: JSON.stringify({ body_markdown: a.body, description: a.description })
+          body: JSON.stringify({
+            body_markdown: a.body,
+            description: a.description,
+            ...a.if_match_version !== undefined && a.if_match_version !== null ? { if_match_version: a.if_match_version } : {}
+          })
         });
         const text = await r.text();
         if (!r.ok)
@@ -8158,17 +8300,42 @@ ${list}` }] };
       }
     }
     if (name === "list_loops") {
+      const checked = validateListLoopsInput(args);
+      if (!checked.ok) {
+        return { content: [{ type: "text", text: checked.error }], isError: true };
+      }
       try {
         const r = await apiFetch(`${REST_URL}/api/loops/mine`, { headers: { Authorization: `Bearer ${TOKEN}` } });
         if (!r.ok)
           return { content: [{ type: "text", text: `Failed (${r.status})` }] };
         const data = await r.json();
-        const loops = Array.isArray(data?.loops) ? data.loops : [];
-        if (loops.length === 0)
-          return { content: [{ type: "text", text: "No loops registered for you." }] };
+        const rawLoops = Array.isArray(data?.loops) ? data.loops : [];
+        const hasFilter = Boolean(checked.value.channel_id || checked.value.status || checked.value.mode || checked.value.objective_id);
+        const loops = rawLoops.filter((l) => {
+          if (!l)
+            return false;
+          if (checked.value.channel_id && l.channel_id !== checked.value.channel_id)
+            return false;
+          const paused = l.paused === true || l.status === "paused" || l.paused_at != null;
+          if (checked.value.status && (paused ? "paused" : "active") !== checked.value.status)
+            return false;
+          const normMode = l.mode === "okr_wake" || l.mode === "okr_watch" ? l.mode : "prompt";
+          if (checked.value.mode && normMode !== checked.value.mode)
+            return false;
+          if (checked.value.objective_id && l.objective_id !== checked.value.objective_id)
+            return false;
+          return true;
+        });
+        if (loops.length === 0) {
+          return { content: [{ type: "text", text: hasFilter ? "No matching loops found." : "No loops registered for you." }] };
+        }
         const lines = loops.map((l) => {
           const targetSuffix = Array.isArray(l.target_agents) && l.target_agents.length ? ` @[${l.target_agents.join(", ")}]` : "";
-          const watchFlags = l.mode === "okr_watch" ? [l.watch_idle ? "+idle" : "", l.watch_supply ? "+supply" : ""].filter(Boolean).join("") : "";
+          const watchFlags = l.mode === "okr_watch" ? [
+            l.watch_idle ? "+idle" : "",
+            l.watch_supply ? "+supply" : "",
+            typeof l.stall_minutes === "number" ? `+stall=${l.stall_minutes}m` : ""
+          ].filter(Boolean).join("") : "";
           const mode = l.mode === "okr_wake" ? `okr_wake \u2192 ${l.objective_id}${targetSuffix}` : l.mode === "okr_watch" ? `okr_watch${watchFlags ? `(${watchFlags})` : ""} \u2192 ${l.objective_id}${targetSuffix}` : `static${targetSuffix}`;
           const paused = l.paused === true || l.status === "paused" || l.paused_at != null;
           const nextIn = typeof l.next_tick_ms === "number" ? Math.max(0, Math.round((l.next_tick_ms - Date.now()) / 60000)) : "?";

@@ -1,7 +1,13 @@
 // Unit tests for validateToolArgs (src/argcheck.ts) — runtime input validation
 // against a tool's declared inputSchema. Run with `bun test`.
 import { test, expect } from "bun:test";
-import { validateCreateLoopInput, validateTaskEvidenceInput, validateToolArgs } from "../src/argcheck.ts";
+import {
+  validateCreateLoopInput,
+  validateDeleteMemoryInput,
+  validateListLoopsInput,
+  validateTaskEvidenceInput,
+  validateToolArgs,
+} from "../src/argcheck.ts";
 
 const schema = {
   type: "object",
@@ -189,4 +195,92 @@ test("validateCreateLoopInput rejects path traversal, invalid intervals, missing
     ok: false,
     error: "create_loop prompt rejected: appears to contain a secret or token.",
   });
+});
+
+test("validateCreateLoopInput validates stall_minutes for okr_watch only (5..1440)", () => {
+  expect(
+    validateCreateLoopInput({
+      channel_id: "chan-1",
+      mode: "okr_watch",
+      objective_id: "obj_watch_123",
+      stall_minutes: 15,
+    }),
+  ).toEqual({
+    ok: true,
+    value: {
+      channel_id: "chan-1",
+      mode: "okr_watch",
+      objective_id: "obj_watch_123",
+      stall_minutes: 15,
+    },
+  });
+  expect(
+    validateCreateLoopInput({
+      channel_id: "chan-1",
+      mode: "okr_wake",
+      objective_id: "obj_watch_123",
+      stall_minutes: 15,
+    }).ok,
+  ).toBe(false);
+  expect(
+    validateCreateLoopInput({
+      channel_id: "chan-1",
+      mode: "okr_watch",
+      objective_id: "obj_watch_123",
+      stall_minutes: 4,
+    }).ok,
+  ).toBe(false);
+  expect(
+    validateCreateLoopInput({
+      channel_id: "chan-1",
+      mode: "okr_watch",
+      objective_id: "obj_watch_123",
+      stall_minutes: 1441,
+    }).ok,
+  ).toBe(false);
+});
+
+test("validateListLoopsInput accepts safe filters and rejects invalid modes/statuses/ids", () => {
+  expect(validateListLoopsInput({})).toEqual({ ok: true, value: {} });
+  expect(
+    validateListLoopsInput({
+      channel_id: " chan-1 ",
+      status: "paused",
+      mode: "okr_watch",
+      objective_id: " obj_watch_123 ",
+    }),
+  ).toEqual({
+    ok: true,
+    value: {
+      channel_id: "chan-1",
+      status: "paused",
+      mode: "okr_watch",
+      objective_id: "obj_watch_123",
+    },
+  });
+  expect(validateListLoopsInput({ channel_id: "../admin" }).ok).toBe(false);
+  expect(validateListLoopsInput({ status: "stopped" }).ok).toBe(false);
+  expect(validateListLoopsInput({ mode: "static" }).ok).toBe(false);
+  expect(validateListLoopsInput({ objective_id: "bad/id" }).ok).toBe(false);
+});
+
+test("validateDeleteMemoryInput validates slug, CAS version, and allow_missing", () => {
+  expect(
+    validateDeleteMemoryInput({
+      name: " sprint-note_1.v2 ",
+      if_match_version: 3,
+      allow_missing: true,
+    }),
+  ).toEqual({
+    ok: true,
+    value: {
+      name: "sprint-note_1.v2",
+      if_match_version: 3,
+      allow_missing: true,
+    },
+  });
+  expect(validateDeleteMemoryInput({ name: "../etc/passwd" }).ok).toBe(false);
+  expect(validateDeleteMemoryInput({ name: ".hidden" }).ok).toBe(false);
+  expect(validateDeleteMemoryInput({ name: "note", if_match_version: 0 }).ok).toBe(false);
+  expect(validateDeleteMemoryInput({ name: "note", allow_missing: "yes" }).ok).toBe(false);
 });

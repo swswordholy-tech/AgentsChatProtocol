@@ -54,6 +54,8 @@ import {
   responseIncludesAppendedEvidence,
   validateAppendTaskEvidenceInput,
   validateCreateLoopInput,
+  validateDeleteMemoryInput,
+  validateListLoopsInput,
   validateOkrAddKrInput,
   validateOkrArchiveObjectiveInput,
   validateOkrLinkedChannelDocsInput,
@@ -1167,6 +1169,7 @@ const CORE_TOOL_NAMES = new Set([
   "okr_list",
   "load_memory",
   "save_memory",
+  "delete_memory",
 ]);
 
 const META_TOOL_NAMES = new Set([
@@ -1751,15 +1754,29 @@ const ALL_TOOL_DEFS = [
     },
     {
       name: "save_memory",
-      description: "Persist a memory doc under YOUR agent_id so a future fresh instance (same key) restores it via load_memory. Pass name (slug) + body (freeform markdown — your notes/state/lessons) + optional description (one-line index hook; auto-summarized if omitted). Reuse the same name to update in place (version bumps). 256KB/doc, 20 docs/agent. Tip: keep a lean top-level 'index' doc pointing to finer docs (progressive disclosure — load the index first, expand on demand).",
+      description: "Persist a memory doc under YOUR agent_id so a future fresh instance (same key) restores it via load_memory. Pass name (slug) + body (freeform markdown — your notes/state/lessons) + optional description (one-line index hook; auto-summarized if omitted) + optional if_match_version CAS guard. Reuse the same name to update in place (version bumps). 256KB/doc, 20 docs/agent. Tip: keep a lean top-level 'index' doc pointing to finer docs (progressive disclosure — load the index first, expand on demand), and call delete_memory on obsolete sprint notes to free slots.",
       inputSchema: {
         type: "object" as const,
         properties: {
           name: { type: "string", description: "Memory doc name/slug (e.g. 'index', 'context', 'lessons'). Reuse to update." },
           body: { type: "string", description: "The memory content in markdown (freeform)." },
           description: { type: "string", description: "Optional one-line index hook; auto-summarized from body if omitted." },
+          if_match_version: { type: "integer", minimum: 0, maximum: 1000000, description: "Optional CAS guard: pass 0 to create only if absent, or current version integer to avoid overwriting concurrent updates." },
         },
         required: ["name", "body"],
+      },
+    },
+    {
+      name: "delete_memory",
+      description: "Delete an obsolete persistent working-memory doc under YOUR agent_id to free up the 20-doc per-agent cap after a sprint finishes. Supports optional if_match_version (>= 1) optimistic concurrency guard and allow_missing=true for idempotent cleanup.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          name: { type: "string", description: "Memory doc name/slug to delete (1..64 safe chars)" },
+          if_match_version: { type: "integer", minimum: 1, maximum: 1000000, description: "Optional CAS guard: delete only if stored note matches this exact version" },
+          allow_missing: { type: "boolean", description: "When true, return { ok: true, deleted: false } instead of an error if the note is already absent" },
+        },
+        required: ["name"],
       },
     },
     {
@@ -1871,14 +1888,23 @@ const ALL_TOOL_DEFS = [
           },
           watch_idle: { type: "boolean", description: "okr_watch only: also alert when all tasks sit idle in todo with zero doing" },
           watch_supply: { type: "boolean", description: "okr_watch only: also alert when all tasks are done (task-supply exhausted)" },
+          stall_minutes: { type: "integer", minimum: 5, maximum: 1440, description: "okr_watch only: base silent stall threshold in minutes (integer 5..1440, default 5)" },
         },
         required: ["channel_id", "mode"],
       },
     },
     {
       name: "list_loops",
-      description: "List YOUR /loop records (server-side scheduler). Use after creating a loop to VERIFY it registered — slash replies are filtered off your context, so creation is otherwise blind. Shows loop_id, channel, interval, mode (okr_wake/okr_watch/static), next tick.",
-      inputSchema: { type: "object" as const, properties: {} },
+      description: "List YOUR /loop records (server-side scheduler). Use after creating a loop to VERIFY it registered — slash replies are filtered off your context, so creation is otherwise blind. Supports optional channel_id, status (active|paused), mode (okr_wake|okr_watch|prompt), and objective_id filters.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          channel_id: { type: "string", description: "Optional channel_id filter" },
+          status: { type: "string", enum: ["active", "paused"], description: "Optional status filter (active or paused)" },
+          mode: { type: "string", enum: [...CREATE_LOOP_MODES], description: "Optional mode filter (okr_wake, okr_watch, or prompt)" },
+          objective_id: { type: "string", description: "Optional target objective_id filter" },
+        },
+      },
     },
     {
       name: "pause_loop",
@@ -2655,6 +2681,7 @@ HANDLERS.set("create_loop", async (args) => {
             ...(Array.isArray(loop.target_agents) ? { target_agents: loop.target_agents } : {}),
             ...(typeof loop.watch_idle === "boolean" ? { watch_idle: loop.watch_idle } : {}),
             ...(typeof loop.watch_supply === "boolean" ? { watch_supply: loop.watch_supply } : {}),
+            ...(typeof loop.stall_minutes === "number" ? { stall_minutes: loop.stall_minutes } : {}),
             status: paused ? "paused" : (loop.status || (active ? "active" : "unknown")),
             paused,
             next_tick_ms: paused ? null : (loop.next_tick_ms ?? null),
@@ -2775,6 +2802,52 @@ HANDLERS.set("stop_loop", async (args) => {
     };
   } catch (e: any) {
     return { content: [{ type: "text", text: `stop_loop error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
+  }
+});
+
+HANDLERS.set("delete_memory", async (args) => {
+  const checked = validateDeleteMemoryInput(args);
+  if (!checked.ok) {
+    return { content: [{ type: "text", text: checked.error }], isError: true };
+  }
+  try {
+    const qs = checked.value.if_match_version !== undefined
+      ? `?if_match_version=${checked.value.if_match_version}`
+      : "";
+    const r = await apiFetch(`${REST_URL}/api/memory/${encodeURIComponent(checked.value.name)}${qs}`, {
+      method: "DELETE",
+      headers: { "Authorization": `Bearer ${TOKEN}` },
+    });
+    const text = await r.text();
+    if (!r.ok) {
+      return {
+        content: [{ type: "text", text: `delete_memory failed (${r.status}): ${text.slice(0, 240)}` }],
+        isError: true,
+      };
+    }
+    const resp = JSON.parse(text) as any;
+    const deleted = Boolean(resp?.deleted);
+    if (!deleted && !checked.value.allow_missing) {
+      return {
+        content: [{
+          type: "text",
+          text: `delete_memory: memory "${checked.value.name}" does not exist (pass allow_missing=true for idempotent cleanup).`,
+        }],
+        isError: true,
+      };
+    }
+    return {
+      content: [{
+        type: "text",
+        text: JSON.stringify({
+          ok: true,
+          name: typeof resp?.name === "string" && resp.name ? resp.name : checked.value.name,
+          deleted,
+        }),
+      }],
+    };
+  } catch (e: any) {
+    return { content: [{ type: "text", text: `delete_memory network error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
   }
 });
 
@@ -4069,15 +4142,26 @@ const handleToolCall = async (request: any): Promise<any> => {
   }
 
   if (name === "save_memory") {
-    const a = (args || {}) as { name?: string; body?: string; description?: string };
+    const a = (args || {}) as { name?: string; body?: string; description?: string; if_match_version?: number };
     if (!a.name || !a.body) {
       return { content: [{ type: "text", text: "save_memory needs name (slug) + body (markdown). Optional description (one-line index hook)." }], isError: true };
+    }
+    if (
+      a.if_match_version !== undefined &&
+      a.if_match_version !== null &&
+      (!Number.isSafeInteger(a.if_match_version) || a.if_match_version < 0 || a.if_match_version > 1_000_000)
+    ) {
+      return { content: [{ type: "text", text: "save_memory if_match_version must be an integer in 0..1000000." }], isError: true };
     }
     try {
       const r = await apiFetch(`${REST_URL}/api/memory/${encodeURIComponent(a.name)}`, {
         method: "PUT",
         headers: { "Authorization": `Bearer ${TOKEN}`, "Content-Type": "application/json" },
-        body: JSON.stringify({ body_markdown: a.body, description: a.description }),
+        body: JSON.stringify({
+          body_markdown: a.body,
+          description: a.description,
+          ...(a.if_match_version !== undefined && a.if_match_version !== null ? { if_match_version: a.if_match_version } : {}),
+        }),
       });
       const text = await r.text();
       if (!r.ok) return { content: [{ type: "text", text: `save_memory failed (${r.status}): ${text.slice(0, 240)}` }], isError: true };
@@ -5246,16 +5330,39 @@ const handleToolCall = async (request: any): Promise<any> => {
   }
 
   if (name === "list_loops") {
+    const checked = validateListLoopsInput(args);
+    if (!checked.ok) {
+      return { content: [{ type: "text", text: checked.error }], isError: true };
+    }
     try {
       const r = await apiFetch(`${REST_URL}/api/loops/mine`, { headers: { "Authorization": `Bearer ${TOKEN}` } });
       if (!r.ok) return { content: [{ type: "text", text: `Failed (${r.status})` }] };
       const data = await r.json() as any;
-      const loops = Array.isArray(data?.loops) ? data.loops : [];
-      if (loops.length === 0) return { content: [{ type: "text", text: "No loops registered for you." }] };
+      const rawLoops = Array.isArray(data?.loops) ? data.loops : [];
+      const hasFilter = Boolean(
+        checked.value.channel_id || checked.value.status || checked.value.mode || checked.value.objective_id,
+      );
+      const loops = rawLoops.filter((l: any) => {
+        if (!l) return false;
+        if (checked.value.channel_id && l.channel_id !== checked.value.channel_id) return false;
+        const paused = l.paused === true || l.status === "paused" || l.paused_at != null;
+        if (checked.value.status && (paused ? "paused" : "active") !== checked.value.status) return false;
+        const normMode = l.mode === "okr_wake" || l.mode === "okr_watch" ? l.mode : "prompt";
+        if (checked.value.mode && normMode !== checked.value.mode) return false;
+        if (checked.value.objective_id && l.objective_id !== checked.value.objective_id) return false;
+        return true;
+      });
+      if (loops.length === 0) {
+        return { content: [{ type: "text", text: hasFilter ? "No matching loops found." : "No loops registered for you." }] };
+      }
       const lines = loops.map((l: any) => {
         const targetSuffix = Array.isArray(l.target_agents) && l.target_agents.length ? ` @[${l.target_agents.join(", ")}]` : "";
         const watchFlags = l.mode === "okr_watch"
-          ? [l.watch_idle ? "+idle" : "", l.watch_supply ? "+supply" : ""].filter(Boolean).join("")
+          ? [
+              l.watch_idle ? "+idle" : "",
+              l.watch_supply ? "+supply" : "",
+              typeof l.stall_minutes === "number" ? `+stall=${l.stall_minutes}m` : "",
+            ].filter(Boolean).join("")
           : "";
         const mode = l.mode === "okr_wake"
           ? `okr_wake → ${l.objective_id}${targetSuffix}`

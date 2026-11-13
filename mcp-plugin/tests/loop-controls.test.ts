@@ -24,6 +24,8 @@ let keepStoppedLoopAlive = false;
 let malformedLoopsVerification = false;
 let omitCreatedLoopOnVerify = false;
 let forceDeduplicatedCreate = false;
+let extraLoops: any[] = [];
+const memoryStore = new Map<string, { version: number; body_markdown: string; description?: string }>();
 
 beforeEach(() => {
   currentLoop = { ...runningLoop };
@@ -32,6 +34,8 @@ beforeEach(() => {
   malformedLoopsVerification = false;
   omitCreatedLoopOnVerify = false;
   forceDeduplicatedCreate = false;
+  extraLoops = [];
+  memoryStore.clear();
 });
 
 beforeAll(() => {
@@ -76,7 +80,7 @@ beforeAll(() => {
       }
       if (req.method === "GET" && url.pathname === "/api/loops/mine") {
         if (malformedLoopsVerification) return Response.json({ ok: true });
-        return Response.json({ loops: currentLoop ? [currentLoop] : [] });
+        return Response.json({ loops: [...(currentLoop ? [currentLoop] : []), ...extraLoops] });
       }
       if (req.method === "POST" && url.pathname === "/api/loops/loop-1/pause") {
         currentLoop = { ...runningLoop, status: "paused", paused: true };
@@ -102,6 +106,7 @@ beforeAll(() => {
           ...(Array.isArray(body.target_agents) ? { target_agents: body.target_agents } : {}),
           ...(typeof body.watch_idle === "boolean" ? { watch_idle: body.watch_idle } : {}),
           ...(typeof body.watch_supply === "boolean" ? { watch_supply: body.watch_supply } : {}),
+          ...(typeof body.stall_minutes === "number" ? { stall_minutes: body.stall_minutes } : {}),
           status: "active",
           paused: false,
           next_tick_ms: 1730000300000,
@@ -117,6 +122,45 @@ beforeAll(() => {
       if (req.method === "POST" && url.pathname === "/api/loops/loop-1/stop") {
         if (!keepStoppedLoopAlive) currentLoop = null;
         return Response.json({ ok: true, stopped: "loop-1" });
+      }
+      if (url.pathname.startsWith("/api/memory/")) {
+        const memName = decodeURIComponent(url.pathname.slice("/api/memory/".length));
+        if (req.method === "PUT") {
+          const body = await req.json() as any;
+          const existing = memoryStore.get(memName);
+          if (body.if_match_version !== undefined) {
+            const currentVer = existing ? existing.version : 0;
+            if (body.if_match_version !== currentVer) {
+              return Response.json(
+                { error: "version_conflict", code: "MEMORY_VERSION_CONFLICT", current_version: currentVer },
+                { status: 409 },
+              );
+            }
+          }
+          const nextVer = (existing?.version ?? 0) + 1;
+          memoryStore.set(memName, { version: nextVer, body_markdown: body.body_markdown, description: body.description });
+          return Response.json({
+            ok: true,
+            name: memName,
+            version: nextVer,
+            bytes: String(body.body_markdown || "").length,
+          });
+        }
+        if (req.method === "DELETE") {
+          const existing = memoryStore.get(memName);
+          const qVerRaw = url.searchParams.get("if_match_version");
+          if (qVerRaw !== null) {
+            const qVer = Number(qVerRaw);
+            if (!existing || existing.version !== qVer) {
+              return Response.json(
+                { error: "version_conflict", code: "MEMORY_VERSION_CONFLICT", current_version: existing?.version ?? 0 },
+                { status: 409 },
+              );
+            }
+          }
+          const deleted = memoryStore.delete(memName);
+          return Response.json({ ok: true, name: memName, deleted });
+        }
       }
       return Response.json({ error: "not_found" }, { status: 404 });
     },
@@ -429,5 +473,101 @@ describe("MCP loop controls", () => {
     ]);
     expect(missingRes.get(3)?.result?.isError).toBe(true);
     expect(missingRes.get(3)?.result?.content?.[0]?.text || "").toContain("absent from state verification");
+  });
+
+  test("create_loop supports stall_minutes, list_loops filters by mode/objective_id/status/channel_id, and delete_memory + save_memory enforce CAS", async () => {
+    extraLoops = [
+      {
+        loop_id: "loop-wake-other",
+        channel_id: "channel-2",
+        interval_ms: 300000,
+        mode: "okr_wake",
+        objective_id: "obj_other_999",
+        status: "paused",
+        paused: true,
+        next_tick_ms: 1730000300000,
+      },
+    ];
+    const { res } = await drive([
+      INIT,
+      INITED,
+      LIST,
+      callTool(3, "create_loop", {
+        channel_id: "channel-1",
+        mode: "okr_watch",
+        interval: "15m",
+        objective_id: "obj_mweop0bd_5nsf2366",
+        watch_idle: true,
+        watch_supply: true,
+        stall_minutes: 20,
+      }),
+      callTool(4, "list_loops", {
+        channel_id: "channel-1",
+        mode: "okr_watch",
+        objective_id: "obj_mweop0bd_5nsf2366",
+        status: "active",
+      }),
+      callTool(5, "list_loops", {
+        mode: "okr_wake",
+        status: "active",
+      }),
+      callTool(6, "save_memory", {
+        name: "sprint-note",
+        body: "# Sprint Note v1",
+        if_match_version: 0,
+      }),
+      callTool(7, "save_memory", {
+        name: "sprint-note",
+        body: "# Stale write",
+        if_match_version: 0,
+      }),
+      callTool(8, "delete_memory", {
+        name: "sprint-note",
+        if_match_version: 2,
+      }),
+      callTool(9, "delete_memory", {
+        name: "sprint-note",
+        if_match_version: 1,
+      }),
+      callTool(10, "delete_memory", {
+        name: "sprint-note",
+      }),
+      callTool(11, "delete_memory", {
+        name: "sprint-note",
+        allow_missing: true,
+      }),
+    ]);
+
+    const tools = res.get(2)?.result?.tools || [];
+    expect(tools.some((tool: any) => tool.name === "delete_memory")).toBe(true);
+
+    const createdWatch = JSON.parse(res.get(3)?.result?.content?.[0]?.text || "null");
+    expect(createdWatch.ok).toBe(true);
+    expect(createdWatch.loop.stall_minutes).toBe(20);
+
+    const filteredWatchText = res.get(4)?.result?.content?.[0]?.text || "";
+    expect(filteredWatchText).toContain("1 loop(s):");
+    expect(filteredWatchText).toContain("okr_watch(+idle+supply+stall=20m) → obj_mweop0bd_5nsf2366");
+    expect(filteredWatchText).not.toContain("loop-wake-other");
+
+    expect(res.get(5)?.result?.content?.[0]?.text).toBe("No matching loops found.");
+
+    expect(res.get(6)?.result?.isError).toBeUndefined();
+    expect(res.get(6)?.result?.content?.[0]?.text || "").toContain('Saved memory "sprint-note" (v1');
+
+    expect(res.get(7)?.result?.isError).toBe(true);
+    expect(res.get(7)?.result?.content?.[0]?.text || "").toContain("409");
+
+    expect(res.get(8)?.result?.isError).toBe(true);
+    expect(res.get(8)?.result?.content?.[0]?.text || "").toContain("409");
+
+    const deletedJson = JSON.parse(res.get(9)?.result?.content?.[0]?.text || "null");
+    expect(deletedJson).toEqual({ ok: true, name: "sprint-note", deleted: true });
+
+    expect(res.get(10)?.result?.isError).toBe(true);
+    expect(res.get(10)?.result?.content?.[0]?.text || "").toContain("does not exist");
+
+    const idempotentJson = JSON.parse(res.get(11)?.result?.content?.[0]?.text || "null");
+    expect(idempotentJson).toEqual({ ok: true, name: "sprint-note", deleted: false });
   });
 });

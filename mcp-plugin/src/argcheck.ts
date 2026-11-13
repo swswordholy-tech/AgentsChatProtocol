@@ -283,6 +283,7 @@ export interface ValidatedCreateLoopBody {
   target_agents?: string[];
   watch_idle?: boolean;
   watch_supply?: boolean;
+  stall_minutes?: number;
 }
 
 const LOOP_MIN_INTERVAL_MS = 60_000;
@@ -390,6 +391,20 @@ export function validateCreateLoopInput(
     ...(targetAgents ? { target_agents: targetAgents } : {}),
   };
 
+  if (a.stall_minutes !== undefined && a.stall_minutes !== null) {
+    if (mode !== "okr_watch") {
+      return { ok: false, error: 'create_loop stall_minutes is only supported when mode="okr_watch".' };
+    }
+    if (
+      typeof a.stall_minutes !== "number" ||
+      !Number.isSafeInteger(a.stall_minutes) ||
+      a.stall_minutes < 5 ||
+      a.stall_minutes > 1_440
+    ) {
+      return { ok: false, error: "create_loop stall_minutes must be an integer in 5..1440." };
+    }
+  }
+
   if (mode === "okr_wake" || mode === "okr_watch") {
     const objectiveId = typeof a.objective_id === "string" ? a.objective_id.trim() : "";
     if (!SAFE_OBJECTIVE_ID_RE.test(objectiveId)) {
@@ -399,6 +414,7 @@ export function validateCreateLoopInput(
     if (mode === "okr_watch") {
       if (typeof a.watch_idle === "boolean") out.watch_idle = a.watch_idle;
       if (typeof a.watch_supply === "boolean") out.watch_supply = a.watch_supply;
+      if (typeof a.stall_minutes === "number") out.stall_minutes = a.stall_minutes;
     }
     return { ok: true, value: out };
   }
@@ -869,6 +885,7 @@ export function validateOkrUpdateObjectiveInput(
   return { ok: true, value: { objective_id: objectiveId, body } };
 }
 
+
 export function validateOkrArchiveObjectiveInput(
   args: unknown,
 ): { ok: true; value: { objective_id: string; body: Record<string, unknown> } } | { ok: false; error: string } {
@@ -894,4 +911,95 @@ export function validateOkrArchiveObjectiveInput(
     }
   }
   return { ok: true, value: { objective_id: objectiveId, body } };
+}
+
+export interface ValidatedListLoopsFilter {
+  channel_id?: string;
+  status?: "active" | "paused";
+  mode?: CreateLoopMode;
+  objective_id?: string;
+}
+
+export function validateListLoopsInput(
+  args: unknown,
+): { ok: true; value: ValidatedListLoopsFilter } | { ok: false; error: string } {
+  const a = args && typeof args === "object" && !Array.isArray(args)
+    ? (args as Record<string, unknown>)
+    : {};
+  const out: ValidatedListLoopsFilter = {};
+  if (a.channel_id !== undefined && a.channel_id !== null) {
+    const cid = typeof a.channel_id === "string" ? a.channel_id.trim() : "";
+    if (!SAFE_CHANNEL_OR_LOOP_ID_RE.test(cid) || cid.includes("..") || EVIDENCE_SECRET_RE.test(cid)) {
+      return { ok: false, error: "list_loops channel_id must be a valid channel identifier." };
+    }
+    out.channel_id = cid;
+  }
+  if (a.status !== undefined && a.status !== null) {
+    if (a.status !== "active" && a.status !== "paused") {
+      return { ok: false, error: "list_loops status must be one of: active, paused." };
+    }
+    out.status = a.status;
+  }
+  if (a.mode !== undefined && a.mode !== null) {
+    if (typeof a.mode !== "string" || !(CREATE_LOOP_MODES as readonly string[]).includes(a.mode)) {
+      return { ok: false, error: "list_loops mode must be one of: okr_wake, okr_watch, prompt." };
+    }
+    out.mode = a.mode as CreateLoopMode;
+  }
+  if (a.objective_id !== undefined && a.objective_id !== null) {
+    const oid = typeof a.objective_id === "string" ? a.objective_id.trim() : "";
+    if (!SAFE_OBJECTIVE_ID_RE.test(oid) || EVIDENCE_SECRET_RE.test(oid)) {
+      return { ok: false, error: "list_loops objective_id must be a valid objective identifier." };
+    }
+    out.objective_id = oid;
+  }
+  return { ok: true, value: out };
+}
+
+const SAFE_MEMORY_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/;
+
+export interface ValidatedDeleteMemoryInput {
+  name: string;
+  if_match_version?: number;
+  allow_missing?: boolean;
+}
+
+export function validateDeleteMemoryInput(
+  args: unknown,
+): { ok: true; value: ValidatedDeleteMemoryInput } | { ok: false; error: string } {
+  const a = args && typeof args === "object" && !Array.isArray(args)
+    ? (args as Record<string, unknown>)
+    : {};
+  const name = typeof a.name === "string" ? a.name.trim() : "";
+  if (
+    !name ||
+    !SAFE_MEMORY_NAME_RE.test(name) ||
+    name.includes("..") ||
+    EVIDENCE_CTRL_RE.test(name) ||
+    EVIDENCE_SECRET_RE.test(name)
+  ) {
+    return {
+      ok: false,
+      error: "delete_memory requires a valid memory name (1..64 alphanumeric/._- chars starting with alphanumeric).",
+    };
+  }
+  const out: ValidatedDeleteMemoryInput = { name };
+  if (a.if_match_version !== undefined && a.if_match_version !== null) {
+    if (
+      typeof a.if_match_version !== "number" ||
+      !Number.isSafeInteger(a.if_match_version) ||
+      a.if_match_version < 1 ||
+      a.if_match_version > 1_000_000
+    ) {
+      return { ok: false, error: "delete_memory if_match_version must be an integer in 1..1000000." };
+    }
+    out.if_match_version = a.if_match_version;
+  }
+  if (a.allow_missing !== undefined && a.allow_missing !== null) {
+    if (typeof a.allow_missing !== "boolean") {
+      return { ok: false, error: "delete_memory allow_missing must be a boolean." };
+    }
+    out.allow_missing = a.allow_missing;
+  }
+  return { ok: true, value: out };
 }

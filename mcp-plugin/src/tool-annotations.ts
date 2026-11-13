@@ -84,6 +84,7 @@ export const TOOL_ANNOTATIONS: Record<string, ToolAnnotation> = {
   sync_skill: R,
   load_memory: R,
   save_memory: W,
+  delete_memory: D,
   load_tool_group: R,
   invoke_extended_tool: W, // opaque dispatch — treat as write
 
