@@ -1374,6 +1374,132 @@ export class AgentChatREST {
     );
   }
 
+  // MARK: - Machine-Readable A2A / MCP Discovery & Room Membership Governance
+
+  async getAgentCard(): Promise<import("./types").A2AAgentCard> {
+    return this.get<import("./types").A2AAgentCard>("/.well-known/agent-card.json");
+  }
+
+  async getMcpDiscoveryCard(): Promise<import("./types").McpDiscoveryCard> {
+    return this.get<import("./types").McpDiscoveryCard>("/.well-known/mcp.json");
+  }
+
+  async updateAgentCapabilities(
+    agentId: string,
+    capabilities: string[],
+    opts?: { bearerToken?: string },
+  ): Promise<import("./types").UpdateAgentCapabilitiesResponse> {
+    const safeAgentId = agentId?.trim() ?? "";
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/.test(safeAgentId) || /^(?:ac_|sk[-_])/i.test(safeAgentId)) {
+      throw new Error("Invalid agent ID");
+    }
+    if (!Array.isArray(capabilities)) {
+      throw new Error("capabilities array required");
+    }
+    const seen = new Set<string>();
+    const normalized: string[] = [];
+    for (const raw of capabilities) {
+      if (typeof raw !== "string") continue;
+      const cleaned = raw.replace(/[\x00-\x1f\x7f]/g, "").trim();
+      if (!cleaned) continue;
+      if (cleaned.length > 128) {
+        throw new Error("Capability tag exceeds 128 chars");
+      }
+      if (/^(?:ac_|sk[-_]|ghp_|eyJ[A-Za-z0-9_-]+\.)/i.test(cleaned)) {
+        throw new Error("Capability tag must not resemble a credential");
+      }
+      const key = cleaned.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      normalized.push(cleaned);
+      if (normalized.length >= 32) break;
+    }
+    return this.post<import("./types").UpdateAgentCapabilitiesResponse>(
+      `/api/agents/${encodeURIComponent(safeAgentId)}/capabilities`,
+      { capabilities: normalized },
+      this.authHeaders(opts?.bearerToken),
+    );
+  }
+
+  async getChannelMembers(
+    channelId: string,
+    opts?: { limit?: number; bearerToken?: string },
+  ): Promise<import("./types").ChannelMembersResponse> {
+    const safeChannel = channelId?.trim() ?? "";
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(safeChannel) || /^(?:ac_|sk[-_])/i.test(safeChannel)) {
+      throw new Error("Invalid channel ID");
+    }
+    const qs = new URLSearchParams();
+    if (typeof opts?.limit === "number" && Number.isFinite(opts.limit) && opts.limit > 0) {
+      qs.set("limit", String(Math.min(1000, Math.max(1, Math.trunc(opts.limit)))));
+    }
+    const suffix = qs.size > 0 ? `?${qs.toString()}` : "";
+    return this.get<import("./types").ChannelMembersResponse>(
+      `/api/channels/${encodeURIComponent(safeChannel)}/members${suffix}`,
+      this.authHeaders(opts?.bearerToken),
+    );
+  }
+
+  async joinChannel(
+    channelId: string,
+    opts?: { sender_id?: string; bearerToken?: string },
+  ): Promise<import("./types").ChannelJoinResponse> {
+    const safeChannel = channelId?.trim() ?? "";
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(safeChannel) || /^(?:ac_|sk[-_])/i.test(safeChannel)) {
+      throw new Error("Invalid channel ID");
+    }
+    const body: Record<string, unknown> = {};
+    if (opts?.sender_id !== undefined) {
+      const persona = opts.sender_id.trim();
+      if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/.test(persona) || /^(?:ac_|sk[-_])/i.test(persona)) {
+        throw new Error("Invalid sender_id");
+      }
+      body.sender_id = persona;
+    }
+    return this.post<import("./types").ChannelJoinResponse>(
+      `/api/channels/${encodeURIComponent(safeChannel)}/join`,
+      body,
+      this.authHeaders(opts?.bearerToken),
+    );
+  }
+
+  async leaveChannel(
+    channelId: string,
+    opts?: { sender_id?: string; bearerToken?: string },
+  ): Promise<import("./types").ChannelLeaveResponse> {
+    const safeChannel = channelId?.trim() ?? "";
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(safeChannel) || /^(?:ac_|sk[-_])/i.test(safeChannel)) {
+      throw new Error("Invalid channel ID");
+    }
+    const body: Record<string, unknown> = {};
+    if (opts?.sender_id !== undefined) {
+      const persona = opts.sender_id.trim();
+      if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/.test(persona) || /^(?:ac_|sk[-_])/i.test(persona)) {
+        throw new Error("Invalid sender_id");
+      }
+      body.sender_id = persona;
+    }
+    return this.post<import("./types").ChannelLeaveResponse>(
+      `/api/channels/${encodeURIComponent(safeChannel)}/leave`,
+      body,
+      this.authHeaders(opts?.bearerToken),
+    );
+  }
+
+  async getChannelDetail(
+    channelId: string,
+    opts?: { bearerToken?: string },
+  ): Promise<import("./types").ChannelDetailResponse> {
+    const safeChannel = channelId?.trim() ?? "";
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(safeChannel) || /^(?:ac_|sk[-_])/i.test(safeChannel)) {
+      throw new Error("Invalid channel ID");
+    }
+    return this.get<import("./types").ChannelDetailResponse>(
+      `/api/channels/${encodeURIComponent(safeChannel)}/detail`,
+      this.authHeaders(opts?.bearerToken),
+    );
+  }
+
   // MARK: - Internal
 
   private async get<T = any>(path: string, headers?: Record<string, string>): Promise<T> {

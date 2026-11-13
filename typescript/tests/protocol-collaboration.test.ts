@@ -1008,4 +1008,120 @@ describe("AgentChatClient realtime collaboration WS events", () => {
       globalThis.fetch = originalFetch;
     }
   });
+
+  test("A2A/MCP discovery cards, updateAgentCapabilities normalization, and room membership governance work end-to-end", async () => {
+    const originalFetch = globalThis.fetch;
+    const calls: Array<{ url: string; method: string; headers: Record<string, string>; body?: any }> = [];
+
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      const method = init?.method ?? "GET";
+      const headers = (init?.headers as Record<string, string>) ?? {};
+      const body = init?.body ? JSON.parse(String(init.body)) : undefined;
+      calls.push({ url, method, headers, body });
+
+      if (url.endsWith("/.well-known/agent-card.json")) {
+        return Response.json({
+          name: "AgentChat Hub",
+          description: "Open MCP & WebSocket Hub",
+          url: "https://agents-chat.com",
+          endpoint: "wss://agents-chat.com/ws",
+          mcpEndpoint: "https://agents-chat.com/mcp",
+          documentationUrl: "https://agents-chat.com/protocol",
+          quickstartUrl: "https://agents-chat.com/join",
+          version: "0.2.0",
+          protocolVersion: "0.2.5",
+          skills: [{ id: "okr-dag-orchestration", name: "OKR DAG", description: "OKRs", tags: ["okr"] }],
+        });
+      }
+      if (url.endsWith("/.well-known/mcp.json")) {
+        return Response.json({
+          name: "agentschat-mcp",
+          title: "AgentsChat MCP",
+          description: "Shared MCP rooms",
+          version: "1.0.0",
+          homepage: "https://agents-chat.com/",
+          documentationUrl: "https://agents-chat.com/protocol",
+          quickstartUrl: "https://agents-chat.com/join",
+          remotes: [{ transportType: "streamable-http", url: "https://agents-chat.com/mcp", toolCount: 25 }],
+          tools: [{ name: "agentschat_list_channels", readOnly: true }],
+        });
+      }
+      if (url.endsWith("/api/agents/bot-alpha-01/capabilities") && method === "POST") {
+        return Response.json({ id: "bot-alpha-01", capabilities: body.capabilities });
+      }
+      if (url.endsWith("/api/channels/room-dev/members?limit=50") && method === "GET") {
+        return Response.json({
+          members: [{ agent_id: "bot-alpha-01", online: true, role: "admin", display_name: "Alpha" }],
+          source: "hub",
+          coordinator_agent_id: "bot-alpha-01",
+          same_owner_direct: false,
+        });
+      }
+      if (url.endsWith("/api/channels/room-dev/join") && method === "POST") {
+        return Response.json({ ok: true, channel_id: "room-dev", name: "Room Dev" });
+      }
+      if (url.endsWith("/api/channels/room-dev/leave") && method === "POST") {
+        return Response.json({ ok: true, channel_id: "room-dev", left: body.sender_id || "owner-1", was_member: true });
+      }
+      if (url.endsWith("/api/channels/room-dev/detail") && method === "GET") {
+        return Response.json({
+          id: "room-dev",
+          name: "Room Dev",
+          type: "group",
+          visibility: "public",
+          topic: "Multi-agent dev",
+          member_count: 5,
+          members: ["bot-alpha-01"],
+          roles: { "bot-alpha-01": "admin" },
+          created_by: "user:sw***",
+          created_at: "2026-11-14T00:00:00.000Z",
+        });
+      }
+      return Response.json({ ok: true });
+    }) as typeof fetch;
+
+    try {
+      const rest = new AgentChatREST({ baseUrl: "https://agents-chat.com", bearerToken: "gov-jwt-token" });
+
+      const a2a = await rest.getAgentCard();
+      expect(a2a.skills[0]?.id).toBe("okr-dag-orchestration");
+
+      const mcpCard = await rest.getMcpDiscoveryCard();
+      expect(mcpCard.remotes[0]?.toolCount).toBe(25);
+
+      const caps = await rest.updateAgentCapabilities("bot-alpha-01", [
+        "  swift ",
+        "Swift",
+        "security-audit\u0000",
+        "",
+      ]);
+      expect(caps.capabilities).toEqual(["swift", "security-audit"]);
+
+      const roster = await rest.getChannelMembers("room-dev", { limit: 50 });
+      expect(roster.members[0]?.agent_id).toBe("bot-alpha-01");
+      expect(roster.coordinator_agent_id).toBe("bot-alpha-01");
+
+      const joined = await rest.joinChannel("room-dev", { sender_id: "bot-alpha-01" });
+      expect(joined.ok).toBe(true);
+      expect(calls.find((c) => c.url.endsWith("/join"))?.body).toEqual({ sender_id: "bot-alpha-01" });
+
+      const left = await rest.leaveChannel("room-dev", { sender_id: "bot-alpha-01" });
+      expect(left.left).toBe("bot-alpha-01");
+
+      const detail = await rest.getChannelDetail("room-dev");
+      expect(detail.created_by).toBe("user:sw***");
+      expect(detail.member_count).toBe(5);
+
+      await expect(rest.updateAgentCapabilities("bot-alpha-01", ["ac_secret_key"])).rejects.toThrow(
+        "Capability tag must not resemble a credential",
+      );
+      await expect(rest.joinChannel("room-dev", { sender_id: "sk-live-secret" })).rejects.toThrow(
+        "Invalid sender_id",
+      );
+      await expect(rest.getChannelDetail("../escape")).rejects.toThrow("Invalid channel ID");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
 });

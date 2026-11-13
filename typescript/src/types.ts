@@ -1223,3 +1223,127 @@ export interface ChannelOkrSnapshotResponse {
   loops?: RoomLoopScheduleItem[];
   note?: string;
 }
+
+// MARK: - Machine-Readable A2A / MCP Capability Discovery & Room Membership
+
+export interface A2AAgentSkill {
+  id: string;
+  name: string;
+  description: string;
+  tags: string[];
+}
+
+export interface A2AAgentCard {
+  name: string;
+  alternateName?: string;
+  description: string;
+  url: string;
+  endpoint: string;
+  mcpEndpoint: string;
+  documentationUrl: string;
+  quickstartUrl: string;
+  cloudStudioUrl?: string;
+  llmsTxtUrl?: string;
+  llmsFullTxtUrl?: string;
+  answersFeedUrl?: string;
+  version: string;
+  protocolVersion: string;
+  build?: string;
+  provider?: {
+    organization: string;
+    url: string;
+  };
+  defaultInputModes?: string[];
+  defaultOutputModes?: string[];
+  capabilities?: {
+    streaming?: boolean;
+    pushNotifications?: boolean;
+    stateTransitionHistory?: boolean;
+  };
+  skills: A2AAgentSkill[];
+}
+
+export interface McpDiscoveryRemote {
+  transportType: string;
+  url: string;
+  oauthProtectedResource?: string;
+  oauthAuthorizationServer?: string;
+  toolCount?: number;
+}
+
+export interface McpDiscoveryToolSummary {
+  name: string;
+  readOnly: boolean;
+}
+
+export interface McpDiscoveryPackage {
+  registryType: string;
+  identifier: string;
+  transport: { type: string };
+}
+
+export interface McpDiscoveryCard {
+  name: string;
+  title: string;
+  description: string;
+  version: string;
+  build?: string;
+  homepage: string;
+  documentationUrl: string;
+  quickstartUrl: string;
+  onboardingGuideUrl?: string;
+  llmsTxtUrl?: string;
+  llmsFullTxtUrl?: string;
+  remotes: McpDiscoveryRemote[];
+  tools: McpDiscoveryToolSummary[];
+  packages?: McpDiscoveryPackage[];
+}
+
+export interface UpdateAgentCapabilitiesResponse {
+  id: string;
+  name?: string;
+  display_name?: string;
+  capabilities: string[];
+  online?: boolean;
+}
+
+export interface ChannelMemberRosterItem {
+  agent_id: string;
+  online: boolean;
+  role: string;
+  display_name: string | null;
+  avatar_url?: string | null;
+}
+
+export interface ChannelMembersResponse {
+  members: ChannelMemberRosterItem[];
+  source?: "hub" | "store" | string;
+  coordinator_agent_id?: string | null;
+  same_owner_direct?: boolean;
+}
+
+export interface ChannelJoinResponse {
+  ok: boolean;
+  channel_id: string;
+  name: string;
+}
+
+export interface ChannelLeaveResponse {
+  ok: boolean;
+  channel_id: string;
+  left: string;
+  was_member: boolean;
+}
+
+export interface ChannelDetailResponse {
+  id: string;
+  name: string;
+  type: ChannelType | string;
+  visibility: "public" | "private" | "invite-only" | string;
+  topic: string;
+  member_count: number;
+  members?: string[];
+  roles?: Record<string, string>;
+  created_by: string;
+  created_at: string;
+}
