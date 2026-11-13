@@ -2054,7 +2054,7 @@ const ALL_TOOL_DEFS = [
     },
     {
       name: "okr_update_objective",
-      description: "Update an unarchived Objective's lifecycle status (active / done / abandoned), metadata (title, horizon, due, narrative, completion_summary), or same-room linked_channel_docs. Pass empty string for due / narrative / completion_summary or [] for linked_channel_docs to clear. Requires Objective ownership (or sibling agent of the same human owner). Never include secrets.",
+      description: "Update an unarchived Objective's lifecycle status (active / done / abandoned), metadata (title, horizon, due, narrative, completion_summary), or same-room linked_channel_docs, with optional if_match_updated_at optimistic concurrency guard (409 stale_objective_version on conflict). Pass empty string for due / narrative / completion_summary or [] for linked_channel_docs to clear. Requires Objective ownership (or sibling agent of the same human owner). Never include secrets.",
       inputSchema: {
         type: "object" as const,
         properties: {
@@ -2078,6 +2078,7 @@ const ALL_TOOL_DEFS = [
               required: ["channel_id", "doc_id"],
             },
           },
+          if_match_updated_at: { type: "string", maxLength: 64, description: "Optional optimistic concurrency guard (objective.updated_at). Rejects with 409 stale_objective_version if modified concurrently." },
         },
         required: ["objective_id"],
       },
@@ -2315,7 +2316,7 @@ const ALL_TOOL_DEFS = [
           title: { type: "string", maxLength: 200, description: "Optional KR title revision (1..200 chars; Objective steward only)" },
           metric_type: { type: "string", enum: ["count", "bool", "percent"], description: "Optional metric_type revision (Objective steward only)" },
           target: { type: "number", description: "Optional target value revision (0..1000000; Objective steward only)" },
-          if_match_updated_at: { type: "string", description: "Optional optimistic concurrency guard (kr.updated_at; routes via PATCH /api/okr/krs/:krid)" },
+          if_match_updated_at: { type: "string", maxLength: 64, description: "Optional optimistic concurrency guard (kr.updated_at; supported on both contributor /progress check-ins and steward metadata revisions, returning 409 stale_kr_version on conflict)" },
         },
         required: ["kr_id"],
       },
@@ -2360,6 +2361,7 @@ const ALL_TOOL_DEFS = [
               required: ["channel_id", "doc_id"],
             },
           },
+          if_match_updated_at: { type: "string", maxLength: 64, description: "Optional optimistic concurrency guard (updated_at of the target objective, kr, or task). Rejects with 409 stale_<target_type>_version if modified concurrently." },
         },
         required: ["target_type", "target_id"],
       },
@@ -6168,7 +6170,7 @@ const handleToolCall = async (request: any): Promise<any> => {
   }
 
   if (name === "okr_set_links") {
-    const { target_type, target_id, narrative, narrative_path, discussion_channel_id, linked_docs, linked_channel_docs } = args as {
+    const { target_type, target_id, narrative, narrative_path, discussion_channel_id, linked_docs, linked_channel_docs, if_match_updated_at } = args as {
       target_type: "objective" | "kr" | "task";
       target_id: string;
       narrative?: unknown;
@@ -6176,6 +6178,7 @@ const handleToolCall = async (request: any): Promise<any> => {
       discussion_channel_id?: string;
       linked_docs?: string[];
       linked_channel_docs?: unknown;
+      if_match_updated_at?: unknown;
     };
     const body: Record<string, unknown> = {};
     if (narrative !== undefined) {
@@ -6194,6 +6197,13 @@ const handleToolCall = async (request: any): Promise<any> => {
         return { content: [{ type: "text", text: `okr_set_links invalid linked_channel_docs: ${docsCheck.error}` }], isError: true };
       }
       body.linked_channel_docs = docsCheck.value;
+    }
+    if (if_match_updated_at !== undefined && if_match_updated_at !== null) {
+      const verCheck = validateTaskVersionToken(if_match_updated_at);
+      if (!verCheck.ok) {
+        return { content: [{ type: "text", text: `okr_set_links invalid if_match_updated_at: ${verCheck.error}` }], isError: true };
+      }
+      body.if_match_updated_at = verCheck.value;
     }
     try {
       const r = await apiFetch(`${REST_URL}/api/okr/links/${encodeURIComponent(target_type)}/${encodeURIComponent(target_id)}`, {

@@ -200,6 +200,12 @@ export function validateTaskVersionToken(
       error: "if_match_updated_at must be a valid non-empty timestamp token (<=64 chars)",
     };
   }
+  if (EVIDENCE_SECRET_RE.test(trimmed)) {
+    return {
+      ok: false,
+      error: "if_match_updated_at rejected: appears to contain a secret or token",
+    };
+  }
   return { ok: true, value: trimmed };
 }
 
@@ -643,7 +649,6 @@ function validateOkrKrMutationInput(
     body.title !== undefined ||
     body.metric_type !== undefined ||
     body.target !== undefined ||
-    body.if_match_updated_at !== undefined ||
     body.current === undefined;
 
   return {
@@ -1041,6 +1046,14 @@ export function validateOkrUpdateObjectiveInput(
       ok: false,
       error: "at least one mutable field (title, status, horizon, due, narrative, completion_summary, linked_channel_docs) is required",
     };
+  }
+
+  if (a.if_match_updated_at !== undefined && a.if_match_updated_at !== null) {
+    const verCheck = validateTaskVersionToken(a.if_match_updated_at);
+    if (!verCheck.ok) {
+      return { ok: false, error: verCheck.error };
+    }
+    body.if_match_updated_at = verCheck.value;
   }
 
   return { ok: true, value: { objective_id: objectiveId, body } };

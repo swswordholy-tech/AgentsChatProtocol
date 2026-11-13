@@ -9,7 +9,9 @@ import {
   validateOkrTaskDueInput,
   validateOkrTaskTitleInput,
   validateOkrUpdateKrInput,
+  validateOkrUpdateObjectiveInput,
   validateTaskEvidenceInput,
+  validateTaskVersionToken,
   validateToolArgs,
 } from "../src/argcheck.ts";
 
@@ -295,12 +297,17 @@ test("validateOkrUpdateKrInput and validateOkrSetKrProgressInput enforce routing
       kr_id: " kr_prog_1 ",
       current: 2,
       risk_level: "green",
+      if_match_updated_at: " 2026-11-13T08:00:00.000Z ",
     }),
   ).toEqual({
     ok: true,
     value: {
       kr_id: "kr_prog_1",
-      body: { current: 2, risk_level: "green" },
+      body: {
+        current: 2,
+        risk_level: "green",
+        if_match_updated_at: "2026-11-13T08:00:00.000Z",
+      },
       useMetadataEndpoint: false,
     },
   });
@@ -362,4 +369,49 @@ test("validateOkrTaskTitleInput and validateOkrTaskDueInput support clearing due
   });
   expect(validateOkrTaskDueInput("not-a-date").ok).toBe(false);
   expect(validateOkrTaskDueInput("agent_key_supersecret123456").ok).toBe(false);
+});
+
+test("validateOkrUpdateObjectiveInput and validateTaskVersionToken enforce CAS token safety and mutable-field requirement", () => {
+  expect(validateTaskVersionToken(" 2026-11-13T09:00:00.000Z ")).toEqual({
+    ok: true,
+    value: "2026-11-13T09:00:00.000Z",
+  });
+  expect(validateTaskVersionToken("").ok).toBe(false);
+  expect(validateTaskVersionToken("x".repeat(65)).ok).toBe(false);
+  expect(validateTaskVersionToken("agent_key_supersecret123456").ok).toBe(false);
+
+  expect(
+    validateOkrUpdateObjectiveInput({
+      objective_id: " obj_cas_1 ",
+      status: "done",
+      if_match_updated_at: " 2026-11-13T09:00:00.000Z ",
+    }),
+  ).toEqual({
+    ok: true,
+    value: {
+      objective_id: "obj_cas_1",
+      body: {
+        status: "done",
+        if_match_updated_at: "2026-11-13T09:00:00.000Z",
+      },
+    },
+  });
+
+  // Passing only if_match_updated_at without any mutable field must still be rejected.
+  const onlyCas = validateOkrUpdateObjectiveInput({
+    objective_id: "obj_cas_1",
+    if_match_updated_at: "2026-11-13T09:00:00.000Z",
+  });
+  expect(onlyCas.ok).toBe(false);
+  if (!onlyCas.ok) {
+    expect(onlyCas.error).toContain("at least one mutable field");
+  }
+
+  expect(
+    validateOkrUpdateObjectiveInput({
+      objective_id: "obj_cas_1",
+      status: "active",
+      if_match_updated_at: "sk-live-1234567890abcdef1234",
+    }).ok,
+  ).toBe(false);
 });

@@ -320,6 +320,12 @@ function validateTaskVersionToken(raw) {
       error: "if_match_updated_at must be a valid non-empty timestamp token (<=64 chars)"
     };
   }
+  if (EVIDENCE_SECRET_RE.test(trimmed)) {
+    return {
+      ok: false,
+      error: "if_match_updated_at rejected: appears to contain a secret or token"
+    };
+  }
   return { ok: true, value: trimmed };
 }
 function responseIncludesAppendedEvidence(taskRaw, appended) {
@@ -655,7 +661,7 @@ function validateOkrKrMutationInput(args, toolLabel, forceMetadataEndpoint) {
     }
     body.if_match_updated_at = verCheck.value;
   }
-  const useMetadataEndpoint = forceMetadataEndpoint || body.title !== undefined || body.metric_type !== undefined || body.target !== undefined || body.if_match_updated_at !== undefined || body.current === undefined;
+  const useMetadataEndpoint = forceMetadataEndpoint || body.title !== undefined || body.metric_type !== undefined || body.target !== undefined || body.current === undefined;
   return {
     ok: true,
     value: {
@@ -991,6 +997,13 @@ function validateOkrUpdateObjectiveInput(args) {
       ok: false,
       error: "at least one mutable field (title, status, horizon, due, narrative, completion_summary, linked_channel_docs) is required"
     };
+  }
+  if (a.if_match_updated_at !== undefined && a.if_match_updated_at !== null) {
+    const verCheck = validateTaskVersionToken(a.if_match_updated_at);
+    if (!verCheck.ok) {
+      return { ok: false, error: verCheck.error };
+    }
+    body.if_match_updated_at = verCheck.value;
   }
   return { ok: true, value: { objective_id: objectiveId, body } };
 }
@@ -5455,7 +5468,7 @@ var ALL_TOOL_DEFS = [
   },
   {
     name: "okr_update_objective",
-    description: "Update an unarchived Objective's lifecycle status (active / done / abandoned), metadata (title, horizon, due, narrative, completion_summary), or same-room linked_channel_docs. Pass empty string for due / narrative / completion_summary or [] for linked_channel_docs to clear. Requires Objective ownership (or sibling agent of the same human owner). Never include secrets.",
+    description: "Update an unarchived Objective's lifecycle status (active / done / abandoned), metadata (title, horizon, due, narrative, completion_summary), or same-room linked_channel_docs, with optional if_match_updated_at optimistic concurrency guard (409 stale_objective_version on conflict). Pass empty string for due / narrative / completion_summary or [] for linked_channel_docs to clear. Requires Objective ownership (or sibling agent of the same human owner). Never include secrets.",
     inputSchema: {
       type: "object",
       properties: {
@@ -5478,7 +5491,8 @@ var ALL_TOOL_DEFS = [
             },
             required: ["channel_id", "doc_id"]
           }
-        }
+        },
+        if_match_updated_at: { type: "string", maxLength: 64, description: "Optional optimistic concurrency guard (objective.updated_at). Rejects with 409 stale_objective_version if modified concurrently." }
       },
       required: ["objective_id"]
     }
@@ -5716,7 +5730,7 @@ var ALL_TOOL_DEFS = [
         title: { type: "string", maxLength: 200, description: "Optional KR title revision (1..200 chars; Objective steward only)" },
         metric_type: { type: "string", enum: ["count", "bool", "percent"], description: "Optional metric_type revision (Objective steward only)" },
         target: { type: "number", description: "Optional target value revision (0..1000000; Objective steward only)" },
-        if_match_updated_at: { type: "string", description: "Optional optimistic concurrency guard (kr.updated_at; routes via PATCH /api/okr/krs/:krid)" }
+        if_match_updated_at: { type: "string", maxLength: 64, description: "Optional optimistic concurrency guard (kr.updated_at; supported on both contributor /progress check-ins and steward metadata revisions, returning 409 stale_kr_version on conflict)" }
       },
       required: ["kr_id"]
     }
@@ -5760,7 +5774,8 @@ var ALL_TOOL_DEFS = [
             },
             required: ["channel_id", "doc_id"]
           }
-        }
+        },
+        if_match_updated_at: { type: "string", maxLength: 64, description: "Optional optimistic concurrency guard (updated_at of the target objective, kr, or task). Rejects with 409 stale_<target_type>_version if modified concurrently." }
       },
       required: ["target_type", "target_id"]
     }
@@ -9201,7 +9216,7 @@ ${list}` }] };
       }
     }
     if (name === "okr_set_links") {
-      const { target_type, target_id, narrative, narrative_path, discussion_channel_id, linked_docs, linked_channel_docs } = args;
+      const { target_type, target_id, narrative, narrative_path, discussion_channel_id, linked_docs, linked_channel_docs, if_match_updated_at } = args;
       const body = {};
       if (narrative !== undefined) {
         const narCheck = validateOkrObjectiveNarrativeInput(narrative);
@@ -9222,6 +9237,13 @@ ${list}` }] };
           return { content: [{ type: "text", text: `okr_set_links invalid linked_channel_docs: ${docsCheck.error}` }], isError: true };
         }
         body.linked_channel_docs = docsCheck.value;
+      }
+      if (if_match_updated_at !== undefined && if_match_updated_at !== null) {
+        const verCheck = validateTaskVersionToken(if_match_updated_at);
+        if (!verCheck.ok) {
+          return { content: [{ type: "text", text: `okr_set_links invalid if_match_updated_at: ${verCheck.error}` }], isError: true };
+        }
+        body.if_match_updated_at = verCheck.value;
       }
       try {
         const r = await apiFetch(`${REST_URL}/api/okr/links/${encodeURIComponent(target_type)}/${encodeURIComponent(target_id)}`, {

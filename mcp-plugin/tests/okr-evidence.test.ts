@@ -15,6 +15,7 @@ let receivedArchivedObjectives: Array<{ objectiveId: string; body: any }> = [];
 let receivedAddedTasks: Array<{ objectiveId: string; body: any }> = [];
 let receivedKrPatches: Array<{ krId: string; body: any }> = [];
 let receivedKrProgressPatches: Array<{ krId: string; body: any }> = [];
+let receivedLinksPatches: Array<{ targetType: string; targetId: string; body: any }> = [];
 let legacyIgnoreAppend = false;
 let storedEvidenceByTask: Record<string, any[]> = {};
 let storedContributesByTask: Record<string, string[]> = {};
@@ -27,6 +28,7 @@ beforeEach(() => {
   receivedAddedTasks = [];
   receivedKrPatches = [];
   receivedKrProgressPatches = [];
+  receivedLinksPatches = [];
   legacyIgnoreAppend = false;
   storedEvidenceByTask = {};
   storedContributesByTask = {};
@@ -130,6 +132,9 @@ beforeAll(() => {
         const body = await req.json() as any;
         const objectiveId = decodeURIComponent(patchObjMatch[1]);
         receivedObjectivePatches.push({ objectiveId, body });
+        if (body.if_match_updated_at === "stale-v0") {
+          return Response.json({ error: "stale_objective_version" }, { status: 409 });
+        }
         return Response.json({
           ok: true,
           objective: {
@@ -143,6 +148,25 @@ beforeAll(() => {
             linked_channel_docs: Array.isArray(body.linked_channel_docs) && body.linked_channel_docs.length === 0
               ? undefined
               : body.linked_channel_docs,
+            updated_at: "2026-11-13T09:10:00.000Z",
+          },
+        });
+      }
+      const patchLinksMatch = url.pathname.match(/^\/api\/okr\/links\/(objective|kr|task)\/([^/]+)$/);
+      if (req.method === "PATCH" && patchLinksMatch) {
+        const body = await req.json() as any;
+        const targetType = patchLinksMatch[1];
+        const targetId = decodeURIComponent(patchLinksMatch[2]);
+        receivedLinksPatches.push({ targetType, targetId, body });
+        if (body.if_match_updated_at === "stale-v0") {
+          return Response.json({ error: `stale_${targetType}_version` }, { status: 409 });
+        }
+        return Response.json({
+          ok: true,
+          [targetType]: {
+            id: targetId,
+            ...body,
+            updated_at: "2026-11-13T09:11:00.000Z",
           },
         });
       }
@@ -902,5 +926,116 @@ describe("MCP okr_update_task structured evidence", () => {
         },
       },
     ]);
+  });
+
+  test("okr_update_objective, okr_set_links, and contributor okr_set_kr_progress forward if_match_updated_at and surface 409 conflicts", async () => {
+    const out = await drive([
+      INIT,
+      INITED,
+      callTool(2, "load_tool_group", { group_name: "okr" }),
+      { jsonrpc: "2.0", id: 3, method: "tools/list", params: {} },
+      callTool(4, "okr_update_objective", {
+        objective_id: "obj_cas_live",
+        narrative: "CAS guarded narrative",
+        if_match_updated_at: " 2026-11-13T09:00:00.000Z ",
+      }),
+      callTool(5, "okr_update_objective", {
+        objective_id: "obj_cas_live",
+        status: "done",
+        if_match_updated_at: "stale-v0",
+      }),
+      callTool(6, "okr_set_links", {
+        target_type: "objective",
+        target_id: "obj_cas_live",
+        linked_docs: ["docs/spec.md"],
+        if_match_updated_at: " 2026-11-13T09:10:00.000Z ",
+      }),
+      callTool(7, "okr_set_links", {
+        target_type: "task",
+        target_id: "task_cas_live",
+        linked_docs: ["docs/runbook.md"],
+        if_match_updated_at: "stale-v0",
+      }),
+      callTool(8, "okr_set_kr_progress", {
+        kr_id: "kr_cas_contrib",
+        current: 1,
+        risk_level: "green",
+        if_match_updated_at: " 2026-11-13T09:05:00.000Z ",
+      }),
+      callTool(9, "okr_set_links", {
+        target_type: "objective",
+        target_id: "obj_cas_live",
+        linked_docs: [],
+        if_match_updated_at: "agent_key_supersecret123456",
+      }),
+    ], 2400);
+
+    const tools = out.res.get(3)?.result?.tools || [];
+    const updateObjDef = tools.find((t: any) => t.name === "okr_update_objective");
+    const setLinksDef = tools.find((t: any) => t.name === "okr_set_links");
+    expect(updateObjDef?.inputSchema?.properties?.if_match_updated_at?.maxLength).toBe(64);
+    expect(setLinksDef?.inputSchema?.properties?.if_match_updated_at?.maxLength).toBe(64);
+
+    expect(out.res.get(4)?.result?.isError).toBeUndefined();
+    expect(out.res.get(6)?.result?.isError).toBeUndefined();
+    expect(out.res.get(8)?.result?.isError).toBeUndefined();
+
+    expect(out.res.get(5)?.result?.isError).toBe(true);
+    expect(out.res.get(5)?.result?.content?.[0]?.text).toContain("409");
+    expect(out.res.get(5)?.result?.content?.[0]?.text).toContain("stale_objective_version");
+
+    expect(out.res.get(7)?.result?.isError).toBe(true);
+    expect(out.res.get(7)?.result?.content?.[0]?.text).toContain("409");
+    expect(out.res.get(7)?.result?.content?.[0]?.text).toContain("stale_task_version");
+
+    expect(out.res.get(9)?.result?.isError).toBe(true);
+    expect(out.res.get(9)?.result?.content?.[0]?.text).toContain("secret or token");
+
+    expect(receivedObjectivePatches).toEqual([
+      {
+        objectiveId: "obj_cas_live",
+        body: {
+          narrative: "CAS guarded narrative",
+          if_match_updated_at: "2026-11-13T09:00:00.000Z",
+        },
+      },
+      {
+        objectiveId: "obj_cas_live",
+        body: {
+          status: "done",
+          if_match_updated_at: "stale-v0",
+        },
+      },
+    ]);
+    expect(receivedLinksPatches).toEqual([
+      {
+        targetType: "objective",
+        targetId: "obj_cas_live",
+        body: {
+          linked_docs: ["docs/spec.md"],
+          if_match_updated_at: "2026-11-13T09:10:00.000Z",
+        },
+      },
+      {
+        targetType: "task",
+        targetId: "task_cas_live",
+        body: {
+          linked_docs: ["docs/runbook.md"],
+          if_match_updated_at: "stale-v0",
+        },
+      },
+    ]);
+    // Contributor progress + CAS routes to PATCH /api/okr/krs/:id/progress (not metadata endpoint)!
+    expect(receivedKrProgressPatches).toEqual([
+      {
+        krId: "kr_cas_contrib",
+        body: {
+          current: 1,
+          risk_level: "green",
+          if_match_updated_at: "2026-11-13T09:05:00.000Z",
+        },
+      },
+    ]);
+    expect(receivedKrPatches).toEqual([]);
   });
 });
