@@ -105,6 +105,7 @@ export const TOOL_ANNOTATIONS: Record<string, ToolAnnotation> = {
   okr_task_blocks: R,
   okr_open_thread: W,
   okr_add_kr: W,
+  okr_update_kr: W,
   archive_objective: W,
   unarchive_objective: W,
   okr_reparent_objective: W,

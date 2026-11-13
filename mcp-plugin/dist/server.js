@@ -577,32 +577,137 @@ function validateOkrAddKrInput(args) {
     }
   };
 }
-function validateOkrSetKrProgressInput(args) {
+function validateOkrKrMutationInput(args, toolLabel, forceMetadataEndpoint) {
   const a = args && typeof args === "object" && !Array.isArray(args) ? args : {};
   const krId = typeof a.kr_id === "string" ? a.kr_id.trim() : "";
-  if (!krId || !SAFE_CHANNEL_OR_LOOP_ID_RE.test(krId) || krId.includes("..")) {
-    return { ok: false, error: "okr_set_kr_progress requires a valid kr_id." };
+  if (!krId || !SAFE_CHANNEL_OR_LOOP_ID_RE.test(krId) || krId.includes("..") || EVIDENCE_CTRL_RE.test(krId) || EVIDENCE_SECRET_RE.test(krId)) {
+    return { ok: false, error: `${toolLabel} requires a valid kr_id.` };
   }
-  if (typeof a.current !== "number" || !Number.isFinite(a.current) || a.current < 0 || a.current > 1e6) {
-    return { ok: false, error: "okr_set_kr_progress current must be a finite number in 0..1000000." };
+  const body = {};
+  if (a.title !== undefined && a.title !== null) {
+    if (typeof a.title !== "string") {
+      return { ok: false, error: `${toolLabel} title must be a non-empty string (1..200 chars).` };
+    }
+    if (EVIDENCE_CTRL_RE.test(a.title)) {
+      return { ok: false, error: `${toolLabel} title must not contain control characters.` };
+    }
+    if (EVIDENCE_SECRET_RE.test(a.title)) {
+      return { ok: false, error: `${toolLabel} title rejected: appears to contain a secret or token.` };
+    }
+    const trimmedTitle = a.title.trim();
+    if (!trimmedTitle || trimmedTitle.length > 200) {
+      return { ok: false, error: `${toolLabel} title must be 1..200 chars.` };
+    }
+    body.title = trimmedTitle;
   }
-  let riskLevel;
+  let metricType;
+  if (a.metric_type !== undefined && a.metric_type !== null) {
+    if (typeof a.metric_type !== "string" || !OKR_KR_METRIC_TYPES.includes(a.metric_type)) {
+      return { ok: false, error: `${toolLabel} metric_type must be count|bool|percent.` };
+    }
+    metricType = a.metric_type;
+    body.metric_type = metricType;
+  }
+  if (a.target !== undefined && a.target !== null) {
+    if (typeof a.target !== "number" || !Number.isFinite(a.target) || a.target < 0 || a.target > 1e6) {
+      return { ok: false, error: `${toolLabel} target must be a finite number in 0..1000000.` };
+    }
+    if (metricType === "bool" && a.target !== 0 && a.target !== 1) {
+      return { ok: false, error: `${toolLabel} bool target must be 0 or 1.` };
+    }
+    if (metricType === "percent" && a.target > 100) {
+      return { ok: false, error: `${toolLabel} percent target must be <= 100.` };
+    }
+    body.target = a.target;
+  }
+  if (a.current !== undefined && a.current !== null) {
+    if (typeof a.current !== "number" || !Number.isFinite(a.current) || a.current < 0 || a.current > 1e6) {
+      return { ok: false, error: `${toolLabel} current must be a finite number in 0..1000000.` };
+    }
+    if (metricType === "bool" && a.current !== 0 && a.current !== 1) {
+      return { ok: false, error: `${toolLabel} bool current must be 0 or 1.` };
+    }
+    if (metricType === "percent" && a.current > 100) {
+      return { ok: false, error: `${toolLabel} percent current must be <= 100.` };
+    }
+    body.current = a.current;
+  }
   if (a.risk_level !== undefined && a.risk_level !== null) {
     if (typeof a.risk_level !== "string" || !OKR_KR_RISK_LEVELS.includes(a.risk_level)) {
-      return { ok: false, error: "okr_set_kr_progress risk_level must be green|yellow|red." };
+      return { ok: false, error: `${toolLabel} risk_level must be green|yellow|red.` };
     }
-    riskLevel = a.risk_level;
+    body.risk_level = a.risk_level;
   }
+  const hasMutableField = body.title !== undefined || body.metric_type !== undefined || body.target !== undefined || body.current !== undefined || body.risk_level !== undefined;
+  if (!hasMutableField) {
+    return {
+      ok: false,
+      error: `${toolLabel} requires at least one of current, risk_level, title, metric_type, or target.`
+    };
+  }
+  if (a.if_match_updated_at !== undefined && a.if_match_updated_at !== null) {
+    const verCheck = validateTaskVersionToken(a.if_match_updated_at);
+    if (!verCheck.ok) {
+      return { ok: false, error: `${toolLabel} invalid if_match_updated_at: ${verCheck.error}` };
+    }
+    if (EVIDENCE_SECRET_RE.test(verCheck.value)) {
+      return { ok: false, error: `${toolLabel} if_match_updated_at rejected: appears to contain a secret or token.` };
+    }
+    body.if_match_updated_at = verCheck.value;
+  }
+  const useMetadataEndpoint = forceMetadataEndpoint || body.title !== undefined || body.metric_type !== undefined || body.target !== undefined || body.if_match_updated_at !== undefined || body.current === undefined;
   return {
     ok: true,
     value: {
       kr_id: krId,
-      body: {
-        current: a.current,
-        ...riskLevel !== undefined ? { risk_level: riskLevel } : {}
-      }
+      body,
+      useMetadataEndpoint
     }
   };
+}
+function validateOkrSetKrProgressInput(args) {
+  return validateOkrKrMutationInput(args, "okr_set_kr_progress", false);
+}
+function validateOkrUpdateKrInput(args) {
+  return validateOkrKrMutationInput(args, "okr_update_kr", true);
+}
+function validateOkrTaskTitleInput(raw) {
+  if (typeof raw !== "string") {
+    return { ok: false, error: "title must be a non-empty string (1..200 chars)" };
+  }
+  if (EVIDENCE_CTRL_RE.test(raw)) {
+    return { ok: false, error: "title must not contain control characters" };
+  }
+  if (EVIDENCE_SECRET_RE.test(raw)) {
+    return { ok: false, error: "title rejected: appears to contain a secret or token" };
+  }
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed.length > 200) {
+    return { ok: false, error: "title must be 1..200 chars" };
+  }
+  return { ok: true, value: trimmed };
+}
+function validateOkrTaskDueInput(raw) {
+  if (raw === null || raw === "") {
+    return { ok: true, value: "" };
+  }
+  if (typeof raw !== "string") {
+    return { ok: false, error: "due must be an ISO-8601 date/timestamp string (<= 32 chars) or empty string to clear" };
+  }
+  if (EVIDENCE_CTRL_RE.test(raw)) {
+    return { ok: false, error: "due must not contain control characters" };
+  }
+  if (EVIDENCE_SECRET_RE.test(raw)) {
+    return { ok: false, error: "due rejected: appears to contain a secret or token" };
+  }
+  const trimmed = raw.trim();
+  if (!trimmed) {
+    return { ok: true, value: "" };
+  }
+  if (trimmed.length > 32 || !Number.isFinite(Date.parse(trimmed))) {
+    return { ok: false, error: "due must be a valid ISO-8601 date/timestamp (<= 32 chars) or empty string to clear" };
+  }
+  return { ok: true, value: trimmed };
 }
 var OKR_TASK_CONTRIBUTES_CAP = 5;
 function validateOkrTaskAssigneeInput(raw) {
@@ -1273,6 +1378,7 @@ var TOOL_ANNOTATIONS = {
   okr_task_blocks: R,
   okr_open_thread: W,
   okr_add_kr: W,
+  okr_update_kr: W,
   archive_objective: W,
   unarchive_objective: W,
   okr_reparent_objective: W,
@@ -4501,6 +4607,7 @@ var TOOL_GROUPS = [
       "okr_task_blocks",
       "okr_open_thread",
       "okr_add_kr",
+      "okr_update_kr",
       "okr_set_kr_progress",
       "okr_add_task_comment",
       "okr_set_links",
@@ -5407,11 +5514,12 @@ var ALL_TOOL_DEFS = [
   },
   {
     name: "okr_update_task",
-    description: "Update a Task \u2014 change status, re-assign assignee, bind/clear contributes_to Key Results, block/unblock, add blocker info, adjust DAG dependencies (depends_on), attach/clear room skill/spec docs (linked_channel_docs), or record structured completion evidence. Caller must be the assignee, Objective owner, or admin. Reassign and contributes_to changes are owner/admin-only. Pass depends_on:[], linked_channel_docs:[], or contributes_to:[] to clear, or a new array to replace; server rejects cycles. Prefer append_evidence:[{kind, ref, note?}] (1..10 items, deduplicated without overwriting existing receipts) or pass evidence:[{kind, ref, note?}] (full replacement; [] to clear) plus optional if_match_updated_at CAS token.",
+    description: 'Update a Task \u2014 revise title or due date (pass empty string "" to clear due), change status, re-assign assignee, bind/clear contributes_to Key Results, block/unblock, add blocker info, adjust DAG dependencies (depends_on), attach/clear room skill/spec docs (linked_channel_docs), or record structured completion evidence. Caller must be the assignee, Objective owner, or admin. Reassign and contributes_to changes are owner/admin-only. Pass depends_on:[], linked_channel_docs:[], or contributes_to:[] to clear, or a new array to replace; server rejects cycles. Prefer append_evidence:[{kind, ref, note?}] (1..10 items, deduplicated without overwriting existing receipts) or pass evidence:[{kind, ref, note?}] (full replacement; [] to clear) plus optional if_match_updated_at CAS token.',
     inputSchema: {
       type: "object",
       properties: {
         task_id: { type: "string", description: "Task id to update" },
+        title: { type: "string", maxLength: 200, description: "Updated task title (1..200 chars; never include secrets)" },
         status: { type: "string", enum: ["todo", "doing", "done", "blocked"], description: "New status" },
         assignee: { type: "string", description: "Re-assign to another agent handle (Objective owner/admin only; never an email address)" },
         contributes_to: {
@@ -5436,7 +5544,7 @@ var ALL_TOOL_DEFS = [
             required: ["channel_id", "doc_id"]
           }
         },
-        due: { type: "string", description: "ISO-8601 due date" },
+        due: { type: "string", maxLength: 32, description: 'ISO-8601 due date/timestamp (<=32 chars), or pass empty string "" to clear' },
         evidence: {
           type: "array",
           maxItems: 10,
@@ -5545,6 +5653,23 @@ var ALL_TOOL_DEFS = [
     }
   },
   {
+    name: "okr_update_kr",
+    description: "Non-destructively revise a KeyResult's mid-sprint metadata (title, metric_type, target) and/or progress (current, risk_level) via PATCH /api/okr/krs/:krid, with optional if_match_updated_at optimistic concurrency guard (409 stale_kr_version on conflict). Requires Objective stewardship (owner, sibling agent of human owner, or admin).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        kr_id: { type: "string", description: "KR id to revise" },
+        title: { type: "string", maxLength: 200, description: "Updated KR title (1..200 chars; never include secrets)" },
+        metric_type: { type: "string", enum: ["count", "bool", "percent"], description: "Updated metric shape (bool requires target/current in {0,1}; percent <= 100)" },
+        target: { type: "number", description: "Updated target value (0..1000000; bool: 0 or 1; percent: <= 100)" },
+        current: { type: "number", description: "Optional updated current value (0..1000000; bool: 0 or 1; percent: <= 100)" },
+        risk_level: { type: "string", enum: ["green", "yellow", "red"], description: "Optional updated risk self-assessment" },
+        if_match_updated_at: { type: "string", description: "Optional optimistic concurrency guard (kr.updated_at). Rejects with 409 stale_kr_version if modified concurrently." }
+      },
+      required: ["kr_id"]
+    }
+  },
+  {
     name: "archive_objective",
     description: "Archive one completed/abandoned objective into the collapsed archived view (releasing the 20-active-Objectives room cap). Objective-level only in v1; completion_summary must be <=280 chars without secrets.",
     inputSchema: {
@@ -5581,15 +5706,19 @@ var ALL_TOOL_DEFS = [
   },
   {
     name: "okr_set_kr_progress",
-    description: "Update a KR's current value (progress ping) and optionally risk_level. Allowed for the Objective owner, an admin, or any task assignee whose task contributes_to this KR (self-report path). Unthrottled \u2014 progress updates are expected to be frequent during a sprint.",
+    description: "Update a KR's quantitative progress (current, risk_level) or revise KR metadata (title, metric_type, target, if_match_updated_at). Progress pings (current + optional risk_level) are open to Objective stewards and assigned task contributors; metadata revisions require Objective stewardship.",
     inputSchema: {
       type: "object",
       properties: {
         kr_id: { type: "string", description: "KR id to update" },
-        current: { type: "number", description: "New current value. bool: 0/1 only. percent: \u2264100." },
-        risk_level: { type: "string", enum: ["green", "yellow", "red"], description: "Update risk self-assessment" }
+        current: { type: "number", description: "New current value (0..1000000; bool: 0/1 only; percent: <=100)" },
+        risk_level: { type: "string", enum: ["green", "yellow", "red"], description: "Update risk self-assessment" },
+        title: { type: "string", maxLength: 200, description: "Optional KR title revision (1..200 chars; Objective steward only)" },
+        metric_type: { type: "string", enum: ["count", "bool", "percent"], description: "Optional metric_type revision (Objective steward only)" },
+        target: { type: "number", description: "Optional target value revision (0..1000000; Objective steward only)" },
+        if_match_updated_at: { type: "string", description: "Optional optimistic concurrency guard (kr.updated_at; routes via PATCH /api/okr/krs/:krid)" }
       },
-      required: ["kr_id", "current"]
+      required: ["kr_id"]
     }
   },
   {
@@ -6086,6 +6215,27 @@ HANDLERS.set("delete_memory", async (args) => {
     };
   } catch (e) {
     return { content: [{ type: "text", text: `delete_memory network error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
+  }
+});
+HANDLERS.set("okr_update_kr", async (args) => {
+  const validated = validateOkrUpdateKrInput(args);
+  if (!validated.ok) {
+    return { content: [{ type: "text", text: `okr_update_kr invalid arguments: ${validated.error}` }], isError: true };
+  }
+  const { kr_id, body } = validated.value;
+  try {
+    const r = await apiFetch(`${REST_URL}/api/okr/krs/${encodeURIComponent(kr_id)}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${TOKEN}` },
+      body: JSON.stringify(body)
+    });
+    const text = await r.text();
+    if (!r.ok) {
+      return { content: [{ type: "text", text: `okr_update_kr failed (${r.status}): ${text.slice(0, 160)}` }], isError: true };
+    }
+    return { content: [{ type: "text", text: `Updated: ${text}` }] };
+  } catch (e) {
+    return { content: [{ type: "text", text: `okr_update_kr network error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
   }
 });
 function redactCloudAgentDisplayName(name) {
@@ -8710,11 +8860,15 @@ ${list}` }] };
     }
     if (name === "okr_add_task") {
       const { objective_id, title, assignee, contributes_to, depends_on, linked_channel_docs, due } = args;
+      const titleCheck = validateOkrTaskTitleInput(title);
+      if (!titleCheck.ok) {
+        return { content: [{ type: "text", text: `okr_add_task invalid title: ${titleCheck.error}` }], isError: true };
+      }
       const assigneeCheck = validateOkrTaskAssigneeInput(assignee);
       if (!assigneeCheck.ok) {
         return { content: [{ type: "text", text: `okr_add_task invalid assignee: ${assigneeCheck.error}` }], isError: true };
       }
-      const body = { title, assignee: assigneeCheck.value };
+      const body = { title: titleCheck.value, assignee: assigneeCheck.value };
       if (contributes_to !== undefined) {
         const contribCheck = validateOkrTaskContributesToInput(contributes_to);
         if (!contribCheck.ok) {
@@ -8739,8 +8893,14 @@ ${list}` }] };
         if (docsCheck.value.length > 0)
           body.linked_channel_docs = docsCheck.value;
       }
-      if (due)
-        body.due = due;
+      if (due !== undefined && due !== null && due !== "") {
+        const dueCheck = validateOkrTaskDueInput(due);
+        if (!dueCheck.ok) {
+          return { content: [{ type: "text", text: `okr_add_task invalid due: ${dueCheck.error}` }], isError: true };
+        }
+        if (dueCheck.value)
+          body.due = dueCheck.value;
+      }
       try {
         const r = await apiFetch(`${REST_URL}/api/okr/objectives/${encodeURIComponent(objective_id)}/tasks`, {
           method: "POST",
@@ -8759,6 +8919,7 @@ ${list}` }] };
     if (name === "okr_update_task") {
       const {
         task_id,
+        title,
         status,
         assignee,
         contributes_to,
@@ -8778,6 +8939,13 @@ ${list}` }] };
         };
       }
       const patch = {};
+      if (title !== undefined) {
+        const titleCheck = validateOkrTaskTitleInput(title);
+        if (!titleCheck.ok) {
+          return { content: [{ type: "text", text: `okr_update_task invalid title: ${titleCheck.error}` }], isError: true };
+        }
+        patch.title = titleCheck.value;
+      }
       if (status)
         patch.status = status;
       if (assignee !== undefined) {
@@ -8812,8 +8980,13 @@ ${list}` }] };
         }
         patch.linked_channel_docs = docsCheck.value;
       }
-      if (due)
-        patch.due = due;
+      if (due !== undefined) {
+        const dueCheck = validateOkrTaskDueInput(due);
+        if (!dueCheck.ok) {
+          return { content: [{ type: "text", text: `okr_update_task invalid due: ${dueCheck.error}` }], isError: true };
+        }
+        patch.due = dueCheck.value;
+      }
       if (evidence !== undefined) {
         const evCheck = validateTaskEvidenceInput(evidence);
         if (!evCheck.ok) {
@@ -8992,9 +9165,10 @@ ${list}` }] };
       if (!validated.ok) {
         return { content: [{ type: "text", text: `okr_set_kr_progress invalid arguments: ${validated.error}` }], isError: true };
       }
-      const { kr_id, body } = validated.value;
+      const { kr_id, body, useMetadataEndpoint } = validated.value;
+      const pathSuffix = useMetadataEndpoint ? "" : "/progress";
       try {
-        const r = await apiFetch(`${REST_URL}/api/okr/krs/${encodeURIComponent(kr_id)}/progress`, {
+        const r = await apiFetch(`${REST_URL}/api/okr/krs/${encodeURIComponent(kr_id)}${pathSuffix}`, {
           method: "PATCH",
           headers: { "Content-Type": "application/json", Authorization: `Bearer ${TOKEN}` },
           body: JSON.stringify(body)

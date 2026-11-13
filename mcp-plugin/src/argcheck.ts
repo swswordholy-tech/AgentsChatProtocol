@@ -519,36 +519,197 @@ export function validateOkrAddKrInput(
   };
 }
 
-export function validateOkrSetKrProgressInput(
+export interface ValidatedOkrKrUpdateBody {
+  title?: string;
+  metric_type?: OkrKrMetricType;
+  target?: number;
+  current?: number;
+  risk_level?: OkrKrRiskLevel;
+  if_match_updated_at?: string;
+}
+
+export interface ValidatedOkrKrUpdateResult {
+  kr_id: string;
+  body: ValidatedOkrKrUpdateBody;
+  useMetadataEndpoint: boolean;
+}
+
+function validateOkrKrMutationInput(
   args: unknown,
-): { ok: true; value: { kr_id: string; body: { current: number; risk_level?: OkrKrRiskLevel } } } | { ok: false; error: string } {
+  toolLabel: "okr_set_kr_progress" | "okr_update_kr",
+  forceMetadataEndpoint: boolean,
+): { ok: true; value: ValidatedOkrKrUpdateResult } | { ok: false; error: string } {
   const a = args && typeof args === "object" && !Array.isArray(args)
     ? (args as Record<string, unknown>)
     : {};
   const krId = typeof a.kr_id === "string" ? a.kr_id.trim() : "";
-  if (!krId || !SAFE_CHANNEL_OR_LOOP_ID_RE.test(krId) || krId.includes("..")) {
-    return { ok: false, error: "okr_set_kr_progress requires a valid kr_id." };
+  if (
+    !krId ||
+    !SAFE_CHANNEL_OR_LOOP_ID_RE.test(krId) ||
+    krId.includes("..") ||
+    EVIDENCE_CTRL_RE.test(krId) ||
+    EVIDENCE_SECRET_RE.test(krId)
+  ) {
+    return { ok: false, error: `${toolLabel} requires a valid kr_id.` };
   }
-  if (typeof a.current !== "number" || !Number.isFinite(a.current) || a.current < 0 || a.current > 1_000_000) {
-    return { ok: false, error: "okr_set_kr_progress current must be a finite number in 0..1000000." };
+
+  const body: ValidatedOkrKrUpdateBody = {};
+
+  if (a.title !== undefined && a.title !== null) {
+    if (typeof a.title !== "string") {
+      return { ok: false, error: `${toolLabel} title must be a non-empty string (1..200 chars).` };
+    }
+    if (EVIDENCE_CTRL_RE.test(a.title)) {
+      return { ok: false, error: `${toolLabel} title must not contain control characters.` };
+    }
+    if (EVIDENCE_SECRET_RE.test(a.title)) {
+      return { ok: false, error: `${toolLabel} title rejected: appears to contain a secret or token.` };
+    }
+    const trimmedTitle = a.title.trim();
+    if (!trimmedTitle || trimmedTitle.length > 200) {
+      return { ok: false, error: `${toolLabel} title must be 1..200 chars.` };
+    }
+    body.title = trimmedTitle;
   }
-  let riskLevel: OkrKrRiskLevel | undefined;
+
+  let metricType: OkrKrMetricType | undefined;
+  if (a.metric_type !== undefined && a.metric_type !== null) {
+    if (typeof a.metric_type !== "string" || !(OKR_KR_METRIC_TYPES as readonly string[]).includes(a.metric_type)) {
+      return { ok: false, error: `${toolLabel} metric_type must be count|bool|percent.` };
+    }
+    metricType = a.metric_type as OkrKrMetricType;
+    body.metric_type = metricType;
+  }
+
+  if (a.target !== undefined && a.target !== null) {
+    if (typeof a.target !== "number" || !Number.isFinite(a.target) || a.target < 0 || a.target > 1_000_000) {
+      return { ok: false, error: `${toolLabel} target must be a finite number in 0..1000000.` };
+    }
+    if (metricType === "bool" && a.target !== 0 && a.target !== 1) {
+      return { ok: false, error: `${toolLabel} bool target must be 0 or 1.` };
+    }
+    if (metricType === "percent" && a.target > 100) {
+      return { ok: false, error: `${toolLabel} percent target must be <= 100.` };
+    }
+    body.target = a.target;
+  }
+
+  if (a.current !== undefined && a.current !== null) {
+    if (typeof a.current !== "number" || !Number.isFinite(a.current) || a.current < 0 || a.current > 1_000_000) {
+      return { ok: false, error: `${toolLabel} current must be a finite number in 0..1000000.` };
+    }
+    if (metricType === "bool" && a.current !== 0 && a.current !== 1) {
+      return { ok: false, error: `${toolLabel} bool current must be 0 or 1.` };
+    }
+    if (metricType === "percent" && a.current > 100) {
+      return { ok: false, error: `${toolLabel} percent current must be <= 100.` };
+    }
+    body.current = a.current;
+  }
+
   if (a.risk_level !== undefined && a.risk_level !== null) {
     if (typeof a.risk_level !== "string" || !(OKR_KR_RISK_LEVELS as readonly string[]).includes(a.risk_level)) {
-      return { ok: false, error: "okr_set_kr_progress risk_level must be green|yellow|red." };
+      return { ok: false, error: `${toolLabel} risk_level must be green|yellow|red.` };
     }
-    riskLevel = a.risk_level as OkrKrRiskLevel;
+    body.risk_level = a.risk_level as OkrKrRiskLevel;
   }
+
+  const hasMutableField =
+    body.title !== undefined ||
+    body.metric_type !== undefined ||
+    body.target !== undefined ||
+    body.current !== undefined ||
+    body.risk_level !== undefined;
+  if (!hasMutableField) {
+    return {
+      ok: false,
+      error: `${toolLabel} requires at least one of current, risk_level, title, metric_type, or target.`,
+    };
+  }
+
+  if (a.if_match_updated_at !== undefined && a.if_match_updated_at !== null) {
+    const verCheck = validateTaskVersionToken(a.if_match_updated_at);
+    if (!verCheck.ok) {
+      return { ok: false, error: `${toolLabel} invalid if_match_updated_at: ${verCheck.error}` };
+    }
+    if (EVIDENCE_SECRET_RE.test(verCheck.value)) {
+      return { ok: false, error: `${toolLabel} if_match_updated_at rejected: appears to contain a secret or token.` };
+    }
+    body.if_match_updated_at = verCheck.value;
+  }
+
+  const useMetadataEndpoint =
+    forceMetadataEndpoint ||
+    body.title !== undefined ||
+    body.metric_type !== undefined ||
+    body.target !== undefined ||
+    body.if_match_updated_at !== undefined ||
+    body.current === undefined;
+
   return {
     ok: true,
     value: {
       kr_id: krId,
-      body: {
-        current: a.current,
-        ...(riskLevel !== undefined ? { risk_level: riskLevel } : {}),
-      },
+      body,
+      useMetadataEndpoint,
     },
   };
+}
+
+export function validateOkrSetKrProgressInput(
+  args: unknown,
+): { ok: true; value: ValidatedOkrKrUpdateResult } | { ok: false; error: string } {
+  return validateOkrKrMutationInput(args, "okr_set_kr_progress", false);
+}
+
+export function validateOkrUpdateKrInput(
+  args: unknown,
+): { ok: true; value: ValidatedOkrKrUpdateResult } | { ok: false; error: string } {
+  return validateOkrKrMutationInput(args, "okr_update_kr", true);
+}
+
+export function validateOkrTaskTitleInput(
+  raw: unknown,
+): { ok: true; value: string } | { ok: false; error: string } {
+  if (typeof raw !== "string") {
+    return { ok: false, error: "title must be a non-empty string (1..200 chars)" };
+  }
+  if (EVIDENCE_CTRL_RE.test(raw)) {
+    return { ok: false, error: "title must not contain control characters" };
+  }
+  if (EVIDENCE_SECRET_RE.test(raw)) {
+    return { ok: false, error: "title rejected: appears to contain a secret or token" };
+  }
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed.length > 200) {
+    return { ok: false, error: "title must be 1..200 chars" };
+  }
+  return { ok: true, value: trimmed };
+}
+
+export function validateOkrTaskDueInput(
+  raw: unknown,
+): { ok: true; value: string } | { ok: false; error: string } {
+  if (raw === null || raw === "") {
+    return { ok: true, value: "" };
+  }
+  if (typeof raw !== "string") {
+    return { ok: false, error: "due must be an ISO-8601 date/timestamp string (<= 32 chars) or empty string to clear" };
+  }
+  if (EVIDENCE_CTRL_RE.test(raw)) {
+    return { ok: false, error: "due must not contain control characters" };
+  }
+  if (EVIDENCE_SECRET_RE.test(raw)) {
+    return { ok: false, error: "due rejected: appears to contain a secret or token" };
+  }
+  const trimmed = raw.trim();
+  if (!trimmed) {
+    return { ok: true, value: "" };
+  }
+  if (trimmed.length > 32 || !Number.isFinite(Date.parse(trimmed))) {
+    return { ok: false, error: "due must be a valid ISO-8601 date/timestamp (<= 32 chars) or empty string to clear" };
+  }
+  return { ok: true, value: trimmed };
 }
 
 const OKR_TASK_CONTRIBUTES_CAP = 5;

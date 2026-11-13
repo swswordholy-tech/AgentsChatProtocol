@@ -13,6 +13,8 @@ let receivedObjectives: any[] = [];
 let receivedObjectivePatches: Array<{ objectiveId: string; body: any }> = [];
 let receivedArchivedObjectives: Array<{ objectiveId: string; body: any }> = [];
 let receivedAddedTasks: Array<{ objectiveId: string; body: any }> = [];
+let receivedKrPatches: Array<{ krId: string; body: any }> = [];
+let receivedKrProgressPatches: Array<{ krId: string; body: any }> = [];
 let legacyIgnoreAppend = false;
 let storedEvidenceByTask: Record<string, any[]> = {};
 let storedContributesByTask: Record<string, string[]> = {};
@@ -23,6 +25,8 @@ beforeEach(() => {
   receivedObjectivePatches = [];
   receivedArchivedObjectives = [];
   receivedAddedTasks = [];
+  receivedKrPatches = [];
+  receivedKrProgressPatches = [];
   legacyIgnoreAppend = false;
   storedEvidenceByTask = {};
   storedContributesByTask = {};
@@ -139,6 +143,39 @@ beforeAll(() => {
             linked_channel_docs: Array.isArray(body.linked_channel_docs) && body.linked_channel_docs.length === 0
               ? undefined
               : body.linked_channel_docs,
+          },
+        });
+      }
+      const patchKrProgressMatch = url.pathname.match(/^\/api\/okr\/krs\/([^/]+)\/progress$/);
+      if (req.method === "PATCH" && patchKrProgressMatch) {
+        const body = await req.json() as any;
+        const krId = decodeURIComponent(patchKrProgressMatch[1]);
+        receivedKrProgressPatches.push({ krId, body });
+        return Response.json({
+          ok: true,
+          kr: {
+            id: krId,
+            current: body.current,
+            risk_level: body.risk_level ?? "green",
+            updated_at: "2026-11-13T08:40:00.000Z",
+          },
+        });
+      }
+      const patchKrMatch = url.pathname.match(/^\/api\/okr\/krs\/([^/]+)$/);
+      if (req.method === "PATCH" && patchKrMatch) {
+        const body = await req.json() as any;
+        const krId = decodeURIComponent(patchKrMatch[1]);
+        receivedKrPatches.push({ krId, body });
+        return Response.json({
+          ok: true,
+          kr: {
+            id: krId,
+            title: body.title ?? "Existing KR",
+            metric_type: body.metric_type ?? "count",
+            target: body.target ?? 3,
+            current: body.current ?? 1,
+            risk_level: body.risk_level ?? "green",
+            updated_at: "2026-11-13T08:41:00.000Z",
           },
         });
       }
@@ -758,6 +795,110 @@ describe("MCP okr_update_task structured evidence", () => {
         objectiveId: "obj_gov_1",
         body: {
           completion_summary: "Archived cleanly within 280 chars",
+        },
+      },
+    ]);
+  });
+
+  test("okr_update_kr, okr_set_kr_progress metadata routing, and okr_update_task title/due revision & clear work end-to-end", async () => {
+    const out = await drive([
+      INIT,
+      INITED,
+      callTool(2, "load_tool_group", { group_name: "okr" }),
+      { jsonrpc: "2.0", id: 3, method: "tools/list", params: {} },
+      callTool(4, "okr_update_kr", {
+        kr_id: "kr_rev_1",
+        title: " Ship 5 verified endpoints ",
+        metric_type: "count",
+        target: 5,
+        current: 2,
+        risk_level: "green",
+        if_match_updated_at: "2026-11-13T08:00:00.000Z",
+      }),
+      callTool(5, "okr_set_kr_progress", {
+        kr_id: "kr_rev_1",
+        current: 3,
+        risk_level: "green",
+      }),
+      callTool(6, "okr_set_kr_progress", {
+        kr_id: "kr_rev_1",
+        title: "Ship 6 verified endpoints",
+        target: 6,
+      }),
+      callTool(7, "okr_update_task", {
+        task_id: "task_meta_1",
+        title: " Updated task title ",
+        due: "2026-11-20T09:00:00Z",
+      }),
+      callTool(8, "okr_update_task", {
+        task_id: "task_meta_1",
+        due: "",
+      }),
+      callTool(9, "okr_update_task", {
+        task_id: "task_meta_1",
+        due: "not-an-iso-date",
+      }),
+      callTool(10, "okr_update_kr", {
+        kr_id: "kr_rev_1",
+        title: "Leak agent_key_supersecret123456",
+      }),
+    ], 2400);
+
+    const tools = out.res.get(3)?.result?.tools || [];
+    const updateKrDef = tools.find((t: any) => t.name === "okr_update_kr");
+    const setKrProgDef = tools.find((t: any) => t.name === "okr_set_kr_progress");
+    const updateTaskDef = tools.find((t: any) => t.name === "okr_update_task");
+    expect(updateKrDef?.inputSchema?.required).toEqual(["kr_id"]);
+    expect(setKrProgDef?.inputSchema?.required).toEqual(["kr_id"]);
+    expect(updateTaskDef?.inputSchema?.properties?.title?.maxLength).toBe(200);
+
+    for (const id of [4, 5, 6, 7, 8]) {
+      expect(out.res.get(id)?.result?.isError).toBeUndefined();
+    }
+    for (const id of [9, 10]) {
+      expect(out.res.get(id)?.result?.isError).toBe(true);
+    }
+    expect(out.res.get(9)?.result?.content?.[0]?.text).toContain("ISO-8601");
+    expect(out.res.get(10)?.result?.content?.[0]?.text).toContain("secret or token");
+
+    expect(receivedKrProgressPatches).toEqual([
+      {
+        krId: "kr_rev_1",
+        body: { current: 3, risk_level: "green" },
+      },
+    ]);
+    expect(receivedKrPatches).toEqual([
+      {
+        krId: "kr_rev_1",
+        body: {
+          title: "Ship 5 verified endpoints",
+          metric_type: "count",
+          target: 5,
+          current: 2,
+          risk_level: "green",
+          if_match_updated_at: "2026-11-13T08:00:00.000Z",
+        },
+      },
+      {
+        krId: "kr_rev_1",
+        body: {
+          title: "Ship 6 verified endpoints",
+          target: 6,
+        },
+      },
+    ]);
+    expect(receivedPatches).toEqual([
+      {
+        taskId: "task_meta_1",
+        body: {
+          title: "Updated task title",
+          due: "2026-11-20T09:00:00Z",
+        },
+      },
+      {
+        taskId: "task_meta_1",
+        body: {
+          due: "",
         },
       },
     ]);

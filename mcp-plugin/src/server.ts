@@ -64,6 +64,9 @@ import {
   validateOkrTaskAssigneeInput,
   validateOkrTaskContributesToInput,
   validateOkrTaskDependsOnInput,
+  validateOkrTaskDueInput,
+  validateOkrTaskTitleInput,
+  validateOkrUpdateKrInput,
   validateOkrUpdateObjectiveInput,
   validateTaskEvidenceInput,
   validateTaskVersionToken,
@@ -1194,6 +1197,7 @@ const TOOL_GROUPS: ToolGroupMeta[] = [
       "okr_task_blocks",
       "okr_open_thread",
       "okr_add_kr",
+      "okr_update_kr",
       "okr_set_kr_progress",
       "okr_add_task_comment",
       "okr_set_links",
@@ -2109,11 +2113,12 @@ const ALL_TOOL_DEFS = [
     },
     {
       name: "okr_update_task",
-      description: "Update a Task — change status, re-assign assignee, bind/clear contributes_to Key Results, block/unblock, add blocker info, adjust DAG dependencies (depends_on), attach/clear room skill/spec docs (linked_channel_docs), or record structured completion evidence. Caller must be the assignee, Objective owner, or admin. Reassign and contributes_to changes are owner/admin-only. Pass depends_on:[], linked_channel_docs:[], or contributes_to:[] to clear, or a new array to replace; server rejects cycles. Prefer append_evidence:[{kind, ref, note?}] (1..10 items, deduplicated without overwriting existing receipts) or pass evidence:[{kind, ref, note?}] (full replacement; [] to clear) plus optional if_match_updated_at CAS token.",
+      description: "Update a Task — revise title or due date (pass empty string \"\" to clear due), change status, re-assign assignee, bind/clear contributes_to Key Results, block/unblock, add blocker info, adjust DAG dependencies (depends_on), attach/clear room skill/spec docs (linked_channel_docs), or record structured completion evidence. Caller must be the assignee, Objective owner, or admin. Reassign and contributes_to changes are owner/admin-only. Pass depends_on:[], linked_channel_docs:[], or contributes_to:[] to clear, or a new array to replace; server rejects cycles. Prefer append_evidence:[{kind, ref, note?}] (1..10 items, deduplicated without overwriting existing receipts) or pass evidence:[{kind, ref, note?}] (full replacement; [] to clear) plus optional if_match_updated_at CAS token.",
       inputSchema: {
         type: "object" as const,
         properties: {
           task_id: { type: "string", description: "Task id to update" },
+          title: { type: "string", maxLength: 200, description: "Updated task title (1..200 chars; never include secrets)" },
           status: { type: "string", enum: ["todo", "doing", "done", "blocked"], description: "New status" },
           assignee: { type: "string", description: "Re-assign to another agent handle (Objective owner/admin only; never an email address)" },
           contributes_to: {
@@ -2138,7 +2143,7 @@ const ALL_TOOL_DEFS = [
               required: ["channel_id", "doc_id"],
             },
           },
-          due: { type: "string", description: "ISO-8601 due date" },
+          due: { type: "string", maxLength: 32, description: "ISO-8601 due date/timestamp (<=32 chars), or pass empty string \"\" to clear" },
           evidence: {
             type: "array",
             maxItems: 10,
@@ -2247,6 +2252,23 @@ const ALL_TOOL_DEFS = [
       },
     },
     {
+      name: "okr_update_kr",
+      description: "Non-destructively revise a KeyResult's mid-sprint metadata (title, metric_type, target) and/or progress (current, risk_level) via PATCH /api/okr/krs/:krid, with optional if_match_updated_at optimistic concurrency guard (409 stale_kr_version on conflict). Requires Objective stewardship (owner, sibling agent of human owner, or admin).",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          kr_id: { type: "string", description: "KR id to revise" },
+          title: { type: "string", maxLength: 200, description: "Updated KR title (1..200 chars; never include secrets)" },
+          metric_type: { type: "string", enum: ["count", "bool", "percent"], description: "Updated metric shape (bool requires target/current in {0,1}; percent <= 100)" },
+          target: { type: "number", description: "Updated target value (0..1000000; bool: 0 or 1; percent: <= 100)" },
+          current: { type: "number", description: "Optional updated current value (0..1000000; bool: 0 or 1; percent: <= 100)" },
+          risk_level: { type: "string", enum: ["green", "yellow", "red"], description: "Optional updated risk self-assessment" },
+          if_match_updated_at: { type: "string", description: "Optional optimistic concurrency guard (kr.updated_at). Rejects with 409 stale_kr_version if modified concurrently." },
+        },
+        required: ["kr_id"],
+      },
+    },
+    {
       name: "archive_objective",
       description: "Archive one completed/abandoned objective into the collapsed archived view (releasing the 20-active-Objectives room cap). Objective-level only in v1; completion_summary must be <=280 chars without secrets.",
       inputSchema: {
@@ -2283,15 +2305,19 @@ const ALL_TOOL_DEFS = [
     },
     {
       name: "okr_set_kr_progress",
-      description: "Update a KR's current value (progress ping) and optionally risk_level. Allowed for the Objective owner, an admin, or any task assignee whose task contributes_to this KR (self-report path). Unthrottled — progress updates are expected to be frequent during a sprint.",
+      description: "Update a KR's quantitative progress (current, risk_level) or revise KR metadata (title, metric_type, target, if_match_updated_at). Progress pings (current + optional risk_level) are open to Objective stewards and assigned task contributors; metadata revisions require Objective stewardship.",
       inputSchema: {
         type: "object" as const,
         properties: {
           kr_id: { type: "string", description: "KR id to update" },
-          current: { type: "number", description: "New current value. bool: 0/1 only. percent: ≤100." },
+          current: { type: "number", description: "New current value (0..1000000; bool: 0/1 only; percent: <=100)" },
           risk_level: { type: "string", enum: ["green", "yellow", "red"], description: "Update risk self-assessment" },
+          title: { type: "string", maxLength: 200, description: "Optional KR title revision (1..200 chars; Objective steward only)" },
+          metric_type: { type: "string", enum: ["count", "bool", "percent"], description: "Optional metric_type revision (Objective steward only)" },
+          target: { type: "number", description: "Optional target value revision (0..1000000; Objective steward only)" },
+          if_match_updated_at: { type: "string", description: "Optional optimistic concurrency guard (kr.updated_at; routes via PATCH /api/okr/krs/:krid)" },
         },
-        required: ["kr_id", "current"],
+        required: ["kr_id"],
       },
     },
     {
@@ -2848,6 +2874,28 @@ HANDLERS.set("delete_memory", async (args) => {
     };
   } catch (e: any) {
     return { content: [{ type: "text", text: `delete_memory network error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
+  }
+});
+
+HANDLERS.set("okr_update_kr", async (args) => {
+  const validated = validateOkrUpdateKrInput(args);
+  if (!validated.ok) {
+    return { content: [{ type: "text", text: `okr_update_kr invalid arguments: ${validated.error}` }], isError: true };
+  }
+  const { kr_id, body } = validated.value;
+  try {
+    const r = await apiFetch(`${REST_URL}/api/okr/krs/${encodeURIComponent(kr_id)}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${TOKEN}` },
+      body: JSON.stringify(body),
+    });
+    const text = await r.text();
+    if (!r.ok) {
+      return { content: [{ type: "text", text: `okr_update_kr failed (${r.status}): ${text.slice(0, 160)}` }], isError: true };
+    }
+    return { content: [{ type: "text", text: `Updated: ${text}` }] };
+  } catch (e: any) {
+    return { content: [{ type: "text", text: `okr_update_kr network error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
   }
 });
 
@@ -5763,13 +5811,17 @@ const handleToolCall = async (request: any): Promise<any> => {
       contributes_to?: unknown;
       depends_on?: unknown;
       linked_channel_docs?: unknown;
-      due?: string;
+      due?: unknown;
     };
+    const titleCheck = validateOkrTaskTitleInput(title);
+    if (!titleCheck.ok) {
+      return { content: [{ type: "text", text: `okr_add_task invalid title: ${titleCheck.error}` }], isError: true };
+    }
     const assigneeCheck = validateOkrTaskAssigneeInput(assignee);
     if (!assigneeCheck.ok) {
       return { content: [{ type: "text", text: `okr_add_task invalid assignee: ${assigneeCheck.error}` }], isError: true };
     }
-    const body: Record<string, unknown> = { title, assignee: assigneeCheck.value };
+    const body: Record<string, unknown> = { title: titleCheck.value, assignee: assigneeCheck.value };
     if (contributes_to !== undefined) {
       const contribCheck = validateOkrTaskContributesToInput(contributes_to);
       if (!contribCheck.ok) {
@@ -5791,7 +5843,13 @@ const handleToolCall = async (request: any): Promise<any> => {
       }
       if (docsCheck.value.length > 0) body.linked_channel_docs = docsCheck.value;
     }
-    if (due) body.due = due;
+    if (due !== undefined && due !== null && due !== "") {
+      const dueCheck = validateOkrTaskDueInput(due);
+      if (!dueCheck.ok) {
+        return { content: [{ type: "text", text: `okr_add_task invalid due: ${dueCheck.error}` }], isError: true };
+      }
+      if (dueCheck.value) body.due = dueCheck.value;
+    }
     try {
       const r = await apiFetch(`${REST_URL}/api/okr/objectives/${encodeURIComponent(objective_id)}/tasks`, {
         method: "POST",
@@ -5811,6 +5869,7 @@ const handleToolCall = async (request: any): Promise<any> => {
   if (name === "okr_update_task") {
     const {
       task_id,
+      title,
       status,
       assignee,
       contributes_to,
@@ -5824,6 +5883,7 @@ const handleToolCall = async (request: any): Promise<any> => {
       if_match_updated_at,
     } = args as {
       task_id: string;
+      title?: unknown;
       status?: string;
       assignee?: unknown;
       contributes_to?: unknown;
@@ -5831,7 +5891,7 @@ const handleToolCall = async (request: any): Promise<any> => {
       blocker_agent?: string;
       depends_on?: unknown;
       linked_channel_docs?: unknown;
-      due?: string;
+      due?: unknown;
       evidence?: unknown;
       append_evidence?: unknown;
       if_match_updated_at?: unknown;
@@ -5843,6 +5903,13 @@ const handleToolCall = async (request: any): Promise<any> => {
       };
     }
     const patch: Record<string, unknown> = {};
+    if (title !== undefined) {
+      const titleCheck = validateOkrTaskTitleInput(title);
+      if (!titleCheck.ok) {
+        return { content: [{ type: "text", text: `okr_update_task invalid title: ${titleCheck.error}` }], isError: true };
+      }
+      patch.title = titleCheck.value;
+    }
     if (status) patch.status = status;
     if (assignee !== undefined) {
       const assigneeCheck = validateOkrTaskAssigneeInput(assignee);
@@ -5874,7 +5941,13 @@ const handleToolCall = async (request: any): Promise<any> => {
       }
       patch.linked_channel_docs = docsCheck.value;
     }
-    if (due) patch.due = due;
+    if (due !== undefined) {
+      const dueCheck = validateOkrTaskDueInput(due);
+      if (!dueCheck.ok) {
+        return { content: [{ type: "text", text: `okr_update_task invalid due: ${dueCheck.error}` }], isError: true };
+      }
+      patch.due = dueCheck.value;
+    }
     if (evidence !== undefined) {
       const evCheck = validateTaskEvidenceInput(evidence);
       if (!evCheck.ok) {
@@ -6057,9 +6130,10 @@ const handleToolCall = async (request: any): Promise<any> => {
     if (!validated.ok) {
       return { content: [{ type: "text", text: `okr_set_kr_progress invalid arguments: ${validated.error}` }], isError: true };
     }
-    const { kr_id, body } = validated.value;
+    const { kr_id, body, useMetadataEndpoint } = validated.value;
+    const pathSuffix = useMetadataEndpoint ? "" : "/progress";
     try {
-      const r = await apiFetch(`${REST_URL}/api/okr/krs/${encodeURIComponent(kr_id)}/progress`, {
+      const r = await apiFetch(`${REST_URL}/api/okr/krs/${encodeURIComponent(kr_id)}${pathSuffix}`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json", "Authorization": `Bearer ${TOKEN}` },
         body: JSON.stringify(body),

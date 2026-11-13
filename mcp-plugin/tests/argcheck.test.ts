@@ -5,6 +5,10 @@ import {
   validateCreateLoopInput,
   validateDeleteMemoryInput,
   validateListLoopsInput,
+  validateOkrSetKrProgressInput,
+  validateOkrTaskDueInput,
+  validateOkrTaskTitleInput,
+  validateOkrUpdateKrInput,
   validateTaskEvidenceInput,
   validateToolArgs,
 } from "../src/argcheck.ts";
@@ -283,4 +287,79 @@ test("validateDeleteMemoryInput validates slug, CAS version, and allow_missing",
   expect(validateDeleteMemoryInput({ name: ".hidden" }).ok).toBe(false);
   expect(validateDeleteMemoryInput({ name: "note", if_match_version: 0 }).ok).toBe(false);
   expect(validateDeleteMemoryInput({ name: "note", allow_missing: "yes" }).ok).toBe(false);
+});
+
+test("validateOkrUpdateKrInput and validateOkrSetKrProgressInput enforce routing, metric bounds, CAS, and secret blocks", () => {
+  expect(
+    validateOkrSetKrProgressInput({
+      kr_id: " kr_prog_1 ",
+      current: 2,
+      risk_level: "green",
+    }),
+  ).toEqual({
+    ok: true,
+    value: {
+      kr_id: "kr_prog_1",
+      body: { current: 2, risk_level: "green" },
+      useMetadataEndpoint: false,
+    },
+  });
+
+  expect(
+    validateOkrSetKrProgressInput({
+      kr_id: "kr_meta_1",
+      title: " Ship 5 tasks ",
+      target: 5,
+      if_match_updated_at: "2026-11-13T08:00:00.000Z",
+    }),
+  ).toEqual({
+    ok: true,
+    value: {
+      kr_id: "kr_meta_1",
+      body: {
+        title: "Ship 5 tasks",
+        target: 5,
+        if_match_updated_at: "2026-11-13T08:00:00.000Z",
+      },
+      useMetadataEndpoint: true,
+    },
+  });
+
+  expect(
+    validateOkrUpdateKrInput({
+      kr_id: "kr_bool_1",
+      metric_type: "bool",
+      target: 1,
+      current: 1,
+    }),
+  ).toEqual({
+    ok: true,
+    value: {
+      kr_id: "kr_bool_1",
+      body: { metric_type: "bool", target: 1, current: 1 },
+      useMetadataEndpoint: true,
+    },
+  });
+
+  expect(validateOkrUpdateKrInput({ kr_id: "kr_empty" }).ok).toBe(false);
+  expect(validateOkrUpdateKrInput({ kr_id: "kr_bad", metric_type: "bool", target: 2 }).ok).toBe(false);
+  expect(validateOkrUpdateKrInput({ kr_id: "kr_bad", metric_type: "percent", target: 101 }).ok).toBe(false);
+  expect(validateOkrUpdateKrInput({ kr_id: "kr_sec", title: "agent_key_supersecret123456" }).ok).toBe(false);
+});
+
+test("validateOkrTaskTitleInput and validateOkrTaskDueInput support clearing due and block secrets/invalid dates", () => {
+  expect(validateOkrTaskTitleInput("  Revise KR endpoint  ")).toEqual({
+    ok: true,
+    value: "Revise KR endpoint",
+  });
+  expect(validateOkrTaskTitleInput("").ok).toBe(false);
+  expect(validateOkrTaskTitleInput("sk-live-1234567890abcdef1234").ok).toBe(false);
+
+  expect(validateOkrTaskDueInput("")).toEqual({ ok: true, value: "" });
+  expect(validateOkrTaskDueInput("2026-11-20T12:00:00Z")).toEqual({
+    ok: true,
+    value: "2026-11-20T12:00:00Z",
+  });
+  expect(validateOkrTaskDueInput("not-a-date").ok).toBe(false);
+  expect(validateOkrTaskDueInput("agent_key_supersecret123456").ok).toBe(false);
 });
