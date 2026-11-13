@@ -503,6 +503,97 @@ function validateCreateLoopInput(args) {
   out.prompt = prompt;
   return { ok: true, value: out };
 }
+var OKR_KR_METRIC_TYPES = ["count", "bool", "percent"];
+var OKR_KR_RISK_LEVELS = ["green", "yellow", "red"];
+function validateOkrAddKrInput(args) {
+  const a = args && typeof args === "object" && !Array.isArray(args) ? args : {};
+  const objectiveId = typeof a.objective_id === "string" ? a.objective_id.trim() : "";
+  if (!objectiveId || !SAFE_CHANNEL_OR_LOOP_ID_RE.test(objectiveId) || objectiveId.includes("..")) {
+    return { ok: false, error: "okr_add_kr requires a valid objective_id." };
+  }
+  const rawTitle = typeof a.title === "string" ? a.title : "";
+  const title = rawTitle.replace(/[\r\n\t]+/g, " ").trim();
+  if (!title || title.length > 200 || EVIDENCE_CTRL_RE.test(title)) {
+    return { ok: false, error: "okr_add_kr title must be a non-empty string (<=200 chars) without control characters." };
+  }
+  if (EVIDENCE_SECRET_RE.test(title)) {
+    return { ok: false, error: "okr_add_kr title rejected: appears to contain a secret or token." };
+  }
+  const mt = a.metric_type === undefined ? "count" : a.metric_type;
+  if (typeof mt !== "string" || !OKR_KR_METRIC_TYPES.includes(mt)) {
+    return { ok: false, error: "okr_add_kr metric_type must be count|bool|percent." };
+  }
+  const metricType = mt;
+  if (typeof a.target !== "number" || !Number.isFinite(a.target) || a.target < 0 || a.target > 1e6) {
+    return { ok: false, error: "okr_add_kr target must be a finite number in 0..1000000." };
+  }
+  if (metricType === "bool" && a.target !== 0 && a.target !== 1) {
+    return { ok: false, error: "okr_add_kr bool target must be 0 or 1." };
+  }
+  if (metricType === "percent" && a.target > 100) {
+    return { ok: false, error: "okr_add_kr percent target must be <= 100." };
+  }
+  let current;
+  if (a.current !== undefined && a.current !== null) {
+    if (typeof a.current !== "number" || !Number.isFinite(a.current) || a.current < 0 || a.current > 1e6) {
+      return { ok: false, error: "okr_add_kr current must be a finite number in 0..1000000." };
+    }
+    if (metricType === "bool" && a.current !== 0 && a.current !== 1) {
+      return { ok: false, error: "okr_add_kr bool current must be 0 or 1." };
+    }
+    if (metricType === "percent" && a.current > 100) {
+      return { ok: false, error: "okr_add_kr percent current must be <= 100." };
+    }
+    current = a.current;
+  }
+  let riskLevel;
+  if (a.risk_level !== undefined && a.risk_level !== null) {
+    if (typeof a.risk_level !== "string" || !OKR_KR_RISK_LEVELS.includes(a.risk_level)) {
+      return { ok: false, error: "okr_add_kr risk_level must be green|yellow|red." };
+    }
+    riskLevel = a.risk_level;
+  }
+  return {
+    ok: true,
+    value: {
+      objective_id: objectiveId,
+      body: {
+        title,
+        metric_type: metricType,
+        target: a.target,
+        ...current !== undefined ? { current } : {},
+        ...riskLevel !== undefined ? { risk_level: riskLevel } : {}
+      }
+    }
+  };
+}
+function validateOkrSetKrProgressInput(args) {
+  const a = args && typeof args === "object" && !Array.isArray(args) ? args : {};
+  const krId = typeof a.kr_id === "string" ? a.kr_id.trim() : "";
+  if (!krId || !SAFE_CHANNEL_OR_LOOP_ID_RE.test(krId) || krId.includes("..")) {
+    return { ok: false, error: "okr_set_kr_progress requires a valid kr_id." };
+  }
+  if (typeof a.current !== "number" || !Number.isFinite(a.current) || a.current < 0 || a.current > 1e6) {
+    return { ok: false, error: "okr_set_kr_progress current must be a finite number in 0..1000000." };
+  }
+  let riskLevel;
+  if (a.risk_level !== undefined && a.risk_level !== null) {
+    if (typeof a.risk_level !== "string" || !OKR_KR_RISK_LEVELS.includes(a.risk_level)) {
+      return { ok: false, error: "okr_set_kr_progress risk_level must be green|yellow|red." };
+    }
+    riskLevel = a.risk_level;
+  }
+  return {
+    ok: true,
+    value: {
+      kr_id: krId,
+      body: {
+        current: a.current,
+        ...riskLevel !== undefined ? { risk_level: riskLevel } : {}
+      }
+    }
+  };
+}
 
 // src/identity.ts
 function decideIdentity(i) {
@@ -8198,12 +8289,11 @@ ${list}` }] };
       }
     }
     if (name === "okr_add_kr") {
-      const { objective_id, title, metric_type, current, target, risk_level } = args;
-      const body = { title, metric_type, target };
-      if (typeof current === "number")
-        body.current = current;
-      if (risk_level)
-        body.risk_level = risk_level;
+      const validated = validateOkrAddKrInput(args);
+      if (!validated.ok) {
+        return { content: [{ type: "text", text: `okr_add_kr invalid arguments: ${validated.error}` }], isError: true };
+      }
+      const { objective_id, body } = validated.value;
       try {
         const r = await apiFetch(`${REST_URL}/api/okr/objectives/${encodeURIComponent(objective_id)}/krs`, {
           method: "POST",
@@ -8253,10 +8343,11 @@ ${list}` }] };
       }
     }
     if (name === "okr_set_kr_progress") {
-      const { kr_id, current, risk_level } = args;
-      const body = { current };
-      if (risk_level)
-        body.risk_level = risk_level;
+      const validated = validateOkrSetKrProgressInput(args);
+      if (!validated.ok) {
+        return { content: [{ type: "text", text: `okr_set_kr_progress invalid arguments: ${validated.error}` }], isError: true };
+      }
+      const { kr_id, body } = validated.value;
       try {
         const r = await apiFetch(`${REST_URL}/api/okr/krs/${encodeURIComponent(kr_id)}/progress`, {
           method: "PATCH",

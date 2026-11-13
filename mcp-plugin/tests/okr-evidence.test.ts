@@ -364,4 +364,45 @@ describe("MCP okr_update_task structured evidence", () => {
       note: "Task marked done; remember to report quantitative progress for linked KR(s): kr_alpha, kr_beta.",
     });
   });
+
+  test("okr_add_kr and okr_set_kr_progress enforce client-side secret screening and metric bounds before network IO", async () => {
+    const out = await drive([
+      INIT,
+      INITED,
+      callTool(2, "load_tool_group", { group_name: "okr" }),
+      callTool(3, "okr_add_kr", {
+        objective_id: "obj_1",
+        title: "Leak agent_key_supersecret12345",
+        metric_type: "count",
+        target: 5,
+      }),
+      callTool(4, "okr_add_kr", {
+        objective_id: "obj_1",
+        title: "Bool bad current",
+        metric_type: "bool",
+        current: 2,
+        target: 1,
+      }),
+      callTool(5, "okr_add_kr", {
+        objective_id: "obj_1",
+        title: "Percent bad current",
+        metric_type: "percent",
+        current: 120,
+        target: 100,
+      }),
+      callTool(6, "okr_set_kr_progress", {
+        kr_id: "kr_1",
+        current: -5,
+        risk_level: "green",
+      }),
+    ], 1500);
+
+    for (const id of [3, 4, 5, 6]) {
+      expect(out.res.get(id)?.result?.isError).toBe(true);
+    }
+    expect(out.res.get(3)?.result?.content?.[0]?.text).toContain("secret or token");
+    expect(out.res.get(4)?.result?.content?.[0]?.text).toContain("bool current must be 0 or 1");
+    expect(out.res.get(5)?.result?.content?.[0]?.text).toContain("percent current must be <= 100");
+    expect(out.res.get(6)?.result?.content?.[0]?.text).toContain("0..1000000");
+  });
 });

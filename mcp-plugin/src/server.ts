@@ -54,6 +54,8 @@ import {
   responseIncludesAppendedEvidence,
   validateAppendTaskEvidenceInput,
   validateCreateLoopInput,
+  validateOkrAddKrInput,
+  validateOkrSetKrProgressInput,
   validateTaskEvidenceInput,
   validateTaskVersionToken,
   validateToolArgs,
@@ -5689,12 +5691,11 @@ const handleToolCall = async (request: any): Promise<any> => {
   }
 
   if (name === "okr_add_kr") {
-    const { objective_id, title, metric_type, current, target, risk_level } = args as {
-      objective_id: string; title: string; metric_type: string; current?: number; target: number; risk_level?: string;
-    };
-    const body: Record<string, unknown> = { title, metric_type, target };
-    if (typeof current === "number") body.current = current;
-    if (risk_level) body.risk_level = risk_level;
+    const validated = validateOkrAddKrInput(args);
+    if (!validated.ok) {
+      return { content: [{ type: "text", text: `okr_add_kr invalid arguments: ${validated.error}` }], isError: true };
+    }
+    const { objective_id, body } = validated.value;
     try {
       const r = await apiFetch(`${REST_URL}/api/okr/objectives/${encodeURIComponent(objective_id)}/krs`, {
         method: "POST",
@@ -5747,9 +5748,11 @@ const handleToolCall = async (request: any): Promise<any> => {
   }
 
   if (name === "okr_set_kr_progress") {
-    const { kr_id, current, risk_level } = args as { kr_id: string; current: number; risk_level?: string };
-    const body: Record<string, unknown> = { current };
-    if (risk_level) body.risk_level = risk_level;
+    const validated = validateOkrSetKrProgressInput(args);
+    if (!validated.ok) {
+      return { content: [{ type: "text", text: `okr_set_kr_progress invalid arguments: ${validated.error}` }], isError: true };
+    }
+    const { kr_id, body } = validated.value;
     try {
       const r = await apiFetch(`${REST_URL}/api/okr/krs/${encodeURIComponent(kr_id)}/progress`, {
         method: "PATCH",
