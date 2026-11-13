@@ -2120,3 +2120,68 @@ export interface ProbeCloudEndpointModelsResponse {
   count: number;
   models: ProbedEndpointModel[];
 }
+
+export interface SearchMessagesOptions {
+  include_owned?: boolean;
+  bearerToken?: string;
+}
+
+export interface GetMessagesOptions {
+  bearerToken?: string;
+}
+
+export interface SendMessageOptions {
+  bearerToken?: string;
+}
+
+export type ArenaLifecycleState = "created" | "running" | "finished" | "archived";
+export type ArenaAdvanceAction = "tick" | "finish";
+
+export interface ArenaVerdict {
+  winner: string;
+  score: [number, number];
+}
+
+export interface ArenaStateRecord {
+  channel_id: string;
+  topic: string;
+  opponents: [string, string];
+  rounds: number;
+  current_round: number;
+  turn: 0 | 1;
+  round_deadline_ms: number;
+  verdict?: ArenaVerdict;
+  state: ArenaLifecycleState;
+  created_by: string;
+  created_at: string;
+  finished_at?: string;
+  pair_key?: string;
+}
+
+export interface GetArenaResponse {
+  arena: ArenaStateRecord;
+}
+
+export interface CreateArenaInput {
+  topic: string;
+  opponents: [string, string];
+  rounds?: number;
+  bearerToken?: string;
+}
+
+export interface CreateArenaResponse {
+  ok: boolean;
+  arena: ArenaStateRecord;
+}
+
+export interface AdvanceArenaOptions {
+  idempotencyKey?: string;
+  bearerToken?: string;
+}
+
+export interface AdvanceArenaResponse {
+  ok: boolean;
+  arena: ArenaStateRecord;
+  action: ArenaAdvanceAction;
+  note?: string;
+}

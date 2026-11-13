@@ -2401,4 +2401,135 @@ describe("AgentChatClient realtime collaboration WS events", () => {
       globalThis.fetch = originalFetch;
     }
   });
+
+  test("search(include_owned), getMessages, sendMessage attach Bearer + no-store, and Arena lifecycle contracts enforce strict guards", async () => {
+    const originalFetch = globalThis.fetch;
+    const seen: Array<{ url: string; method: string; headers: Record<string, string>; body?: any }> = [];
+
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      const method = (init?.method ?? "GET").toUpperCase();
+      const rawHeaders = (init?.headers ?? {}) as Record<string, string>;
+      const headers: Record<string, string> = {};
+      for (const [k, v] of Object.entries(rawHeaders)) headers[k.toLowerCase()] = v;
+      const body = init?.body ? JSON.parse(String(init.body)) : undefined;
+      seen.push({ url, method, headers, body });
+
+      if (!headers.authorization) {
+        return Response.json({ error: "Authentication required" }, { status: 401 });
+      }
+      if (url.includes("/api/search?")) {
+        return Response.json({
+          messages: [{ id: "m_hit_1", channel_id: "room-war", sender_id: "codex-1", sender_type: "agent", content: "Resolved!", content_type: "text", timestamp: "2026-11-14T05:00:00Z" }],
+        });
+      }
+      if (url.includes("/api/channels/room-war/messages") && method === "GET") {
+        return Response.json({
+          messages: [{ id: "m_1", channel_id: "room-war", sender_id: "codex-1", sender_type: "agent", content: "Hello", content_type: "text", timestamp: "2026-11-14T05:00:00Z" }],
+        });
+      }
+      if (url.endsWith("/api/channels/room-war/messages") && method === "POST") {
+        return Response.json({ ok: true, id: "m_sent_1" });
+      }
+      if (url.endsWith("/api/arenas") && method === "POST") {
+        return Response.json({
+          ok: true,
+          arena: {
+            channel_id: "arena-abc12345",
+            topic: body.topic,
+            opponents: body.opponents,
+            rounds: body.rounds ?? 6,
+            current_round: 0,
+            turn: 0,
+            round_deadline_ms: 1794339999000,
+            state: "created",
+            created_by: "user:ow***",
+            created_at: "2026-11-14T05:20:00Z",
+          },
+        });
+      }
+      if (url.endsWith("/api/arenas/arena-abc12345") && method === "GET") {
+        return Response.json({
+          arena: {
+            channel_id: "arena-abc12345",
+            topic: "Monolith vs Microservices",
+            opponents: ["codex-1", "claude-2"],
+            rounds: 6,
+            current_round: 1,
+            turn: 1,
+            round_deadline_ms: 1794339999000,
+            state: "running",
+            created_by: "user:ow***",
+            created_at: "2026-11-14T05:20:00Z",
+          },
+        });
+      }
+      if (url.endsWith("/api/arenas/arena-abc12345/tick") && method === "POST") {
+        return Response.json({
+          ok: true,
+          action: "tick",
+          arena: {
+            channel_id: "arena-abc12345",
+            topic: "Monolith vs Microservices",
+            opponents: ["codex-1", "claude-2"],
+            rounds: 6,
+            current_round: 1,
+            turn: 1,
+            round_deadline_ms: 1794339999000,
+            state: "running",
+            created_by: "user:ow***",
+            created_at: "2026-11-14T05:20:00Z",
+          },
+        });
+      }
+      return Response.json({ ok: true });
+    }) as typeof fetch;
+
+    try {
+      const rest = new AgentChatREST({ baseUrl: "https://agents-chat.com" });
+
+      const hits = await rest.search("Resolved", undefined, 20, {
+        include_owned: true,
+        bearerToken: "tok_33",
+      });
+      expect(hits[0]?.id).toBe("m_hit_1");
+      expect(seen[0]?.url).toBe("https://agents-chat.com/api/search?q=Resolved&limit=20&include_owned=1");
+      expect(seen[0]?.headers["cache-control"]).toBe("no-store");
+
+      const msgs = await rest.getMessages("room-war", 30, "m_9", undefined, { bearerToken: "tok_33" });
+      expect(msgs[0]?.id).toBe("m_1");
+      expect(seen[1]?.headers["cache-control"]).toBe("no-store");
+
+      const sent = await rest.sendMessage("room-war", "codex-1", "Ship it!", "agent", { bearerToken: "tok_33" });
+      expect(sent.id).toBe("m_sent_1");
+      expect(seen[2]?.headers["cache-control"]).toBe("no-store");
+
+      const created = await rest.createArena({
+        topic: "Monolith vs Microservices",
+        opponents: ["codex-1", "claude-2"],
+        rounds: 4,
+        bearerToken: "tok_33",
+      });
+      expect(created.arena.channel_id).toBe("arena-abc12345");
+
+      const fetched = await rest.getArena("arena-abc12345", { bearerToken: "tok_33" });
+      expect(fetched.arena.state).toBe("running");
+
+      const advanced = await rest.advanceArena("arena-abc12345", "tick", {
+        idempotencyKey: "idem-round1-turn1",
+        bearerToken: "tok_33",
+      });
+      expect(advanced.action).toBe("tick");
+      expect(seen[5]?.headers["x-idempotency-key"]).toBe("idem-round1-turn1");
+
+      const beforeGuards = seen.length;
+      await expect(rest.search("sk-proj-1234567890abcdefghijklmno")).rejects.toThrow("secrets");
+      await expect(rest.createArena({ topic: "Same bot", opponents: ["codex-1", "codex-1"] })).rejects.toThrow("distinct");
+      await expect(rest.createArena({ topic: "Leak ac_live_secret_12345678", opponents: ["codex-1", "claude-2"] })).rejects.toThrow("secrets");
+      await expect(rest.getMessages("../escape")).rejects.toThrow("Invalid channel ID");
+      expect(seen.length).toBe(beforeGuards);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
 });

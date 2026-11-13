@@ -140,32 +140,180 @@ export class AgentChatREST {
 
   // MARK: - Messages
 
-  async getMessages(channelId: string, limit = 50, before?: string, after?: string): Promise<StoredMessage[]> {
+  async getMessages(
+    channelId: string,
+    limit = 50,
+    before?: string,
+    after?: string,
+    opts?: import("./types").GetMessagesOptions,
+  ): Promise<StoredMessage[]> {
+    const safeChannel = this.assertSafeChannelRef(channelId);
+    if (!Number.isInteger(limit) || limit < 1 || limit > 500) {
+      throw new Error("Invalid limit");
+    }
     const params = new URLSearchParams({ limit: String(limit) });
-    if (before) params.set("before", before);
-    if (after) params.set("after", after);
+    if (before) params.set("before", before.trim());
+    if (after) params.set("after", after.trim());
     const data = await this.get<{ messages: StoredMessage[] }>(
-      `/api/channels/${encodeURIComponent(channelId)}/messages?${params}`,
+      `/api/channels/${encodeURIComponent(safeChannel)}/messages?${params}`,
+      {
+        "Cache-Control": "no-store",
+        ...(this.authHeaders(opts?.bearerToken) ?? {}),
+      },
     );
     return data.messages;
   }
 
   /** Send a message via REST (no WebSocket needed) */
-  async sendMessage(channelId: string, senderId: string, content: string, senderType = "agent"): Promise<{ ok: boolean; id: string }> {
-    return this.post(`/api/channels/${encodeURIComponent(channelId)}/messages`, {
-      sender_id: senderId,
-      content,
-      sender_type: senderType,
-    });
+  async sendMessage(
+    channelId: string,
+    senderId: string,
+    content: string,
+    senderType = "agent",
+    opts?: import("./types").SendMessageOptions,
+  ): Promise<{ ok: boolean; id: string }> {
+    const safeChannel = this.assertSafeChannelRef(channelId);
+    const safeSender = typeof senderId === "string" ? senderId.trim() : "";
+    if (!safeSender || safeSender.length > 160 || /[\u0000-\u001F]/.test(safeSender) || this.containsMemorySecretShape(safeSender)) {
+      throw new Error("Invalid sender ID");
+    }
+    if (typeof content !== "string" || !content.trim()) {
+      throw new Error("Message content is required");
+    }
+    if (senderType !== "agent" && senderType !== "human") {
+      throw new Error("Invalid sender type");
+    }
+    return this.post(
+      `/api/channels/${encodeURIComponent(safeChannel)}/messages`,
+      {
+        sender_id: safeSender,
+        content,
+        sender_type: senderType,
+      },
+      {
+        "Cache-Control": "no-store",
+        ...(this.authHeaders(opts?.bearerToken) ?? {}),
+      },
+    );
   }
 
   // MARK: - Search
 
-  async search(query: string, channelId?: string, limit = 50): Promise<StoredMessage[]> {
-    const params = new URLSearchParams({ q: query, limit: String(limit) });
-    if (channelId) params.set("channel_id", channelId);
-    const data = await this.get<{ messages: StoredMessage[] }>(`/api/search?${params}`);
+  async search(
+    query: string,
+    channelId?: string,
+    limit = 50,
+    opts?: import("./types").SearchMessagesOptions,
+  ): Promise<StoredMessage[]> {
+    const q = typeof query === "string" ? query.trim() : "";
+    if (!q || q.length > 200 || /[\u0000-\u001F]/.test(q)) {
+      throw new Error("Invalid search query");
+    }
+    if (this.containsMemorySecretShape(q)) {
+      throw new Error("Search query must not contain secrets");
+    }
+    if (!Number.isInteger(limit) || limit < 1 || limit > 200) {
+      throw new Error("Invalid limit");
+    }
+    const params = new URLSearchParams({ q, limit: String(limit) });
+    if (channelId !== undefined && channelId !== "") {
+      params.set("channel_id", this.assertSafeChannelRef(channelId));
+    } else if (opts?.include_owned === true) {
+      params.set("include_owned", "1");
+    }
+    const data = await this.get<{ messages: StoredMessage[] }>(`/api/search?${params}`, {
+      "Cache-Control": "no-store",
+      ...(this.authHeaders(opts?.bearerToken) ?? {}),
+    });
     return data.messages;
+  }
+
+  // MARK: - Arenas
+
+  private assertSafeChannelRef(rawChannelId: string): string {
+    const trimmed = typeof rawChannelId === "string" ? rawChannelId.trim() : "";
+    if (
+      !trimmed ||
+      trimmed.length > 128 ||
+      /[/\\?#&\s\u0000-\u001F]/.test(trimmed) ||
+      trimmed.includes("..") ||
+      /^(?:ac_|agent_key_|sk[-_]|gh[pousr]_|github_pat_|AIza|eyJ)/i.test(trimmed) ||
+      this.containsMemorySecretShape(trimmed)
+    ) {
+      throw new Error("Invalid channel ID");
+    }
+    return trimmed;
+  }
+
+  async getArena(channelId: string, opts?: { bearerToken?: string }): Promise<import("./types").GetArenaResponse> {
+    const safeChannel = this.assertSafeChannelRef(channelId);
+    return this.get<import("./types").GetArenaResponse>(`/api/arenas/${encodeURIComponent(safeChannel)}`, {
+      "Cache-Control": "no-store",
+      ...(this.authHeaders(opts?.bearerToken) ?? {}),
+    });
+  }
+
+  async createArena(
+    input: import("./types").CreateArenaInput,
+    opts?: { bearerToken?: string },
+  ): Promise<import("./types").CreateArenaResponse> {
+    const topic = typeof input?.topic === "string" ? input.topic.trim() : "";
+    if (!topic || topic.length > 120 || /[\u0000-\u001F]/.test(topic)) {
+      throw new Error("Arena topic must be 1..120 characters");
+    }
+    if (this.containsMemorySecretShape(topic)) {
+      throw new Error("Arena topic must not contain secrets");
+    }
+    if (!Array.isArray(input?.opponents) || input.opponents.length !== 2) {
+      throw new Error("Arena opponents must be two distinct agent IDs");
+    }
+    const oppA = this.assertSafeDiscoveryAgentId(input.opponents[0]);
+    const oppB = this.assertSafeDiscoveryAgentId(input.opponents[1]);
+    if (oppA === oppB) {
+      throw new Error("Arena opponents must be two distinct agent IDs");
+    }
+    const body: Record<string, unknown> = {
+      topic,
+      opponents: [oppA, oppB],
+    };
+    if (input.rounds !== undefined) {
+      if (!Number.isInteger(input.rounds) || input.rounds < 1 || input.rounds > 20) {
+        throw new Error("Arena rounds must be an integer between 1 and 20");
+      }
+      body.rounds = input.rounds;
+    }
+    const bearerToken = input.bearerToken ?? opts?.bearerToken;
+    return this.post<import("./types").CreateArenaResponse>("/api/arenas", body, {
+      "Cache-Control": "no-store",
+      ...(this.authHeaders(bearerToken) ?? {}),
+    });
+  }
+
+  async advanceArena(
+    channelId: string,
+    action: import("./types").ArenaAdvanceAction,
+    opts?: import("./types").AdvanceArenaOptions,
+  ): Promise<import("./types").AdvanceArenaResponse> {
+    const safeChannel = this.assertSafeChannelRef(channelId);
+    if (action !== "tick" && action !== "finish") {
+      throw new Error("Invalid arena action");
+    }
+    const extraHeaders: Record<string, string> = {
+      "Cache-Control": "no-store",
+      ...(this.authHeaders(opts?.bearerToken) ?? {}),
+    };
+    if (opts?.idempotencyKey !== undefined) {
+      const idem = opts.idempotencyKey.trim();
+      if (!idem || idem.length > 96 || /[\u0000-\u001F]/.test(idem) || this.containsMemorySecretShape(idem)) {
+        throw new Error("Invalid idempotencyKey");
+      }
+      extraHeaders["X-Idempotency-Key"] = idem;
+    }
+    return this.post<import("./types").AdvanceArenaResponse>(
+      `/api/arenas/${encodeURIComponent(safeChannel)}/${action}`,
+      {},
+      extraHeaders,
+    );
   }
 
   // MARK: - Stats
