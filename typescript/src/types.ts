@@ -2310,3 +2310,23 @@ export interface AdvanceArenaResponse {
   action: ArenaAdvanceAction;
   note?: string;
 }
+
+export interface InheritableObjectiveChannelNode {
+  id?: string | null;
+  parent_id?: string | null;
+  discussion_channel_id?: string | null;
+}
+
+export interface LocalTaskActionabilityInputItem {
+  id?: string | null;
+  status?: string | null;
+  ready?: boolean;
+  depends_on?: ReadonlyArray<string> | null;
+  unresolved_depends_on?: ReadonlyArray<string> | null;
+}
+
+export interface LocalTaskActionabilitySummary {
+  ready_task_ids: string[];
+  waiting_task_ids: string[];
+  unresolved_edge_count: number;
+}

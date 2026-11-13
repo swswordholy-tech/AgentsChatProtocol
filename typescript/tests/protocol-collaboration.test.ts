@@ -2,7 +2,9 @@ import { describe, expect, test } from "bun:test";
 import {
   AgentChatClient,
   AgentChatREST,
+  computeLocalTaskActionability,
   isValidCollaborationRoster,
+  resolveInheritedObjectiveChannel,
   summarizeWorkspaceGraphReadiness,
   type ACMessage,
   type ChannelBrief,
@@ -3058,6 +3060,69 @@ describe("AgentChatClient realtime collaboration WS events", () => {
       });
       expect(fetchCalls).toBe(1);
       expect(summarizeWorkspaceGraphReadiness(okGraph)?.unresolved_edges).toBe(3);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("resolveInheritedObjectiveChannel, computeLocalTaskActionability, and OKR entity ID secret/PII guards", async () => {
+    const objectives = [
+      { id: "obj_root", discussion_channel_id: "room-main" },
+      { id: "obj_child", parent_id: "obj_root" },
+      { id: "obj_grandchild", parent_id: "obj_child" },
+      { id: "obj_dm_override", parent_id: "obj_root", discussion_channel_id: "dm-private-chat" },
+      { id: "obj_cycle_a", parent_id: "obj_cycle_b" },
+      { id: "obj_cycle_b", parent_id: "obj_cycle_a" },
+    ];
+    expect(resolveInheritedObjectiveChannel("obj_grandchild", objectives)).toBe("room-main");
+    // Explicit DM override on child must never fall through to public parent room
+    expect(resolveInheritedObjectiveChannel("obj_dm_override", objectives)).toBeNull();
+    // Cycles terminate safely
+    expect(resolveInheritedObjectiveChannel("obj_cycle_a", objectives)).toBeNull();
+    expect(resolveInheritedObjectiveChannel("ac_live_secret", objectives)).toBeNull();
+
+    // Local + archived external dependency actionability
+    const actionability = computeLocalTaskActionability(
+      [
+        { id: "t_done", status: "done" },
+        { id: "t_ready_archived_dep", status: "todo", depends_on: ["t_done", "t_archived_up"] },
+        { id: "t_waiting", status: "todo", depends_on: ["t_ready_archived_dep", "t_missing_ext"] },
+        { id: "t_doing_blocked", status: "doing", unresolved_depends_on: ["t_missing_ext"] },
+        { id: "ac_bad_task_id", status: "todo" },
+      ],
+      { t_archived_up: "done" },
+    );
+    expect(actionability).toEqual({
+      ready_task_ids: ["t_ready_archived_dep"],
+      waiting_task_ids: ["t_waiting", "t_doing_blocked"],
+      unresolved_edge_count: 3,
+    });
+
+    const originalFetch = globalThis.fetch;
+    let fetchCalls = 0;
+    globalThis.fetch = (async () => {
+      fetchCalls += 1;
+      return Response.json({ ok: true, blockers: [], blocks: [], comments: [] });
+    }) as unknown as typeof fetch;
+
+    try {
+      const rest = new AgentChatREST({ baseUrl: "https://agents-chat.com", bearerToken: "tok_39" });
+      for (const badId of [
+        "agent_key_secret",
+        "ghp_secret123",
+        "github_pat_abc",
+        "AIzaSyKey123",
+        "eyJhbGciOiJIUzI1NiJ9.payload.sig",
+        "owner@example.com",
+        "13800138000",
+        "task..escape",
+      ]) {
+        await expect(rest.getTaskBlockers(badId)).rejects.toThrow("Invalid task ID");
+        await expect(rest.getTaskBlocks(badId)).rejects.toThrow("Invalid task ID");
+        await expect(rest.listTaskComments(badId)).rejects.toThrow("Invalid task ID");
+        await expect(rest.listObjectives({ owner: badId })).rejects.toThrow("Invalid OKR owner");
+      }
+      expect(fetchCalls).toBe(0);
     } finally {
       globalThis.fetch = originalFetch;
     }

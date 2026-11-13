@@ -2,8 +2,10 @@ export { AgentChatClient } from "./client";
 export {
   AgentChatREST,
   classifyOkrCommentKind,
+  computeLocalTaskActionability,
   isValidCollaborationRoster,
   parseSseFrames,
+  resolveInheritedObjectiveChannel,
   summarizeWorkspaceGraphReadiness,
   type RESTClientOptions,
 } from "./rest";
@@ -127,6 +129,9 @@ export type {
   DiscoverChannelsOptions,
   KickChannelMemberInput,
   KickChannelMemberResponse,
+  InheritableObjectiveChannelNode,
+  LocalTaskActionabilityInputItem,
+  LocalTaskActionabilitySummary,
   ManagedChannelJoinRequestItem,
   ManagedChannelJoinRequestsResponse,
   McpDiscoveryCard,

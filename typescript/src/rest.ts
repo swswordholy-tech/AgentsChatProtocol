@@ -266,6 +266,120 @@ export function summarizeWorkspaceGraphReadiness(
   return summary;
 }
 
+const DM_OR_DIRECT_CHANNEL_RE = /^(?:dm[-_]|direct(?:$|[-_:]))/i;
+
+function safeNonDmChannelId(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    value.length >= 1 &&
+    value.length <= 128 &&
+    !DM_OR_DIRECT_CHANNEL_RE.test(value) &&
+    safeGraphId(value)
+  );
+}
+
+export function resolveInheritedObjectiveChannel(
+  objectiveId: string,
+  objectives: ReadonlyArray<import("./types").InheritableObjectiveChannelNode>,
+): string | null {
+  const startId = typeof objectiveId === "string" ? objectiveId.trim() : "";
+  if (!safeGraphId(startId) || !Array.isArray(objectives) || objectives.length === 0) {
+    return null;
+  }
+  const byId = new Map<string, import("./types").InheritableObjectiveChannelNode>();
+  for (const row of objectives) {
+    if (row && typeof row.id === "string" && safeGraphId(row.id) && !byId.has(row.id)) {
+      byId.set(row.id, row);
+    }
+  }
+  let cur = byId.get(startId);
+  const seen = new Set<string>();
+  let hops = 0;
+  while (cur && hops <= 8) {
+    const id = typeof cur.id === "string" ? cur.id : "";
+    if (!id || seen.has(id)) return null;
+    seen.add(id);
+    if (typeof cur.discussion_channel_id === "string" && cur.discussion_channel_id.trim() !== "") {
+      const chan = cur.discussion_channel_id.trim();
+      return safeNonDmChannelId(chan) ? chan : null;
+    }
+    const parentId = typeof cur.parent_id === "string" ? cur.parent_id.trim() : "";
+    if (!parentId || !safeGraphId(parentId)) return null;
+    cur = byId.get(parentId);
+    hops += 1;
+  }
+  return null;
+}
+
+export function computeLocalTaskActionability(
+  tasks: ReadonlyArray<import("./types").LocalTaskActionabilityInputItem>,
+  externalDepStatuses?: ReadonlyMap<string, string> | Record<string, string>,
+): import("./types").LocalTaskActionabilitySummary {
+  const ready_task_ids: string[] = [];
+  const waiting_task_ids: string[] = [];
+  let unresolved_edge_count = 0;
+  if (!Array.isArray(tasks) || tasks.length === 0) {
+    return { ready_task_ids, waiting_task_ids, unresolved_edge_count };
+  }
+
+  const statusById = new Map<string, string>();
+  for (const t of tasks) {
+    if (t && typeof t.id === "string" && safeGraphId(t.id)) {
+      statusById.set(t.id, typeof t.status === "string" && t.status ? t.status : "todo");
+    }
+  }
+  const lookupStatus = (depId: string): string | undefined => {
+    const local = statusById.get(depId);
+    if (local !== undefined) return local;
+    if (!externalDepStatuses) return undefined;
+    if (externalDepStatuses instanceof Map) {
+      const val = externalDepStatuses.get(depId);
+      return typeof val === "string" ? val : undefined;
+    }
+    if (typeof externalDepStatuses === "object" && Object.prototype.hasOwnProperty.call(externalDepStatuses, depId)) {
+      const val = (externalDepStatuses as Record<string, unknown>)[depId];
+      return typeof val === "string" ? val : undefined;
+    }
+    return undefined;
+  };
+
+  const seenTaskIds = new Set<string>();
+  for (const t of tasks) {
+    if (!t || typeof t.id !== "string" || !safeGraphId(t.id) || seenTaskIds.has(t.id)) continue;
+    seenTaskIds.add(t.id);
+    const status = typeof t.status === "string" && t.status ? t.status : "todo";
+    let unresolvedCount = 0;
+    if (Array.isArray(t.unresolved_depends_on)) {
+      unresolvedCount = new Set(t.unresolved_depends_on.filter(safeGraphId)).size;
+    } else if (t.ready === true) {
+      unresolvedCount = 0;
+    } else if (Array.isArray(t.depends_on) && t.depends_on.length > 0) {
+      const uniqueDeps = [
+        ...new Set(t.depends_on.filter((d: unknown): d is string => typeof d === "string" && d.length > 0)),
+      ];
+      for (const depId of uniqueDeps) {
+        if (!safeGraphId(depId) || lookupStatus(depId) !== "done") {
+          unresolvedCount += 1;
+        }
+      }
+      if (t.ready === false && unresolvedCount === 0) {
+        unresolvedCount = 1;
+      }
+    } else if (t.ready === false && status === "todo") {
+      unresolvedCount = 1;
+    }
+
+    if (status !== "done" && unresolvedCount > 0) {
+      waiting_task_ids.push(t.id);
+      unresolved_edge_count += unresolvedCount;
+    } else if (status === "todo" && unresolvedCount === 0) {
+      ready_task_ids.push(t.id);
+    }
+  }
+
+  return { ready_task_ids, waiting_task_ids, unresolved_edge_count };
+}
+
 export interface RESTClientOptions {
   baseUrl: string; // e.g. "http://localhost:8080"
   bearerToken?: string;
@@ -1673,7 +1787,13 @@ export class AgentChatREST {
 
   private assertOkrEntityId(rawId: string, label: string): string {
     const trimmed = rawId?.trim() ?? "";
-    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(trimmed) || /^(?:ac_|sk[-_])/i.test(trimmed)) {
+    if (
+      !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(trimmed) ||
+      trimmed.includes("..") ||
+      CREDENTIAL_PREFIX_RE.test(trimmed) ||
+      EMAIL_ID_RE.test(trimmed) ||
+      PHONE_ID_RE.test(trimmed)
+    ) {
       throw new Error(`Invalid ${label}`);
     }
     return trimmed;
@@ -1709,7 +1829,17 @@ export class AgentChatREST {
     }
     if (opts?.owner !== undefined) {
       const owner = opts.owner.trim();
-      if (!owner || owner.length > 160 || /^(?:ac_|sk[-_])/i.test(owner)) throw new Error("Invalid OKR owner");
+      if (
+        !owner ||
+        owner.length > 160 ||
+        owner.includes("..") ||
+        CREDENTIAL_PREFIX_RE.test(owner) ||
+        EMAIL_ID_RE.test(owner) ||
+        PHONE_ID_RE.test(owner) ||
+        /[\x00-\x1f\x7f]/.test(owner)
+      ) {
+        throw new Error("Invalid OKR owner");
+      }
       params.set("owner", owner);
     }
     if (opts?.include_archived) params.set("include_archived", "true");
