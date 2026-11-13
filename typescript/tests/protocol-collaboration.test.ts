@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
   AgentChatClient,
   AgentChatREST,
+  isValidCollaborationRoster,
   type ACMessage,
   type ChannelBrief,
   type ChannelDocUpdatedMessage,
@@ -2826,6 +2827,110 @@ describe("AgentChatClient realtime collaboration WS events", () => {
         }),
       ).rejects.toThrow("Invalid task evidence list");
       expect(seen.length).toBe(beforeInvalid);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("isValidCollaborationRoster enforces opaque member_ref, delegated read-only viewer invariants, and getChannelBrief blocks secrets/PII", async () => {
+    const refA = "mr_" + "a".repeat(64);
+    const refB = "mr_" + "b".repeat(64);
+
+    const validDelegated = {
+      source: "collaboration" as const,
+      viewer: {
+        role: "member" as const,
+        is_member: false,
+        can_kick: false,
+        can_set_coordinator: false,
+        delegated_read_only: true,
+        delegated_via_agent_id: "codex-staff-engineer-ca7590",
+      },
+      coordinator_ref: refA,
+      members: [
+        {
+          agent_id: "codex-staff-engineer-ca7590",
+          member_ref: refA,
+          type: "agent" as const,
+          display_name: "Codex Staff Engineer",
+          role: "member" as const,
+          online: true,
+          capabilities: ["typescript", "security-audit"],
+          is_self: false,
+          can_mention: false,
+          can_kick: false,
+          can_set_coordinator: false,
+          ownership_scope: "owned" as const,
+        },
+        {
+          agent_id: refB,
+          member_ref: refB,
+          type: "user" as const,
+          display_name: "user:sw***",
+          role: "admin" as const,
+          online: true,
+          capabilities: [],
+          is_self: false,
+          can_mention: false,
+          can_kick: false,
+          can_set_coordinator: false,
+        },
+      ],
+    };
+    expect(isValidCollaborationRoster(validDelegated)).toBe(true);
+
+    // Reject raw email leak on user row, escalated delegated flags, or secret agent_id
+    expect(
+      isValidCollaborationRoster({
+        ...validDelegated,
+        members: [{ ...validDelegated.members[1], agent_id: "owner@example.com" }],
+      }),
+    ).toBe(false);
+    expect(
+      isValidCollaborationRoster({
+        ...validDelegated,
+        viewer: { ...validDelegated.viewer, can_kick: true },
+      }),
+    ).toBe(false);
+    expect(
+      isValidCollaborationRoster({
+        ...validDelegated,
+        members: [{ ...validDelegated.members[0], can_mention: true }],
+      }),
+    ).toBe(false);
+    expect(
+      isValidCollaborationRoster({
+        ...validDelegated,
+        viewer: { ...validDelegated.viewer, delegated_via_agent_id: "ac_live_secret" },
+      }),
+    ).toBe(false);
+
+    const originalFetch = globalThis.fetch;
+    let fetchCount = 0;
+    globalThis.fetch = (async () => {
+      fetchCount += 1;
+      return new Response(
+        JSON.stringify({
+          channel_id: "_ops-room",
+          channel: { id: "_ops-room", type: "group" },
+          agents: [],
+          personal_skills_unavailable: true,
+        } satisfies ChannelBrief),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }) as unknown as typeof fetch;
+
+    try {
+      const rest = new AgentChatREST({ baseUrl: "https://agents-chat.com", bearerToken: "tok_37" });
+      const brief = await rest.getChannelBrief("_ops-room");
+      expect(brief.personal_skills_unavailable).toBe(true);
+      expect(fetchCount).toBe(1);
+
+      for (const bad of ["agent_key_12345", "ghp_secret123", "eyJhbGciOiJIUzI1NiJ9", "user@example.com", "+86 13800138000", "a..b"]) {
+        await expect(rest.getChannelBrief(bad)).rejects.toThrow("Invalid channel ID");
+        await expect(rest.getChannelCollaborationRoster(bad)).rejects.toThrow("Invalid channel ID");
+      }
+      expect(fetchCount).toBe(1);
     } finally {
       globalThis.fetch = originalFetch;
     }

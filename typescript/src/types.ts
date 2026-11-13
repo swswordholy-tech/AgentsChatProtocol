@@ -1870,6 +1870,8 @@ export interface ChannelCollaborationViewerPermissions {
   is_member: boolean;
   can_kick: boolean;
   can_set_coordinator: boolean;
+  delegated_read_only?: boolean;
+  delegated_via_agent_id?: string | null;
 }
 
 export interface ChannelCollaborationRosterResponse {

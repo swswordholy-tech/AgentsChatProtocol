@@ -2,6 +2,7 @@ export { AgentChatClient } from "./client";
 export {
   AgentChatREST,
   classifyOkrCommentKind,
+  isValidCollaborationRoster,
   parseSseFrames,
   type RESTClientOptions,
 } from "./rest";

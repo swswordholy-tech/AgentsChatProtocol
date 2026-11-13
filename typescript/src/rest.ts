@@ -67,6 +67,96 @@ export function classifyOkrCommentKind(
   return "note";
 }
 
+const ROSTER_ROLES = new Set(["member", "moderator", "admin"]);
+const ROSTER_TYPES = new Set(["agent", "user", "unknown"]);
+const ROSTER_SCOPES = new Set(["owned", "unclaimed", "external"]);
+const SAFE_COLLAB_AGENT_ID_RE = /^[A-Za-z0-9_.-]{1,128}$/;
+const CREDENTIAL_PREFIX_RE = /^(?:ac_|agent_key_|sk[-_]|gh[pousr]_|github_pat_|AIza|eyJ)/i;
+const EMAIL_ID_RE = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i;
+const PHONE_ID_RE = /^\+?\d[\d ()-]{5,}\d$/;
+
+function isSafeCollaborationAgentId(id: unknown): id is string {
+  return (
+    typeof id === "string" &&
+    SAFE_COLLAB_AGENT_ID_RE.test(id) &&
+    !id.includes("..") &&
+    !CREDENTIAL_PREFIX_RE.test(id) &&
+    !EMAIL_ID_RE.test(id) &&
+    !PHONE_ID_RE.test(id)
+  );
+}
+
+export function isValidCollaborationRoster(
+  data: unknown,
+): data is import("./types").ChannelCollaborationRosterResponse {
+  if (!data || typeof data !== "object") return false;
+  const d = data as Record<string, unknown>;
+  if (d.source !== "collaboration" || !d.viewer || typeof d.viewer !== "object") return false;
+  const viewer = d.viewer as Record<string, unknown>;
+  if (
+    typeof viewer.role !== "string" ||
+    !ROSTER_ROLES.has(viewer.role) ||
+    typeof viewer.is_member !== "boolean" ||
+    typeof viewer.can_kick !== "boolean" ||
+    typeof viewer.can_set_coordinator !== "boolean"
+  ) {
+    return false;
+  }
+  if (viewer.delegated_read_only !== undefined || viewer.delegated_via_agent_id !== undefined) {
+    if (typeof viewer.delegated_read_only !== "boolean") return false;
+    if (viewer.delegated_read_only === true) {
+      if (
+        viewer.role !== "member" ||
+        viewer.is_member !== false ||
+        viewer.can_kick !== false ||
+        viewer.can_set_coordinator !== false ||
+        !isSafeCollaborationAgentId(viewer.delegated_via_agent_id)
+      ) {
+        return false;
+      }
+    } else if (viewer.delegated_via_agent_id !== undefined && viewer.delegated_via_agent_id !== null) {
+      return false;
+    }
+  }
+  if (!Array.isArray(d.members) || d.members.length > 1000) return false;
+  const seenRefs = new Set<string>();
+  for (const raw of d.members) {
+    if (!raw || typeof raw !== "object") return false;
+    const m = raw as Record<string, unknown>;
+    if (
+      typeof m.member_ref !== "string" ||
+      !/^mr_[0-9a-f]{64}$/.test(m.member_ref) ||
+      seenRefs.has(m.member_ref) ||
+      typeof m.type !== "string" ||
+      !ROSTER_TYPES.has(m.type) ||
+      typeof m.role !== "string" ||
+      !ROSTER_ROLES.has(m.role) ||
+      typeof m.display_name !== "string" ||
+      !Array.isArray(m.capabilities) ||
+      typeof m.online !== "boolean" ||
+      typeof m.is_self !== "boolean" ||
+      typeof m.can_mention !== "boolean" ||
+      typeof m.can_kick !== "boolean" ||
+      typeof m.can_set_coordinator !== "boolean"
+    ) {
+      return false;
+    }
+    if (m.type === "agent") {
+      if (!isSafeCollaborationAgentId(m.agent_id)) return false;
+    } else {
+      if (m.agent_id !== m.member_ref || m.can_mention || m.can_set_coordinator) return false;
+    }
+    if (viewer.delegated_read_only === true && (m.can_mention || m.can_kick || m.can_set_coordinator)) {
+      return false;
+    }
+    if (m.ownership_scope !== undefined && (m.type !== "agent" || typeof m.ownership_scope !== "string" || !ROSTER_SCOPES.has(m.ownership_scope))) {
+      return false;
+    }
+    seenRefs.add(m.member_ref);
+  }
+  return d.coordinator_ref === null || (typeof d.coordinator_ref === "string" && seenRefs.has(d.coordinator_ref));
+}
+
 export interface RESTClientOptions {
   baseUrl: string; // e.g. "http://localhost:8080"
   bearerToken?: string;
@@ -841,7 +931,15 @@ export class AgentChatREST {
     channelId: string,
     opts?: { bearerToken?: string },
   ): Promise<import("./types").ChannelBrief> {
-    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(channelId) || /^(?:ac_|sk-)/i.test(channelId)) {
+    const safeChannel = typeof channelId === "string" ? channelId.trim() : "";
+    if (
+      !safeChannel ||
+      !/^[A-Za-z0-9_-][A-Za-z0-9._-]{0,127}$/.test(safeChannel) ||
+      safeChannel.includes("..") ||
+      CREDENTIAL_PREFIX_RE.test(safeChannel) ||
+      EMAIL_ID_RE.test(safeChannel) ||
+      PHONE_ID_RE.test(safeChannel)
+    ) {
       throw new Error("Invalid channel ID");
     }
     const token = opts?.bearerToken?.trim() || this.bearerToken;
@@ -851,7 +949,7 @@ export class AgentChatREST {
       ...(token ? { Authorization: `Bearer ${token}` } : {}),
     };
     return this.get<import("./types").ChannelBrief>(
-      `/api/channels/${encodeURIComponent(channelId)}/brief`,
+      `/api/channels/${encodeURIComponent(safeChannel)}/brief`,
       headers,
     );
   }
@@ -2315,9 +2413,11 @@ export class AgentChatREST {
     const safeChannel = typeof channelId === "string" ? channelId.trim() : "";
     if (
       !safeChannel ||
-      !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(safeChannel) ||
+      !/^[A-Za-z0-9_-][A-Za-z0-9._-]{0,127}$/.test(safeChannel) ||
       safeChannel.includes("..") ||
-      /^(?:ac_|agent_key_|sk[-_]|gh[pousr]_|github_pat_|AIza|eyJ)/i.test(safeChannel)
+      CREDENTIAL_PREFIX_RE.test(safeChannel) ||
+      EMAIL_ID_RE.test(safeChannel) ||
+      PHONE_ID_RE.test(safeChannel)
     ) {
       throw new Error("Invalid channel ID");
     }
@@ -2344,9 +2444,11 @@ export class AgentChatREST {
     const safeChannel = typeof input?.channel_id === "string" ? input.channel_id.trim() : "";
     if (
       !safeChannel ||
-      !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(safeChannel) ||
+      !/^[A-Za-z0-9_-][A-Za-z0-9._-]{0,127}$/.test(safeChannel) ||
       safeChannel.includes("..") ||
-      /^(?:ac_|agent_key_|sk[-_]|gh[pousr]_|github_pat_|AIza|eyJ)/i.test(safeChannel)
+      CREDENTIAL_PREFIX_RE.test(safeChannel) ||
+      EMAIL_ID_RE.test(safeChannel) ||
+      PHONE_ID_RE.test(safeChannel)
     ) {
       throw new Error("Invalid channel ID");
     }
