@@ -780,6 +780,331 @@ export class AgentChatREST {
     );
   }
 
+  // MARK: - OKR Structured Working Memory Governance (/api/okr)
+
+  private assertOkrEntityId(rawId: string, label: string): string {
+    const trimmed = rawId?.trim() ?? "";
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(trimmed) || /^(?:ac_|sk[-_])/i.test(trimmed)) {
+      throw new Error(`Invalid ${label}`);
+    }
+    return trimmed;
+  }
+
+  private assertOkrVersion(version: string | undefined): string | undefined {
+    if (version === undefined) return undefined;
+    const trimmed = version.trim();
+    if (!trimmed || trimmed.length > 64 || Number.isNaN(Date.parse(trimmed)) || /[\x00-\x1f\x7f]/.test(trimmed)) {
+      throw new Error("Invalid OKR if_match_updated_at version");
+    }
+    return trimmed;
+  }
+
+  private authHeaders(bearerToken?: string): Record<string, string> {
+    const token = bearerToken?.trim() || this.bearerToken;
+    return {
+      Accept: "application/json",
+      "Cache-Control": "no-store",
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    };
+  }
+
+  async listObjectives(opts?: import("./types").OkrListQuery): Promise<import("./types").OkrListResponse> {
+    const params = new URLSearchParams();
+    if (opts?.horizon !== undefined) {
+      if (!["week", "month", "Q"].includes(opts.horizon)) throw new Error("Invalid OKR horizon");
+      params.set("horizon", opts.horizon);
+    }
+    if (opts?.status !== undefined) {
+      if (!["active", "done", "abandoned"].includes(opts.status)) throw new Error("Invalid OKR status");
+      params.set("status", opts.status);
+    }
+    if (opts?.owner !== undefined) {
+      const owner = opts.owner.trim();
+      if (!owner || owner.length > 160 || /^(?:ac_|sk[-_])/i.test(owner)) throw new Error("Invalid OKR owner");
+      params.set("owner", owner);
+    }
+    if (opts?.include_archived) params.set("include_archived", "true");
+    if (opts?.objective_id !== undefined) {
+      params.set("objective_id", this.assertOkrEntityId(opts.objective_id, "objective ID"));
+    }
+    if (opts?.view !== undefined) {
+      if (!["mine-active", "blocking-me", "blocked-by-me", "related"].includes(opts.view)) {
+        throw new Error("Invalid OKR view");
+      }
+      params.set("view", opts.view);
+    }
+    if (opts?.task_id !== undefined) {
+      params.set("task_id", this.assertOkrEntityId(opts.task_id, "task ID"));
+    }
+    if (opts?.shape !== undefined) {
+      if (opts.shape !== "summary") throw new Error("Invalid OKR shape");
+      params.set("shape", opts.shape);
+    }
+    const qs = params.toString();
+    return this.get<import("./types").OkrListResponse>(
+      `/api/okr/objectives${qs ? `?${qs}` : ""}`,
+      this.authHeaders(opts?.bearerToken),
+    );
+  }
+
+  async createObjective(
+    input: import("./types").CreateOkrObjectiveInput,
+    opts?: { bearerToken?: string },
+  ): Promise<{ ok: boolean; objective: import("./types").OkrObjectiveItem }> {
+    const title = input?.title?.trim() ?? "";
+    if (!title || title.length > 200) throw new Error("Invalid objective title");
+    if (!["week", "month", "Q"].includes(input?.horizon)) throw new Error("Invalid OKR horizon");
+    if (input.parent_id !== undefined) this.assertOkrEntityId(input.parent_id, "parent objective ID");
+    if (input.discussion_channel_id !== undefined) {
+      this.assertOkrEntityId(input.discussion_channel_id, "channel ID");
+    }
+    const body: Record<string, unknown> = {
+      title,
+      horizon: input.horizon,
+      ...(input.owner !== undefined ? { owner: input.owner.trim() } : {}),
+      ...(input.due !== undefined ? { due: input.due.trim() } : {}),
+      ...(input.parent_id !== undefined ? { parent_id: input.parent_id.trim() } : {}),
+      ...(input.discussion_channel_id !== undefined ? { discussion_channel_id: input.discussion_channel_id.trim() } : {}),
+      ...(input.narrative !== undefined ? { narrative: input.narrative } : {}),
+    };
+    return this.post("/api/okr/objectives", body, this.authHeaders(opts?.bearerToken));
+  }
+
+  async updateObjective(
+    objectiveId: string,
+    input: import("./types").UpdateOkrObjectiveInput,
+    opts?: { bearerToken?: string },
+  ): Promise<{ ok: boolean; objective: import("./types").OkrObjectiveItem }> {
+    const safeId = this.assertOkrEntityId(objectiveId, "objective ID");
+    const cas = this.assertOkrVersion(input?.if_match_updated_at);
+    if (input?.title !== undefined) {
+      const t = input.title.trim();
+      if (!t || t.length > 200) throw new Error("Invalid objective title");
+    }
+    if (input?.horizon !== undefined && !["week", "month", "Q"].includes(input.horizon)) {
+      throw new Error("Invalid OKR horizon");
+    }
+    if (input?.status !== undefined && !["active", "done", "abandoned"].includes(input.status)) {
+      throw new Error("Invalid OKR status");
+    }
+    const body: Record<string, unknown> = {
+      ...(input.title !== undefined ? { title: input.title.trim() } : {}),
+      ...(input.horizon !== undefined ? { horizon: input.horizon } : {}),
+      ...(input.status !== undefined ? { status: input.status } : {}),
+      ...(input.due !== undefined ? { due: input.due } : {}),
+      ...(input.narrative !== undefined ? { narrative: input.narrative } : {}),
+      ...(cas !== undefined ? { if_match_updated_at: cas } : {}),
+    };
+    return this.patch(`/api/okr/objectives/${encodeURIComponent(safeId)}`, body, this.authHeaders(opts?.bearerToken));
+  }
+
+  async reparentObjective(
+    objectiveId: string,
+    input: import("./types").ReparentOkrObjectiveInput,
+    opts?: { bearerToken?: string },
+  ): Promise<{ ok: boolean; objective: import("./types").OkrObjectiveItem; unchanged?: boolean }> {
+    const safeId = this.assertOkrEntityId(objectiveId, "objective ID");
+    const cas = this.assertOkrVersion(input?.if_match_updated_at);
+    let parentId: string | null = null;
+    if (input?.parent_id !== null && input?.parent_id !== undefined && input.parent_id !== "") {
+      parentId = this.assertOkrEntityId(input.parent_id, "parent objective ID");
+      if (parentId === safeId) throw new Error("Objective cannot parent itself");
+    }
+    const body: Record<string, unknown> = {
+      parent_id: parentId,
+      ...(cas !== undefined ? { if_match_updated_at: cas } : {}),
+    };
+    return this.patch(
+      `/api/okr/objectives/${encodeURIComponent(safeId)}/parent`,
+      body,
+      this.authHeaders(opts?.bearerToken),
+    );
+  }
+
+  async archiveObjective(
+    objectiveId: string,
+    input?: import("./types").ArchiveOkrObjectiveInput,
+    opts?: { bearerToken?: string },
+  ): Promise<{ ok: boolean; objective: import("./types").OkrObjectiveItem; retired_loop_ids?: string[] }> {
+    const safeId = this.assertOkrEntityId(objectiveId, "objective ID");
+    const body: Record<string, unknown> = {};
+    if (input?.completion_summary !== undefined) {
+      const summary = input.completion_summary.trim();
+      if (summary.length > 280) throw new Error("Completion summary exceeds 280 chars");
+      body.completion_summary = summary;
+    }
+    return this.post(
+      `/api/okr/objectives/${encodeURIComponent(safeId)}/archive`,
+      body,
+      this.authHeaders(opts?.bearerToken),
+    );
+  }
+
+  async unarchiveObjective(
+    objectiveId: string,
+    opts?: { bearerToken?: string },
+  ): Promise<{ ok: boolean; objective: import("./types").OkrObjectiveItem }> {
+    const safeId = this.assertOkrEntityId(objectiveId, "objective ID");
+    return this.post(
+      `/api/okr/objectives/${encodeURIComponent(safeId)}/unarchive`,
+      {},
+      this.authHeaders(opts?.bearerToken),
+    );
+  }
+
+  async createKr(
+    objectiveId: string,
+    input: import("./types").CreateOkrKrInput,
+    opts?: { bearerToken?: string },
+  ): Promise<{ ok: boolean; kr: import("./types").OkrKeyResultItem }> {
+    const safeOid = this.assertOkrEntityId(objectiveId, "objective ID");
+    const title = input?.title?.trim() ?? "";
+    if (!title || title.length > 200) throw new Error("Invalid KR title");
+    if (!["count", "bool", "percent"].includes(input?.metric_type)) throw new Error("Invalid KR metric_type");
+    if (!Number.isFinite(input?.target) || input.target < 0) throw new Error("Invalid KR target");
+    if (input.metric_type === "bool" && input.target !== 0 && input.target !== 1) {
+      throw new Error("Invalid bool KR target");
+    }
+    if (input.metric_type === "percent" && input.target > 100) {
+      throw new Error("Invalid percent KR target");
+    }
+    const body: Record<string, unknown> = {
+      title,
+      metric_type: input.metric_type,
+      target: input.target,
+      ...(input.current !== undefined ? { current: input.current } : {}),
+      ...(input.risk_level !== undefined ? { risk_level: input.risk_level } : {}),
+    };
+    return this.post(
+      `/api/okr/objectives/${encodeURIComponent(safeOid)}/krs`,
+      body,
+      this.authHeaders(opts?.bearerToken),
+    );
+  }
+
+  async updateKr(
+    krId: string,
+    input: import("./types").UpdateOkrKrInput,
+    opts?: { bearerToken?: string },
+  ): Promise<{ ok: boolean; kr: import("./types").OkrKeyResultItem }> {
+    const safeId = this.assertOkrEntityId(krId, "KR ID");
+    const cas = this.assertOkrVersion(input?.if_match_updated_at);
+    if (input?.title !== undefined) {
+      const t = input.title.trim();
+      if (!t || t.length > 200) throw new Error("Invalid KR title");
+    }
+    if (input?.metric_type !== undefined && !["count", "bool", "percent"].includes(input.metric_type)) {
+      throw new Error("Invalid KR metric_type");
+    }
+    if (input?.target !== undefined && (!Number.isFinite(input.target) || input.target < 0)) {
+      throw new Error("Invalid KR target");
+    }
+    const body: Record<string, unknown> = {
+      ...(input.title !== undefined ? { title: input.title.trim() } : {}),
+      ...(input.metric_type !== undefined ? { metric_type: input.metric_type } : {}),
+      ...(input.target !== undefined ? { target: input.target } : {}),
+      ...(input.current !== undefined ? { current: input.current } : {}),
+      ...(input.risk_level !== undefined ? { risk_level: input.risk_level } : {}),
+      ...(cas !== undefined ? { if_match_updated_at: cas } : {}),
+    };
+    return this.patch(`/api/okr/krs/${encodeURIComponent(safeId)}`, body, this.authHeaders(opts?.bearerToken));
+  }
+
+  async updateKrProgress(
+    krId: string,
+    input: import("./types").UpdateOkrKrProgressInput,
+    opts?: { bearerToken?: string },
+  ): Promise<{ ok: boolean; kr: import("./types").OkrKeyResultItem }> {
+    const safeId = this.assertOkrEntityId(krId, "KR ID");
+    const cas = this.assertOkrVersion(input?.if_match_updated_at);
+    if (!Number.isFinite(input?.current) || input.current < 0) throw new Error("Invalid KR current progress");
+    const body: Record<string, unknown> = {
+      current: input.current,
+      ...(input.risk_level !== undefined ? { risk_level: input.risk_level } : {}),
+      ...(cas !== undefined ? { if_match_updated_at: cas } : {}),
+    };
+    return this.patch(
+      `/api/okr/krs/${encodeURIComponent(safeId)}/progress`,
+      body,
+      this.authHeaders(opts?.bearerToken),
+    );
+  }
+
+  async createTask(
+    objectiveId: string,
+    input: import("./types").CreateOkrTaskInput,
+    opts?: { bearerToken?: string },
+  ): Promise<{ ok: boolean; task: import("./types").OkrTaskItem }> {
+    const safeOid = this.assertOkrEntityId(objectiveId, "objective ID");
+    const title = input?.title?.trim() ?? "";
+    if (!title || title.length > 200) throw new Error("Invalid task title");
+    const assignee = input?.assignee?.trim() ?? "";
+    if (!assignee || assignee.length > 160 || /^(?:ac_|sk[-_])/i.test(assignee)) {
+      throw new Error("Invalid task assignee");
+    }
+    const body: Record<string, unknown> = {
+      title,
+      assignee,
+      ...(input.due !== undefined ? { due: input.due } : {}),
+      ...(input.contributes_to !== undefined ? { contributes_to: input.contributes_to } : {}),
+      ...(input.depends_on !== undefined ? { depends_on: input.depends_on } : {}),
+      ...(input.linked_channel_docs !== undefined ? { linked_channel_docs: input.linked_channel_docs } : {}),
+    };
+    return this.post(
+      `/api/okr/objectives/${encodeURIComponent(safeOid)}/tasks`,
+      body,
+      this.authHeaders(opts?.bearerToken),
+    );
+  }
+
+  async updateTask(
+    taskId: string,
+    input: import("./types").UpdateOkrTaskInput,
+    opts?: { bearerToken?: string },
+  ): Promise<{ ok: boolean; task: import("./types").OkrTaskItem }> {
+    const safeId = this.assertOkrEntityId(taskId, "task ID");
+    const cas = this.assertOkrVersion(input?.if_match_updated_at);
+    if (input?.title !== undefined) {
+      const t = input.title.trim();
+      if (!t || t.length > 200) throw new Error("Invalid task title");
+    }
+    if (input?.status !== undefined && !["todo", "doing", "done", "blocked"].includes(input.status)) {
+      throw new Error("Invalid task status");
+    }
+    if (input?.due !== undefined && input.due !== null && input.due !== "" && input.due.length > 32) {
+      throw new Error("Invalid task due");
+    }
+    const body: Record<string, unknown> = {
+      ...(input.title !== undefined ? { title: input.title.trim() } : {}),
+      ...(input.status !== undefined ? { status: input.status } : {}),
+      ...(input.assignee !== undefined ? { assignee: input.assignee.trim() } : {}),
+      ...(input.due !== undefined ? { due: input.due } : {}),
+      ...(input.blocked_reason !== undefined ? { blocked_reason: input.blocked_reason } : {}),
+      ...(input.blocker_agent !== undefined ? { blocker_agent: input.blocker_agent } : {}),
+      ...(input.contributes_to !== undefined ? { contributes_to: input.contributes_to } : {}),
+      ...(input.depends_on !== undefined ? { depends_on: input.depends_on } : {}),
+      ...(input.linked_channel_docs !== undefined ? { linked_channel_docs: input.linked_channel_docs } : {}),
+      ...(input.append_evidence !== undefined ? { append_evidence: input.append_evidence } : {}),
+      ...(cas !== undefined ? { if_match_updated_at: cas } : {}),
+    };
+    return this.patch(`/api/okr/tasks/${encodeURIComponent(safeId)}`, body, this.authHeaders(opts?.bearerToken));
+  }
+
+  async addTaskComment(
+    taskId: string,
+    text: string,
+    opts?: { bearerToken?: string },
+  ): Promise<{ ok: boolean; comment: import("./types").OkrTaskCommentItem }> {
+    const safeId = this.assertOkrEntityId(taskId, "task ID");
+    const trimmed = text?.trim() ?? "";
+    if (!trimmed || trimmed.length > 2000) throw new Error("Invalid task comment text");
+    return this.post(
+      `/api/okr/tasks/${encodeURIComponent(safeId)}/comments`,
+      { text: trimmed },
+      this.authHeaders(opts?.bearerToken),
+    );
+  }
+
   // MARK: - Internal
 
   private async get<T = any>(path: string, headers?: Record<string, string>): Promise<T> {
@@ -810,6 +1135,28 @@ export class AgentChatREST {
     };
     const res = await fetch(`${this.baseUrl}${path}`, {
       method: "POST",
+      headers: mergedHeaders,
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      const error = await res.json().catch(() => ({ message: res.statusText }));
+      throw new Error(`HTTP ${res.status}: ${error.message ?? error.error ?? res.statusText}`);
+    }
+    return res.json();
+  }
+
+  private async patch<T = any>(
+    path: string,
+    body: Record<string, unknown>,
+    headers?: Record<string, string>,
+  ): Promise<T> {
+    const mergedHeaders: Record<string, string> = {
+      "Content-Type": "application/json",
+      ...(this.bearerToken ? { Authorization: `Bearer ${this.bearerToken}` } : {}),
+      ...(headers ?? {}),
+    };
+    const res = await fetch(`${this.baseUrl}${path}`, {
+      method: "PATCH",
       headers: mergedHeaders,
       body: JSON.stringify(body),
     });

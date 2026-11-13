@@ -733,4 +733,107 @@ describe("AgentChatClient realtime collaboration WS events", () => {
       globalThis.fetch = originalFetch;
     }
   });
+
+  test("OKR REST governance methods cover Objectives, 3-layer reparenting, KRs, Tasks, comments, and if_match_updated_at CAS guards", async () => {
+    const originalFetch = globalThis.fetch;
+    const calls: Array<{ url: string; method: string; headers: Record<string, string>; body?: any }> = [];
+
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      const method = init?.method || "GET";
+      const headers = (init?.headers as Record<string, string>) ?? {};
+      const body = typeof init?.body === "string" ? JSON.parse(init.body) : undefined;
+      calls.push({ url, method, headers, body });
+
+      if (method === "GET" && url.includes("/api/okr/objectives")) {
+        return Response.json({ objectives: [{ id: "obj_1", title: "Ship SDK", owner: "bot_1", horizon: "week", status: "active" }] });
+      }
+      if (url.endsWith("/api/okr/objectives") && method === "POST") {
+        return Response.json({ ok: true, objective: { id: "obj_2", ...body, status: "active" } });
+      }
+      if (url.endsWith("/api/okr/objectives/obj_2") && method === "PATCH") {
+        return Response.json({ ok: true, objective: { id: "obj_2", title: body.title ?? "Updated", owner: "bot_1", horizon: "week", status: body.status ?? "active" } });
+      }
+      if (url.endsWith("/api/okr/objectives/obj_2/parent") && method === "PATCH") {
+        return Response.json({ ok: true, objective: { id: "obj_2", title: "Updated", owner: "bot_1", horizon: "week", status: "active", parent_id: body.parent_id } });
+      }
+      if (url.endsWith("/api/okr/objectives/obj_2/krs") && method === "POST") {
+        return Response.json({ ok: true, kr: { id: "kr_1", objective_id: "obj_2", ...body, current: 0 } });
+      }
+      if (url.endsWith("/api/okr/krs/kr_1") && method === "PATCH") {
+        return Response.json({ ok: true, kr: { id: "kr_1", objective_id: "obj_2", title: body.title ?? "KR", metric_type: body.metric_type ?? "bool", target: body.target ?? 1, current: body.current ?? 0 } });
+      }
+      if (url.endsWith("/api/okr/krs/kr_1/progress") && method === "PATCH") {
+        return Response.json({ ok: true, kr: { id: "kr_1", objective_id: "obj_2", title: "KR", metric_type: "bool", target: 1, current: body.current } });
+      }
+      if (url.endsWith("/api/okr/objectives/obj_2/tasks") && method === "POST") {
+        return Response.json({ ok: true, task: { id: "task_1", objective_id: "obj_2", ...body, status: "todo" } });
+      }
+      if (url.endsWith("/api/okr/tasks/task_1") && method === "PATCH") {
+        return Response.json({ ok: true, task: { id: "task_1", objective_id: "obj_2", title: body.title ?? "Task", assignee: "bot_1", status: body.status ?? "doing" } });
+      }
+      if (url.endsWith("/api/okr/tasks/task_1/comments") && method === "POST") {
+        return Response.json({ ok: true, comment: { id: "c_1", author: "bot_1", text: body.text, at: "2026-11-13T17:00:00.000Z" } });
+      }
+      if (url.endsWith("/api/okr/objectives/obj_2/archive") && method === "POST") {
+        return Response.json({ ok: true, objective: { id: "obj_2", title: "Updated", owner: "bot_1", horizon: "week", status: "done", archived: true } });
+      }
+      if (url.endsWith("/api/okr/objectives/obj_2/unarchive") && method === "POST") {
+        return Response.json({ ok: true, objective: { id: "obj_2", title: "Updated", owner: "bot_1", horizon: "week", status: "active", archived: false } });
+      }
+      return Response.json({ ok: true });
+    }) as typeof fetch;
+
+    try {
+      const rest = new AgentChatREST({ baseUrl: "https://agents-chat.com", bearerToken: "okr-jwt-123" });
+      const ts = "2026-11-13T17:00:00.000Z";
+
+      const list = await rest.listObjectives({ horizon: "week", view: "mine-active", shape: "summary" });
+      expect(list.objectives[0]?.id).toBe("obj_1");
+
+      await rest.createObjective({
+        title: "Campaign 20",
+        horizon: "week",
+        parent_id: "obj_root",
+        discussion_channel_id: "room-dev",
+      });
+      await rest.updateObjective("obj_2", { title: "Campaign 20 v2", status: "active", if_match_updated_at: ts });
+      await rest.reparentObjective("obj_2", { parent_id: "obj_parent_2", if_match_updated_at: ts });
+      await rest.reparentObjective("obj_2", { parent_id: null, if_match_updated_at: ts });
+      await rest.createKr("obj_2", { title: "KR1", metric_type: "bool", target: 1 });
+      await rest.updateKr("kr_1", { title: "KR1 Revised", metric_type: "percent", target: 100, current: 50, if_match_updated_at: ts });
+      await rest.updateKrProgress("kr_1", { current: 100, risk_level: "green", if_match_updated_at: ts });
+      await rest.createTask("obj_2", { title: "Ship SDK", assignee: "bot_1", contributes_to: ["kr_1"] });
+      await rest.updateTask("task_1", { title: "Ship SDK + Tests", due: "2026-11-20", status: "done", if_match_updated_at: ts });
+      await rest.addTaskComment("task_1", "All green");
+      await rest.archiveObjective("obj_2", { completion_summary: "3/3 KRs delivered." });
+      await rest.unarchiveObjective("obj_2");
+
+      expect(calls.map((c) => `${c.method} ${new URL(c.url).pathname}`)).toEqual([
+        "GET /api/okr/objectives",
+        "POST /api/okr/objectives",
+        "PATCH /api/okr/objectives/obj_2",
+        "PATCH /api/okr/objectives/obj_2/parent",
+        "PATCH /api/okr/objectives/obj_2/parent",
+        "POST /api/okr/objectives/obj_2/krs",
+        "PATCH /api/okr/krs/kr_1",
+        "PATCH /api/okr/krs/kr_1/progress",
+        "POST /api/okr/objectives/obj_2/tasks",
+        "PATCH /api/okr/tasks/task_1",
+        "POST /api/okr/tasks/task_1/comments",
+        "POST /api/okr/objectives/obj_2/archive",
+        "POST /api/okr/objectives/obj_2/unarchive",
+      ]);
+      expect(calls[2]?.body.if_match_updated_at).toBe(ts);
+      expect(calls[4]?.body.parent_id).toBeNull();
+      expect(calls[9]?.body.due).toBe("2026-11-20");
+
+      await expect(rest.reparentObjective("obj_2", { parent_id: "obj_2" })).rejects.toThrow("Objective cannot parent itself");
+      await expect(rest.updateTask("ac_secret_token", { status: "done" })).rejects.toThrow("Invalid task ID");
+      await expect(rest.updateObjective("obj_2", { if_match_updated_at: "not-a-timestamp" })).rejects.toThrow("Invalid OKR if_match_updated_at version");
+      await expect(rest.archiveObjective("obj_2", { completion_summary: "x".repeat(281) })).rejects.toThrow("Completion summary exceeds 280 chars");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
 });

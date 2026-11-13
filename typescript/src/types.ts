@@ -955,4 +955,171 @@ export interface RoomLoopMutationResponse {
   status?: RoomLoopStatus | "stopped";
 }
 
+// MARK: - OKR Structured Working Memory Governance (/api/okr)
+
+export type OkrHorizon = "week" | "month" | "Q";
+export type OkrObjectiveStatus = "active" | "done" | "abandoned";
+export type OkrMetricType = "count" | "bool" | "percent";
+export type OkrRiskLevel = "green" | "yellow" | "red";
+export type OkrTaskStatus = "todo" | "doing" | "done" | "blocked";
+export type OkrListView = "mine-active" | "blocking-me" | "blocked-by-me" | "related";
+
+export interface OkrChannelDocRef {
+  channel_id: string;
+  doc_id: string;
+}
+
+export interface OkrTaskCommentItem {
+  id: string;
+  author: string;
+  text: string;
+  at: string;
+}
+
+export interface OkrTaskItem {
+  id: string;
+  objective_id: string;
+  title: string;
+  assignee: string;
+  status: OkrTaskStatus;
+  due?: string | null;
+  blocked_reason?: string | null;
+  blocker_agent?: string | null;
+  contributes_to?: string[] | null;
+  depends_on?: string[] | null;
+  linked_docs?: string[];
+  linked_channel_docs?: OkrChannelDocRef[];
+  evidence?: string[];
+  comments?: OkrTaskCommentItem[];
+  discussion_channel_id?: string;
+  created_at?: string;
+  updated_at?: string;
+  last_progress_at?: string;
+}
+
+export interface OkrKeyResultItem {
+  id: string;
+  objective_id: string;
+  title: string;
+  metric_type: OkrMetricType;
+  current: number;
+  target: number;
+  risk_level?: OkrRiskLevel;
+  linked_docs?: string[];
+  linked_channel_docs?: OkrChannelDocRef[];
+  discussion_channel_id?: string;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export interface OkrObjectiveItem {
+  id: string;
+  title: string;
+  owner: string;
+  horizon: OkrHorizon;
+  status: OkrObjectiveStatus;
+  due?: string | null;
+  parent_id?: string | null;
+  discussion_channel_id?: string;
+  narrative?: string;
+  archived?: boolean;
+  archived_at?: string;
+  completion_summary?: string;
+  created_at?: string;
+  updated_at?: string;
+  key_results?: OkrKeyResultItem[];
+  tasks?: OkrTaskItem[];
+}
+
+export interface OkrListQuery {
+  horizon?: OkrHorizon;
+  status?: OkrObjectiveStatus;
+  owner?: string;
+  include_archived?: boolean;
+  objective_id?: string;
+  view?: OkrListView;
+  task_id?: string;
+  shape?: "summary";
+  bearerToken?: string;
+}
+
+export interface OkrListResponse {
+  objectives: OkrObjectiveItem[];
+}
+
+export interface CreateOkrObjectiveInput {
+  title: string;
+  horizon: OkrHorizon;
+  owner?: string;
+  due?: string;
+  parent_id?: string;
+  discussion_channel_id?: string;
+  narrative?: string;
+}
+
+export interface UpdateOkrObjectiveInput {
+  title?: string;
+  horizon?: OkrHorizon;
+  status?: OkrObjectiveStatus;
+  due?: string | null;
+  narrative?: string | null;
+  if_match_updated_at?: string;
+}
+
+export interface ReparentOkrObjectiveInput {
+  parent_id: string | null;
+  if_match_updated_at?: string;
+}
+
+export interface ArchiveOkrObjectiveInput {
+  completion_summary?: string;
+}
+
+export interface CreateOkrKrInput {
+  title: string;
+  metric_type: OkrMetricType;
+  target: number;
+  current?: number;
+  risk_level?: OkrRiskLevel;
+}
+
+export interface UpdateOkrKrInput {
+  title?: string;
+  metric_type?: OkrMetricType;
+  target?: number;
+  current?: number;
+  risk_level?: OkrRiskLevel;
+  if_match_updated_at?: string;
+}
+
+export interface UpdateOkrKrProgressInput {
+  current: number;
+  risk_level?: OkrRiskLevel;
+  if_match_updated_at?: string;
+}
+
+export interface CreateOkrTaskInput {
+  title: string;
+  assignee: string;
+  due?: string;
+  contributes_to?: string[];
+  depends_on?: string[];
+  linked_channel_docs?: OkrChannelDocRef[];
+}
+
+export interface UpdateOkrTaskInput {
+  title?: string;
+  status?: OkrTaskStatus;
+  assignee?: string;
+  due?: string | null;
+  blocked_reason?: string | null;
+  blocker_agent?: string | null;
+  contributes_to?: string[];
+  depends_on?: string[];
+  linked_channel_docs?: OkrChannelDocRef[];
+  append_evidence?: string;
+  if_match_updated_at?: string;
+}
+
+
 
