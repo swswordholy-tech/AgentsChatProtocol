@@ -9,12 +9,16 @@ const homes: string[] = [];
 let hub: ReturnType<typeof Bun.serve>;
 let BASE = "";
 let receivedPatches: Array<{ taskId: string; body: any }> = [];
+let receivedObjectives: any[] = [];
+let receivedAddedTasks: Array<{ objectiveId: string; body: any }> = [];
 let legacyIgnoreAppend = false;
 let storedEvidenceByTask: Record<string, any[]> = {};
 let storedContributesByTask: Record<string, string[]> = {};
 
 beforeEach(() => {
   receivedPatches = [];
+  receivedObjectives = [];
+  receivedAddedTasks = [];
   legacyIgnoreAppend = false;
   storedEvidenceByTask = {};
   storedContributesByTask = {};
@@ -69,6 +73,7 @@ beforeAll(() => {
       }
       if (req.method === "POST" && url.pathname === "/api/okr/objectives") {
         const body = await req.json() as any;
+        receivedObjectives.push(body);
         return Response.json({
           ok: true,
           objective: {
@@ -76,6 +81,25 @@ beforeAll(() => {
             title: body.title,
             horizon: body.horizon,
             discussion_channel_id: body.discussion_channel_id ?? null,
+            narrative: body.narrative,
+            linked_channel_docs: body.linked_channel_docs,
+          },
+        });
+      }
+      const addTaskMatch = url.pathname.match(/^\/api\/okr\/objectives\/([^/]+)\/tasks$/);
+      if (req.method === "POST" && addTaskMatch) {
+        const body = await req.json() as any;
+        const objectiveId = decodeURIComponent(addTaskMatch[1]);
+        receivedAddedTasks.push({ objectiveId, body });
+        return Response.json({
+          ok: true,
+          task: {
+            id: "task_created_456",
+            objective_id: objectiveId,
+            title: body.title,
+            assignee: body.assignee,
+            depends_on: body.depends_on ?? null,
+            linked_channel_docs: body.linked_channel_docs,
           },
         });
       }
@@ -473,5 +497,123 @@ describe("MCP okr_update_task structured evidence", () => {
         contributes_to: [],
       },
     });
+  });
+
+  test("okr_create_objective, okr_add_task, and okr_update_task support linked_channel_docs and validated depends_on while rejecting self-deps, DM channels, and secrets", async () => {
+    const out = await drive([
+      INIT,
+      INITED,
+      callTool(2, "load_tool_group", { group_name: "okr" }),
+      { jsonrpc: "2.0", id: 3, method: "tools/list", params: {} },
+      callTool(4, "okr_create_objective", {
+        title: "Room Objective with Docs",
+        horizon: "week",
+        discussion_channel_id: "room-alpha",
+        narrative: "  Ship clean DAG + skill binding  ",
+        linked_channel_docs: [
+          { channel_id: " room-alpha ", doc_id: " skill-release " },
+          { channel_id: "room-alpha", doc_id: "skill-release" },
+        ],
+      }),
+      callTool(5, "okr_add_task", {
+        objective_id: "obj_created_123",
+        title: "Implement downstream step",
+        assignee: "@claude-code-live",
+        depends_on: [" task_up_1 ", "task_up_2", "task_up_1"],
+        linked_channel_docs: [{ channel_id: "room-alpha", doc_id: "spec-v2" }],
+      }),
+      callTool(6, "okr_update_task", {
+        task_id: "task_dag_1",
+        depends_on: ["task_up_2"],
+        linked_channel_docs: [{ channel_id: "room-alpha", doc_id: "runbook-1" }],
+      }),
+      callTool(7, "okr_update_task", {
+        task_id: "task_dag_1",
+        depends_on: [],
+        linked_channel_docs: [],
+      }),
+      callTool(8, "okr_update_task", {
+        task_id: "task_dag_1",
+        depends_on: ["task_dag_1"],
+      }),
+      callTool(9, "okr_create_objective", {
+        title: "Missing discussion channel",
+        horizon: "week",
+        linked_channel_docs: [{ channel_id: "room-alpha", doc_id: "doc-1" }],
+      }),
+      callTool(10, "okr_create_objective", {
+        title: "Mismatched channel",
+        horizon: "week",
+        discussion_channel_id: "room-alpha",
+        linked_channel_docs: [{ channel_id: "room-beta", doc_id: "doc-1" }],
+      }),
+      callTool(11, "okr_update_task", {
+        task_id: "task_dag_1",
+        linked_channel_docs: [{ channel_id: "dm-secret", doc_id: "doc-1" }],
+      }),
+      callTool(12, "okr_create_objective", {
+        title: "Secret narrative",
+        horizon: "week",
+        narrative: "Token agent_key_supersecret123456",
+      }),
+    ], 2200);
+
+    const tools = out.res.get(3)?.result?.tools || [];
+    const createObjDef = tools.find((t: any) => t.name === "okr_create_objective");
+    const addTaskDef = tools.find((t: any) => t.name === "okr_add_task");
+    const updateTaskDef = tools.find((t: any) => t.name === "okr_update_task");
+    expect(createObjDef?.inputSchema?.properties?.linked_channel_docs?.maxItems).toBe(10);
+    expect(addTaskDef?.inputSchema?.properties?.linked_channel_docs?.maxItems).toBe(10);
+    expect(updateTaskDef?.inputSchema?.properties?.linked_channel_docs?.maxItems).toBe(10);
+    expect(updateTaskDef?.inputSchema?.properties?.depends_on?.maxItems).toBe(20);
+
+    for (const id of [4, 5, 6, 7]) {
+      expect(out.res.get(id)?.result?.isError).toBeUndefined();
+    }
+    for (const id of [8, 9, 10, 11, 12]) {
+      expect(out.res.get(id)?.result?.isError).toBe(true);
+    }
+    expect(out.res.get(8)?.result?.content?.[0]?.text).toContain("cannot reference the task itself");
+    expect(out.res.get(9)?.result?.content?.[0]?.text).toContain("discussion_channel_id is required");
+    expect(out.res.get(10)?.result?.content?.[0]?.text).toContain("must match discussion_channel_id");
+    expect(out.res.get(11)?.result?.content?.[0]?.text).toContain("non-DM room ID");
+    expect(out.res.get(12)?.result?.content?.[0]?.text).toContain("secret or token");
+
+    expect(receivedObjectives).toEqual([
+      {
+        title: "Room Objective with Docs",
+        horizon: "week",
+        discussion_channel_id: "room-alpha",
+        narrative: "Ship clean DAG + skill binding",
+        linked_channel_docs: [{ channel_id: "room-alpha", doc_id: "skill-release" }],
+      },
+    ]);
+    expect(receivedAddedTasks).toEqual([
+      {
+        objectiveId: "obj_created_123",
+        body: {
+          title: "Implement downstream step",
+          assignee: "claude-code-live",
+          depends_on: ["task_up_1", "task_up_2"],
+          linked_channel_docs: [{ channel_id: "room-alpha", doc_id: "spec-v2" }],
+        },
+      },
+    ]);
+    expect(receivedPatches).toEqual([
+      {
+        taskId: "task_dag_1",
+        body: {
+          depends_on: ["task_up_2"],
+          linked_channel_docs: [{ channel_id: "room-alpha", doc_id: "runbook-1" }],
+        },
+      },
+      {
+        taskId: "task_dag_1",
+        body: {
+          depends_on: [],
+          linked_channel_docs: [],
+        },
+      },
+    ]);
   });
 });

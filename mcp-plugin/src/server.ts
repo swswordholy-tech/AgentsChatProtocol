@@ -55,9 +55,12 @@ import {
   validateAppendTaskEvidenceInput,
   validateCreateLoopInput,
   validateOkrAddKrInput,
+  validateOkrLinkedChannelDocsInput,
+  validateOkrObjectiveNarrativeInput,
   validateOkrSetKrProgressInput,
   validateOkrTaskAssigneeInput,
   validateOkrTaskContributesToInput,
+  validateOkrTaskDependsOnInput,
   validateTaskEvidenceInput,
   validateTaskVersionToken,
   validateToolArgs,
@@ -1988,7 +1991,7 @@ const ALL_TOOL_DEFS = [
     },
     {
       name: "okr_create_objective",
-      description: "Create a new OKR Objective. Team is flat by default (no parent_id). Any authed caller can create; root Objectives (no parent) are audit-logged. owner defaults to caller.",
+      description: "Create a new OKR Objective. Team is flat by default (no parent_id). Any authed caller can create; root Objectives (no parent) are audit-logged. owner defaults to caller. Optionally attach inline narrative (<=2000 chars) and same-room linked_channel_docs (requires discussion_channel_id).",
       inputSchema: {
         type: "object" as const,
         properties: {
@@ -1998,13 +2001,27 @@ const ALL_TOOL_DEFS = [
           parent_id: { type: "string", description: "Optional parent Objective id for hierarchical OKRs (max 3 layers deep)" },
           due: { type: "string", description: "ISO-8601 due date (e.g. 2026-05-19)" },
           discussion_channel_id: { type: "string", description: "Optional existing channel id to anchor this objective into Workspace Graph / channel insights" },
+          narrative: { type: "string", description: "Optional inline WHY summary (<=2000 chars; never include secrets)" },
+          linked_channel_docs: {
+            type: "array",
+            maxItems: 10,
+            description: "Optional same-room ChannelDoc / skill references (max 10; requires discussion_channel_id matching channel_id).",
+            items: {
+              type: "object",
+              properties: {
+                channel_id: { type: "string", description: "Room channel_id containing the document (must match discussion_channel_id)" },
+                doc_id: { type: "string", description: "Referenced channel doc or skill id" },
+              },
+              required: ["channel_id", "doc_id"],
+            },
+          },
         },
         required: ["title", "horizon"],
       },
     },
     {
       name: "okr_add_task",
-      description: "Add a Task under an Objective. Tasks attach to Objectives, optionally cross-reference KRs they advance via contributes_to[]. Caller must own the Objective (or be admin). v0.7.5: depends_on[] lets you express 'this task waits on those'; cycles are rejected by the server.",
+      description: "Add a Task under an Objective. Tasks attach to Objectives, optionally cross-reference KRs they advance via contributes_to[], upstream DAG blockers via depends_on[], and room skill/spec docs via linked_channel_docs[] (surfaced automatically by okr_wake). Caller must own the Objective (or be admin). Server rejects cycles.",
       inputSchema: {
         type: "object" as const,
         properties: {
@@ -2012,7 +2029,20 @@ const ALL_TOOL_DEFS = [
           title: { type: "string", description: "Task title (max 200 chars)" },
           assignee: { type: "string", description: "Agent handle to assign the task to (never an email address)" },
           contributes_to: { type: "array", maxItems: 5, items: { type: "string" }, description: "Optional KR ids (0..5) on the Objective that this task advances" },
-          depends_on: { type: "array", items: { type: "string" }, description: "Optional task ids this task waits on. Any task within the same objective tree (cross-objective allowed; unrelated roots rejected). Max 20 direct deps. Server rejects cycles." },
+          depends_on: { type: "array", maxItems: 20, items: { type: "string" }, description: "Optional task ids this task waits on. Any task within the same objective tree (cross-objective allowed; unrelated roots rejected). Max 20 direct deps. Server rejects cycles." },
+          linked_channel_docs: {
+            type: "array",
+            maxItems: 10,
+            description: "Optional same-room ChannelDoc / skill references (max 10; requires the Objective to be anchored to that discussion channel).",
+            items: {
+              type: "object",
+              properties: {
+                channel_id: { type: "string", description: "Room channel_id containing the document (must match Objective discussion_channel_id)" },
+                doc_id: { type: "string", description: "Referenced channel doc or skill id" },
+              },
+              required: ["channel_id", "doc_id"],
+            },
+          },
           due: { type: "string", description: "ISO-8601 due date" },
         },
         required: ["objective_id", "title", "assignee"],
@@ -2020,7 +2050,7 @@ const ALL_TOOL_DEFS = [
     },
     {
       name: "okr_update_task",
-      description: "Update a Task — change status, re-assign assignee, bind/clear contributes_to Key Results, block/unblock, add blocker info, adjust dependencies, or record structured completion evidence. Caller must be the assignee, Objective owner, or admin. Reassign and contributes_to changes are owner/admin-only. Pass depends_on:[] or contributes_to:[] to clear, or a new array to replace; server rejects cycles. Prefer append_evidence:[{kind, ref, note?}] (1..10 items, deduplicated without overwriting existing receipts) or pass evidence:[{kind, ref, note?}] (full replacement; [] to clear) plus optional if_match_updated_at CAS token.",
+      description: "Update a Task — change status, re-assign assignee, bind/clear contributes_to Key Results, block/unblock, add blocker info, adjust DAG dependencies (depends_on), attach/clear room skill/spec docs (linked_channel_docs), or record structured completion evidence. Caller must be the assignee, Objective owner, or admin. Reassign and contributes_to changes are owner/admin-only. Pass depends_on:[], linked_channel_docs:[], or contributes_to:[] to clear, or a new array to replace; server rejects cycles. Prefer append_evidence:[{kind, ref, note?}] (1..10 items, deduplicated without overwriting existing receipts) or pass evidence:[{kind, ref, note?}] (full replacement; [] to clear) plus optional if_match_updated_at CAS token.",
       inputSchema: {
         type: "object" as const,
         properties: {
@@ -2035,7 +2065,20 @@ const ALL_TOOL_DEFS = [
           },
           blocked_reason: { type: "string", description: "Why is this task blocked (max 500 chars)" },
           blocker_agent: { type: "string", description: "Which agent is blocking this task" },
-          depends_on: { type: "array", items: { type: "string" }, description: "Replacement dependency list (any task in the same objective tree, max 20, no cycles). Pass empty array to clear." },
+          depends_on: { type: "array", maxItems: 20, items: { type: "string" }, description: "Replacement dependency list (any task in the same objective tree, max 20, no cycles). Pass empty array to clear." },
+          linked_channel_docs: {
+            type: "array",
+            maxItems: 10,
+            description: "Replacement same-room ChannelDoc / skill references (0..10 items; pass [] to clear).",
+            items: {
+              type: "object",
+              properties: {
+                channel_id: { type: "string", description: "Room channel_id containing the document (must match task/Objective discussion_channel_id)" },
+                doc_id: { type: "string", description: "Referenced channel doc or skill id" },
+              },
+              required: ["channel_id", "doc_id"],
+            },
+          },
           due: { type: "string", description: "ISO-8601 due date" },
           evidence: {
             type: "array",
@@ -5475,14 +5518,43 @@ const handleToolCall = async (request: any): Promise<any> => {
   }
 
   if (name === "okr_create_objective") {
-    const { title, horizon, owner, parent_id, due, discussion_channel_id } = args as {
-      title: string; horizon: string; owner?: string; parent_id?: string; due?: string; discussion_channel_id?: string;
+    const { title, horizon, owner, parent_id, due, discussion_channel_id, narrative, linked_channel_docs } = args as {
+      title: string;
+      horizon: string;
+      owner?: string;
+      parent_id?: string;
+      due?: string;
+      discussion_channel_id?: string;
+      narrative?: unknown;
+      linked_channel_docs?: unknown;
     };
     const body: Record<string, unknown> = { title, horizon };
     if (owner) body.owner = owner;
     if (parent_id) body.parent_id = parent_id;
     if (due) body.due = due;
     if (discussion_channel_id) body.discussion_channel_id = discussion_channel_id;
+    if (narrative !== undefined) {
+      const narCheck = validateOkrObjectiveNarrativeInput(narrative);
+      if (!narCheck.ok) {
+        return { content: [{ type: "text", text: `okr_create_objective invalid narrative: ${narCheck.error}` }], isError: true };
+      }
+      if (narCheck.value) body.narrative = narCheck.value;
+    }
+    if (linked_channel_docs !== undefined) {
+      const docsCheck = validateOkrLinkedChannelDocsInput(linked_channel_docs, discussion_channel_id);
+      if (!docsCheck.ok) {
+        return { content: [{ type: "text", text: `okr_create_objective invalid linked_channel_docs: ${docsCheck.error}` }], isError: true };
+      }
+      if (docsCheck.value.length > 0) {
+        if (!discussion_channel_id || !discussion_channel_id.trim()) {
+          return {
+            content: [{ type: "text", text: "okr_create_objective invalid linked_channel_docs: discussion_channel_id is required when attaching linked_channel_docs" }],
+            isError: true,
+          };
+        }
+        body.linked_channel_docs = docsCheck.value;
+      }
+    }
     try {
       const r = await apiFetch(`${REST_URL}/api/okr/objectives`, {
         method: "POST",
@@ -5522,8 +5594,14 @@ const handleToolCall = async (request: any): Promise<any> => {
   }
 
   if (name === "okr_add_task") {
-    const { objective_id, title, assignee, contributes_to, depends_on, due } = args as {
-      objective_id: string; title: string; assignee: string; contributes_to?: unknown; depends_on?: string[]; due?: string;
+    const { objective_id, title, assignee, contributes_to, depends_on, linked_channel_docs, due } = args as {
+      objective_id: string;
+      title: string;
+      assignee: string;
+      contributes_to?: unknown;
+      depends_on?: unknown;
+      linked_channel_docs?: unknown;
+      due?: string;
     };
     const assigneeCheck = validateOkrTaskAssigneeInput(assignee);
     if (!assigneeCheck.ok) {
@@ -5537,7 +5615,20 @@ const handleToolCall = async (request: any): Promise<any> => {
       }
       if (contribCheck.value.length > 0) body.contributes_to = contribCheck.value;
     }
-    if (Array.isArray(depends_on) && depends_on.length > 0) body.depends_on = depends_on;
+    if (depends_on !== undefined) {
+      const depsCheck = validateOkrTaskDependsOnInput(depends_on);
+      if (!depsCheck.ok) {
+        return { content: [{ type: "text", text: `okr_add_task invalid depends_on: ${depsCheck.error}` }], isError: true };
+      }
+      if (depsCheck.value.length > 0) body.depends_on = depsCheck.value;
+    }
+    if (linked_channel_docs !== undefined) {
+      const docsCheck = validateOkrLinkedChannelDocsInput(linked_channel_docs);
+      if (!docsCheck.ok) {
+        return { content: [{ type: "text", text: `okr_add_task invalid linked_channel_docs: ${docsCheck.error}` }], isError: true };
+      }
+      if (docsCheck.value.length > 0) body.linked_channel_docs = docsCheck.value;
+    }
     if (due) body.due = due;
     try {
       const r = await apiFetch(`${REST_URL}/api/okr/objectives/${encodeURIComponent(objective_id)}/tasks`, {
@@ -5564,6 +5655,7 @@ const handleToolCall = async (request: any): Promise<any> => {
       blocked_reason,
       blocker_agent,
       depends_on,
+      linked_channel_docs,
       due,
       evidence,
       append_evidence,
@@ -5575,7 +5667,8 @@ const handleToolCall = async (request: any): Promise<any> => {
       contributes_to?: unknown;
       blocked_reason?: string;
       blocker_agent?: string;
-      depends_on?: string[];
+      depends_on?: unknown;
+      linked_channel_docs?: unknown;
       due?: string;
       evidence?: unknown;
       append_evidence?: unknown;
@@ -5605,7 +5698,20 @@ const handleToolCall = async (request: any): Promise<any> => {
     }
     if (blocked_reason !== undefined) patch.blocked_reason = blocked_reason;
     if (blocker_agent !== undefined) patch.blocker_agent = blocker_agent;
-    if (Array.isArray(depends_on)) patch.depends_on = depends_on;
+    if (depends_on !== undefined) {
+      const depsCheck = validateOkrTaskDependsOnInput(depends_on, task_id);
+      if (!depsCheck.ok) {
+        return { content: [{ type: "text", text: `okr_update_task invalid depends_on: ${depsCheck.error}` }], isError: true };
+      }
+      patch.depends_on = depsCheck.value;
+    }
+    if (linked_channel_docs !== undefined) {
+      const docsCheck = validateOkrLinkedChannelDocsInput(linked_channel_docs);
+      if (!docsCheck.ok) {
+        return { content: [{ type: "text", text: `okr_update_task invalid linked_channel_docs: ${docsCheck.error}` }], isError: true };
+      }
+      patch.linked_channel_docs = docsCheck.value;
+    }
     if (due) patch.due = due;
     if (evidence !== undefined) {
       const evCheck = validateTaskEvidenceInput(evidence);
@@ -5825,18 +5931,30 @@ const handleToolCall = async (request: any): Promise<any> => {
     const { target_type, target_id, narrative, narrative_path, discussion_channel_id, linked_docs, linked_channel_docs } = args as {
       target_type: "objective" | "kr" | "task";
       target_id: string;
-      narrative?: string;
+      narrative?: unknown;
       narrative_path?: string;
       discussion_channel_id?: string;
       linked_docs?: string[];
-      linked_channel_docs?: Array<{ channel_id: string; doc_id: string }>;
+      linked_channel_docs?: unknown;
     };
     const body: Record<string, unknown> = {};
-    if (narrative !== undefined) body.narrative = narrative;
+    if (narrative !== undefined) {
+      const narCheck = validateOkrObjectiveNarrativeInput(narrative);
+      if (!narCheck.ok) {
+        return { content: [{ type: "text", text: `okr_set_links invalid narrative: ${narCheck.error}` }], isError: true };
+      }
+      body.narrative = narCheck.value;
+    }
     if (narrative_path !== undefined) body.narrative_path = narrative_path;
     if (discussion_channel_id !== undefined) body.discussion_channel_id = discussion_channel_id;
     if (linked_docs !== undefined) body.linked_docs = linked_docs;
-    if (linked_channel_docs !== undefined) body.linked_channel_docs = linked_channel_docs;
+    if (linked_channel_docs !== undefined) {
+      const docsCheck = validateOkrLinkedChannelDocsInput(linked_channel_docs, discussion_channel_id);
+      if (!docsCheck.ok) {
+        return { content: [{ type: "text", text: `okr_set_links invalid linked_channel_docs: ${docsCheck.error}` }], isError: true };
+      }
+      body.linked_channel_docs = docsCheck.value;
+    }
     try {
       const r = await apiFetch(`${REST_URL}/api/okr/links/${encodeURIComponent(target_type)}/${encodeURIComponent(target_id)}`, {
         method: "PATCH",

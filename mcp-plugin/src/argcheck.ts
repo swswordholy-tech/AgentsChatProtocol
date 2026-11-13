@@ -597,3 +597,131 @@ export function validateOkrTaskContributesToInput(
   }
   return { ok: true, value: out };
 }
+
+const OKR_TASK_DEPENDS_ON_CAP = 20;
+const OKR_LINKED_CHANNEL_DOCS_CAP = 10;
+const OKR_DOC_CHANNEL_ID_RE = /^[A-Za-z0-9_-]{1,80}$/;
+const OKR_DOC_ID_RE = /^[A-Za-z0-9_-]{1,120}$/;
+const OKR_NARRATIVE_MAX = 2000;
+
+export interface OkrLinkedChannelDocInput {
+  channel_id: string;
+  doc_id: string;
+}
+
+export function validateOkrTaskDependsOnInput(
+  raw: unknown,
+  selfTaskId?: string,
+): { ok: true; value: string[] } | { ok: false; error: string } {
+  if (raw === null) return { ok: true, value: [] };
+  if (!Array.isArray(raw)) {
+    return {
+      ok: false,
+      error: `depends_on must be an array of task IDs (0..${OKR_TASK_DEPENDS_ON_CAP} items; pass [] to clear)`,
+    };
+  }
+  if (raw.length === 0) return { ok: true, value: [] };
+  if (raw.length > OKR_TASK_DEPENDS_ON_CAP) {
+    return { ok: false, error: `depends_on exceeds max ${OKR_TASK_DEPENDS_ON_CAP} task IDs` };
+  }
+  const normalizedSelf = typeof selfTaskId === "string" ? selfTaskId.trim() : "";
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (let i = 0; i < raw.length; i++) {
+    const item = raw[i];
+    if (typeof item !== "string") {
+      return { ok: false, error: `depends_on[${i}] must be a non-empty task ID string` };
+    }
+    const id = item.trim();
+    if (!id || id.length > 128 || EVIDENCE_CTRL_RE.test(id)) {
+      return { ok: false, error: `depends_on[${i}] must be a non-empty task ID (<=128 chars)` };
+    }
+    if (EVIDENCE_SECRET_RE.test(id)) {
+      return { ok: false, error: `depends_on[${i}] rejected: appears to contain a secret or token` };
+    }
+    if (!SAFE_CHANNEL_OR_LOOP_ID_RE.test(id) || id.includes("..")) {
+      return { ok: false, error: `depends_on[${i}] contains invalid task ID characters` };
+    }
+    if (normalizedSelf && id === normalizedSelf) {
+      return { ok: false, error: `depends_on[${i}] cannot reference the task itself (${id})` };
+    }
+    if (!seen.has(id)) {
+      seen.add(id);
+      out.push(id);
+    }
+  }
+  return { ok: true, value: out };
+}
+
+export function validateOkrLinkedChannelDocsInput(
+  raw: unknown,
+  expectedChannelId?: string,
+): { ok: true; value: OkrLinkedChannelDocInput[] } | { ok: false; error: string } {
+  if (raw === null) return { ok: true, value: [] };
+  if (!Array.isArray(raw)) {
+    return {
+      ok: false,
+      error: `linked_channel_docs must be an array of {channel_id, doc_id} objects (0..${OKR_LINKED_CHANNEL_DOCS_CAP} items; pass [] to clear)`,
+    };
+  }
+  if (raw.length === 0) return { ok: true, value: [] };
+  if (raw.length > OKR_LINKED_CHANNEL_DOCS_CAP) {
+    return { ok: false, error: `linked_channel_docs exceeds max ${OKR_LINKED_CHANNEL_DOCS_CAP} items` };
+  }
+  const requiredChannel = typeof expectedChannelId === "string" ? expectedChannelId.trim() : "";
+  const out: OkrLinkedChannelDocInput[] = [];
+  const seen = new Set<string>();
+  for (let i = 0; i < raw.length; i++) {
+    const item = raw[i];
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      return { ok: false, error: `linked_channel_docs[${i}] must be an object with channel_id and doc_id` };
+    }
+    const rawChannelId = (item as Record<string, unknown>).channel_id;
+    const rawDocId = (item as Record<string, unknown>).doc_id;
+    if (typeof rawChannelId !== "string" || typeof rawDocId !== "string") {
+      return { ok: false, error: `linked_channel_docs[${i}] requires string channel_id and doc_id` };
+    }
+    const channelId = rawChannelId.trim();
+    const docId = rawDocId.trim();
+    if (!channelId || !OKR_DOC_CHANNEL_ID_RE.test(channelId) || /^dm-/i.test(channelId)) {
+      return {
+        ok: false,
+        error: `linked_channel_docs[${i}].channel_id must be a valid non-DM room ID (1..80 chars)`,
+      };
+    }
+    if (EVIDENCE_SECRET_RE.test(channelId) || EVIDENCE_SECRET_RE.test(docId)) {
+      return { ok: false, error: `linked_channel_docs[${i}] rejected: appears to contain a secret or token` };
+    }
+    if (!docId || !OKR_DOC_ID_RE.test(docId)) {
+      return { ok: false, error: `linked_channel_docs[${i}].doc_id must match ^[A-Za-z0-9_-]{1,120}$` };
+    }
+    if (requiredChannel && channelId !== requiredChannel) {
+      return {
+        ok: false,
+        error: `linked_channel_docs[${i}].channel_id (${channelId}) must match discussion_channel_id (${requiredChannel})`,
+      };
+    }
+    const key = `${channelId}:${docId}`;
+    if (!seen.has(key)) {
+      seen.add(key);
+      out.push({ channel_id: channelId, doc_id: docId });
+    }
+  }
+  return { ok: true, value: out };
+}
+
+export function validateOkrObjectiveNarrativeInput(
+  raw: unknown,
+): { ok: true; value: string } | { ok: false; error: string } {
+  if (raw === null || raw === "") return { ok: true, value: "" };
+  if (typeof raw !== "string") {
+    return { ok: false, error: "narrative must be a string" };
+  }
+  if (raw.length > OKR_NARRATIVE_MAX || EVIDENCE_CTRL_RE.test(raw)) {
+    return { ok: false, error: `narrative must be <= ${OKR_NARRATIVE_MAX} chars without control characters` };
+  }
+  if (EVIDENCE_SECRET_RE.test(raw)) {
+    return { ok: false, error: "narrative rejected: appears to contain a secret or token" };
+  }
+  return { ok: true, value: raw.trim() };
+}
