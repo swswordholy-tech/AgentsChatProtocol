@@ -432,7 +432,18 @@ export interface AgentStatusBroadcast {
   status_emoji?: string;
 }
 
-export type ChannelDocKind = "rule" | "plan" | "context" | "decision" | "skill" | "channel_skill";
+export type ChannelDocKind =
+  | "topic"
+  | "rules"
+  | "roles"
+  | "context"
+  | "deep_dive"
+  | "skill"
+  | "channel_skill"
+  | "rule"
+  | "plan"
+  | "decision";
+export type ChannelDocLevel = 1 | 2 | 3 | 4;
 
 export interface OkrUpdatedMessage {
   type: "okr_updated";
@@ -1120,6 +1131,78 @@ export interface UpdateOkrTaskInput {
   append_evidence?: string;
   if_match_updated_at?: string;
 }
+
+// MARK: - Channel Docs CAS & Revision History (/api/channels/:id/docs) & Key Rotation
+
+export interface ChannelDocRevisionItem {
+  version: number;
+  title: string;
+  kind: ChannelDocKind;
+  level: ChannelDocLevel;
+  bodyMarkdown: string;
+  updatedAt: string;
+  updatedBy: string;
+}
+
+export interface ChannelDocSummaryItem {
+  id: string;
+  title: string;
+  kind: ChannelDocKind;
+  level: ChannelDocLevel;
+  bodySummary: string;
+  version: number;
+  updatedAt: string;
+  updatedBy: string;
+  archived?: boolean;
+  skill_meta?: {
+    name?: string;
+    description?: string;
+    trigger?: string;
+    argument_hint?: string;
+  };
+}
+
+export interface ChannelDocBacklinkItem {
+  type: string;
+  id: string;
+  title: string;
+  relation: string;
+}
+
+export interface ChannelDocDetailItem extends ChannelDocSummaryItem {
+  bodyMarkdown: string;
+  revisions?: ChannelDocRevisionItem[];
+  backlinks?: ChannelDocBacklinkItem[];
+}
+
+export interface ChannelDocsListResponse {
+  channel_id: string;
+  docs: ChannelDocSummaryItem[];
+}
+
+export interface ChannelDocRevisionsResponse {
+  revisions: ChannelDocRevisionItem[];
+}
+
+export interface SaveChannelDocInput {
+  title: string;
+  kind: ChannelDocKind;
+  level: ChannelDocLevel;
+  body_markdown: string;
+  if_match_version: number;
+}
+
+export interface ArchiveChannelDocResponse {
+  archived: true;
+  version?: number;
+}
+
+export interface RotateAgentKeyResponse {
+  ok: boolean;
+  agent_id: string;
+  key: string;
+}
+
 
 
 

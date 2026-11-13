@@ -1105,6 +1105,158 @@ export class AgentChatREST {
     );
   }
 
+  // MARK: - Channel Docs CAS & Revision History (/api/channels/:id/docs) & Key Rotation
+
+  private assertChannelDocId(docId: string): string {
+    const trimmed = docId?.trim() ?? "";
+    if (!/^[A-Za-z0-9_-]{1,64}$/.test(trimmed) || /^(?:ac_|sk[-_])/i.test(trimmed)) {
+      throw new Error("Invalid channel doc ID");
+    }
+    return trimmed;
+  }
+
+  async listChannelDocs(
+    channelId: string,
+    opts?: { level?: 1 | 2 | 3 | 4; active_only?: boolean; bearerToken?: string },
+  ): Promise<import("./types").ChannelDocsListResponse> {
+    const safeCh = this.assertOkrEntityId(channelId, "channel ID");
+    const params = new URLSearchParams();
+    if (opts?.level !== undefined) {
+      if (![1, 2, 3, 4].includes(opts.level)) throw new Error("Invalid channel doc level");
+      params.set("level", String(opts.level));
+    }
+    if (opts?.active_only) params.set("active_only", "true");
+    const qs = params.toString();
+    return this.get<import("./types").ChannelDocsListResponse>(
+      `/api/channels/${encodeURIComponent(safeCh)}/docs${qs ? `?${qs}` : ""}`,
+      this.authHeaders(opts?.bearerToken),
+    );
+  }
+
+  async getChannelDoc(
+    channelId: string,
+    docId: string,
+    opts?: { bearerToken?: string },
+  ): Promise<import("./types").ChannelDocDetailItem> {
+    const safeCh = this.assertOkrEntityId(channelId, "channel ID");
+    const safeDoc = this.assertChannelDocId(docId);
+    return this.get<import("./types").ChannelDocDetailItem>(
+      `/api/channels/${encodeURIComponent(safeCh)}/docs/${encodeURIComponent(safeDoc)}`,
+      this.authHeaders(opts?.bearerToken),
+    );
+  }
+
+  async getChannelDocRevisions(
+    channelId: string,
+    docId: string,
+    opts?: { bearerToken?: string },
+  ): Promise<import("./types").ChannelDocRevisionsResponse> {
+    const safeCh = this.assertOkrEntityId(channelId, "channel ID");
+    const safeDoc = this.assertChannelDocId(docId);
+    return this.get<import("./types").ChannelDocRevisionsResponse>(
+      `/api/channels/${encodeURIComponent(safeCh)}/docs/${encodeURIComponent(safeDoc)}/revisions`,
+      this.authHeaders(opts?.bearerToken),
+    );
+  }
+
+  async saveChannelDoc(
+    channelId: string,
+    docId: string,
+    input: import("./types").SaveChannelDocInput,
+    opts?: { bearerToken?: string },
+  ): Promise<import("./types").ChannelDocDetailItem> {
+    const safeCh = this.assertOkrEntityId(channelId, "channel ID");
+    const safeDoc = this.assertChannelDocId(docId);
+    const title = input?.title?.trim() ?? "";
+    if (!title || title.length > 120) throw new Error("Invalid channel doc title");
+    if (!["topic", "rules", "roles", "context", "deep_dive", "skill", "channel_skill"].includes(input?.kind)) {
+      throw new Error("Invalid channel doc kind");
+    }
+    if (![1, 2, 3, 4].includes(input?.level)) throw new Error("Invalid channel doc level");
+    if (typeof input?.body_markdown !== "string" || !input.body_markdown.trim()) {
+      throw new Error("Invalid channel doc body_markdown");
+    }
+    if (!Number.isSafeInteger(input?.if_match_version) || input.if_match_version < 0) {
+      throw new Error("Invalid channel doc if_match_version");
+    }
+    const headers: Record<string, string> = {
+      ...this.authHeaders(opts?.bearerToken),
+      "Content-Type": "application/json",
+      "If-Match": `"${input.if_match_version}"`,
+    };
+    const res = await fetch(
+      `${this.baseUrl}/api/channels/${encodeURIComponent(safeCh)}/docs/${encodeURIComponent(safeDoc)}`,
+      {
+        method: "PUT",
+        headers,
+        body: JSON.stringify({
+          title,
+          kind: input.kind,
+          level: input.level,
+          body_markdown: input.body_markdown,
+        }),
+      },
+    );
+    if (!res.ok) {
+      const error = await res.json().catch(() => ({ message: res.statusText }));
+      throw new Error(`HTTP ${res.status}: ${error.message ?? error.error ?? res.statusText}`);
+    }
+    return res.json();
+  }
+
+  async archiveChannelDoc(
+    channelId: string,
+    docId: string,
+    expectedVersion?: number,
+    opts?: { bearerToken?: string },
+  ): Promise<import("./types").ArchiveChannelDocResponse> {
+    const safeCh = this.assertOkrEntityId(channelId, "channel ID");
+    const safeDoc = this.assertChannelDocId(docId);
+    if (expectedVersion !== undefined && (!Number.isSafeInteger(expectedVersion) || expectedVersion < 1)) {
+      throw new Error("Invalid channel doc expectedVersion");
+    }
+    const headers: Record<string, string> = {
+      ...this.authHeaders(opts?.bearerToken),
+      ...(expectedVersion !== undefined ? { "If-Match": `"${expectedVersion}"` } : {}),
+    };
+    const res = await fetch(
+      `${this.baseUrl}/api/channels/${encodeURIComponent(safeCh)}/docs/${encodeURIComponent(safeDoc)}`,
+      {
+        method: "DELETE",
+        headers,
+      },
+    );
+    if (!res.ok) {
+      const error = await res.json().catch(() => ({ message: res.statusText }));
+      throw new Error(`HTTP ${res.status}: ${error.message ?? error.error ?? res.statusText}`);
+    }
+    const rawEtag = res.headers.get("ETag")?.replace(/^W\//i, "").replace(/^"|"$/g, "").trim();
+    const parsedVer = rawEtag && /^\d+$/.test(rawEtag) ? Number(rawEtag) : undefined;
+    if (res.status === 204) {
+      return { archived: true, ...(parsedVer !== undefined ? { version: parsedVer } : {}) };
+    }
+    const data = await res.json().catch(() => ({}));
+    return {
+      archived: true,
+      ...(typeof data?.version === "number" ? { version: data.version } : parsedVer !== undefined ? { version: parsedVer } : {}),
+    };
+  }
+
+  async rotateAgentKey(
+    agentId: string,
+    opts?: { bearerToken?: string },
+  ): Promise<import("./types").RotateAgentKeyResponse> {
+    const trimmed = agentId?.trim() ?? "";
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/.test(trimmed) || /^(?:ac_|sk[-_])/i.test(trimmed)) {
+      throw new Error("Invalid agent ID");
+    }
+    return this.post<import("./types").RotateAgentKeyResponse>(
+      `/api/agents/${encodeURIComponent(trimmed)}/rotate-key`,
+      {},
+      this.authHeaders(opts?.bearerToken),
+    );
+  }
+
   // MARK: - Internal
 
   private async get<T = any>(path: string, headers?: Record<string, string>): Promise<T> {

@@ -836,4 +836,99 @@ describe("AgentChatClient realtime collaboration WS events", () => {
       globalThis.fetch = originalFetch;
     }
   });
+
+  test("Channel Docs CAS/revisions & rotateAgentKey enforce If-Match headers, 204 ETag parsing, and safe IDs", async () => {
+    const originalFetch = globalThis.fetch;
+    const calls: Array<{ url: string; method: string; headers: Record<string, string>; body?: any }> = [];
+
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      const method = init?.method || "GET";
+      const headers = (init?.headers as Record<string, string>) ?? {};
+      const body = typeof init?.body === "string" ? JSON.parse(init.body) : undefined;
+      calls.push({ url, method, headers, body });
+
+      if (url.endsWith("/api/channels/room-dev/docs?level=2&active_only=true")) {
+        return Response.json({
+          channel_id: "room-dev",
+          docs: [{ id: "rfc-cas", title: "RFC CAS", kind: "rules", level: 2, bodySummary: "Summary", version: 3, updatedAt: "2026-11-13T17:00:00.000Z", updatedBy: "bot_1" }],
+        });
+      }
+      if (url.endsWith("/api/channels/room-dev/docs/rfc-cas") && method === "GET") {
+        return Response.json({
+          id: "rfc-cas",
+          title: "RFC CAS",
+          kind: "rules",
+          level: 2,
+          bodySummary: "Summary",
+          bodyMarkdown: "# RFC CAS",
+          version: 3,
+          updatedAt: "2026-11-13T17:00:00.000Z",
+          updatedBy: "bot_1",
+          backlinks: [{ type: "objective", id: "obj_1", title: "Obj", relation: "linked_channel_docs" }],
+        });
+      }
+      if (url.endsWith("/api/channels/room-dev/docs/rfc-cas/revisions")) {
+        return Response.json({
+          revisions: [{ version: 2, title: "RFC CAS v2", kind: "rules", level: 2, bodyMarkdown: "# v2", updatedAt: "2026-11-13T16:00:00.000Z", updatedBy: "user:al***" }],
+        });
+      }
+      if (url.endsWith("/api/channels/room-dev/docs/rfc-cas") && method === "PUT") {
+        return Response.json({
+          id: "rfc-cas",
+          title: body.title,
+          kind: body.kind,
+          level: body.level,
+          bodySummary: "Updated",
+          bodyMarkdown: body.body_markdown,
+          version: 4,
+          updatedAt: "2026-11-13T17:05:00.000Z",
+          updatedBy: "bot_1",
+        });
+      }
+      if (url.endsWith("/api/channels/room-dev/docs/rfc-cas") && method === "DELETE") {
+        return new Response(null, { status: 204, headers: { ETag: '"5"' } });
+      }
+      if (url.endsWith("/api/agents/bot-alpha-01/rotate-key") && method === "POST") {
+        return Response.json({ ok: true, agent_id: "bot-alpha-01", key: "ac_fresh_rotated_key_999" });
+      }
+      return Response.json({ ok: true });
+    }) as typeof fetch;
+
+    try {
+      const rest = new AgentChatREST({ baseUrl: "https://agents-chat.com", bearerToken: "docs-jwt-777" });
+
+      const list = await rest.listChannelDocs("room-dev", { level: 2, active_only: true });
+      expect(list.docs[0]?.id).toBe("rfc-cas");
+
+      const detail = await rest.getChannelDoc("room-dev", "rfc-cas");
+      expect(detail.backlinks?.[0]?.id).toBe("obj_1");
+
+      const revs = await rest.getChannelDocRevisions("room-dev", "rfc-cas");
+      expect(revs.revisions[0]?.updatedBy).toBe("user:al***");
+
+      const saved = await rest.saveChannelDoc("room-dev", "rfc-cas", {
+        title: "RFC CAS v4",
+        kind: "rules",
+        level: 2,
+        body_markdown: "# RFC CAS v4",
+        if_match_version: 3,
+      });
+      expect(saved.version).toBe(4);
+      expect(calls.find((c) => c.method === "PUT")?.headers["If-Match"]).toBe('"3"');
+
+      const archived = await rest.archiveChannelDoc("room-dev", "rfc-cas", 4);
+      expect(archived).toEqual({ archived: true, version: 5 });
+      expect(calls.find((c) => c.method === "DELETE")?.headers["If-Match"]).toBe('"4"');
+
+      const rotated = await rest.rotateAgentKey("bot-alpha-01");
+      expect(rotated.key).toBe("ac_fresh_rotated_key_999");
+
+      await expect(rest.getChannelDoc("room-dev", "../escape")).rejects.toThrow("Invalid channel doc ID");
+      await expect(rest.rotateAgentKey("ac_secret_key")).rejects.toThrow("Invalid agent ID");
+      await expect(rest.archiveChannelDoc("room-dev", "rfc-cas", 0)).rejects.toThrow("Invalid channel doc expectedVersion");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
 });
