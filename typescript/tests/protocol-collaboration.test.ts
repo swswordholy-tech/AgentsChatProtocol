@@ -1248,4 +1248,152 @@ describe("AgentChatClient realtime collaboration WS events", () => {
       globalThis.fetch = originalFetch;
     }
   });
+
+  test("persistent agent memory CAS (list/get/revisions/save/delete) and cloud-agent room/wake APIs work end-to-end", async () => {
+    const originalFetch = globalThis.fetch;
+    const calls: Array<{ url: string; method: string; headers: Record<string, string>; body?: any }> = [];
+
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      const method = init?.method ?? "GET";
+      const headers = (init?.headers as Record<string, string>) ?? {};
+      const body = init?.body ? JSON.parse(String(init.body)) : undefined;
+      calls.push({ url, method, headers, body });
+
+      if (url.endsWith("/api/memory") && method === "GET") {
+        return Response.json({
+          agent_id: "bot-alpha-01",
+          memories: [
+            {
+              name: "sprint-checkpoint",
+              description: "Current sprint checkpoint",
+              version: 2,
+              bytes: 128,
+              updated_at: "2026-11-14T02:50:00.000Z",
+            },
+          ],
+        });
+      }
+      if (url.endsWith("/api/memory/sprint-checkpoint") && method === "GET") {
+        return Response.json({
+          name: "sprint-checkpoint",
+          description: "Current sprint checkpoint",
+          version: 2,
+          bytes: 128,
+          updated_at: "2026-11-14T02:50:00.000Z",
+          body_markdown: "# Sprint 25\n- Zero NUL verified",
+        });
+      }
+      if (url.endsWith("/api/memory/sprint-checkpoint/revisions") && method === "GET") {
+        return Response.json({
+          name: "sprint-checkpoint",
+          revisions: [
+            {
+              version: 1,
+              description: "Initial note",
+              bytes: 64,
+              body_markdown: "# Sprint 24",
+              updated_at: "2026-11-14T02:30:00.000Z",
+            },
+          ],
+        });
+      }
+      if (url.endsWith("/api/memory/sprint-checkpoint") && method === "PUT") {
+        expect(headers["If-Match"]).toBe('"2"');
+        expect(body?.if_match_version).toBe(2);
+        return Response.json({
+          ok: true,
+          agent_id: "bot-alpha-01",
+          created: false,
+          name: "sprint-checkpoint",
+          version: 3,
+          bytes: 140,
+          description: "Updated sprint checkpoint",
+          updated_at: "2026-11-14T02:51:00.000Z",
+          load: "GET /api/memory/sprint-checkpoint",
+        });
+      }
+      if (url.endsWith("/api/memory/sprint-checkpoint?if_match_version=3") && method === "DELETE") {
+        expect(headers["If-Match"]).toBe('"3"');
+        return Response.json({
+          ok: true,
+          agent_id: "bot-alpha-01",
+          name: "sprint-checkpoint",
+          deleted: true,
+        });
+      }
+      if (url.endsWith("/api/cloud-agents/codex-cloud-01/join-channel") && method === "POST") {
+        return Response.json({
+          ok: true,
+          already_member: false,
+          channel_id: body?.channel_id,
+          channel_name: "Dev Room",
+        });
+      }
+      if (url.endsWith("/api/cloud-agents/codex-cloud-01/leave-channel") && method === "POST") {
+        return Response.json({
+          ok: true,
+          already_left: false,
+          channel_id: body?.channel_id,
+        });
+      }
+      if (url.endsWith("/api/cloud-agents/codex-cloud-01/wake") && method === "POST") {
+        return Response.json({ ok: true, status: "ok" });
+      }
+      return Response.json({ ok: true });
+    }) as typeof fetch;
+
+    try {
+      const rest = new AgentChatREST({ baseUrl: "https://agents-chat.com", bearerToken: "mem-jwt-01" });
+
+      const listed = await rest.listMemories();
+      expect(listed.memories[0]?.version).toBe(2);
+
+      const loaded = await rest.getMemory("sprint-checkpoint");
+      expect(loaded.body_markdown).toContain("Sprint 25");
+
+      const revs = await rest.getMemoryRevisions("sprint-checkpoint");
+      expect(revs.revisions[0]?.version).toBe(1);
+
+      const saved = await rest.saveMemory("sprint-checkpoint", {
+        body_markdown: "# Sprint 25\n- Updated",
+        description: "Updated sprint checkpoint",
+        if_match_version: 2,
+      });
+      expect(saved.version).toBe(3);
+
+      const deleted = await rest.deleteMemory("sprint-checkpoint", { if_match_version: 3 });
+      expect(deleted.deleted).toBe(true);
+
+      const joined = await rest.cloudAgentJoinChannel("codex-cloud-01", "room-dev");
+      expect(joined.channel_id).toBe("room-dev");
+
+      const left = await rest.cloudAgentLeaveChannel("codex-cloud-01", "room-dev");
+      expect(left.ok).toBe(true);
+
+      const woken = await rest.wakeCloudAgent("codex-cloud-01", {
+        channel_id: "room-dev",
+        prompt: "Review PR #25",
+      });
+      expect(woken.ok).toBe(true);
+
+      await expect(
+        rest.saveMemory("sprint-checkpoint", { body_markdown: "Token ac_super_secret_agent_token_1234" }),
+      ).rejects.toThrow("Memory must not contain API keys, tokens, or private keys");
+      await expect(rest.deleteMemory("sprint-checkpoint", { if_match_version: 0 })).rejects.toThrow(
+        "Memory delete if_match_version must be an integer >= 1",
+      );
+      await expect(rest.cloudAgentLeaveChannel("codex-cloud-01", "welcome")).rejects.toThrow(
+        "Default channel welcome cannot be removed",
+      );
+      await expect(rest.cloudAgentJoinChannel("codex-cloud-01", "dm-abc123")).rejects.toThrow(
+        "Invalid group channel ID",
+      );
+      await expect(
+        rest.wakeCloudAgent("codex-cloud-01", { prompt: "Leak sk-proj-SECRETTOKENVALUE123456" }),
+      ).rejects.toThrow("Wake prompt must not contain credentials");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
 });

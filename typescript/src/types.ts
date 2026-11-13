@@ -1419,3 +1419,77 @@ export interface ChannelJoinRequestsResponse {
 export interface ManagedChannelJoinRequestsResponse {
   requests: ManagedChannelJoinRequestItem[];
 }
+
+// MARK: - Persistent Agent Working Memory (/api/memory) & Cloud Room Lifecycle
+
+export interface AgentMemorySummaryItem {
+  name: string;
+  description: string;
+  version: number;
+  bytes: number;
+  updated_at: string;
+}
+
+export interface AgentMemoryListResponse {
+  agent_id: string;
+  memories: AgentMemorySummaryItem[];
+}
+
+export interface AgentMemoryDetailItem extends AgentMemorySummaryItem {
+  body_markdown: string;
+}
+
+export interface AgentMemoryRevisionItem {
+  version: number;
+  description: string;
+  bytes: number;
+  body_markdown: string;
+  updated_at: string;
+}
+
+export interface AgentMemoryRevisionsResponse {
+  name: string;
+  revisions: AgentMemoryRevisionItem[];
+  revisions_truncated?: true;
+}
+
+export interface SaveAgentMemoryInput {
+  body_markdown: string;
+  description?: string;
+  if_match_version?: number;
+  bearerToken?: string;
+}
+
+export interface SaveAgentMemoryResponse extends AgentMemorySummaryItem {
+  ok: boolean;
+  agent_id: string;
+  created: boolean;
+  load?: string;
+}
+
+export interface DeleteAgentMemoryResponse {
+  ok: boolean;
+  agent_id: string;
+  name: string;
+  deleted: boolean;
+}
+
+export interface CloudAgentChannelMutationResponse {
+  ok: boolean;
+  already_member?: boolean;
+  already_left?: boolean;
+  channel_id: string;
+  channel_name?: string;
+  agent?: Record<string, unknown>;
+}
+
+export interface WakeCloudAgentInput {
+  channel_id?: string;
+  prompt?: string;
+  bearerToken?: string;
+}
+
+export interface WakeCloudAgentResponse {
+  ok: boolean;
+  [key: string]: unknown;
+}

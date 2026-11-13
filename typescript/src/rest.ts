@@ -1670,6 +1670,216 @@ export class AgentChatREST {
     );
   }
 
+  // MARK: - Persistent Agent Working Memory (/api/memory) & Cloud Room Lifecycle
+
+  private assertMemorySlug(rawName: string): string {
+    const safe = rawName?.trim() ?? "";
+    if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/.test(safe) || safe.includes("..")) {
+      throw new Error("Invalid memory name");
+    }
+    return safe;
+  }
+
+  private containsMemorySecretShape(text: string): boolean {
+    if (!text) return false;
+    return (
+      /\bac_[A-Za-z0-9_-]{12,}\b/.test(text) ||
+      /\bsk-(?:ant|proj|live|test)-[A-Za-z0-9_-]{10,}\b/.test(text) ||
+      /\bgh[pousr]_[A-Za-z0-9]{20,}\b/.test(text) ||
+      /\bgithub_pat_[A-Za-z0-9_]{20,}\b/.test(text) ||
+      /\bAIza[0-9A-Za-z_-]{30,}\b/.test(text) ||
+      /\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/.test(text) ||
+      /-----BEGIN (?:RSA |EC |OPENSSH |)PRIVATE KEY-----/.test(text)
+    );
+  }
+
+  async listMemories(opts?: { bearerToken?: string }): Promise<import("./types").AgentMemoryListResponse> {
+    return this.get<import("./types").AgentMemoryListResponse>("/api/memory", this.authHeaders(opts?.bearerToken));
+  }
+
+  async getMemory(
+    name: string,
+    opts?: { bearerToken?: string },
+  ): Promise<import("./types").AgentMemoryDetailItem> {
+    const safeName = this.assertMemorySlug(name);
+    return this.get<import("./types").AgentMemoryDetailItem>(
+      `/api/memory/${encodeURIComponent(safeName)}`,
+      this.authHeaders(opts?.bearerToken),
+    );
+  }
+
+  async getMemoryRevisions(
+    name: string,
+    opts?: { bearerToken?: string },
+  ): Promise<import("./types").AgentMemoryRevisionsResponse> {
+    const safeName = this.assertMemorySlug(name);
+    return this.get<import("./types").AgentMemoryRevisionsResponse>(
+      `/api/memory/${encodeURIComponent(safeName)}/revisions`,
+      this.authHeaders(opts?.bearerToken),
+    );
+  }
+
+  async saveMemory(
+    name: string,
+    input: import("./types").SaveAgentMemoryInput,
+  ): Promise<import("./types").SaveAgentMemoryResponse> {
+    const safeName = this.assertMemorySlug(name);
+    if (typeof input?.body_markdown !== "string" || !input.body_markdown.trim()) {
+      throw new Error("Memory body_markdown is required");
+    }
+    const byteLen = new TextEncoder().encode(input.body_markdown).byteLength;
+    if (byteLen > 256_000) {
+      throw new Error("Memory body_markdown exceeds 256000 UTF-8 bytes");
+    }
+    if (
+      this.containsMemorySecretShape(input.body_markdown) ||
+      (typeof input.description === "string" && this.containsMemorySecretShape(input.description))
+    ) {
+      throw new Error("Memory must not contain API keys, tokens, or private keys");
+    }
+    if (input.description !== undefined && (typeof input.description !== "string" || input.description.length > 280)) {
+      throw new Error("Memory description must be a string up to 280 characters");
+    }
+    if (
+      input.if_match_version !== undefined &&
+      (!Number.isInteger(input.if_match_version) || input.if_match_version < 0 || input.if_match_version > 1_000_000)
+    ) {
+      throw new Error("Invalid memory if_match_version");
+    }
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+      ...(this.bearerToken ? { Authorization: `Bearer ${this.bearerToken}` } : {}),
+      ...(this.authHeaders(input.bearerToken) ?? {}),
+      ...(input.if_match_version !== undefined ? { "If-Match": `"${input.if_match_version}"` } : {}),
+    };
+    const body: Record<string, unknown> = {
+      body_markdown: input.body_markdown,
+      ...(typeof input.description === "string" ? { description: input.description } : {}),
+      ...(input.if_match_version !== undefined ? { if_match_version: input.if_match_version } : {}),
+    };
+    const res = await fetch(`${this.baseUrl}/api/memory/${encodeURIComponent(safeName)}`, {
+      method: "PUT",
+      headers,
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      const error = await res.json().catch(() => ({ message: res.statusText }));
+      throw new Error(`HTTP ${res.status}: ${error.message ?? error.error ?? res.statusText}`);
+    }
+    return res.json();
+  }
+
+  async deleteMemory(
+    name: string,
+    opts?: { if_match_version?: number; bearerToken?: string },
+  ): Promise<import("./types").DeleteAgentMemoryResponse> {
+    const safeName = this.assertMemorySlug(name);
+    if (
+      opts?.if_match_version !== undefined &&
+      (!Number.isInteger(opts.if_match_version) || opts.if_match_version < 1 || opts.if_match_version > 1_000_000)
+    ) {
+      throw new Error("Memory delete if_match_version must be an integer >= 1");
+    }
+    const qs = opts?.if_match_version !== undefined ? `?if_match_version=${opts.if_match_version}` : "";
+    const headers: Record<string, string> = {
+      ...(this.bearerToken ? { Authorization: `Bearer ${this.bearerToken}` } : {}),
+      ...(this.authHeaders(opts?.bearerToken) ?? {}),
+      ...(opts?.if_match_version !== undefined ? { "If-Match": `"${opts.if_match_version}"` } : {}),
+    };
+    const res = await fetch(`${this.baseUrl}/api/memory/${encodeURIComponent(safeName)}${qs}`, {
+      method: "DELETE",
+      ...(Object.keys(headers).length > 0 ? { headers } : {}),
+    });
+    if (!res.ok) {
+      const error = await res.json().catch(() => ({ message: res.statusText }));
+      throw new Error(`HTTP ${res.status}: ${error.message ?? error.error ?? res.statusText}`);
+    }
+    return res.json();
+  }
+
+  async cloudAgentJoinChannel(
+    agentId: string,
+    channelId: string,
+    opts?: { bearerToken?: string },
+  ): Promise<import("./types").CloudAgentChannelMutationResponse> {
+    const safeAgent = agentId?.trim() ?? "";
+    if (!/^[A-Za-z0-9_-]{2,64}$/.test(safeAgent) || /^(?:ac_|sk[-_])/i.test(safeAgent)) {
+      throw new Error("Invalid cloud agent ID");
+    }
+    const safeChannel = channelId?.trim() ?? "";
+    if (
+      !/^[A-Za-z0-9_][A-Za-z0-9_-]{0,127}$/.test(safeChannel) ||
+      /^dm-/i.test(safeChannel) ||
+      /^(?:ac_|sk[-_])/i.test(safeChannel)
+    ) {
+      throw new Error("Invalid group channel ID");
+    }
+    return this.post<import("./types").CloudAgentChannelMutationResponse>(
+      `/api/cloud-agents/${encodeURIComponent(safeAgent)}/join-channel`,
+      { channel_id: safeChannel },
+      this.authHeaders(opts?.bearerToken),
+    );
+  }
+
+  async cloudAgentLeaveChannel(
+    agentId: string,
+    channelId: string,
+    opts?: { bearerToken?: string },
+  ): Promise<import("./types").CloudAgentChannelMutationResponse> {
+    const safeAgent = agentId?.trim() ?? "";
+    if (!/^[A-Za-z0-9_-]{2,64}$/.test(safeAgent) || /^(?:ac_|sk[-_])/i.test(safeAgent)) {
+      throw new Error("Invalid cloud agent ID");
+    }
+    const safeChannel = channelId?.trim() ?? "";
+    if (
+      !/^[A-Za-z0-9_][A-Za-z0-9_-]{0,127}$/.test(safeChannel) ||
+      /^dm-/i.test(safeChannel) ||
+      /^(?:ac_|sk[-_])/i.test(safeChannel)
+    ) {
+      throw new Error("Invalid group channel ID");
+    }
+    if (safeChannel === "welcome") {
+      throw new Error("Default channel welcome cannot be removed");
+    }
+    return this.post<import("./types").CloudAgentChannelMutationResponse>(
+      `/api/cloud-agents/${encodeURIComponent(safeAgent)}/leave-channel`,
+      { channel_id: safeChannel },
+      this.authHeaders(opts?.bearerToken),
+    );
+  }
+
+  async wakeCloudAgent(
+    agentId: string,
+    input?: import("./types").WakeCloudAgentInput,
+  ): Promise<import("./types").WakeCloudAgentResponse> {
+    const safeAgent = agentId?.trim() ?? "";
+    if (!/^[A-Za-z0-9_-]{2,64}$/.test(safeAgent) || /^(?:ac_|sk[-_])/i.test(safeAgent)) {
+      throw new Error("Invalid cloud agent ID");
+    }
+    const body: Record<string, unknown> = {};
+    if (input?.channel_id !== undefined) {
+      const safeChannel = input.channel_id.trim();
+      if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(safeChannel) || /^(?:ac_|sk[-_])/i.test(safeChannel)) {
+        throw new Error("Invalid channel ID");
+      }
+      body.channel_id = safeChannel;
+    }
+    if (input?.prompt !== undefined) {
+      if (typeof input.prompt !== "string" || input.prompt.length > 4000) {
+        throw new Error("Wake prompt must be a string up to 4000 characters");
+      }
+      if (this.containsMemorySecretShape(input.prompt)) {
+        throw new Error("Wake prompt must not contain credentials");
+      }
+      body.prompt = input.prompt;
+    }
+    return this.post<import("./types").WakeCloudAgentResponse>(
+      `/api/cloud-agents/${encodeURIComponent(safeAgent)}/wake`,
+      body,
+      this.authHeaders(input?.bearerToken),
+    );
+  }
+
   // MARK: - Internal
 
   private async get<T = any>(path: string, headers?: Record<string, string>): Promise<T> {
