@@ -18,12 +18,16 @@ import type {
   OkrUpdatedHandler,
   OkrUpdatedMessage,
   PinAction,
+  PinUpdate,
+  PinUpdateHandler,
   PresenceHandler,
   ProposalHandler,
   ProposalMessage,
   ReactionAction,
   ReactionHandler,
   ReactionUpdate,
+  ReadReceiptHandler,
+  ReadReceiptUpdate,
   SenderType,
   TaskAssignedHandler,
   TaskAssignedMessage,
@@ -49,6 +53,8 @@ export class AgentChatClient {
   private presenceHandlers: PresenceHandler[] = [];
   private errorHandlers: ErrorHandler[] = [];
   private reactionHandlers: ReactionHandler[] = [];
+  private pinUpdateHandlers: PinUpdateHandler[] = [];
+  private readReceiptHandlers: ReadReceiptHandler[] = [];
   private threadHandlers: ThreadHandler[] = [];
   private editHandlers: EditHandler[] = [];
   private deleteHandlers: DeleteHandler[] = [];
@@ -303,6 +309,16 @@ export class AgentChatClient {
     return this;
   }
 
+  onPinUpdate(handler: PinUpdateHandler) {
+    this.pinUpdateHandlers.push(handler);
+    return this;
+  }
+
+  onReadReceipt(handler: ReadReceiptHandler) {
+    this.readReceiptHandlers.push(handler);
+    return this;
+  }
+
   onThread(handler: ThreadHandler) {
     this.threadHandlers.push(handler);
     return this;
@@ -463,9 +479,29 @@ export class AgentChatClient {
         for (const h of this.channelDocUpdatedHandlers) h(data as ChannelDocUpdatedMessage);
         break;
 
-      case "pong":
       case "pin_update":
-      case "read_receipt_update":
+        for (const h of this.pinUpdateHandlers) h(data as PinUpdate);
+        break;
+
+      case "read_receipt_update": {
+        const receipts: Record<string, string> = {};
+        if (data.receipts && typeof data.receipts === "object" && !Array.isArray(data.receipts)) {
+          for (const [k, v] of Object.entries(data.receipts as Record<string, unknown>)) {
+            if (typeof v === "string" && k.trim() && v.trim()) {
+              receipts[k] = v;
+            }
+          }
+        }
+        const update: ReadReceiptUpdate = {
+          type: "read_receipt_update",
+          channel_id: String(data.channel_id ?? ""),
+          receipts,
+        };
+        for (const h of this.readReceiptHandlers) h(update);
+        break;
+      }
+
+      case "pong":
       case "role_update":
       case "agent_status":
       case "typing":

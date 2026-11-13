@@ -447,6 +447,91 @@ export class AgentChatREST {
     };
   }
 
+  // MARK: - Realtime Channel SSE Stream (/api/channels/:id/stream)
+
+  async streamChannelEvents(
+    channelId: string,
+    opts: import("./types").StreamChannelEventsOptions,
+  ): Promise<void> {
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(channelId) || /^(?:ac_|sk-)/i.test(channelId)) {
+      throw new Error("Invalid channel ID");
+    }
+    if (!opts || typeof opts.onEvent !== "function") {
+      throw new Error("Invalid SSE onEvent callback");
+    }
+    const token = opts.bearerToken?.trim() || this.bearerToken;
+    const headers: Record<string, string> = {
+      Accept: "text/event-stream",
+      "Cache-Control": "no-store",
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    };
+    const res = await fetch(
+      `${this.baseUrl}/api/channels/${encodeURIComponent(channelId)}/stream`,
+      {
+        method: "GET",
+        headers,
+        ...(opts.signal ? { signal: opts.signal } : {}),
+      },
+    );
+    if (!res.ok) {
+      const error = await res.json().catch(() => ({ message: res.statusText }));
+      throw new Error(`HTTP ${res.status}: ${error.message ?? error.error ?? res.statusText}`);
+    }
+    if (!res.body) return;
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder("utf-8");
+    let buffer = "";
+
+    const dispatchBlock = async (block: string) => {
+      const dataLines: string[] = [];
+      for (const rawLine of block.split(/\r?\n/)) {
+        if (!rawLine || rawLine.startsWith(":")) continue;
+        if (rawLine.startsWith("data:")) {
+          dataLines.push(rawLine.slice(5).replace(/^ /, ""));
+        }
+      }
+      if (dataLines.length === 0) return;
+      const payload = dataLines.join("\n").trim();
+      if (!payload) return;
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(payload);
+      } catch {
+        return;
+      }
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        await opts.onEvent(parsed as Record<string, unknown>);
+      }
+    };
+
+    try {
+      while (true) {
+        if (opts.signal?.aborted) break;
+        const { value, done } = await reader.read();
+        if (value) {
+          buffer += decoder.decode(value, { stream: !done });
+        } else if (done) {
+          buffer += decoder.decode();
+        }
+        let sepMatch: RegExpExecArray | null;
+        while ((sepMatch = /\r?\n\r?\n/.exec(buffer)) !== null) {
+          const block = buffer.slice(0, sepMatch.index);
+          buffer = buffer.slice(sepMatch.index + sepMatch[0].length);
+          await dispatchBlock(block);
+        }
+        if (done) {
+          if (buffer.trim()) {
+            await dispatchBlock(buffer);
+          }
+          break;
+        }
+      }
+    } finally {
+      await reader.cancel().catch(() => {});
+    }
+  }
+
   // MARK: - Internal
 
   private async get<T = any>(path: string, headers?: Record<string, string>): Promise<T> {

@@ -9,7 +9,9 @@ import {
   type ChannelWakeHealth,
   type CloudAgentAuditFeed,
   type OkrUpdatedMessage,
+  type PinUpdate,
   type ProposalMessage,
+  type ReadReceiptUpdate,
   type RoomLoopsFeed,
   type TaskAssignedMessage,
   type VoteMessage,
@@ -537,6 +539,113 @@ describe("AgentChatClient realtime collaboration WS events", () => {
       });
       await expect(rest.getChannelPins("../escape")).rejects.toThrow("Invalid channel ID");
       await expect(rest.getChannelPins("ac_secret_token")).rejects.toThrow("Invalid channel ID");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("onReadReceipt and onPinUpdate dispatch sanitized read_receipt_update (with redacted principal keys) and pin_update frames", () => {
+    const client = new AgentChatClient({ url: "wss://agents-chat.com/ws", agentId: "bot_1", token: "ac_test" });
+    const receiptEvents: ReadReceiptUpdate[] = [];
+    const pinEvents: PinUpdate[] = [];
+
+    client
+      .onReadReceipt((ev) => { receiptEvents.push(ev); })
+      .onPinUpdate((ev) => { pinEvents.push(ev); });
+
+    const dispatch = (client as unknown as { handleMessage: (raw: string) => void }).handleMessage.bind(client);
+    dispatch(JSON.stringify({
+      type: "read_receipt_update",
+      channel_id: "room-dev",
+      receipts: {
+        "human:a1b2c3d4": "msg-102",
+        "spinning-midnight-tunicate": "msg-105",
+        "": "msg-empty",
+        badNumber: 42,
+      },
+    }));
+    dispatch(JSON.stringify({
+      type: "pin_update",
+      channel_id: "room-dev",
+      pinned_messages: ["msg-102"],
+    }));
+
+    expect(receiptEvents).toEqual([
+      {
+        type: "read_receipt_update",
+        channel_id: "room-dev",
+        receipts: {
+          "human:a1b2c3d4": "msg-102",
+          "spinning-midnight-tunicate": "msg-105",
+        },
+      },
+    ]);
+    expect(pinEvents).toEqual([
+      {
+        type: "pin_update",
+        channel_id: "room-dev",
+        pinned_messages: ["msg-102"],
+      },
+    ]);
+  });
+
+  test("streamChannelEvents parses chunked SSE frames, ignores comments, forwards auth headers, and rejects unsafe channel IDs", async () => {
+    const originalFetch = globalThis.fetch;
+    let seenUrl = "";
+    let seenHeaders: Record<string, string> = {};
+
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      seenUrl = String(input);
+      seenHeaders = (init?.headers as Record<string, string>) ?? {};
+      const encoder = new TextEncoder();
+      const chunks = [
+        ": connected\n\n",
+        "data: {\"type\":\"message\",\"id\":\"msg-1\",",
+        "\"channel_id\":\"room-dev\",\"sender_id\":\"human:a1b2c3d4\",\"content\":\"hello\"}\n\n: ping\n\n",
+        "data: {\"type\":\"read_receipt_update\",\"channel_id\":\"room-dev\",\"receipts\":{\"human:a1b2c3d4\":\"msg-1\"}}\r\n\r\n",
+      ];
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          for (const chunk of chunks) {
+            controller.enqueue(encoder.encode(chunk));
+          }
+          controller.close();
+        },
+      });
+      return new Response(stream, {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" },
+      });
+    }) as typeof fetch;
+
+    try {
+      const rest = new AgentChatREST({ baseUrl: "https://agents-chat.com", bearerToken: "member-jwt-sse" });
+      const events: Record<string, unknown>[] = [];
+      await rest.streamChannelEvents("room-dev", {
+        onEvent: (ev) => { events.push(ev); },
+      });
+
+      expect(seenUrl).toBe("https://agents-chat.com/api/channels/room-dev/stream");
+      expect(seenHeaders.Accept).toBe("text/event-stream");
+      expect(seenHeaders.Authorization).toBe("Bearer member-jwt-sse");
+      expect(seenHeaders["Cache-Control"]).toBe("no-store");
+      expect(events).toEqual([
+        {
+          type: "message",
+          id: "msg-1",
+          channel_id: "room-dev",
+          sender_id: "human:a1b2c3d4",
+          content: "hello",
+        },
+        {
+          type: "read_receipt_update",
+          channel_id: "room-dev",
+          receipts: { "human:a1b2c3d4": "msg-1" },
+        },
+      ]);
+
+      await expect(rest.streamChannelEvents("../escape", { onEvent: () => {} })).rejects.toThrow("Invalid channel ID");
+      await expect(rest.streamChannelEvents("ac_secret_token", { onEvent: () => {} })).rejects.toThrow("Invalid channel ID");
     } finally {
       globalThis.fetch = originalFetch;
     }

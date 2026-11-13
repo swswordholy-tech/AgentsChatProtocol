@@ -63,6 +63,7 @@ export interface ReactionUpdate {
 }
 
 export interface PinUpdate {
+  type?: "pin_update";
   channel_id: string;
   pinned_messages: string[];
 }
@@ -97,8 +98,9 @@ export interface MessageDeleted {
 }
 
 export interface ReadReceiptUpdate {
+  type?: "read_receipt_update";
   channel_id: string;
-  receipts: Record<string, string>; // agent_id → last_read_message_id
+  receipts: Record<string, string>; // principal_or_redacted_id → last_read_message_id
 }
 
 export interface RoleUpdate {
@@ -539,12 +541,20 @@ export type VoteResultHandler = (result: VoteResult) => void | Promise<void>;
 export type PresenceHandler = (presence: AgentPresence) => void | Promise<void>;
 export type ErrorHandler = (code: number, message: string) => void;
 export type ReactionHandler = (update: ReactionUpdate) => void | Promise<void>;
+export type PinUpdateHandler = (update: PinUpdate) => void | Promise<void>;
+export type ReadReceiptHandler = (update: ReadReceiptUpdate) => void | Promise<void>;
 export type ThreadHandler = (data: ThreadReply | ThreadUpdate) => void | Promise<void>;
 export type EditHandler = (data: MessageEdited) => void | Promise<void>;
 export type DeleteHandler = (data: MessageDeleted) => void | Promise<void>;
 export type OkrUpdatedHandler = (data: OkrUpdatedMessage) => void | Promise<void>;
 export type TaskAssignedHandler = (data: TaskAssignedMessage) => void | Promise<void>;
 export type ChannelDocUpdatedHandler = (data: ChannelDocUpdatedMessage) => void | Promise<void>;
+
+export interface StreamChannelEventsOptions {
+  signal?: AbortSignal;
+  bearerToken?: string;
+  onEvent: (event: Record<string, unknown>) => void | Promise<void>;
+}
 
 // MARK: - Owner-Scoped Forensic Security Audit Types
 
