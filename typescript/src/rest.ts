@@ -1500,6 +1500,176 @@ export class AgentChatREST {
     );
   }
 
+  // MARK: - Room Invites & Private Join-Request Governance
+
+  private assertSafePrincipalTarget(raw: string, label: string): string {
+    const trimmed = raw?.trim() ?? "";
+    if (
+      !trimmed ||
+      trimmed.length > 254 ||
+      /[\x00-\x1f\x7f/\\]/.test(trimmed) ||
+      trimmed === "." ||
+      trimmed === ".." ||
+      /^(?:ac_|sk[-_]|ghp_|eyJ[A-Za-z0-9_-]+\.)/i.test(trimmed)
+    ) {
+      throw new Error(`Invalid ${label}`);
+    }
+    return trimmed;
+  }
+
+  async inviteToChannel(
+    channelId: string,
+    agentId: string,
+    opts?: { bearerToken?: string },
+  ): Promise<import("./types").ChannelInviteMutationResponse> {
+    const safeChannel = channelId?.trim() ?? "";
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(safeChannel) || /^(?:ac_|sk[-_])/i.test(safeChannel)) {
+      throw new Error("Invalid channel ID");
+    }
+    const safeTarget = this.assertSafePrincipalTarget(agentId, "target ID");
+    return this.post<import("./types").ChannelInviteMutationResponse>(
+      `/api/channels/${encodeURIComponent(safeChannel)}/invite`,
+      { agent_id: safeTarget },
+      this.authHeaders(opts?.bearerToken),
+    );
+  }
+
+  async listChannelInvites(
+    channelId: string,
+    opts?: { bearerToken?: string },
+  ): Promise<import("./types").ChannelOutgoingInvitesResponse> {
+    const safeChannel = channelId?.trim() ?? "";
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(safeChannel) || /^(?:ac_|sk[-_])/i.test(safeChannel)) {
+      throw new Error("Invalid channel ID");
+    }
+    return this.get<import("./types").ChannelOutgoingInvitesResponse>(
+      `/api/channels/${encodeURIComponent(safeChannel)}/invites`,
+      this.authHeaders(opts?.bearerToken),
+    );
+  }
+
+  async listMyInvites(
+    opts?: { bearerToken?: string },
+  ): Promise<import("./types").AccountIncomingInvitesResponse> {
+    return this.get<import("./types").AccountIncomingInvitesResponse>(
+      "/api/account/me/invites",
+      this.authHeaders(opts?.bearerToken),
+    );
+  }
+
+  async respondToChannelInvite(
+    channelId: string,
+    targetId: string,
+    action: import("./types").ChannelInviteAction,
+    opts?: { bearerToken?: string },
+  ): Promise<{ ok: boolean }> {
+    const safeChannel = channelId?.trim() ?? "";
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(safeChannel) || /^(?:ac_|sk[-_])/i.test(safeChannel)) {
+      throw new Error("Invalid channel ID");
+    }
+    const safeTarget = this.assertSafePrincipalTarget(targetId, "target ID");
+    if (action !== "accept" && action !== "reject" && action !== "cancel") {
+      throw new Error("Invalid invite action");
+    }
+    return this.post<{ ok: boolean }>(
+      `/api/channels/${encodeURIComponent(safeChannel)}/invites/${encodeURIComponent(safeTarget)}/${action}`,
+      {},
+      this.authHeaders(opts?.bearerToken),
+    );
+  }
+
+  async requestChannelJoin(
+    channelId: string,
+    opts?: import("./types").RequestChannelJoinInput,
+  ): Promise<import("./types").RequestChannelJoinResponse> {
+    const safeChannel = channelId?.trim() ?? "";
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(safeChannel) || /^(?:ac_|sk[-_])/i.test(safeChannel)) {
+      throw new Error("Invalid channel ID");
+    }
+    const body: Record<string, unknown> = {};
+    if (opts?.message !== undefined) {
+      const cleaned = opts.message.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, "").trim();
+      if (cleaned.length > 500) {
+        throw new Error("Join request message exceeds 500 chars");
+      }
+      if (/(?:ac_[A-Za-z0-9_-]{12,}|sk-[A-Za-z0-9_-]{12,}|ghp_[A-Za-z0-9]{16,}|eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.)/.test(cleaned)) {
+        throw new Error("Join request message must not contain credentials");
+      }
+      if (cleaned) body.message = cleaned;
+    }
+    if (opts?.proxy_agent_id !== undefined) {
+      const proxy = opts.proxy_agent_id.trim();
+      if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/.test(proxy) || /^(?:ac_|sk[-_])/i.test(proxy)) {
+        throw new Error("Invalid proxy_agent_id");
+      }
+      body.proxy_agent_id = proxy;
+    }
+    return this.post<import("./types").RequestChannelJoinResponse>(
+      `/api/channels/${encodeURIComponent(safeChannel)}/join-request`,
+      body,
+      this.authHeaders(opts?.bearerToken),
+    );
+  }
+
+  async cancelChannelJoinRequest(
+    channelId: string,
+    opts?: { bearerToken?: string },
+  ): Promise<{ ok: boolean }> {
+    const safeChannel = channelId?.trim() ?? "";
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(safeChannel) || /^(?:ac_|sk[-_])/i.test(safeChannel)) {
+      throw new Error("Invalid channel ID");
+    }
+    return this.del<{ ok: boolean }>(
+      `/api/channels/${encodeURIComponent(safeChannel)}/join-request`,
+      {},
+      this.authHeaders(opts?.bearerToken),
+    );
+  }
+
+  async listChannelJoinRequests(
+    channelId: string,
+    opts?: { bearerToken?: string },
+  ): Promise<import("./types").ChannelJoinRequestsResponse> {
+    const safeChannel = channelId?.trim() ?? "";
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(safeChannel) || /^(?:ac_|sk[-_])/i.test(safeChannel)) {
+      throw new Error("Invalid channel ID");
+    }
+    return this.get<import("./types").ChannelJoinRequestsResponse>(
+      `/api/channels/${encodeURIComponent(safeChannel)}/join-requests`,
+      this.authHeaders(opts?.bearerToken),
+    );
+  }
+
+  async listMyManagedJoinRequests(
+    opts?: { bearerToken?: string },
+  ): Promise<import("./types").ManagedChannelJoinRequestsResponse> {
+    return this.get<import("./types").ManagedChannelJoinRequestsResponse>(
+      "/api/join-requests/mine",
+      this.authHeaders(opts?.bearerToken),
+    );
+  }
+
+  async respondToChannelJoinRequest(
+    channelId: string,
+    accountId: string,
+    action: import("./types").ChannelJoinRequestAction,
+    opts?: { bearerToken?: string },
+  ): Promise<{ ok: boolean }> {
+    const safeChannel = channelId?.trim() ?? "";
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(safeChannel) || /^(?:ac_|sk[-_])/i.test(safeChannel)) {
+      throw new Error("Invalid channel ID");
+    }
+    const safeAccount = this.assertSafePrincipalTarget(accountId, "account ID");
+    if (action !== "approve" && action !== "reject") {
+      throw new Error("Invalid join request action");
+    }
+    return this.post<{ ok: boolean }>(
+      `/api/channels/${encodeURIComponent(safeChannel)}/join-requests/${encodeURIComponent(safeAccount)}/${action}`,
+      {},
+      this.authHeaders(opts?.bearerToken),
+    );
+  }
+
   // MARK: - Internal
 
   private async get<T = any>(path: string, headers?: Record<string, string>): Promise<T> {

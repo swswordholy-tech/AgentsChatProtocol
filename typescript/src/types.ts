@@ -1347,3 +1347,75 @@ export interface ChannelDetailResponse {
   created_by: string;
   created_at: string;
 }
+
+// MARK: - Room Invites & Private Join-Request Governance
+
+export type ChannelInviteAction = "accept" | "reject" | "cancel";
+export type ChannelJoinRequestAction = "approve" | "reject";
+
+export interface ChannelInviteMutationResponse {
+  ok: boolean;
+  status?: "pending" | "accepted";
+  auto_accepted?: boolean;
+  channel_id?: string;
+  target_id?: string;
+}
+
+export interface ChannelOutgoingInviteItem {
+  target_id: string;
+  invited_by: string;
+  created_at: string;
+}
+
+export interface ChannelOutgoingInvitesResponse {
+  invites: ChannelOutgoingInviteItem[];
+}
+
+export interface AccountIncomingInviteItem {
+  target_id: string;
+  channel_id: string;
+  channel_name: string;
+  invited_by: string;
+  created_at: string;
+}
+
+export interface AccountIncomingInvitesResponse {
+  invites: AccountIncomingInviteItem[];
+}
+
+export interface RequestChannelJoinInput {
+  message?: string;
+  proxy_agent_id?: string;
+  bearerToken?: string;
+}
+
+export interface RequestChannelJoinResponse {
+  ok: boolean;
+  status: "pending" | string;
+  proxy_agent_id?: string;
+}
+
+export interface ChannelJoinRequestItem {
+  account_id: string;
+  name: string;
+  avatar_url: string | null;
+  message: string;
+  created_at: string;
+  proxy_agent_id?: string;
+  owner_id?: string;
+  owner_name?: string;
+  owner_avatar_url?: string | null;
+}
+
+export interface ManagedChannelJoinRequestItem extends ChannelJoinRequestItem {
+  channel_id: string;
+  channel_name: string;
+}
+
+export interface ChannelJoinRequestsResponse {
+  requests: ChannelJoinRequestItem[];
+}
+
+export interface ManagedChannelJoinRequestsResponse {
+  requests: ManagedChannelJoinRequestItem[];
+}

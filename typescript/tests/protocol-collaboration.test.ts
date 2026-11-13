@@ -1124,4 +1124,128 @@ describe("AgentChatClient realtime collaboration WS events", () => {
       globalThis.fetch = originalFetch;
     }
   });
+
+  test("Channel invites & private join-request governance REST methods enforce path/credential safety and end-to-end flows", async () => {
+    const originalFetch = globalThis.fetch;
+    const calls: Array<{ url: string; method: string; headers: Record<string, string>; body?: any }> = [];
+
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      const method = init?.method ?? "GET";
+      const headers = (init?.headers as Record<string, string>) ?? {};
+      const body = init?.body ? JSON.parse(String(init.body)) : undefined;
+      calls.push({ url, method, headers, body });
+
+      if (url.endsWith("/api/channels/priv-room/invite") && method === "POST") {
+        return Response.json({ ok: true, status: "pending", channel_id: "priv-room", target_id: body.agent_id });
+      }
+      if (url.endsWith("/api/channels/priv-room/invites") && method === "GET") {
+        return Response.json({
+          invites: [{ target_id: "bot-peer-02", invited_by: "user:sw***", created_at: "2026-11-14T00:00:00.000Z" }],
+        });
+      }
+      if (url.endsWith("/api/account/me/invites") && method === "GET") {
+        return Response.json({
+          invites: [
+            {
+              target_id: "bot-peer-02",
+              channel_id: "priv-room",
+              channel_name: "Private Room",
+              invited_by: "user:sw***",
+              created_at: "2026-11-14T00:00:00.000Z",
+            },
+          ],
+        });
+      }
+      if (url.endsWith("/api/channels/priv-room/invites/bot-peer-02/accept") && method === "POST") {
+        return Response.json({ ok: true });
+      }
+      if (url.endsWith("/api/channels/priv-room/join-request") && method === "POST") {
+        return Response.json({ ok: true, status: "pending", proxy_agent_id: body.proxy_agent_id });
+      }
+      if (url.endsWith("/api/channels/priv-room/join-request") && method === "DELETE") {
+        return Response.json({ ok: true });
+      }
+      if (url.endsWith("/api/channels/priv-room/join-requests") && method === "GET") {
+        return Response.json({
+          requests: [
+            {
+              account_id: "bot-applicant-01",
+              name: "Applicant Bot",
+              avatar_url: null,
+              message: "Ready to review Swift PRs",
+              created_at: "2026-11-14T01:00:00.000Z",
+              proxy_agent_id: "bot-applicant-01",
+              owner_id: "user:al***",
+              owner_name: "user:al***",
+            },
+          ],
+        });
+      }
+      if (url.endsWith("/api/join-requests/mine") && method === "GET") {
+        return Response.json({
+          requests: [
+            {
+              channel_id: "priv-room",
+              channel_name: "Private Room",
+              account_id: "bot-applicant-01",
+              name: "Applicant Bot",
+              avatar_url: null,
+              message: "Ready to review Swift PRs",
+              created_at: "2026-11-14T01:00:00.000Z",
+            },
+          ],
+        });
+      }
+      if (url.endsWith("/api/channels/priv-room/join-requests/bot-applicant-01/approve") && method === "POST") {
+        return Response.json({ ok: true });
+      }
+      return Response.json({ ok: true });
+    }) as typeof fetch;
+
+    try {
+      const rest = new AgentChatREST({ baseUrl: "https://agents-chat.com", bearerToken: "invite-jwt-01" });
+
+      const invited = await rest.inviteToChannel("priv-room", "bot-peer-02");
+      expect(invited.status).toBe("pending");
+
+      const outgoing = await rest.listChannelInvites("priv-room");
+      expect(outgoing.invites[0]?.invited_by).toBe("user:sw***");
+
+      const inbox = await rest.listMyInvites();
+      expect(inbox.invites[0]?.channel_name).toBe("Private Room");
+
+      const accepted = await rest.respondToChannelInvite("priv-room", "bot-peer-02", "accept");
+      expect(accepted.ok).toBe(true);
+
+      const applied = await rest.requestChannelJoin("priv-room", {
+        message: "Ready to review Swift PRs",
+        proxy_agent_id: "bot-applicant-01",
+      });
+      expect(applied.proxy_agent_id).toBe("bot-applicant-01");
+
+      const chReqs = await rest.listChannelJoinRequests("priv-room");
+      expect(chReqs.requests[0]?.owner_id).toBe("user:al***");
+
+      const managed = await rest.listMyManagedJoinRequests();
+      expect(managed.requests[0]?.channel_id).toBe("priv-room");
+
+      const approved = await rest.respondToChannelJoinRequest("priv-room", "bot-applicant-01", "approve");
+      expect(approved.ok).toBe(true);
+
+      const cancelled = await rest.cancelChannelJoinRequest("priv-room");
+      expect(cancelled.ok).toBe(true);
+      expect(calls.find((c) => c.method === "DELETE")?.headers.Authorization).toBe("Bearer invite-jwt-01");
+
+      await expect(
+        rest.requestChannelJoin("priv-room", { message: "Here is my key ac_super_secret_agent_token_1234" }),
+      ).rejects.toThrow("Join request message must not contain credentials");
+      await expect(rest.inviteToChannel("priv-room", "../escape")).rejects.toThrow("Invalid target ID");
+      await expect(
+        rest.respondToChannelJoinRequest("priv-room", "ac_secret_token_value", "approve"),
+      ).rejects.toThrow("Invalid account ID");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
 });
