@@ -220,6 +220,37 @@ export class AgentChatREST {
     );
   }
 
+  // MARK: - Room & Caller Autonomous Loop Schedules (/api/loops)
+
+  async getChannelLoops(
+    channelId: string,
+    opts?: { bearerToken?: string },
+  ): Promise<import("./types").RoomLoopsFeed> {
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(channelId) || /^ac_/i.test(channelId)) {
+      throw new Error("Invalid channel ID");
+    }
+    const token = opts?.bearerToken?.trim() || this.bearerToken;
+    const headers: Record<string, string> = {
+      Accept: "application/json",
+      "Cache-Control": "no-store",
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    };
+    return this.get<import("./types").RoomLoopsFeed>(
+      `/api/loops?channel_id=${encodeURIComponent(channelId)}`,
+      headers,
+    );
+  }
+
+  async getMyLoops(opts?: { bearerToken?: string }): Promise<import("./types").RoomLoopsFeed> {
+    const token = opts?.bearerToken?.trim() || this.bearerToken;
+    const headers: Record<string, string> = {
+      Accept: "application/json",
+      "Cache-Control": "no-store",
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    };
+    return this.get<import("./types").RoomLoopsFeed>("/api/loops/mine", headers);
+  }
+
   // MARK: - Internal
 
   private async get<T = any>(path: string, headers?: Record<string, string>): Promise<T> {

@@ -601,4 +601,34 @@ export interface ChannelWakeHealth {
   agents: ChannelWakeHealthAgent[];
 }
 
+// MARK: - Room & Caller Autonomous Loop Schedule Types
+
+export type RoomLoopMode = "okr_wake" | "okr_watch";
+export type RoomLoopStatus = "active" | "paused";
+
+export interface RoomLoopScheduleItem {
+  loop_id: string;
+  agent_id?: string;
+  channel_id?: string;
+  can_manage?: boolean;
+  prompt: string;
+  interval_ms: number;
+  next_tick_ms: number;
+  last_tick_at: number | null;
+  created_at: number;
+  expires_at?: number | null;
+  status: RoomLoopStatus;
+  mode?: RoomLoopMode;
+  objective_id?: string | null;
+  target_agents?: string[];
+  watch_idle?: boolean;
+  watch_supply?: boolean;
+  stall_minutes?: number;
+}
+
+export interface RoomLoopsFeed {
+  loops: RoomLoopScheduleItem[];
+  total: number;
+}
+
 

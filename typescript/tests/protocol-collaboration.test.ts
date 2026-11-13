@@ -7,6 +7,7 @@ import {
   type ChannelWakeHealth,
   type CloudAgentAuditFeed,
   type OkrUpdatedMessage,
+  type RoomLoopsFeed,
   type TaskAssignedMessage,
 } from "../src/index";
 
@@ -185,6 +186,54 @@ describe("AgentChatClient realtime collaboration WS events", () => {
       ]);
       await expect(rest.getChannelWakeHealth("ac_secret_key")).rejects.toThrow("Invalid channel ID");
       await expect(rest.getChannelWakeHealth("../escape")).rejects.toThrow("Invalid channel ID");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("AgentChatREST.getChannelLoops and getMyLoops parse stall_minutes and target_agents on okr_watch schedules", async () => {
+    const originalFetch = globalThis.fetch;
+    const seen: string[] = [];
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      seen.push(String(input));
+      const payload: RoomLoopsFeed = {
+        loops: [
+          {
+            loop_id: "loop_watch_1",
+            agent_id: "spinning-midnight-tunicate",
+            channel_id: "edbb8180-4356-4dab-9d75-bc9fe6f26194",
+            can_manage: true,
+            prompt: "okr-watch+supply:obj_mweyzn7i_0jms9ez8",
+            interval_ms: 300_000,
+            next_tick_ms: 1_794_332_000_000,
+            last_tick_at: 1_794_331_700_000,
+            created_at: 1_794_330_000_000,
+            status: "active",
+            mode: "okr_watch",
+            objective_id: "obj_mweyzn7i_0jms9ez8",
+            target_agents: ["codex-staff-engineer-ca7590"],
+            watch_idle: false,
+            watch_supply: true,
+            stall_minutes: 15,
+          },
+        ],
+        total: 1,
+      };
+      return Response.json(payload, { status: 200 });
+    }) as typeof fetch;
+
+    try {
+      const rest = new AgentChatREST({ baseUrl: "https://agents-chat.com", bearerToken: "member-jwt-789" });
+      const roomLoops = await rest.getChannelLoops("edbb8180-4356-4dab-9d75-bc9fe6f26194");
+      expect(roomLoops.loops[0]?.stall_minutes).toBe(15);
+      expect(roomLoops.loops[0]?.target_agents).toEqual(["codex-staff-engineer-ca7590"]);
+      const myLoops = await rest.getMyLoops();
+      expect(myLoops.total).toBe(1);
+      expect(seen).toEqual([
+        "https://agents-chat.com/api/loops?channel_id=edbb8180-4356-4dab-9d75-bc9fe6f26194",
+        "https://agents-chat.com/api/loops/mine",
+      ]);
+      await expect(rest.getChannelLoops("ac_secret_key")).rejects.toThrow("Invalid channel ID");
     } finally {
       globalThis.fetch = originalFetch;
     }
