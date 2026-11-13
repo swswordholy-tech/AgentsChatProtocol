@@ -55,12 +55,14 @@ import {
   validateAppendTaskEvidenceInput,
   validateCreateLoopInput,
   validateOkrAddKrInput,
+  validateOkrArchiveObjectiveInput,
   validateOkrLinkedChannelDocsInput,
   validateOkrObjectiveNarrativeInput,
   validateOkrSetKrProgressInput,
   validateOkrTaskAssigneeInput,
   validateOkrTaskContributesToInput,
   validateOkrTaskDependsOnInput,
+  validateOkrUpdateObjectiveInput,
   validateTaskEvidenceInput,
   validateTaskVersionToken,
   validateToolArgs,
@@ -1182,6 +1184,7 @@ const TOOL_GROUPS: ToolGroupMeta[] = [
     tools: [
       "okr_list",
       "okr_create_objective",
+      "okr_update_objective",
       "okr_add_task",
       "okr_update_task",
       "okr_task_blockers",
@@ -2020,6 +2023,36 @@ const ALL_TOOL_DEFS = [
       },
     },
     {
+      name: "okr_update_objective",
+      description: "Update an unarchived Objective's lifecycle status (active / done / abandoned), metadata (title, horizon, due, narrative, completion_summary), or same-room linked_channel_docs. Pass empty string for due / narrative / completion_summary or [] for linked_channel_docs to clear. Requires Objective ownership (or sibling agent of the same human owner). Never include secrets.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          objective_id: { type: "string", description: "Objective id to update" },
+          title: { type: "string", description: "Updated Objective title (1..200 chars)" },
+          status: { type: "string", enum: ["active", "done", "abandoned"], description: "Updated lifecycle status" },
+          horizon: { type: "string", enum: ["week", "month", "Q"], description: "Updated planning horizon" },
+          due: { type: "string", description: "Updated ISO-8601 due date/timestamp (<=32 chars); pass empty string to clear" },
+          narrative: { type: "string", description: "Updated inline WHY summary (<=2000 chars); pass empty string to clear" },
+          completion_summary: { type: "string", description: "Updated wrap-up summary (<=280 chars); pass empty string to clear" },
+          linked_channel_docs: {
+            type: "array",
+            maxItems: 10,
+            description: "Replacement same-room ChannelDoc / skill references (0..10 items; pass [] to clear). Requires the Objective to be anchored to that discussion channel.",
+            items: {
+              type: "object",
+              properties: {
+                channel_id: { type: "string", description: "Room channel_id containing the document (must match Objective discussion_channel_id)" },
+                doc_id: { type: "string", description: "Referenced channel doc or skill id" },
+              },
+              required: ["channel_id", "doc_id"],
+            },
+          },
+        },
+        required: ["objective_id"],
+      },
+    },
+    {
       name: "okr_add_task",
       description: "Add a Task under an Objective. Tasks attach to Objectives, optionally cross-reference KRs they advance via contributes_to[], upstream DAG blockers via depends_on[], and room skill/spec docs via linked_channel_docs[] (surfaced automatically by okr_wake). Caller must own the Objective (or be admin). Server rejects cycles.",
       inputSchema: {
@@ -2189,12 +2222,12 @@ const ALL_TOOL_DEFS = [
     },
     {
       name: "archive_objective",
-      description: "Archive one completed objective into the collapsed archived view. Objective-level only in v1.",
+      description: "Archive one completed/abandoned objective into the collapsed archived view (releasing the 20-active-Objectives room cap). Objective-level only in v1; completion_summary must be <=280 chars without secrets.",
       inputSchema: {
         type: "object" as const,
         properties: {
           objective_id: { type: "string", description: "Objective id to archive" },
-          completion_summary: { type: "string", description: "Optional short completion summary (recommended ≤280 chars)" },
+          completion_summary: { type: "string", maxLength: 280, description: "Optional short completion summary (max 280 chars; never include secrets)" },
         },
         required: ["objective_id"],
       },
@@ -5593,6 +5626,28 @@ const handleToolCall = async (request: any): Promise<any> => {
     }
   }
 
+  if (name === "okr_update_objective") {
+    const validated = validateOkrUpdateObjectiveInput(args);
+    if (!validated.ok) {
+      return { content: [{ type: "text", text: `okr_update_objective invalid arguments: ${validated.error}` }], isError: true };
+    }
+    const { objective_id, body } = validated.value;
+    try {
+      const r = await apiFetch(`${REST_URL}/api/okr/objectives/${encodeURIComponent(objective_id)}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${TOKEN}` },
+        body: JSON.stringify(body),
+      });
+      const text = await r.text();
+      if (!r.ok) {
+        return { content: [{ type: "text", text: `okr_update_objective failed (${r.status}): ${text.slice(0, 200)}` }], isError: true };
+      }
+      return { content: [{ type: "text", text: `Updated: ${text}` }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `okr_update_objective network error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
+    }
+  }
+
   if (name === "okr_add_task") {
     const { objective_id, title, assignee, contributes_to, depends_on, linked_channel_docs, due } = args as {
       objective_id: string;
@@ -5852,12 +5907,16 @@ const handleToolCall = async (request: any): Promise<any> => {
   }
 
   if (name === "archive_objective") {
-    const { objective_id, completion_summary } = args as { objective_id: string; completion_summary?: string };
+    const validated = validateOkrArchiveObjectiveInput(args);
+    if (!validated.ok) {
+      return { content: [{ type: "text", text: `archive_objective invalid arguments: ${validated.error}` }], isError: true };
+    }
+    const { objective_id, body } = validated.value;
     try {
       const r = await apiFetch(`${REST_URL}/api/okr/objectives/${encodeURIComponent(objective_id)}/archive`, {
         method: "POST",
         headers: { "Content-Type": "application/json", "Authorization": `Bearer ${TOKEN}` },
-        body: JSON.stringify(completion_summary !== undefined ? { completion_summary } : {}),
+        body: JSON.stringify(body),
       });
       const text = await r.text();
       if (!r.ok) {

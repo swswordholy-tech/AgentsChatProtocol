@@ -768,6 +768,134 @@ function validateOkrObjectiveNarrativeInput(raw) {
   }
   return { ok: true, value: raw.trim() };
 }
+var OKR_OBJECTIVE_TITLE_MAX = 200;
+var OKR_COMPLETION_SUMMARY_MAX = 280;
+var OKR_OBJECTIVE_STATUSES = ["active", "done", "abandoned"];
+var OKR_OBJECTIVE_HORIZONS = ["week", "month", "Q"];
+function validateOkrCompletionSummaryInput(raw) {
+  if (raw === null || raw === "")
+    return { ok: true, value: "" };
+  if (typeof raw !== "string") {
+    return { ok: false, error: "completion_summary must be a string" };
+  }
+  if (EVIDENCE_CTRL_RE.test(raw)) {
+    return { ok: false, error: "completion_summary must not contain control characters" };
+  }
+  if (EVIDENCE_SECRET_RE.test(raw)) {
+    return { ok: false, error: "completion_summary rejected: appears to contain a secret or token" };
+  }
+  const trimmed = raw.trim();
+  if (trimmed.length > OKR_COMPLETION_SUMMARY_MAX) {
+    return { ok: false, error: `completion_summary exceeds max ${OKR_COMPLETION_SUMMARY_MAX} chars` };
+  }
+  return { ok: true, value: trimmed };
+}
+function validateOkrUpdateObjectiveInput(args) {
+  const a = args && typeof args === "object" && !Array.isArray(args) ? args : {};
+  const objectiveId = typeof a.objective_id === "string" ? a.objective_id.trim() : "";
+  if (!objectiveId || !SAFE_CHANNEL_OR_LOOP_ID_RE.test(objectiveId) || objectiveId.includes("..") || EVIDENCE_CTRL_RE.test(objectiveId) || EVIDENCE_SECRET_RE.test(objectiveId)) {
+    return { ok: false, error: "objective_id must be a valid non-empty identifier" };
+  }
+  const body = {};
+  if (a.title !== undefined) {
+    if (typeof a.title !== "string") {
+      return { ok: false, error: "title must be a non-empty string (<= 200 chars)" };
+    }
+    if (EVIDENCE_CTRL_RE.test(a.title)) {
+      return { ok: false, error: "title must not contain control characters" };
+    }
+    if (EVIDENCE_SECRET_RE.test(a.title)) {
+      return { ok: false, error: "title rejected: appears to contain a secret or token" };
+    }
+    const trimmedTitle = a.title.trim();
+    if (!trimmedTitle || trimmedTitle.length > OKR_OBJECTIVE_TITLE_MAX) {
+      return { ok: false, error: `title must be 1..${OKR_OBJECTIVE_TITLE_MAX} chars` };
+    }
+    body.title = trimmedTitle;
+  }
+  if (a.status !== undefined) {
+    if (typeof a.status !== "string" || !OKR_OBJECTIVE_STATUSES.includes(a.status)) {
+      return { ok: false, error: "status must be active, done, or abandoned" };
+    }
+    body.status = a.status;
+  }
+  if (a.horizon !== undefined) {
+    if (typeof a.horizon !== "string" || !OKR_OBJECTIVE_HORIZONS.includes(a.horizon)) {
+      return { ok: false, error: "horizon must be week, month, or Q" };
+    }
+    body.horizon = a.horizon;
+  }
+  if (a.due !== undefined) {
+    if (a.due === null || a.due === "") {
+      body.due = "";
+    } else if (typeof a.due === "string") {
+      if (EVIDENCE_CTRL_RE.test(a.due)) {
+        return { ok: false, error: "due must not contain control characters" };
+      }
+      if (EVIDENCE_SECRET_RE.test(a.due)) {
+        return { ok: false, error: "due rejected: appears to contain a secret or token" };
+      }
+      const trimmedDue = a.due.trim();
+      if (!trimmedDue) {
+        body.due = "";
+      } else if (trimmedDue.length > 32 || !Number.isFinite(Date.parse(trimmedDue))) {
+        return { ok: false, error: "due must be a valid ISO-8601 date/timestamp (<= 32 chars) or empty string to clear" };
+      } else {
+        body.due = trimmedDue;
+      }
+    } else {
+      return { ok: false, error: "due must be an ISO-8601 date string or empty string to clear" };
+    }
+  }
+  if (a.narrative !== undefined) {
+    const narCheck = validateOkrObjectiveNarrativeInput(a.narrative);
+    if (!narCheck.ok)
+      return narCheck;
+    body.narrative = narCheck.value;
+  }
+  if (a.completion_summary !== undefined) {
+    const sumCheck = validateOkrCompletionSummaryInput(a.completion_summary);
+    if (!sumCheck.ok)
+      return sumCheck;
+    body.completion_summary = sumCheck.value;
+  }
+  if (a.linked_channel_docs !== undefined) {
+    const docsCheck = validateOkrLinkedChannelDocsInput(a.linked_channel_docs);
+    if (!docsCheck.ok)
+      return docsCheck;
+    if (docsCheck.value.length > 1) {
+      const firstChan = docsCheck.value[0].channel_id;
+      if (docsCheck.value.some((d) => d.channel_id !== firstChan)) {
+        return { ok: false, error: "linked_channel_docs items on an Objective must all reference the same channel_id" };
+      }
+    }
+    body.linked_channel_docs = docsCheck.value;
+  }
+  if (Object.keys(body).length === 0) {
+    return {
+      ok: false,
+      error: "at least one mutable field (title, status, horizon, due, narrative, completion_summary, linked_channel_docs) is required"
+    };
+  }
+  return { ok: true, value: { objective_id: objectiveId, body } };
+}
+function validateOkrArchiveObjectiveInput(args) {
+  const a = args && typeof args === "object" && !Array.isArray(args) ? args : {};
+  const objectiveId = typeof a.objective_id === "string" ? a.objective_id.trim() : "";
+  if (!objectiveId || !SAFE_CHANNEL_OR_LOOP_ID_RE.test(objectiveId) || objectiveId.includes("..") || EVIDENCE_CTRL_RE.test(objectiveId) || EVIDENCE_SECRET_RE.test(objectiveId)) {
+    return { ok: false, error: "objective_id must be a valid non-empty identifier" };
+  }
+  const body = {};
+  if (a.completion_summary !== undefined && a.completion_summary !== null) {
+    const sumCheck = validateOkrCompletionSummaryInput(a.completion_summary);
+    if (!sumCheck.ok)
+      return sumCheck;
+    if (sumCheck.value) {
+      body.completion_summary = sumCheck.value;
+    }
+  }
+  return { ok: true, value: { objective_id: objectiveId, body } };
+}
 
 // src/identity.ts
 function decideIdentity(i) {
@@ -1071,6 +1199,7 @@ var TOOL_ANNOTATIONS = {
   hidden_identity_get_state: R,
   okr_list: R,
   okr_create_objective: W,
+  okr_update_objective: W,
   okr_add_task: W,
   okr_update_task: W,
   okr_task_blockers: R,
@@ -4297,6 +4426,7 @@ var TOOL_GROUPS = [
     tools: [
       "okr_list",
       "okr_create_objective",
+      "okr_update_objective",
       "okr_add_task",
       "okr_update_task",
       "okr_task_blockers",
@@ -5126,6 +5256,36 @@ var ALL_TOOL_DEFS = [
     }
   },
   {
+    name: "okr_update_objective",
+    description: "Update an unarchived Objective's lifecycle status (active / done / abandoned), metadata (title, horizon, due, narrative, completion_summary), or same-room linked_channel_docs. Pass empty string for due / narrative / completion_summary or [] for linked_channel_docs to clear. Requires Objective ownership (or sibling agent of the same human owner). Never include secrets.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        objective_id: { type: "string", description: "Objective id to update" },
+        title: { type: "string", description: "Updated Objective title (1..200 chars)" },
+        status: { type: "string", enum: ["active", "done", "abandoned"], description: "Updated lifecycle status" },
+        horizon: { type: "string", enum: ["week", "month", "Q"], description: "Updated planning horizon" },
+        due: { type: "string", description: "Updated ISO-8601 due date/timestamp (<=32 chars); pass empty string to clear" },
+        narrative: { type: "string", description: "Updated inline WHY summary (<=2000 chars); pass empty string to clear" },
+        completion_summary: { type: "string", description: "Updated wrap-up summary (<=280 chars); pass empty string to clear" },
+        linked_channel_docs: {
+          type: "array",
+          maxItems: 10,
+          description: "Replacement same-room ChannelDoc / skill references (0..10 items; pass [] to clear). Requires the Objective to be anchored to that discussion channel.",
+          items: {
+            type: "object",
+            properties: {
+              channel_id: { type: "string", description: "Room channel_id containing the document (must match Objective discussion_channel_id)" },
+              doc_id: { type: "string", description: "Referenced channel doc or skill id" }
+            },
+            required: ["channel_id", "doc_id"]
+          }
+        }
+      },
+      required: ["objective_id"]
+    }
+  },
+  {
     name: "okr_add_task",
     description: "Add a Task under an Objective. Tasks attach to Objectives, optionally cross-reference KRs they advance via contributes_to[], upstream DAG blockers via depends_on[], and room skill/spec docs via linked_channel_docs[] (surfaced automatically by okr_wake). Caller must own the Objective (or be admin). Server rejects cycles.",
     inputSchema: {
@@ -5295,12 +5455,12 @@ var ALL_TOOL_DEFS = [
   },
   {
     name: "archive_objective",
-    description: "Archive one completed objective into the collapsed archived view. Objective-level only in v1.",
+    description: "Archive one completed/abandoned objective into the collapsed archived view (releasing the 20-active-Objectives room cap). Objective-level only in v1; completion_summary must be <=280 chars without secrets.",
     inputSchema: {
       type: "object",
       properties: {
         objective_id: { type: "string", description: "Objective id to archive" },
-        completion_summary: { type: "string", description: "Optional short completion summary (recommended \u2264280 chars)" }
+        completion_summary: { type: "string", maxLength: 280, description: "Optional short completion summary (max 280 chars; never include secrets)" }
       },
       required: ["objective_id"]
     }
@@ -8360,6 +8520,27 @@ ${list}` }] };
         return { content: [{ type: "text", text: `okr_create_objective network error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
       }
     }
+    if (name === "okr_update_objective") {
+      const validated = validateOkrUpdateObjectiveInput(args);
+      if (!validated.ok) {
+        return { content: [{ type: "text", text: `okr_update_objective invalid arguments: ${validated.error}` }], isError: true };
+      }
+      const { objective_id, body } = validated.value;
+      try {
+        const r = await apiFetch(`${REST_URL}/api/okr/objectives/${encodeURIComponent(objective_id)}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${TOKEN}` },
+          body: JSON.stringify(body)
+        });
+        const text = await r.text();
+        if (!r.ok) {
+          return { content: [{ type: "text", text: `okr_update_objective failed (${r.status}): ${text.slice(0, 200)}` }], isError: true };
+        }
+        return { content: [{ type: "text", text: `Updated: ${text}` }] };
+      } catch (e) {
+        return { content: [{ type: "text", text: `okr_update_objective network error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
+      }
+    }
     if (name === "okr_add_task") {
       const { objective_id, title, assignee, contributes_to, depends_on, linked_channel_docs, due } = args;
       const assigneeCheck = validateOkrTaskAssigneeInput(assignee);
@@ -8603,12 +8784,16 @@ ${list}` }] };
       }
     }
     if (name === "archive_objective") {
-      const { objective_id, completion_summary } = args;
+      const validated = validateOkrArchiveObjectiveInput(args);
+      if (!validated.ok) {
+        return { content: [{ type: "text", text: `archive_objective invalid arguments: ${validated.error}` }], isError: true };
+      }
+      const { objective_id, body } = validated.value;
       try {
         const r = await apiFetch(`${REST_URL}/api/okr/objectives/${encodeURIComponent(objective_id)}/archive`, {
           method: "POST",
           headers: { "Content-Type": "application/json", Authorization: `Bearer ${TOKEN}` },
-          body: JSON.stringify(completion_summary !== undefined ? { completion_summary } : {})
+          body: JSON.stringify(body)
         });
         const text = await r.text();
         if (!r.ok) {

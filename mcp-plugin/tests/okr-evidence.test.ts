@@ -10,6 +10,8 @@ let hub: ReturnType<typeof Bun.serve>;
 let BASE = "";
 let receivedPatches: Array<{ taskId: string; body: any }> = [];
 let receivedObjectives: any[] = [];
+let receivedObjectivePatches: Array<{ objectiveId: string; body: any }> = [];
+let receivedArchivedObjectives: Array<{ objectiveId: string; body: any }> = [];
 let receivedAddedTasks: Array<{ objectiveId: string; body: any }> = [];
 let legacyIgnoreAppend = false;
 let storedEvidenceByTask: Record<string, any[]> = {};
@@ -18,6 +20,8 @@ let storedContributesByTask: Record<string, string[]> = {};
 beforeEach(() => {
   receivedPatches = [];
   receivedObjectives = [];
+  receivedObjectivePatches = [];
+  receivedArchivedObjectives = [];
   receivedAddedTasks = [];
   legacyIgnoreAppend = false;
   storedEvidenceByTask = {};
@@ -100,6 +104,41 @@ beforeAll(() => {
             assignee: body.assignee,
             depends_on: body.depends_on ?? null,
             linked_channel_docs: body.linked_channel_docs,
+          },
+        });
+      }
+      const archiveObjMatch = url.pathname.match(/^\/api\/okr\/objectives\/([^/]+)\/archive$/);
+      if (req.method === "POST" && archiveObjMatch) {
+        const body = await req.json() as any;
+        const objectiveId = decodeURIComponent(archiveObjMatch[1]);
+        receivedArchivedObjectives.push({ objectiveId, body });
+        return Response.json({
+          ok: true,
+          objective: {
+            id: objectiveId,
+            archived: true,
+            completion_summary: body.completion_summary,
+          },
+        });
+      }
+      const patchObjMatch = url.pathname.match(/^\/api\/okr\/objectives\/([^/]+)$/);
+      if (req.method === "PATCH" && patchObjMatch) {
+        const body = await req.json() as any;
+        const objectiveId = decodeURIComponent(patchObjMatch[1]);
+        receivedObjectivePatches.push({ objectiveId, body });
+        return Response.json({
+          ok: true,
+          objective: {
+            id: objectiveId,
+            title: body.title ?? "Existing Title",
+            status: body.status ?? "active",
+            horizon: body.horizon ?? "week",
+            due: body.due === "" ? undefined : body.due,
+            narrative: body.narrative === "" ? undefined : body.narrative,
+            completion_summary: body.completion_summary === "" ? undefined : body.completion_summary,
+            linked_channel_docs: Array.isArray(body.linked_channel_docs) && body.linked_channel_docs.length === 0
+              ? undefined
+              : body.linked_channel_docs,
           },
         });
       }
@@ -612,6 +651,113 @@ describe("MCP okr_update_task structured evidence", () => {
         body: {
           depends_on: [],
           linked_channel_docs: [],
+        },
+      },
+    ]);
+  });
+
+  test("okr_update_objective and archive_objective support full lifecycle, metadata/docs clear, and block secrets or >280 summaries", async () => {
+    const out = await drive([
+      INIT,
+      INITED,
+      callTool(2, "load_tool_group", { group_name: "okr" }),
+      { jsonrpc: "2.0", id: 3, method: "tools/list", params: {} },
+      callTool(4, "okr_update_objective", {
+        objective_id: " obj_gov_1 ",
+        title: "  Updated Objective Governance  ",
+        status: "done",
+        horizon: "month",
+        due: " 2026-11-30 ",
+        narrative: "  Room lifecycle closed  ",
+        completion_summary: "  3/3 KRs shipped cleanly  ",
+        linked_channel_docs: [
+          { channel_id: " room-alpha ", doc_id: " skill-gov " },
+          { channel_id: "room-alpha", doc_id: "skill-gov" },
+        ],
+      }),
+      callTool(5, "okr_update_objective", {
+        objective_id: "obj_gov_1",
+        due: "",
+        narrative: "",
+        completion_summary: "",
+        linked_channel_docs: [],
+      }),
+      callTool(6, "archive_objective", {
+        objective_id: " obj_gov_1 ",
+        completion_summary: "  Archived cleanly within 280 chars  ",
+      }),
+      callTool(7, "okr_update_objective", {
+        objective_id: "obj_gov_1",
+      }),
+      callTool(8, "okr_update_objective", {
+        objective_id: "obj_gov_1",
+        title: "Token leak ac_live_secret_token_999999",
+      }),
+      callTool(9, "okr_update_objective", {
+        objective_id: "obj_gov_1",
+        linked_channel_docs: [
+          { channel_id: "room-alpha", doc_id: "doc-1" },
+          { channel_id: "room-beta", doc_id: "doc-2" },
+        ],
+      }),
+      callTool(10, "archive_objective", {
+        objective_id: "obj_gov_1",
+        completion_summary: "x".repeat(281),
+      }),
+      callTool(11, "archive_objective", {
+        objective_id: "obj_gov_1",
+        completion_summary: "Secret agent_key_supersecret123456",
+      }),
+    ], 2400);
+
+    const tools = out.res.get(3)?.result?.tools || [];
+    const updateObjDef = tools.find((t: any) => t.name === "okr_update_objective");
+    const archiveObjDef = tools.find((t: any) => t.name === "archive_objective");
+    expect(updateObjDef?.inputSchema?.properties?.status?.enum).toEqual(["active", "done", "abandoned"]);
+    expect(updateObjDef?.inputSchema?.properties?.horizon?.enum).toEqual(["week", "month", "Q"]);
+    expect(updateObjDef?.inputSchema?.properties?.linked_channel_docs?.maxItems).toBe(10);
+    expect(archiveObjDef?.inputSchema?.properties?.completion_summary?.maxLength).toBe(280);
+
+    for (const id of [4, 5, 6]) {
+      expect(out.res.get(id)?.result?.isError).toBeUndefined();
+    }
+    for (const id of [7, 8, 9, 10, 11]) {
+      expect(out.res.get(id)?.result?.isError).toBe(true);
+    }
+    expect(out.res.get(7)?.result?.content?.[0]?.text).toContain("at least one mutable field");
+    expect(out.res.get(8)?.result?.content?.[0]?.text).toContain("secret or token");
+    expect(out.res.get(9)?.result?.content?.[0]?.text).toContain("same channel_id");
+    expect(out.res.get(10)?.result?.content?.[0]?.text).toContain("exceeds max 280 chars");
+    expect(out.res.get(11)?.result?.content?.[0]?.text).toContain("secret or token");
+
+    expect(receivedObjectivePatches).toEqual([
+      {
+        objectiveId: "obj_gov_1",
+        body: {
+          title: "Updated Objective Governance",
+          status: "done",
+          horizon: "month",
+          due: "2026-11-30",
+          narrative: "Room lifecycle closed",
+          completion_summary: "3/3 KRs shipped cleanly",
+          linked_channel_docs: [{ channel_id: "room-alpha", doc_id: "skill-gov" }],
+        },
+      },
+      {
+        objectiveId: "obj_gov_1",
+        body: {
+          due: "",
+          narrative: "",
+          completion_summary: "",
+          linked_channel_docs: [],
+        },
+      },
+    ]);
+    expect(receivedArchivedObjectives).toEqual([
+      {
+        objectiveId: "obj_gov_1",
+        body: {
+          completion_summary: "Archived cleanly within 280 chars",
         },
       },
     ]);

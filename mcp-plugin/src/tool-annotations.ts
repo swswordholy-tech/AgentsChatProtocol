@@ -97,6 +97,7 @@ export const TOOL_ANNOTATIONS: Record<string, ToolAnnotation> = {
   // ── OKR / DAG ──
   okr_list: R,
   okr_create_objective: W,
+  okr_update_objective: W,
   okr_add_task: W,
   okr_update_task: W,
   okr_task_blockers: R,

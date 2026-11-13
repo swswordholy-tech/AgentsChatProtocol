@@ -725,3 +725,173 @@ export function validateOkrObjectiveNarrativeInput(
   }
   return { ok: true, value: raw.trim() };
 }
+
+const OKR_OBJECTIVE_TITLE_MAX = 200;
+const OKR_COMPLETION_SUMMARY_MAX = 280;
+const OKR_OBJECTIVE_STATUSES = ["active", "done", "abandoned"] as const;
+const OKR_OBJECTIVE_HORIZONS = ["week", "month", "Q"] as const;
+
+export function validateOkrCompletionSummaryInput(
+  raw: unknown,
+): { ok: true; value: string } | { ok: false; error: string } {
+  if (raw === null || raw === "") return { ok: true, value: "" };
+  if (typeof raw !== "string") {
+    return { ok: false, error: "completion_summary must be a string" };
+  }
+  if (EVIDENCE_CTRL_RE.test(raw)) {
+    return { ok: false, error: "completion_summary must not contain control characters" };
+  }
+  if (EVIDENCE_SECRET_RE.test(raw)) {
+    return { ok: false, error: "completion_summary rejected: appears to contain a secret or token" };
+  }
+  const trimmed = raw.trim();
+  if (trimmed.length > OKR_COMPLETION_SUMMARY_MAX) {
+    return { ok: false, error: `completion_summary exceeds max ${OKR_COMPLETION_SUMMARY_MAX} chars` };
+  }
+  return { ok: true, value: trimmed };
+}
+
+export interface ValidatedOkrUpdateObjectiveInput {
+  objective_id: string;
+  body: Record<string, unknown>;
+}
+
+export function validateOkrUpdateObjectiveInput(
+  args: unknown,
+): { ok: true; value: ValidatedOkrUpdateObjectiveInput } | { ok: false; error: string } {
+  const a = args && typeof args === "object" && !Array.isArray(args)
+    ? (args as Record<string, unknown>)
+    : {};
+  const objectiveId = typeof a.objective_id === "string" ? a.objective_id.trim() : "";
+  if (
+    !objectiveId ||
+    !SAFE_CHANNEL_OR_LOOP_ID_RE.test(objectiveId) ||
+    objectiveId.includes("..") ||
+    EVIDENCE_CTRL_RE.test(objectiveId) ||
+    EVIDENCE_SECRET_RE.test(objectiveId)
+  ) {
+    return { ok: false, error: "objective_id must be a valid non-empty identifier" };
+  }
+
+  const body: Record<string, unknown> = {};
+
+  if (a.title !== undefined) {
+    if (typeof a.title !== "string") {
+      return { ok: false, error: "title must be a non-empty string (<= 200 chars)" };
+    }
+    if (EVIDENCE_CTRL_RE.test(a.title)) {
+      return { ok: false, error: "title must not contain control characters" };
+    }
+    if (EVIDENCE_SECRET_RE.test(a.title)) {
+      return { ok: false, error: "title rejected: appears to contain a secret or token" };
+    }
+    const trimmedTitle = a.title.trim();
+    if (!trimmedTitle || trimmedTitle.length > OKR_OBJECTIVE_TITLE_MAX) {
+      return { ok: false, error: `title must be 1..${OKR_OBJECTIVE_TITLE_MAX} chars` };
+    }
+    body.title = trimmedTitle;
+  }
+
+  if (a.status !== undefined) {
+    if (
+      typeof a.status !== "string" ||
+      !(OKR_OBJECTIVE_STATUSES as readonly string[]).includes(a.status)
+    ) {
+      return { ok: false, error: "status must be active, done, or abandoned" };
+    }
+    body.status = a.status;
+  }
+
+  if (a.horizon !== undefined) {
+    if (
+      typeof a.horizon !== "string" ||
+      !(OKR_OBJECTIVE_HORIZONS as readonly string[]).includes(a.horizon)
+    ) {
+      return { ok: false, error: "horizon must be week, month, or Q" };
+    }
+    body.horizon = a.horizon;
+  }
+
+  if (a.due !== undefined) {
+    if (a.due === null || a.due === "") {
+      body.due = "";
+    } else if (typeof a.due === "string") {
+      if (EVIDENCE_CTRL_RE.test(a.due)) {
+        return { ok: false, error: "due must not contain control characters" };
+      }
+      if (EVIDENCE_SECRET_RE.test(a.due)) {
+        return { ok: false, error: "due rejected: appears to contain a secret or token" };
+      }
+      const trimmedDue = a.due.trim();
+      if (!trimmedDue) {
+        body.due = "";
+      } else if (trimmedDue.length > 32 || !Number.isFinite(Date.parse(trimmedDue))) {
+        return { ok: false, error: "due must be a valid ISO-8601 date/timestamp (<= 32 chars) or empty string to clear" };
+      } else {
+        body.due = trimmedDue;
+      }
+    } else {
+      return { ok: false, error: "due must be an ISO-8601 date string or empty string to clear" };
+    }
+  }
+
+  if (a.narrative !== undefined) {
+    const narCheck = validateOkrObjectiveNarrativeInput(a.narrative);
+    if (!narCheck.ok) return narCheck;
+    body.narrative = narCheck.value;
+  }
+
+  if (a.completion_summary !== undefined) {
+    const sumCheck = validateOkrCompletionSummaryInput(a.completion_summary);
+    if (!sumCheck.ok) return sumCheck;
+    body.completion_summary = sumCheck.value;
+  }
+
+  if (a.linked_channel_docs !== undefined) {
+    const docsCheck = validateOkrLinkedChannelDocsInput(a.linked_channel_docs);
+    if (!docsCheck.ok) return docsCheck;
+    if (docsCheck.value.length > 1) {
+      const firstChan = docsCheck.value[0].channel_id;
+      if (docsCheck.value.some((d) => d.channel_id !== firstChan)) {
+        return { ok: false, error: "linked_channel_docs items on an Objective must all reference the same channel_id" };
+      }
+    }
+    body.linked_channel_docs = docsCheck.value;
+  }
+
+  if (Object.keys(body).length === 0) {
+    return {
+      ok: false,
+      error: "at least one mutable field (title, status, horizon, due, narrative, completion_summary, linked_channel_docs) is required",
+    };
+  }
+
+  return { ok: true, value: { objective_id: objectiveId, body } };
+}
+
+export function validateOkrArchiveObjectiveInput(
+  args: unknown,
+): { ok: true; value: { objective_id: string; body: Record<string, unknown> } } | { ok: false; error: string } {
+  const a = args && typeof args === "object" && !Array.isArray(args)
+    ? (args as Record<string, unknown>)
+    : {};
+  const objectiveId = typeof a.objective_id === "string" ? a.objective_id.trim() : "";
+  if (
+    !objectiveId ||
+    !SAFE_CHANNEL_OR_LOOP_ID_RE.test(objectiveId) ||
+    objectiveId.includes("..") ||
+    EVIDENCE_CTRL_RE.test(objectiveId) ||
+    EVIDENCE_SECRET_RE.test(objectiveId)
+  ) {
+    return { ok: false, error: "objective_id must be a valid non-empty identifier" };
+  }
+  const body: Record<string, unknown> = {};
+  if (a.completion_summary !== undefined && a.completion_summary !== null) {
+    const sumCheck = validateOkrCompletionSummaryInput(a.completion_summary);
+    if (!sumCheck.ok) return sumCheck;
+    if (sumCheck.value) {
+      body.completion_summary = sumCheck.value;
+    }
+  }
+  return { ok: true, value: { objective_id: objectiveId, body } };
+}
