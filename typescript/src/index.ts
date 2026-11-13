@@ -1,5 +1,10 @@
 export { AgentChatClient } from "./client";
-export { AgentChatREST, parseSseFrames, type RESTClientOptions } from "./rest";
+export {
+  AgentChatREST,
+  classifyOkrCommentKind,
+  parseSseFrames,
+  type RESTClientOptions,
+} from "./rest";
 export type {
   // Data types
   A2AAgentCard,
@@ -163,6 +168,7 @@ export type {
   ArchiveOkrObjectiveInput,
   ArchivePersonalSkillResponse,
   OkrChannelDocRef,
+  OkrCommentKind,
   OkrHorizon,
   OkrKeyResultItem,
   OkrListQuery,
@@ -177,8 +183,12 @@ export type {
   OkrTaskBlocksResponse,
   OkrTaskCommentItem,
   OkrTaskCommentsListResponse,
+  OkrTaskEvidenceInput,
+  OkrTaskEvidenceItem,
+  OkrTaskEvidenceKind,
   OkrTaskItem,
   OkrTaskStatus,
+  OkrTaskUpstreamHandoffItem,
   LogOkrTaskProgressInput,
   LogOkrTaskProgressResponse,
   OpenOkrThreadInput,

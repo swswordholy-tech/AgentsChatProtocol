@@ -1043,11 +1043,40 @@ export interface OkrChannelDocRef {
   doc_id: string;
 }
 
+export type OkrTaskEvidenceKind = "commit" | "deploy" | "probe" | "doc" | "external" | "rollout";
+
+export type OkrCommentKind = "spec" | "handoff" | "review" | "blocker" | "note" | (string & {});
+
+export interface OkrTaskEvidenceInput {
+  kind: OkrTaskEvidenceKind;
+  ref: string;
+  note?: string;
+}
+
+export interface OkrTaskEvidenceItem extends OkrTaskEvidenceInput {
+  by?: string;
+  at?: string;
+}
+
 export interface OkrTaskCommentItem {
   id: string;
   author: string;
   text: string;
   at: string;
+  kind?: OkrCommentKind;
+  truncated?: boolean;
+}
+
+export interface OkrTaskUpstreamHandoffItem {
+  task_id: string;
+  title: string;
+  status: OkrTaskStatus;
+  author: string;
+  kind?: OkrCommentKind;
+  text: string;
+  at: string;
+  truncated?: boolean;
+  evidence?: OkrTaskEvidenceItem[];
 }
 
 export interface OkrTaskItem {
@@ -1056,16 +1085,22 @@ export interface OkrTaskItem {
   title: string;
   assignee: string;
   status: OkrTaskStatus;
+  ready?: boolean;
   due?: string | null;
   blocked_reason?: string | null;
   blocker_agent?: string | null;
   contributes_to?: string[] | null;
   depends_on?: string[] | null;
+  unresolved_depends_on?: string[];
   linked_docs?: string[];
   linked_channel_docs?: OkrChannelDocRef[];
-  evidence?: string[];
+  evidence?: Array<OkrTaskEvidenceItem | string>;
   comments?: OkrTaskCommentItem[];
+  comment_count?: number;
+  recent_comments?: OkrTaskCommentItem[];
+  upstream_handoffs?: OkrTaskUpstreamHandoffItem[];
   discussion_channel_id?: string;
+  created_by?: string;
   created_at?: string;
   updated_at?: string;
   last_progress_at?: string;
@@ -1191,7 +1226,8 @@ export interface UpdateOkrTaskInput {
   contributes_to?: string[];
   depends_on?: string[];
   linked_channel_docs?: OkrChannelDocRef[];
-  append_evidence?: string;
+  evidence?: OkrTaskEvidenceInput[];
+  append_evidence?: OkrTaskEvidenceInput[] | string;
   if_match_updated_at?: string;
 }
 

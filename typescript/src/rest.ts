@@ -45,6 +45,28 @@ export function parseSseFrames(buffer: string, maxBufferChars = 262_144): Parsed
   return { events, rest };
 }
 
+const VALID_EVIDENCE_KINDS = new Set([
+  "commit",
+  "deploy",
+  "probe",
+  "doc",
+  "external",
+  "rollout",
+]);
+
+export function classifyOkrCommentKind(
+  text: string,
+  explicitKind?: string,
+): import("./types").OkrCommentKind {
+  const raw = typeof text === "string" ? text : "";
+  if (/^\s*\[SPEC\b/i.test(raw)) return "spec";
+  if (explicitKind === "handoff" || /^\s*\[HANDOFF\b/i.test(raw)) return "handoff";
+  if (explicitKind === "review" || /^\s*\[REVIEW\b/i.test(raw)) return "review";
+  if (explicitKind === "blocker" || /^\s*\[BLOCK(?:ER|ED)?\b/i.test(raw)) return "blocker";
+  if (explicitKind && explicitKind.trim()) return explicitKind.trim();
+  return "note";
+}
+
 export interface RESTClientOptions {
   baseUrl: string; // e.g. "http://localhost:8080"
   bearerToken?: string;
@@ -1720,12 +1742,59 @@ export class AgentChatREST {
     if (input?.title !== undefined) {
       const t = input.title.trim();
       if (!t || t.length > 200) throw new Error("Invalid task title");
+      if (this.containsMemorySecretShape(t)) throw new Error("Task title cannot contain credentials or secrets");
     }
     if (input?.status !== undefined && !["todo", "doing", "done", "blocked"].includes(input.status)) {
       throw new Error("Invalid task status");
     }
     if (input?.due !== undefined && input.due !== null && input.due !== "" && input.due.length > 32) {
       throw new Error("Invalid task due");
+    }
+    if (typeof input?.blocked_reason === "string" && this.containsMemorySecretShape(input.blocked_reason)) {
+      throw new Error("Task blocked_reason cannot contain credentials or secrets");
+    }
+    const normalizeEvidenceArray = (
+      items: import("./types").OkrTaskEvidenceInput[],
+      allowEmpty: boolean,
+    ): import("./types").OkrTaskEvidenceInput[] => {
+      if (!Array.isArray(items) || (!allowEmpty && items.length === 0) || items.length > 10) {
+        throw new Error("Invalid task evidence list (expected up to 10 items)");
+      }
+      return items.map((ev) => {
+        if (!ev || !VALID_EVIDENCE_KINDS.has(ev.kind)) {
+          throw new Error("Invalid task evidence kind");
+        }
+        const ref = ev.ref?.trim() ?? "";
+        if (!ref || ref.length > 500) {
+          throw new Error("Invalid task evidence ref");
+        }
+        if (this.containsMemorySecretShape(ref)) {
+          throw new Error("Task evidence cannot contain credentials or secrets");
+        }
+        const note = ev.note?.trim();
+        if (note !== undefined && note.length > 500) {
+          throw new Error("Invalid task evidence note");
+        }
+        if (note && this.containsMemorySecretShape(note)) {
+          throw new Error("Task evidence cannot contain credentials or secrets");
+        }
+        return {
+          kind: ev.kind,
+          ref,
+          ...(note ? { note } : {}),
+        };
+      });
+    };
+    const normalizedEvidence =
+      input?.evidence !== undefined ? normalizeEvidenceArray(input.evidence, true) : undefined;
+    let normalizedAppendEvidence: import("./types").OkrTaskEvidenceInput[] | string | undefined;
+    if (Array.isArray(input?.append_evidence)) {
+      normalizedAppendEvidence = normalizeEvidenceArray(input.append_evidence, false);
+    } else if (typeof input?.append_evidence === "string") {
+      if (this.containsMemorySecretShape(input.append_evidence)) {
+        throw new Error("Task evidence cannot contain credentials or secrets");
+      }
+      normalizedAppendEvidence = input.append_evidence;
     }
     const body: Record<string, unknown> = {
       ...(input.title !== undefined ? { title: input.title.trim() } : {}),
@@ -1737,10 +1806,22 @@ export class AgentChatREST {
       ...(input.contributes_to !== undefined ? { contributes_to: input.contributes_to } : {}),
       ...(input.depends_on !== undefined ? { depends_on: input.depends_on } : {}),
       ...(input.linked_channel_docs !== undefined ? { linked_channel_docs: input.linked_channel_docs } : {}),
-      ...(input.append_evidence !== undefined ? { append_evidence: input.append_evidence } : {}),
+      ...(normalizedEvidence !== undefined ? { evidence: normalizedEvidence } : {}),
+      ...(normalizedAppendEvidence !== undefined ? { append_evidence: normalizedAppendEvidence } : {}),
       ...(cas !== undefined ? { if_match_updated_at: cas } : {}),
     };
-    return this.patch(`/api/okr/tasks/${encodeURIComponent(safeId)}`, body, this.authHeaders(opts?.bearerToken));
+    return this.patch(`/api/okr/tasks/${encodeURIComponent(safeId)}`, body, {
+      "Cache-Control": "no-store",
+      ...this.authHeaders(opts?.bearerToken),
+    });
+  }
+
+  async updateOkrTask(
+    taskId: string,
+    input: import("./types").UpdateOkrTaskInput,
+    opts?: { bearerToken?: string },
+  ): Promise<{ ok: boolean; task: import("./types").OkrTaskItem }> {
+    return this.updateTask(taskId, input, opts);
   }
 
   async addTaskComment(

@@ -2728,4 +2728,106 @@ describe("AgentChatClient realtime collaboration WS events", () => {
       },
     ]);
   });
+
+  test("classifyOkrCommentKind, structured OkrTaskItem TaskEvidence/upstream_handoffs, and updateOkrTask append_evidence validation", async () => {
+    const { classifyOkrCommentKind } = await import("../src/index");
+    expect(classifyOkrCommentKind("[SPEC 1/2] Implement point-read fastpath")).toBe("spec");
+    expect(classifyOkrCommentKind("[HANDOFF] Shipped commit 0180dfa1")).toBe("handoff");
+    expect(classifyOkrCommentKind("[REVIEW] LGTM 0 NUL")).toBe("review");
+    expect(classifyOkrCommentKind("[BLOCKER] Waiting on upstream")).toBe("blocker");
+    expect(classifyOkrCommentKind("General progress ping")).toBe("note");
+
+    const originalFetch = globalThis.fetch;
+    const seen: Array<{ url: string; method: string; headers: Record<string, string>; body: any }> = [];
+
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const headers: Record<string, string> = {};
+      if (init?.headers) {
+        for (const [k, v] of Object.entries(init.headers as Record<string, string>)) {
+          headers[k.toLowerCase()] = String(v);
+        }
+      }
+      const body = typeof init?.body === "string" ? JSON.parse(init.body) : undefined;
+      seen.push({ url: String(input), method: init?.method || "GET", headers, body });
+
+      if (String(input).endsWith("/api/channels/room-dev/okr_snapshot")) {
+        return Response.json({
+          channel_id: "room-dev",
+          objectives: [],
+          krs: [],
+          tasks: [
+            {
+              id: "task_36",
+              objective_id: "obj_36",
+              title: "Verify structured TaskEvidence",
+              assignee: "codex-staff-engineer-ca7590",
+              status: "todo",
+              ready: true,
+              unresolved_depends_on: [],
+              comment_count: 2,
+              evidence: [{ kind: "commit", ref: "0180dfa1", note: "Merged KR1", by: "codex-bot", at: "2026-11-14T06:17:00Z" }],
+              recent_comments: [{ id: "c1", author: "lead", kind: "spec", text: "[SPEC] Full 2000 chars", at: "2026-11-14T06:21:00Z" }],
+              upstream_handoffs: [
+                {
+                  task_id: "task_35",
+                  title: "Upstream sprint",
+                  status: "done",
+                  author: "codex-bot",
+                  kind: "handoff",
+                  text: "All tests green",
+                  at: "2026-11-14T06:18:00Z",
+                  evidence: [{ kind: "probe", ref: "https://agents-chat.com/health" }],
+                },
+              ],
+            },
+          ],
+        });
+      }
+      return Response.json({
+        ok: true,
+        task: {
+          id: "task_36",
+          objective_id: "obj_36",
+          title: "Verify structured TaskEvidence",
+          assignee: "codex-staff-engineer-ca7590",
+          status: "done",
+          evidence: [{ kind: "commit", ref: "0180dfa1", note: "Verified" }],
+        },
+      });
+    }) as typeof fetch;
+
+    try {
+      const rest = new AgentChatREST({ baseUrl: "https://agents-chat.com", bearerToken: "tok_sdk_36" });
+      const snap = await rest.getChannelOkrSnapshot("room-dev");
+      expect(snap.tasks[0]?.ready).toBe(true);
+      expect(snap.tasks[0]?.upstream_handoffs?.[0]?.task_id).toBe("task_35");
+      expect((snap.tasks[0]?.evidence?.[0] as { kind?: string })?.kind).toBe("commit");
+
+      const updated = await rest.updateTask("task_36", {
+        status: "done",
+        append_evidence: [{ kind: "commit", ref: " 0180dfa1 ", note: " Verified " }],
+      });
+      expect(updated.ok).toBe(true);
+      expect(seen[1]?.headers["cache-control"]).toBe("no-store");
+      expect(seen[1]?.body).toEqual({
+        status: "done",
+        append_evidence: [{ kind: "commit", ref: "0180dfa1", note: "Verified" }],
+      });
+
+      const beforeInvalid = seen.length;
+      await expect(
+        rest.updateOkrTask("task_36", {
+          append_evidence: [{ kind: "commit", ref: "ac_live_secret_1234567890" }],
+        }),
+      ).rejects.toThrow("credentials");
+      await expect(
+        rest.updateOkrTask("task_36", {
+          append_evidence: [],
+        }),
+      ).rejects.toThrow("Invalid task evidence list");
+      expect(seen.length).toBe(beforeInvalid);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
 });
