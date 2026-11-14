@@ -44,7 +44,12 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { isHumanPiiHandle, redactParticipantPii, redactSecrets } from "./redact.ts";
 import { matchesMention } from "./mentions.ts";
 import { messageDedupKey, MessageDedup } from "./dedup.ts";
-import { computePleaseReconnectDelay, computeReconnectDelay } from "./reconnect.ts";
+import {
+  computePleaseReconnectDelay,
+  computeReconnectDelay,
+  resolveDrainReconnectDelay,
+  withTimeoutController,
+} from "./reconnect.ts";
 import { normalizeTimestampForCursor } from "./timestamps.ts";
 import {
   CREATE_LOOP_MODES,
@@ -495,17 +500,16 @@ async function apiFetch(
     const wakeId = resolveEnvWakeId();
     if (wakeId) headers[WAKE_ID_HEADER] = wakeId;
   }
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const { signal, cleanup } = withTimeoutController(init.signal, timeoutMs);
   try {
-    const response = await nativeFetch(input as any, { ...init, headers, signal: init.signal ?? controller.signal });
+    const response = await nativeFetch(input as any, { ...init, headers, signal });
     if (!bufferBody) return response;
     // Keep the abort deadline active until the body is consumed. Headers alone
     // must not mark a stalled JSON response as complete.
     const body = await response.text();
     return new Response(body, { status: response.status, statusText: response.statusText, headers: response.headers });
   } finally {
-    clearTimeout(timer);
+    cleanup();
   }
 }
 
@@ -996,6 +1000,8 @@ function startTypingHeartbeat(channelId: string, slot: ProfileSlot | null = acti
   sendTypingFrame(channelId, slot); // immediate first pulse
   const interval = setInterval(() => sendTypingFrame(channelId, slot), TYPING_HEARTBEAT_MS);
   const cap = setTimeout(() => stopTypingHeartbeat(channelId, slot), TYPING_HEARTBEAT_MAX_MS);
+  (interval as any).unref?.();
+  (cap as any).unref?.();
   typingHeartbeats.set(typingHeartbeatKey(channelId, agentId), { interval, cap });
 }
 function stopTypingHeartbeat(channelId: string, slot: ProfileSlot | null = activeSlot) {
@@ -7235,6 +7241,7 @@ function scheduleReconnect(delayMs: number, slot: ProfileSlot | null = activeSlo
     slot.reconnectTimer = null;
     connectWS(slot);
   }, delayMs);
+  (slot.reconnectTimer as any).unref?.();
 }
 
 /**
@@ -7424,6 +7431,7 @@ function connectWS(slot: ProfileSlot | null = activeSlot) {
         slot!.backfillTimer = null;
         if (!shuttingDown) void backfillAllChannels(slot!);
       }, 2000);
+      (slot!.backfillTimer as any).unref?.();
     } else if ((data.type === "message" || data.type === "thread_reply") &&
       data.sender_id === slot!.agentId && typeof data.content === "string" && data.content !== "__typing__" &&
       !["loop_tick", "slash_input", "loop_status", "slash_response"].includes(data.meta?.kind)) {
@@ -7557,6 +7565,7 @@ function connectWS(slot: ProfileSlot | null = activeSlot) {
                     const port = grokPortFromGatewayConfig(gwcfg);
                     const res = await fetch(`http://127.0.0.1:${port}/api/listAgents`, {
                       headers: token ? { Authorization: `Bearer ${token}` } : {},
+                      signal: AbortSignal.timeout(5000),
                     });
                     if (!res.ok) throw new Error(`listAgents HTTP ${res.status}`);
                     const d = (await res.json()) as any;
@@ -7703,7 +7712,8 @@ function connectWS(slot: ProfileSlot | null = activeSlot) {
       process.stderr.write(`[agentchat] Joined channel: ${data.name}\n`);
       if (typeof data.channel_id === "string") slot!.knownChannels.add(data.channel_id);
     } else if (data.type === "shard_moved") {
-      process.stderr.write(`[agentchat] Shard moved, reconnecting...\n`);
+      const delay = resolveDrainReconnectDelay(data);
+      process.stderr.write(`[agentchat] Shard moved, reconnecting in ${delay}ms...\n`);
       if (data.redirect_url) {
         const newUrl = data.redirect_url.replace(/^https/, "wss").replace(/^http/, "ws") + "/ws";
         process.stderr.write(`[agentchat] Redirecting to: ${newUrl}\n`);
@@ -7713,9 +7723,9 @@ function connectWS(slot: ProfileSlot | null = activeSlot) {
       slot!.sessionId = null;
       if (activeSlot === slot) { ws = null; sessionId = null; }
       slot!.wsReconnectAttempt = 0;
-      scheduleReconnect(500, slot!);
+      scheduleReconnect(delay, slot!);
     } else if (data.type === "please_reconnect") {
-      const delay = computePleaseReconnectDelay(data.jitter_ms);
+      const delay = resolveDrainReconnectDelay(data);
       process.stderr.write(`[agentchat] Server draining (please_reconnect), reconnecting in ${delay}ms...\n`);
       if (slot!.ws) { slot!.ws.onclose = null; try { slot!.ws.close(); } catch {} }
       slot!.ws = null;
@@ -7723,6 +7733,18 @@ function connectWS(slot: ProfileSlot | null = activeSlot) {
       if (activeSlot === slot) { ws = null; sessionId = null; }
       slot!.wsReconnectAttempt = 0;
       scheduleReconnect(delay, slot!);
+    } else if (data.type === "auth_error") {
+      const reason = data.error || data.message || "authentication failed";
+      process.stderr.write(`[agentchat] Auth error for ${slot!.agentId}: ${reason} — halting reconnect loop\n`);
+      slot!.heartbeat.stop();
+      if (slot!.reconnectTimer) {
+        clearTimeout(slot!.reconnectTimer);
+        slot!.reconnectTimer = null;
+      }
+      if (slot!.ws) { slot!.ws.onclose = null; try { slot!.ws.close(); } catch {} }
+      slot!.ws = null;
+      slot!.sessionId = null;
+      if (activeSlot === slot) { ws = null; sessionId = null; }
     } else if (data.type === "error") {
       process.stderr.write(`[agentchat] Error: ${data.message}\n`);
     }
@@ -7819,6 +7841,7 @@ function installStdioLifecycleGuards() {
 async function checkVersionStaleness(): Promise<void> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 5000);
+  (timer as any).unref?.();
   try {
     const r = await nativeFetch("https://registry.npmjs.org/agentschat-mcp/latest", { signal: controller.signal });
     if (!r.ok) return;

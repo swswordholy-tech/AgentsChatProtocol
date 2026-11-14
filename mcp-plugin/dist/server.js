@@ -139,6 +139,35 @@ function computePleaseReconnectDelay(jitterMs, rand = Math.random) {
   const maxJitter = typeof jitterMs === "number" && Number.isFinite(jitterMs) && jitterMs > 0 ? Math.min(Math.floor(jitterMs), 1e4) : 2000;
   return 200 + Math.floor(rand() * maxJitter);
 }
+function resolveDrainReconnectDelay(frame, rand = Math.random) {
+  return computePleaseReconnectDelay(frame?.jitter_ms ?? frame?.within_ms, rand);
+}
+function withTimeoutController(parentSignal, timeoutMs) {
+  const controller = new AbortController;
+  const onParentAbort = () => controller.abort(parentSignal?.reason);
+  if (parentSignal) {
+    if (parentSignal.aborted) {
+      controller.abort(parentSignal.reason);
+      return { signal: controller.signal, cleanup: () => {} };
+    }
+    parentSignal.addEventListener("abort", onParentAbort, { once: true });
+  }
+  const timer = timeoutMs > 0 ? setTimeout(() => {
+    const err = new Error(`HTTP request timed out after ${timeoutMs}ms`);
+    err.name = "TimeoutError";
+    controller.abort(err);
+  }, timeoutMs) : null;
+  timer?.unref?.();
+  return {
+    signal: controller.signal,
+    cleanup: () => {
+      if (timer)
+        clearTimeout(timer);
+      if (parentSignal)
+        parentSignal.removeEventListener("abort", onParentAbort);
+    }
+  };
+}
 
 // src/timestamps.ts
 function normalizeTimestampForCursor(ts, mode) {
@@ -3248,6 +3277,7 @@ async function detectDshCallerSession(opts) {
     const f = opts?.fetchImpl ?? fetch;
     const ctrl = new AbortController;
     const timer = setTimeout(() => ctrl.abort(), 150);
+    timer.unref?.();
     try {
       const res = await f(healthUrl, { signal: ctrl.signal });
       if (res.ok) {
@@ -4897,16 +4927,15 @@ async function apiFetch(input, init = {}, timeoutMs = REST_TIMEOUT_MS, bufferBod
     if (wakeId)
       headers[WAKE_ID_HEADER] = wakeId;
   }
-  const controller = new AbortController;
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const { signal, cleanup } = withTimeoutController(init.signal, timeoutMs);
   try {
-    const response = await nativeFetch(input, { ...init, headers, signal: init.signal ?? controller.signal });
+    const response = await nativeFetch(input, { ...init, headers, signal });
     if (!bufferBody)
       return response;
     const body = await response.text();
     return new Response(body, { status: response.status, statusText: response.statusText, headers: response.headers });
   } finally {
-    clearTimeout(timer);
+    cleanup();
   }
 }
 var hasToken = cliArgs.token !== undefined || process.env.AGENTCHAT_TOKEN !== undefined;
@@ -5341,6 +5370,8 @@ function startTypingHeartbeat(channelId, slot = activeSlot) {
   sendTypingFrame(channelId, slot);
   const interval = setInterval(() => sendTypingFrame(channelId, slot), TYPING_HEARTBEAT_MS);
   const cap = setTimeout(() => stopTypingHeartbeat(channelId, slot), TYPING_HEARTBEAT_MAX_MS);
+  interval.unref?.();
+  cap.unref?.();
   typingHeartbeats.set(typingHeartbeatKey(channelId, agentId), { interval, cap });
 }
 function stopTypingHeartbeat(channelId, slot = activeSlot) {
@@ -11031,6 +11062,7 @@ function scheduleReconnect(delayMs, slot = activeSlot) {
     slot.reconnectTimer = null;
     connectWS(slot);
   }, delayMs);
+  slot.reconnectTimer.unref?.();
 }
 async function backfillAllChannels(slot = activeSlot) {
   if (!slot || slot.knownChannels.size === 0)
@@ -11226,6 +11258,7 @@ function connectWS(slot = activeSlot) {
         if (!shuttingDown)
           backfillAllChannels(slot);
       }, 2000);
+      slot.backfillTimer.unref?.();
     } else if ((data.type === "message" || data.type === "thread_reply") && data.sender_id === slot.agentId && typeof data.content === "string" && data.content !== "__typing__" && !["loop_tick", "slash_input", "loop_status", "slash_response"].includes(data.meta?.kind)) {
       stopTypingHeartbeat(data.channel_id, slot);
     } else if ((data.type === "message" || data.type === "thread_reply") && (data.sender_id !== slot.agentId || data.meta && typeof data.meta === "object" && data.meta.kind === "loop_tick")) {
@@ -11343,7 +11376,8 @@ ${context}
                     const token = grokBearerFromGatewayConfig(gwcfg);
                     const port = grokPortFromGatewayConfig(gwcfg);
                     const res = await fetch(`http://127.0.0.1:${port}/api/listAgents`, {
-                      headers: token ? { Authorization: `Bearer ${token}` } : {}
+                      headers: token ? { Authorization: `Bearer ${token}` } : {},
+                      signal: AbortSignal.timeout(5000)
                     });
                     if (!res.ok)
                       throw new Error(`listAgents HTTP ${res.status}`);
@@ -11459,7 +11493,8 @@ ${context}
       if (typeof data.channel_id === "string")
         slot.knownChannels.add(data.channel_id);
     } else if (data.type === "shard_moved") {
-      process.stderr.write(`[agentchat] Shard moved, reconnecting...
+      const delay = resolveDrainReconnectDelay(data);
+      process.stderr.write(`[agentchat] Shard moved, reconnecting in ${delay}ms...
 `);
       if (data.redirect_url) {
         const newUrl = data.redirect_url.replace(/^https/, "wss").replace(/^http/, "ws") + "/ws";
@@ -11479,9 +11514,9 @@ ${context}
         sessionId = null;
       }
       slot.wsReconnectAttempt = 0;
-      scheduleReconnect(500, slot);
+      scheduleReconnect(delay, slot);
     } else if (data.type === "please_reconnect") {
-      const delay = computePleaseReconnectDelay(data.jitter_ms);
+      const delay = resolveDrainReconnectDelay(data);
       process.stderr.write(`[agentchat] Server draining (please_reconnect), reconnecting in ${delay}ms...
 `);
       if (slot.ws) {
@@ -11498,6 +11533,27 @@ ${context}
       }
       slot.wsReconnectAttempt = 0;
       scheduleReconnect(delay, slot);
+    } else if (data.type === "auth_error") {
+      const reason = data.error || data.message || "authentication failed";
+      process.stderr.write(`[agentchat] Auth error for ${slot.agentId}: ${reason} \u2014 halting reconnect loop
+`);
+      slot.heartbeat.stop();
+      if (slot.reconnectTimer) {
+        clearTimeout(slot.reconnectTimer);
+        slot.reconnectTimer = null;
+      }
+      if (slot.ws) {
+        slot.ws.onclose = null;
+        try {
+          slot.ws.close();
+        } catch {}
+      }
+      slot.ws = null;
+      slot.sessionId = null;
+      if (activeSlot === slot) {
+        ws = null;
+        sessionId = null;
+      }
     } else if (data.type === "error") {
       process.stderr.write(`[agentchat] Error: ${data.message}
 `);
@@ -11604,6 +11660,7 @@ function installStdioLifecycleGuards() {
 async function checkVersionStaleness() {
   const controller = new AbortController;
   const timer = setTimeout(() => controller.abort(), 5000);
+  timer.unref?.();
   try {
     const r = await nativeFetch("https://registry.npmjs.org/agentschat-mcp/latest", { signal: controller.signal });
     if (!r.ok)

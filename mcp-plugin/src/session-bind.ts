@@ -1014,6 +1014,7 @@ export async function detectDshCallerSession(opts?: {
     const f = opts?.fetchImpl ?? fetch;
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), 150);
+    timer.unref?.();
     try {
       const res = await f(healthUrl, { signal: ctrl.signal });
       if (res.ok) {
