@@ -6,6 +6,7 @@ import {
   evaluateConsensusTally,
   isValidCollaborationRoster,
   resolveInheritedObjectiveChannel,
+  summarizeChannelBriefReadiness,
   summarizeChannelOkrSnapshot,
   summarizeChannelThreads,
   summarizeProposalsFeed,
@@ -3625,6 +3626,92 @@ describe("AgentChatClient realtime collaboration WS events", () => {
       await expect(rest.registerWebhook("dm-private", "https://hooks.example.com/notify")).rejects.toThrow("Invalid channel ID");
       await expect(rest.registerWebhook("room-dev", "https://hooks.example.com/sk-proj-1234567890abcdef")).rejects.toThrow("Webhook URL must not contain secrets");
       await expect(rest.removeWebhook("direct:alice:bob", "https://hooks.example.com/notify")).rejects.toThrow("Invalid channel ID");
+      expect(fetchCalls).toBe(0);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("summarizeChannelBriefReadiness and brief/wake-health/cloud-loop zero-egress guards", async () => {
+    const summary = summarizeChannelBriefReadiness({
+      channel_id: "room-dev",
+      channel: { id: "room-dev", name: "AgentChatDev", type: "group" },
+      agents: [
+        { id: "codex-1", online: true, capabilities: ["swift", "security-audit", "swift"] },
+        { id: "claude-2", online: false, capabilities: ["swift", "docs"] },
+        { id: "bot_sk-proj-1234567890abcdef", online: true, capabilities: ["swift"] },
+      ],
+      skills_summary: {
+        channel_skills: [
+          { doc_id: "doc-review", skill_meta: { name: "review" } },
+          { doc_id: "doc_ac_secret_123456789", skill_meta: { name: "bad" } },
+        ],
+        personal_skills: [{ name: "my-operator-skill" }],
+      },
+      okr_summary: {
+        active_objective_count: 2,
+        total_task_count: 5,
+        ready_task_count: 2,
+        doing_task_count: 2,
+        blocked_task_count: 1,
+        ready_for_me_count: 1,
+      },
+      loop_summary: {
+        active_loop_count: 1,
+        my_active_loop_count: 1,
+        okr_wake_objective_ids: ["obj_1"],
+        okr_watch_objective_ids: [],
+        unarmed_objective_ids: ["obj_2", "obj_2", "obj_sk-proj-1234567890abcdef"],
+      },
+      wake_health_summary: {
+        observation_only: true,
+        counts: { total_cloud_agents: 2, ok: 1, auth_required: 1, timeout: 0, error: 0, unobserved: 0 },
+        attention_agents: [
+          { agent_id: "claude-2", runtime: "claude", cloud_status: "active", last_wake_status: "auth_required" },
+          { agent_id: "bot_ac_secret_123456789", runtime: "codex", cloud_status: "active", last_wake_status: "error" },
+        ],
+      },
+    });
+    expect(summary).toEqual({
+      channel_id: "room-dev",
+      online_agent_count: 1,
+      total_agent_count: 2,
+      specialties: [
+        { capability: "swift", total_agents: 2, online_agents: 1 },
+        { capability: "security-audit", total_agents: 1, online_agents: 1 },
+        { capability: "docs", total_agents: 1, online_agents: 0 },
+      ],
+      channel_skill_count: 1,
+      personal_skill_count: 1,
+      personal_skills_unavailable: false,
+      ready_for_me_count: 1,
+      unarmed_objective_ids: ["obj_2"],
+      attention_agent_ids: ["claude-2"],
+      is_wake_healthy: false,
+    });
+    expect(summarizeChannelBriefReadiness({ channel_id: "dm-private", channel: { id: "dm-private", type: "direct" }, agents: [] })).toBeNull();
+
+    const originalFetch = globalThis.fetch;
+    let fetchCalls = 0;
+    globalThis.fetch = (async () => {
+      fetchCalls += 1;
+      return Response.json({ ok: true });
+    }) as unknown as typeof fetch;
+
+    try {
+      const rest = new AgentChatREST({ baseUrl: "https://agents-chat.com", bearerToken: "tok_45" });
+      await expect(rest.getChannelBrief("dm-private")).rejects.toThrow("Invalid channel ID");
+      await expect(rest.getChannelWakeHealth("dm-private")).rejects.toThrow("Invalid channel ID");
+      await expect(rest.getChannelWakeHealth("room_sk-proj-1234567890abcdef")).rejects.toThrow("Invalid channel ID");
+      await expect(rest.getChannelLoops("room_ac_secret_123456789")).rejects.toThrow("Invalid channel ID");
+      await expect(
+        rest.createCloudAgentLoop("codex-sub-01", {
+          channel_id: "dm-owner",
+          mode: "okr_wake",
+          objective_id: "obj_alpha_01",
+          interval: "15m",
+        }),
+      ).rejects.toThrow("OKR loops require a group or project channel");
       expect(fetchCalls).toBe(0);
     } finally {
       globalThis.fetch = originalFetch;

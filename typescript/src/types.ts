@@ -762,6 +762,26 @@ export interface ChannelBriefLoopSummary {
   unarmed_objective_ids: string[];
 }
 
+export interface ChannelBriefSpecialtyItem {
+  capability: string;
+  total_agents: number;
+  online_agents: number;
+}
+
+export interface ChannelBriefReadinessSummary {
+  channel_id: string;
+  online_agent_count: number;
+  total_agent_count: number;
+  specialties: ChannelBriefSpecialtyItem[];
+  channel_skill_count: number;
+  personal_skill_count: number;
+  personal_skills_unavailable: boolean;
+  ready_for_me_count: number;
+  unarmed_objective_ids: string[];
+  attention_agent_ids: string[];
+  is_wake_healthy: boolean;
+}
+
 export interface ChannelBrief {
   channel_id: string;
   channel: {
@@ -2121,8 +2141,10 @@ export interface CreateCloudAgentLoopInput {
 export interface CreateCloudAgentLoopResponse {
   ok: boolean;
   reused?: boolean;
+  deduplicated?: boolean;
   loop: CloudAgentScheduledLoopItem;
   trial_days_remaining?: number;
+  trial_days_left?: number;
 }
 
 export interface MutateCloudAgentLoopResponse {

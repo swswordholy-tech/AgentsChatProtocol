@@ -763,6 +763,140 @@ export function summarizeChannelThreads(
   };
 }
 
+export function summarizeChannelBriefReadiness(
+  raw: unknown,
+): import("./types").ChannelBriefReadinessSummary | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const brief = raw as Record<string, unknown>;
+  if (!safeNonDmChannelId(brief.channel_id) || !brief.channel || typeof brief.channel !== "object") {
+    return null;
+  }
+  const chObj = brief.channel as Record<string, unknown>;
+  if (chObj.id !== brief.channel_id || chObj.type === "direct") return null;
+
+  const seenAgents = new Set<string>();
+  let totalAgents = 0;
+  let onlineAgents = 0;
+  const capTotals = new Map<string, number>();
+  const capOnline = new Map<string, number>();
+
+  for (const item of Array.isArray(brief.agents) ? brief.agents.slice(0, 64) : []) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    const ag = item as Record<string, unknown>;
+    const id = typeof ag.id === "string" ? ag.id.trim() : "";
+    if (!safeGraphId(id) || EMBEDDED_SECRET_TOKEN_RE.test(id) || seenAgents.has(id)) continue;
+    seenAgents.add(id);
+    totalAgents += 1;
+    const isOnline = ag.online === true;
+    if (isOnline) onlineAgents += 1;
+    const seenCaps = new Set<string>();
+    for (const rawCap of Array.isArray(ag.capabilities) ? ag.capabilities.slice(0, 16) : []) {
+      const cap = typeof rawCap === "string" ? rawCap.trim().toLowerCase() : "";
+      if (!/^[a-z][a-z0-9_-]{0,31}$/.test(cap) || EMBEDDED_SECRET_TOKEN_RE.test(cap) || seenCaps.has(cap)) {
+        continue;
+      }
+      seenCaps.add(cap);
+      capTotals.set(cap, (capTotals.get(cap) ?? 0) + 1);
+      if (isOnline) capOnline.set(cap, (capOnline.get(cap) ?? 0) + 1);
+    }
+  }
+
+  const specialties: import("./types").ChannelBriefSpecialtyItem[] = [...capTotals.entries()]
+    .map(([capability, total_agents]) => ({
+      capability,
+      total_agents,
+      online_agents: capOnline.get(capability) ?? 0,
+    }))
+    .sort(
+      (a, b) =>
+        b.online_agents - a.online_agents ||
+        b.total_agents - a.total_agents ||
+        a.capability.localeCompare(b.capability),
+    )
+    .slice(0, 16);
+
+  const skillsObj =
+    brief.skills_summary && typeof brief.skills_summary === "object"
+      ? (brief.skills_summary as Record<string, unknown>)
+      : null;
+  const channelSkillCount = Array.isArray(skillsObj?.channel_skills)
+    ? skillsObj!.channel_skills.filter((s: any) => {
+        const docId = typeof s?.doc_id === "string" ? s.doc_id.trim() : "";
+        return safeGraphId(docId) && !EMBEDDED_SECRET_TOKEN_RE.test(docId) && s?.archived !== true;
+      }).length
+    : 0;
+  const personalSkillCount = Array.isArray(skillsObj?.personal_skills)
+    ? skillsObj!.personal_skills.filter((s: any) => {
+        const name = typeof s?.name === "string" ? s.name.trim() : "";
+        return safeGraphId(name) && !EMBEDDED_SECRET_TOKEN_RE.test(name) && s?.archived !== true;
+      }).length
+    : 0;
+
+  const okrObj =
+    brief.okr_summary && typeof brief.okr_summary === "object"
+      ? (brief.okr_summary as Record<string, unknown>)
+      : null;
+  const readyForMe =
+    typeof okrObj?.ready_for_me_count === "number" &&
+    Number.isFinite(okrObj.ready_for_me_count) &&
+    okrObj.ready_for_me_count >= 0
+      ? Math.trunc(okrObj.ready_for_me_count)
+      : 0;
+
+  const loopObj =
+    brief.loop_summary && typeof brief.loop_summary === "object"
+      ? (brief.loop_summary as Record<string, unknown>)
+      : null;
+  const unarmedObjectiveIds = Array.isArray(loopObj?.unarmed_objective_ids)
+    ? [
+        ...new Set(
+          loopObj!.unarmed_objective_ids
+            .filter((x): x is string => typeof x === "string")
+            .map((x) => x.trim())
+            .filter((x) => safeGraphId(x) && !EMBEDDED_SECRET_TOKEN_RE.test(x)),
+        ),
+      ].slice(0, 25)
+    : [];
+
+  const wakeObj =
+    brief.wake_health_summary &&
+    typeof brief.wake_health_summary === "object" &&
+    (brief.wake_health_summary as any).observation_only === true
+      ? (brief.wake_health_summary as Record<string, unknown>)
+      : null;
+  const attentionAgentIds = Array.isArray(wakeObj?.attention_agents)
+    ? [
+        ...new Set(
+          wakeObj!.attention_agents
+            .map((a: any) => (typeof a?.agent_id === "string" ? a.agent_id.trim() : ""))
+            .filter((id: string) => safeGraphId(id) && !EMBEDDED_SECRET_TOKEN_RE.test(id)),
+        ),
+      ].slice(0, 16)
+    : [];
+  const countsObj =
+    wakeObj?.counts && typeof wakeObj.counts === "object"
+      ? (wakeObj.counts as Record<string, unknown>)
+      : null;
+  const degradedCount =
+    ((typeof countsObj?.auth_required === "number" ? countsObj.auth_required : 0) || 0) +
+    ((typeof countsObj?.timeout === "number" ? countsObj.timeout : 0) || 0) +
+    ((typeof countsObj?.error === "number" ? countsObj.error : 0) || 0);
+
+  return {
+    channel_id: brief.channel_id as string,
+    online_agent_count: onlineAgents,
+    total_agent_count: totalAgents,
+    specialties,
+    channel_skill_count: channelSkillCount,
+    personal_skill_count: personalSkillCount,
+    personal_skills_unavailable: brief.personal_skills_unavailable === true,
+    ready_for_me_count: readyForMe,
+    unarmed_objective_ids: unarmedObjectiveIds,
+    attention_agent_ids: attentionAgentIds,
+    is_wake_healthy: attentionAgentIds.length === 0 && degradedCount === 0,
+  };
+}
+
 export function resolveInheritedObjectiveChannel(
   objectiveId: string,
   objectives: ReadonlyArray<import("./types").InheritableObjectiveChannelNode>,
@@ -1706,7 +1840,8 @@ export class AgentChatREST {
     channelId: string,
     opts?: { bearerToken?: string },
   ): Promise<import("./types").ChannelWakeHealth> {
-    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(channelId) || /^ac_/i.test(channelId)) {
+    const safeChannel = typeof channelId === "string" ? channelId.trim() : "";
+    if (!safeNonDmChannelId(safeChannel)) {
       throw new Error("Invalid channel ID");
     }
     const token = opts?.bearerToken?.trim() || this.bearerToken;
@@ -1716,7 +1851,7 @@ export class AgentChatREST {
       ...(token ? { Authorization: `Bearer ${token}` } : {}),
     };
     return this.get<import("./types").ChannelWakeHealth>(
-      `/api/channels/${encodeURIComponent(channelId)}/wake-health`,
+      `/api/channels/${encodeURIComponent(safeChannel)}/wake-health`,
       headers,
     );
   }
@@ -1727,7 +1862,14 @@ export class AgentChatREST {
     channelId: string,
     opts?: { bearerToken?: string },
   ): Promise<import("./types").RoomLoopsFeed> {
-    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(channelId) || /^ac_/i.test(channelId)) {
+    const safeChannel = typeof channelId === "string" ? channelId.trim() : "";
+    if (
+      !safeChannel ||
+      !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(safeChannel) ||
+      safeChannel.includes("..") ||
+      CREDENTIAL_PREFIX_RE.test(safeChannel) ||
+      EMBEDDED_SECRET_TOKEN_RE.test(safeChannel)
+    ) {
       throw new Error("Invalid channel ID");
     }
     const token = opts?.bearerToken?.trim() || this.bearerToken;
@@ -1737,7 +1879,7 @@ export class AgentChatREST {
       ...(token ? { Authorization: `Bearer ${token}` } : {}),
     };
     return this.get<import("./types").RoomLoopsFeed>(
-      `/api/loops?channel_id=${encodeURIComponent(channelId)}`,
+      `/api/loops?channel_id=${encodeURIComponent(safeChannel)}`,
       headers,
     );
   }
@@ -1781,14 +1923,7 @@ export class AgentChatREST {
     opts?: { bearerToken?: string },
   ): Promise<import("./types").ChannelBrief> {
     const safeChannel = typeof channelId === "string" ? channelId.trim() : "";
-    if (
-      !safeChannel ||
-      !/^[A-Za-z0-9_-][A-Za-z0-9._-]{0,127}$/.test(safeChannel) ||
-      safeChannel.includes("..") ||
-      CREDENTIAL_PREFIX_RE.test(safeChannel) ||
-      EMAIL_ID_RE.test(safeChannel) ||
-      PHONE_ID_RE.test(safeChannel)
-    ) {
+    if (!safeNonDmChannelId(safeChannel)) {
       throw new Error("Invalid channel ID");
     }
     const token = opts?.bearerToken?.trim() || this.bearerToken;
@@ -4266,13 +4401,17 @@ export class AgentChatREST {
       !channelId ||
       !/^[A-Za-z0-9_][A-Za-z0-9_-]{0,127}$/.test(channelId) ||
       channelId.startsWith("arena-") ||
-      /^(?:ac_|agent_key_|sk[-_]|gh[pousr]_|github_pat_|AIza|eyJ)/i.test(channelId)
+      /^(?:ac_|agent_key_|sk[-_]|gh[pousr]_|github_pat_|AIza|eyJ)/i.test(channelId) ||
+      EMBEDDED_SECRET_TOKEN_RE.test(channelId)
     ) {
       throw new Error("Invalid channel ID");
     }
     const mode = input.mode ?? "prompt";
     if (!["prompt", "okr_wake", "okr_watch"].includes(mode)) {
       throw new Error("Invalid loop mode");
+    }
+    if (mode !== "prompt" && DM_OR_DIRECT_CHANNEL_RE.test(channelId)) {
+      throw new Error("OKR loops require a group or project channel");
     }
     const body: Record<string, unknown> = { channel_id: channelId, mode };
     if (input.interval !== undefined) {
@@ -4300,7 +4439,7 @@ export class AgentChatREST {
 
     if (mode !== "prompt") {
       const oid = typeof input.objective_id === "string" ? input.objective_id.trim() : "";
-      if (!/^[A-Za-z0-9_-]{6,80}$/.test(oid) || /^ac_/i.test(oid)) {
+      if (!/^[A-Za-z0-9_-]{6,80}$/.test(oid) || /^ac_/i.test(oid) || EMBEDDED_SECRET_TOKEN_RE.test(oid)) {
         throw new Error("Invalid objective ID");
       }
       body.objective_id = oid;
