@@ -423,6 +423,8 @@ export function summarizeWorkspaceGraphHierarchy(
 }
 
 const DM_OR_DIRECT_CHANNEL_RE = /^(?:dm[-_]|direct(?:$|[-_:]))/i;
+const EMBEDDED_SECRET_TOKEN_RE =
+  /(?:^|[^A-Za-z0-9])(?:ac_[A-Za-z0-9_-]{8,}|agent_key_[A-Za-z0-9_-]{8,}|sk[-_][A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9_]{8,}|github_pat_[A-Za-z0-9_]{8,}|AIza[A-Za-z0-9_-]{12,}|eyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}|\bBearer\s+[A-Za-z0-9._~+/=-]{16,}|-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----)/i;
 
 function safeNonDmChannelId(value: unknown): value is string {
   return (
@@ -430,8 +432,168 @@ function safeNonDmChannelId(value: unknown): value is string {
     value.length >= 1 &&
     value.length <= 128 &&
     !DM_OR_DIRECT_CHANNEL_RE.test(value) &&
+    !EMBEDDED_SECRET_TOKEN_RE.test(value) &&
     safeGraphId(value)
   );
+}
+
+export function evaluateConsensusTally(
+  decisions: ReadonlyArray<import("./types").VoteDecision>,
+  totalVoters: number,
+  rule: import("./types").ConsensusRule,
+): import("./types").ConsensusTallyResult {
+  const safeTotal = Number.isFinite(totalVoters) && totalVoters > 0 ? Math.floor(totalVoters) : 0;
+  const safeRule: import("./types").ConsensusRule =
+    rule === "super_majority" || rule === "unanimous" ? rule : "majority";
+  let approveCount = 0;
+  let rejectCount = 0;
+  let abstainCount = 0;
+  if (Array.isArray(decisions)) {
+    for (const d of decisions) {
+      if (d === "approve") approveCount += 1;
+      else if (d === "reject") rejectCount += 1;
+      else if (d === "abstain") abstainCount += 1;
+    }
+  }
+  const votedCount = approveCount + rejectCount + abstainCount;
+  const effectiveVoters = safeTotal - abstainCount;
+  const effectiveForRequired = Math.max(0, effectiveVoters);
+  const requiredApprovals =
+    effectiveForRequired <= 0
+      ? 0
+      : safeRule === "super_majority"
+        ? Math.ceil((effectiveForRequired * 2) / 3)
+        : safeRule === "unanimous"
+          ? effectiveForRequired
+          : Math.floor(effectiveForRequired / 2) + 1;
+
+  if (effectiveVoters <= 0) {
+    return {
+      passed: false,
+      is_complete: votedCount >= safeTotal,
+      approve_count: approveCount,
+      reject_count: rejectCount,
+      abstain_count: abstainCount,
+      effective_voters: effectiveVoters,
+      voted_count: votedCount,
+      total_voters: safeTotal,
+      required_approvals: requiredApprovals,
+    };
+  }
+
+  let passed: boolean;
+  let isComplete: boolean;
+  switch (safeRule) {
+    case "majority": {
+      passed = approveCount / effectiveVoters > 0.5;
+      const remaining = Math.max(0, safeTotal - votedCount);
+      const canStillPass = (approveCount + remaining) / (effectiveVoters + remaining) > 0.5;
+      const canStillFail = approveCount / (effectiveVoters + remaining) <= 0.5;
+      isComplete = votedCount >= safeTotal || (passed && !canStillFail) || (!passed && !canStillPass);
+      break;
+    }
+    case "super_majority": {
+      passed = approveCount / effectiveVoters >= 2 / 3;
+      isComplete = votedCount >= safeTotal;
+      break;
+    }
+    case "unanimous": {
+      passed = approveCount === effectiveVoters && rejectCount === 0;
+      isComplete = rejectCount > 0 || votedCount >= safeTotal;
+      break;
+    }
+  }
+
+  return {
+    passed,
+    is_complete: isComplete,
+    approve_count: approveCount,
+    reject_count: rejectCount,
+    abstain_count: abstainCount,
+    effective_voters: effectiveVoters,
+    voted_count: votedCount,
+    total_voters: safeTotal,
+    required_approvals: requiredApprovals,
+  };
+}
+
+export function summarizeProposalsFeed(
+  raw: unknown,
+  nowMs?: number,
+): import("./types").ProposalsFeedSummary | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const feed = raw as Record<string, unknown>;
+  if (!safeNonDmChannelId(feed.channel_id) || !Array.isArray(feed.proposals) || feed.proposals.length > 500) {
+    return null;
+  }
+  const channelId = feed.channel_id;
+  const refNow = typeof nowMs === "number" && Number.isFinite(nowMs) ? nowMs : Date.now();
+  const canPropose = feed.can_propose === false || feed.read_only === true ? false : true;
+
+  let pendingCount = 0;
+  let passedCount = 0;
+  let rejectedCount = 0;
+  let expiredCount = 0;
+  let ballotRationaleCount = 0;
+  const pendingIds: string[] = [];
+  const seenIds = new Set<string>();
+
+  for (const item of feed.proposals) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    const p = item as Record<string, unknown>;
+    if (!safeGraphId(p.id) || EMBEDDED_SECRET_TOKEN_RE.test(p.id) || seenIds.has(p.id)) continue;
+    if (p.channel_id !== undefined && p.channel_id !== channelId) continue;
+    seenIds.add(p.id);
+
+    let status: import("./types").ChannelProposalStatus =
+      p.status === "passed" || p.status === "rejected" || p.status === "expired" ? p.status : "pending";
+    if (status === "pending" && typeof p.expires_at === "string" && p.expires_at.trim()) {
+      const expMs = Date.parse(p.expires_at);
+      if (Number.isFinite(expMs) && expMs <= refNow) {
+        status = "expired";
+      }
+    }
+
+    if (status === "passed") passedCount += 1;
+    else if (status === "rejected") rejectedCount += 1;
+    else if (status === "expired") expiredCount += 1;
+    else {
+      pendingCount += 1;
+      pendingIds.push(p.id);
+    }
+
+    if (Array.isArray(p.votes)) {
+      const seenVoters = new Set<string>();
+      for (const v of p.votes.slice(0, 200)) {
+        if (!v || typeof v !== "object") continue;
+        const vote = v as Record<string, unknown>;
+        if (vote.decision !== "approve" && vote.decision !== "reject" && vote.decision !== "abstain") continue;
+        const voterKey = typeof vote.voter_id === "string" && vote.voter_id.trim() ? vote.voter_id.trim() : "";
+        if (!voterKey || seenVoters.has(voterKey)) continue;
+        seenVoters.add(voterKey);
+        if (
+          typeof vote.reason === "string" &&
+          vote.reason.trim().length > 0 &&
+          !EMBEDDED_SECRET_TOKEN_RE.test(vote.reason)
+        ) {
+          ballotRationaleCount += 1;
+        }
+      }
+    }
+  }
+
+  return {
+    channel_id: channelId,
+    can_propose: canPropose,
+    read_only: !canPropose,
+    total_proposals: seenIds.size,
+    pending_count: pendingCount,
+    passed_count: passedCount,
+    rejected_count: rejectedCount,
+    expired_count: expiredCount,
+    pending_ids: pendingIds,
+    ballot_rationale_count: ballotRationaleCount,
+  };
 }
 
 export function resolveInheritedObjectiveChannel(
@@ -1526,7 +1688,7 @@ export class AgentChatREST {
     channelId: string,
     opts?: { limit?: number; bearerToken?: string },
   ): Promise<import("./types").ChannelProposalsFeed> {
-    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(channelId) || /^(?:ac_|sk-)/i.test(channelId)) {
+    if (!safeNonDmChannelId(channelId) || this.containsMemorySecretShape(channelId)) {
       throw new Error("Invalid channel ID");
     }
     const params = new URLSearchParams();
@@ -1552,12 +1714,27 @@ export class AgentChatREST {
     input: import("./types").CreateChannelProposalInput,
     opts?: { bearerToken?: string },
   ): Promise<import("./types").CreateChannelProposalResponse> {
-    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(channelId) || /^(?:ac_|sk-)/i.test(channelId)) {
+    if (!safeNonDmChannelId(channelId) || this.containsMemorySecretShape(channelId)) {
       throw new Error("Invalid channel ID");
+    }
+    if (
+      input?.id !== undefined &&
+      (!safeGraphId(input.id) || EMBEDDED_SECRET_TOKEN_RE.test(input.id) || this.containsMemorySecretShape(input.id))
+    ) {
+      throw new Error("Invalid proposal ID");
     }
     const title = input?.title?.trim() ?? "";
     if (!title || title.length > 500) {
       throw new Error("Invalid proposal title");
+    }
+    for (const textField of [title, input?.content, input?.code_diff]) {
+      if (
+        typeof textField === "string" &&
+        textField.length > 0 &&
+        (EMBEDDED_SECRET_TOKEN_RE.test(textField) || this.containsMemorySecretShape(textField))
+      ) {
+        throw new Error("Secret or credential detected in proposal payload");
+      }
     }
     if (input.consensus_rule && !["majority", "super_majority", "unanimous"].includes(input.consensus_rule)) {
       throw new Error("Invalid consensus rule");
@@ -1593,14 +1770,25 @@ export class AgentChatREST {
     input: import("./types").VoteChannelProposalInput,
     opts?: { bearerToken?: string },
   ): Promise<import("./types").VoteChannelProposalResponse> {
-    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(channelId) || /^(?:ac_|sk-)/i.test(channelId)) {
+    if (!safeNonDmChannelId(channelId) || this.containsMemorySecretShape(channelId)) {
       throw new Error("Invalid channel ID");
     }
-    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(proposalId) || /^(?:ac_|sk-)/i.test(proposalId)) {
+    if (
+      !safeGraphId(proposalId) ||
+      EMBEDDED_SECRET_TOKEN_RE.test(proposalId) ||
+      this.containsMemorySecretShape(proposalId)
+    ) {
       throw new Error("Invalid proposal ID");
     }
     if (!input || !["approve", "reject", "abstain"].includes(input.decision)) {
       throw new Error("Invalid vote decision");
+    }
+    if (
+      typeof input.reason === "string" &&
+      input.reason.length > 0 &&
+      (EMBEDDED_SECRET_TOKEN_RE.test(input.reason) || this.containsMemorySecretShape(input.reason))
+    ) {
+      throw new Error("Secret or credential detected in vote reason");
     }
     const token = opts?.bearerToken?.trim() || this.bearerToken;
     const headers: Record<string, string> = {

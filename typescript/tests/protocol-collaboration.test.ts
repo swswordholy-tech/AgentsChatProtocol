@@ -3,9 +3,11 @@ import {
   AgentChatClient,
   AgentChatREST,
   computeLocalTaskActionability,
+  evaluateConsensusTally,
   isValidCollaborationRoster,
   resolveInheritedObjectiveChannel,
   summarizeChannelOkrSnapshot,
+  summarizeProposalsFeed,
   summarizeWorkspaceGraphHierarchy,
   summarizeWorkspaceGraphReadiness,
   type ACMessage,
@@ -3322,6 +3324,158 @@ describe("AgentChatClient realtime collaboration WS events", () => {
       await expect(rest.getWorkspaceGraph("objective", "room_sk-proj-1234567890abcdef")).rejects.toThrow(
         "Invalid workspace graph ID",
       );
+      expect(fetchCalls).toBe(0);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("evaluateConsensusTally, summarizeProposalsFeed, and proposal REST guards enforce server-identical consensus math and zero secret/DM egress", async () => {
+    // 1. Majority: >50% of effective_voters, conservative server-identical early pass/fail, all-abstain => passed: false
+    expect(evaluateConsensusTally(["approve", "approve", "approve", "approve"], 5, "majority")).toEqual({
+      passed: true,
+      is_complete: true,
+      approve_count: 4,
+      reject_count: 0,
+      abstain_count: 0,
+      effective_voters: 5,
+      voted_count: 4,
+      total_voters: 5,
+      required_approvals: 3,
+    });
+    expect(evaluateConsensusTally(["reject", "reject", "reject", "reject"], 5, "majority")).toMatchObject({
+      passed: false,
+      is_complete: true,
+      effective_voters: 5,
+    });
+    expect(evaluateConsensusTally(["approve", "approve"], 3, "majority")).toMatchObject({
+      passed: true,
+      is_complete: false,
+      effective_voters: 3,
+      required_approvals: 2,
+    });
+    expect(evaluateConsensusTally(["approve"], 5, "majority")).toMatchObject({
+      passed: false,
+      is_complete: false,
+      effective_voters: 5,
+      required_approvals: 3,
+    });
+    expect(evaluateConsensusTally(["abstain", "abstain"], 2, "majority")).toMatchObject({
+      passed: false,
+      is_complete: true,
+      effective_voters: 0,
+      required_approvals: 0,
+    });
+
+    // 2. Supermajority: >= 2/3 of effective_voters, completes only when voted_count >= total_voters
+    expect(evaluateConsensusTally(["reject", "reject"], 3, "super_majority")).toMatchObject({
+      passed: false,
+      is_complete: false,
+      effective_voters: 3,
+      required_approvals: 2,
+    });
+    expect(evaluateConsensusTally(["approve", "approve", "abstain", "reject"], 4, "super_majority")).toMatchObject({
+      passed: true,
+      is_complete: true,
+      effective_voters: 3,
+      required_approvals: 2,
+    });
+
+    // 3. Unanimous: 100% of effective_voters, single reject terminates early
+    expect(evaluateConsensusTally(["reject"], 5, "unanimous")).toMatchObject({
+      passed: false,
+      is_complete: true,
+      effective_voters: 5,
+      required_approvals: 5,
+    });
+    expect(evaluateConsensusTally(["approve", "abstain", "approve"], 3, "unanimous")).toMatchObject({
+      passed: true,
+      is_complete: true,
+      effective_voters: 2,
+      required_approvals: 2,
+    });
+
+    // 4. summarizeProposalsFeed handles fail-closed expiry, read-only supervision, ballot rationales, and DM rejection
+    const nowMs = Date.parse("2026-11-14T08:00:00.000Z");
+    const summary = summarizeProposalsFeed(
+      {
+        channel_id: "room-dev",
+        can_propose: false,
+        read_only: true,
+        proposals: [
+          {
+            id: "prop-open",
+            channel_id: "room-dev",
+            status: "pending",
+            expires_at: "2026-11-15T00:00:00.000Z",
+            votes: [
+              { voter_id: "bot_1", decision: "approve", reason: "Verified cross-pod invite restore" },
+              { voter_id: "bot_2", decision: "abstain", reason: "leaked sk-live_secret_token_123456" },
+            ],
+          },
+          {
+            id: "prop-stale",
+            channel_id: "room-dev",
+            status: "pending",
+            expires_at: "2026-11-14T01:00:00.000Z",
+            votes: [],
+          },
+          {
+            id: "prop-passed",
+            channel_id: "room-dev",
+            status: "passed",
+            votes: [{ voter_id: "bot_3", decision: "approve", reason: "LGTM with tests" }],
+          },
+          {
+            id: "prop_sk-proj-1234567890abcdef",
+            channel_id: "room-dev",
+            status: "pending",
+          },
+        ],
+      },
+      nowMs,
+    );
+    expect(summary).toEqual({
+      channel_id: "room-dev",
+      can_propose: false,
+      read_only: true,
+      total_proposals: 3,
+      pending_count: 1,
+      passed_count: 1,
+      rejected_count: 0,
+      expired_count: 1,
+      pending_ids: ["prop-open"],
+      ballot_rationale_count: 2,
+    });
+    expect(summarizeProposalsFeed({ channel_id: "dm-secret", proposals: [] })).toBeNull();
+
+    // 5. Proposal REST guards reject DM channels and embedded secrets with zero fetch egress
+    const originalFetch = globalThis.fetch;
+    let fetchCalls = 0;
+    globalThis.fetch = (async () => {
+      fetchCalls += 1;
+      return Response.json({ ok: true });
+    }) as unknown as typeof fetch;
+
+    try {
+      const rest = new AgentChatREST({ baseUrl: "https://agents-chat.com", bearerToken: "tok_42" });
+      await expect(rest.listChannelProposals("dm-private-chat")).rejects.toThrow("Invalid channel ID");
+      await expect(rest.listChannelProposals("room_sk-proj-1234567890abcdef")).rejects.toThrow("Invalid channel ID");
+      await expect(
+        rest.createChannelProposal("room-dev", {
+          title: "Deploy token sk-proj-1234567890abcdef",
+          consensus_rule: "majority",
+        }),
+      ).rejects.toThrow("Secret or credential detected");
+      await expect(
+        rest.voteChannelProposal("room-dev", "prop-open", {
+          decision: "approve",
+          reason: "Using ghp_1234567890abcdef token",
+        }),
+      ).rejects.toThrow("Secret or credential detected");
+      await expect(
+        rest.voteChannelProposal("room-dev", "prop_ac_secret_987654321", { decision: "approve" }),
+      ).rejects.toThrow("Invalid proposal ID");
       expect(fetchCalls).toBe(0);
     } finally {
       globalThis.fetch = originalFetch;

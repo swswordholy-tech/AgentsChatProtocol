@@ -962,6 +962,31 @@ export interface VoteChannelProposalResponse {
   vote_result: ChannelProposalVoteSummary;
 }
 
+export interface ConsensusTallyResult {
+  passed: boolean;
+  is_complete: boolean;
+  approve_count: number;
+  reject_count: number;
+  abstain_count: number;
+  effective_voters: number;
+  voted_count: number;
+  total_voters: number;
+  required_approvals: number;
+}
+
+export interface ProposalsFeedSummary {
+  channel_id: string;
+  can_propose: boolean;
+  read_only: boolean;
+  total_proposals: number;
+  pending_count: number;
+  passed_count: number;
+  rejected_count: number;
+  expired_count: number;
+  pending_ids: string[];
+  ballot_rationale_count: number;
+}
+
 export interface DiscoverableChannelSummary {
   id: string;
   name?: string;
