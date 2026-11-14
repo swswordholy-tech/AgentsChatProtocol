@@ -1026,6 +1026,80 @@ export function summarizePersonalSkillsLibrary(
 
 const AGENT_MEMORY_DEFAULT_CAP = 20;
 const AGENT_MEMORY_DEFAULT_BODY_CAP = 256_000;
+const PROTOTYPE_POISON_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+const CLOUD_DIRECT_CHANNEL_RE = /^(?:dm[-_]|direct(?:$|[_:]))/i;
+
+function isSafeCloudRoomAgentId(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    /^[A-Za-z0-9_-]{2,64}$/.test(value) &&
+    !PROTOTYPE_POISON_KEYS.has(value) &&
+    !CREDENTIAL_PREFIX_RE.test(value) &&
+    !EMBEDDED_SECRET_TOKEN_RE.test(value)
+  );
+}
+
+function isSafeCloudGroupChannelId(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    /^[A-Za-z0-9_][A-Za-z0-9_-]{0,127}$/.test(value) &&
+    !PROTOTYPE_POISON_KEYS.has(value) &&
+    !CLOUD_DIRECT_CHANNEL_RE.test(value) &&
+    !CREDENTIAL_PREFIX_RE.test(value) &&
+    !EMBEDDED_SECRET_TOKEN_RE.test(value)
+  );
+}
+
+export function summarizeCloudAgentRoomPolicy(
+  raw: unknown,
+): import("./types").CloudAgentRoomPolicySummary | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const rec = raw as Record<string, unknown>;
+  const agentId = typeof rec.agent_id === "string" ? rec.agent_id.trim() : "";
+  if (!isSafeCloudRoomAgentId(agentId)) return null;
+
+  const cfg =
+    rec.recovery_config && typeof rec.recovery_config === "object" && !Array.isArray(rec.recovery_config)
+      ? (rec.recovery_config as Record<string, unknown>)
+      : {};
+  const isSubscription =
+    cfg.auth_mode === "subscription" ||
+    (typeof rec.credential_ref === "string" && rec.credential_ref.startsWith("subscription:"));
+  const eligible =
+    rec.is_host === false &&
+    rec.status === "active" &&
+    !Boolean(rec.deletion_pending) &&
+    (!isSubscription || cfg.subscription_connected === true);
+
+  const channelIds: string[] = [];
+  const seen = new Set<string>();
+  if (Array.isArray(rec.channels)) {
+    for (const rawCh of rec.channels.slice(0, 200)) {
+      if (typeof rawCh !== "string") continue;
+      if (!isSafeCloudGroupChannelId(rawCh) || seen.has(rawCh)) continue;
+      seen.add(rawCh);
+      channelIds.push(rawCh);
+    }
+  }
+
+  const defaultChannelId = channelIds.includes("welcome")
+    ? "welcome"
+    : (channelIds[0] ?? null);
+  const removableChannelIds =
+    eligible && channelIds.length > 1
+      ? channelIds.filter((id) => id !== "welcome" && id !== defaultChannelId)
+      : [];
+
+  return {
+    agent_id: agentId,
+    eligible,
+    channel_ids: channelIds,
+    default_channel_id: defaultChannelId,
+    removable_channel_ids: removableChannelIds,
+    can_join_rooms: eligible,
+    is_protected_only: channelIds.length > 0 && removableChannelIds.length === 0,
+  };
+}
 
 function isValidMemoryAgentId(value: unknown): value is string {
   return (
@@ -4238,15 +4312,11 @@ export class AgentChatREST {
     opts?: { bearerToken?: string },
   ): Promise<import("./types").CloudAgentChannelMutationResponse> {
     const safeAgent = agentId?.trim() ?? "";
-    if (!/^[A-Za-z0-9_-]{2,64}$/.test(safeAgent) || /^(?:ac_|sk[-_])/i.test(safeAgent)) {
+    if (!isSafeCloudRoomAgentId(safeAgent)) {
       throw new Error("Invalid cloud agent ID");
     }
     const safeChannel = channelId?.trim() ?? "";
-    if (
-      !/^[A-Za-z0-9_][A-Za-z0-9_-]{0,127}$/.test(safeChannel) ||
-      /^dm-/i.test(safeChannel) ||
-      /^(?:ac_|sk[-_])/i.test(safeChannel)
-    ) {
+    if (!isSafeCloudGroupChannelId(safeChannel)) {
       throw new Error("Invalid group channel ID");
     }
     return this.post<import("./types").CloudAgentChannelMutationResponse>(
@@ -4262,15 +4332,11 @@ export class AgentChatREST {
     opts?: { bearerToken?: string },
   ): Promise<import("./types").CloudAgentChannelMutationResponse> {
     const safeAgent = agentId?.trim() ?? "";
-    if (!/^[A-Za-z0-9_-]{2,64}$/.test(safeAgent) || /^(?:ac_|sk[-_])/i.test(safeAgent)) {
+    if (!isSafeCloudRoomAgentId(safeAgent)) {
       throw new Error("Invalid cloud agent ID");
     }
     const safeChannel = channelId?.trim() ?? "";
-    if (
-      !/^[A-Za-z0-9_][A-Za-z0-9_-]{0,127}$/.test(safeChannel) ||
-      /^dm-/i.test(safeChannel) ||
-      /^(?:ac_|sk[-_])/i.test(safeChannel)
-    ) {
+    if (!isSafeCloudGroupChannelId(safeChannel)) {
       throw new Error("Invalid group channel ID");
     }
     if (safeChannel === "welcome") {
@@ -4288,13 +4354,19 @@ export class AgentChatREST {
     input?: import("./types").WakeCloudAgentInput,
   ): Promise<import("./types").WakeCloudAgentResponse> {
     const safeAgent = agentId?.trim() ?? "";
-    if (!/^[A-Za-z0-9_-]{2,64}$/.test(safeAgent) || /^(?:ac_|sk[-_])/i.test(safeAgent)) {
+    if (!isSafeCloudRoomAgentId(safeAgent)) {
       throw new Error("Invalid cloud agent ID");
     }
     const body: Record<string, unknown> = {};
     if (input?.channel_id !== undefined) {
       const safeChannel = input.channel_id.trim();
-      if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(safeChannel) || /^(?:ac_|sk[-_])/i.test(safeChannel)) {
+      if (
+        !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(safeChannel) ||
+        safeChannel.includes("..") ||
+        PROTOTYPE_POISON_KEYS.has(safeChannel) ||
+        CREDENTIAL_PREFIX_RE.test(safeChannel) ||
+        EMBEDDED_SECRET_TOKEN_RE.test(safeChannel)
+      ) {
         throw new Error("Invalid channel ID");
       }
       body.channel_id = safeChannel;

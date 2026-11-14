@@ -1829,6 +1829,16 @@ export interface CloudAgentChannelMutationResponse {
   agent?: Record<string, unknown>;
 }
 
+export interface CloudAgentRoomPolicySummary {
+  agent_id: string;
+  eligible: boolean;
+  channel_ids: string[];
+  default_channel_id: string | null;
+  removable_channel_ids: string[];
+  can_join_rooms: boolean;
+  is_protected_only: boolean;
+}
+
 export interface WakeCloudAgentInput {
   channel_id?: string;
   prompt?: string;

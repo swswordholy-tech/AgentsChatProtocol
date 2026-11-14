@@ -10,6 +10,7 @@ import {
   summarizeChannelBriefReadiness,
   summarizeChannelOkrSnapshot,
   summarizeChannelThreads,
+  summarizeCloudAgentRoomPolicy,
   summarizePersonalSkillsLibrary,
   summarizeProposalsFeed,
   summarizeWorkspaceGraphHierarchy,
@@ -3939,5 +3940,78 @@ describe("AgentChatClient realtime collaboration WS events", () => {
         description: "glpat-1234567890abcdefghij",
       }),
     ).rejects.toThrow("must not contain API keys");
+  });
+
+  test("summarizeCloudAgentRoomPolicy and cloud room join/leave/wake enforce default-room & multi-cloud credential guards", async () => {
+    const policy = summarizeCloudAgentRoomPolicy({
+      agent_id: "codex-cloud-01",
+      is_host: false,
+      status: "active",
+      deletion_pending: false,
+      recovery_config: { auth_mode: "subscription", subscription_connected: true },
+      channels: [
+        "room-alpha",
+        "welcome",
+        "room-beta",
+        "room-alpha",
+        "dm-hidden",
+        "dm_secret",
+        "direct",
+        "__proto__",
+        "room_ac_secret_12345678",
+      ],
+    });
+    expect(policy).toEqual({
+      agent_id: "codex-cloud-01",
+      eligible: true,
+      channel_ids: ["room-alpha", "welcome", "room-beta"],
+      default_channel_id: "welcome",
+      removable_channel_ids: ["room-alpha", "room-beta"],
+      can_join_rooms: true,
+      is_protected_only: false,
+    });
+
+    const singleRoom = summarizeCloudAgentRoomPolicy({
+      agent_id: "codex-cloud-02",
+      is_host: false,
+      status: "active",
+      channels: ["only-room"],
+    });
+    expect(singleRoom).toEqual({
+      agent_id: "codex-cloud-02",
+      eligible: true,
+      channel_ids: ["only-room"],
+      default_channel_id: "only-room",
+      removable_channel_ids: [],
+      can_join_rooms: true,
+      is_protected_only: true,
+    });
+
+    const unverifiedSub = summarizeCloudAgentRoomPolicy({
+      agent_id: "codex-cloud-03",
+      is_host: false,
+      status: "active",
+      credential_ref: "subscription:codex",
+      recovery_config: { auth_mode: "subscription", subscription_connected: false },
+      channels: ["welcome", "room-alpha"],
+    });
+    expect(unverifiedSub?.eligible).toBe(false);
+    expect(unverifiedSub?.can_join_rooms).toBe(false);
+    expect(unverifiedSub?.removable_channel_ids).toEqual([]);
+    expect(summarizeCloudAgentRoomPolicy({ agent_id: "__proto__", channels: [] })).toBeNull();
+    expect(summarizeCloudAgentRoomPolicy({ agent_id: "agent_key_1234567890", channels: [] })).toBeNull();
+
+    const rest = new AgentChatREST({ baseUrl: "https://agents-chat.com", bearerToken: "jwt_owner_48" });
+    await expect(rest.cloudAgentJoinChannel("__proto__", "room-alpha")).rejects.toThrow("Invalid cloud agent ID");
+    await expect(rest.cloudAgentJoinChannel("agent_key_1234567890", "room-alpha")).rejects.toThrow("Invalid cloud agent ID");
+    await expect(rest.cloudAgentJoinChannel("bot_ac_secret_12345678", "room-alpha")).rejects.toThrow("Invalid cloud agent ID");
+    await expect(rest.cloudAgentJoinChannel("codex-cloud-01", "dm_secret")).rejects.toThrow("Invalid group channel ID");
+    await expect(rest.cloudAgentJoinChannel("codex-cloud-01", "direct")).rejects.toThrow("Invalid group channel ID");
+    await expect(rest.cloudAgentJoinChannel("codex-cloud-01", "__proto__")).rejects.toThrow("Invalid group channel ID");
+    await expect(rest.cloudAgentLeaveChannel("codex-cloud-01", "welcome")).rejects.toThrow("Default channel welcome");
+    await expect(rest.cloudAgentLeaveChannel("codex-cloud-01", "room_sk-1234567890abcdef")).rejects.toThrow("Invalid group channel ID");
+    await expect(rest.wakeCloudAgent("glpat-1234567890abcdef")).rejects.toThrow("Invalid cloud agent ID");
+    await expect(rest.wakeCloudAgent("codex-cloud-01", { channel_id: "room..escape" })).rejects.toThrow("Invalid channel ID");
+    await expect(rest.wakeCloudAgent("codex-cloud-01", { channel_id: "__proto__" })).rejects.toThrow("Invalid channel ID");
   });
 });
