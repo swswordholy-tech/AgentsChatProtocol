@@ -897,6 +897,133 @@ export function summarizeChannelBriefReadiness(
   };
 }
 
+const PERSONAL_SKILL_SLUG_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/;
+const PERSONAL_SKILL_ACTIVE_QUOTA = 50;
+
+function isValidPersonalSkillSlug(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    PERSONAL_SKILL_SLUG_RE.test(value) &&
+    !value.includes("..") &&
+    !CREDENTIAL_PREFIX_RE.test(value) &&
+    !/^xox[baprs]-/i.test(value) &&
+    !EMBEDDED_SECRET_TOKEN_RE.test(value) &&
+    !EMAIL_ID_RE.test(value) &&
+    !PHONE_ID_RE.test(value)
+  );
+}
+
+function cleanSkillFieldText(value: unknown, maxLen: number): string {
+  if (typeof value !== "string") return "";
+  const cleaned = value.replace(/[\u0000-\u001F\u007F]+/g, " ").trim();
+  if (!cleaned || EMBEDDED_SECRET_TOKEN_RE.test(cleaned) || EMAIL_ID_RE.test(cleaned)) {
+    return "";
+  }
+  return cleaned.slice(0, maxLen);
+}
+
+function hasValidSkillFrontmatter(markdown: string): boolean {
+  const match = markdown.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/);
+  if (!match) return false;
+  let hasName = false;
+  let hasDescription = false;
+  for (const line of match[1].split(/\r?\n/)) {
+    const idx = line.indexOf(":");
+    if (idx <= 0) continue;
+    const key = line.slice(0, idx).trim();
+    const val = line.slice(idx + 1).trim().replace(/^["']|["']$/g, "");
+    if (!val) continue;
+    if (key === "name") hasName = true;
+    else if (key === "description") hasDescription = true;
+  }
+  return hasName && hasDescription;
+}
+
+export function summarizePersonalSkillsLibrary(
+  raw: unknown,
+): import("./types").PersonalSkillsLibrarySummary | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const payload = raw as Record<string, unknown>;
+  if (!Array.isArray(payload.skills) || payload.skills.length > 500) return null;
+
+  const seenNames = new Set<string>();
+  const triggersSet = new Set<string>();
+  const items: import("./types").PersonalSkillCatalogItem[] = [];
+  let activeCount = 0;
+  let archivedCount = 0;
+  let triggeredCount = 0;
+
+  for (const entry of payload.skills) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+    const row = entry as Record<string, unknown>;
+    const name = typeof row.name === "string" ? row.name.trim() : "";
+    if (!isValidPersonalSkillSlug(name) || seenNames.has(name)) continue;
+    seenNames.add(name);
+
+    const meta =
+      row.skill_meta && typeof row.skill_meta === "object" && !Array.isArray(row.skill_meta)
+        ? (row.skill_meta as Record<string, unknown>)
+        : null;
+    const version =
+      typeof row.version === "number" && Number.isSafeInteger(row.version) && row.version >= 1
+        ? row.version
+        : 1;
+    const archived = row.archived === true;
+    const title = cleanSkillFieldText(row.title ?? meta?.name, 120) || name;
+    const description = cleanSkillFieldText(row.description ?? meta?.description, 280);
+    const triggerRaw = cleanSkillFieldText(meta?.trigger, 120);
+    const trigger = triggerRaw || null;
+    const argHintRaw = cleanSkillFieldText(meta?.argument_hint, 120);
+    const argumentHint = argHintRaw || null;
+    const updatedAt =
+      typeof row.updated_at === "string" &&
+      row.updated_at.length <= 64 &&
+      /^\d{4}-\d{2}-\d{2}T/.test(row.updated_at) &&
+      Number.isFinite(Date.parse(row.updated_at))
+        ? row.updated_at
+        : null;
+
+    if (archived) {
+      archivedCount += 1;
+    } else {
+      activeCount += 1;
+      if (trigger) {
+        triggeredCount += 1;
+        triggersSet.add(trigger);
+      }
+    }
+
+    items.push({
+      name,
+      title,
+      description,
+      trigger,
+      argument_hint: argumentHint,
+      version,
+      archived,
+      updated_at: updatedAt,
+    });
+  }
+
+  items.sort((a, b) => {
+    if (a.archived !== b.archived) return a.archived ? 1 : -1;
+    const aTime = a.updated_at ?? "";
+    const bTime = b.updated_at ?? "";
+    if (aTime !== bTime) return bTime.localeCompare(aTime);
+    return a.name.localeCompare(b.name);
+  });
+
+  return {
+    total_skills: items.length,
+    active_count: activeCount,
+    archived_count: archivedCount,
+    remaining_active_quota: Math.max(0, PERSONAL_SKILL_ACTIVE_QUOTA - activeCount),
+    triggered_count: triggeredCount,
+    triggers: [...triggersSet].sort(),
+    items,
+  };
+}
+
 export function resolveInheritedObjectiveChannel(
   objectiveId: string,
   objectives: ReadonlyArray<import("./types").InheritableObjectiveChannelNode>,
@@ -2269,8 +2396,8 @@ export class AgentChatREST {
   // MARK: - Personal Skills Library (/api/skills)
 
   private assertSkillName(name: string): string {
-    const trimmed = name.trim();
-    if (!/^[a-z0-9][a-z0-9_-]{0,63}$/.test(trimmed) || /^(?:ac_|sk[-_])/i.test(trimmed)) {
+    const trimmed = typeof name === "string" ? name.trim() : "";
+    if (!isValidPersonalSkillSlug(trimmed)) {
       throw new Error("Invalid personal skill name");
     }
     return trimmed;
@@ -2339,6 +2466,18 @@ export class AgentChatREST {
     const safeName = this.assertSkillName(name);
     if (!input?.body_markdown || typeof input.body_markdown !== "string" || !input.body_markdown.trim()) {
       throw new Error("Invalid personal skill body_markdown");
+    }
+    if (input.body_markdown.length > 100_000) {
+      throw new Error("Personal skill body_markdown exceeds 100000 characters");
+    }
+    if (!hasValidSkillFrontmatter(input.body_markdown)) {
+      throw new Error("Personal skill body_markdown requires YAML frontmatter with name and description");
+    }
+    if (
+      this.containsMemorySecretShape(input.body_markdown) ||
+      EMBEDDED_SECRET_TOKEN_RE.test(input.body_markdown)
+    ) {
+      throw new Error("Personal skill must not contain API keys, tokens, or private keys");
     }
     if (
       input.if_match_version !== undefined &&

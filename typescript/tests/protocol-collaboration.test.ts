@@ -9,6 +9,7 @@ import {
   summarizeChannelBriefReadiness,
   summarizeChannelOkrSnapshot,
   summarizeChannelThreads,
+  summarizePersonalSkillsLibrary,
   summarizeProposalsFeed,
   summarizeWorkspaceGraphHierarchy,
   summarizeWorkspaceGraphReadiness,
@@ -734,7 +735,7 @@ describe("AgentChatClient realtime collaboration WS events", () => {
         "POST /api/loops/loop-1/stop",
       ]);
 
-      await expect(rest.getPersonalSkill("UPPERCASE")).rejects.toThrow("Invalid personal skill name");
+      await expect(rest.getPersonalSkill("foo..bar")).rejects.toThrow("Invalid personal skill name");
       await expect(rest.getPersonalSkill("ac_secret_token")).rejects.toThrow("Invalid personal skill name");
       await expect(rest.archivePersonalSkill("deploy-sop", 0)).rejects.toThrow("Invalid personal skill expectedVersion");
       await expect(rest.setLoopInterval("loop-1", 10_000)).rejects.toThrow("Invalid loop interval_ms");
@@ -3713,6 +3714,136 @@ describe("AgentChatClient realtime collaboration WS events", () => {
         }),
       ).rejects.toThrow("OKR loops require a group or project channel");
       expect(fetchCalls).toBe(0);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("summarizePersonalSkillsLibrary and Personal Skills REST client support dotted/mixed-case slugs while blocking embedded secrets and invalid frontmatter", async () => {
+    const summary = summarizePersonalSkillsLibrary({
+      owner: "[redacted]",
+      skills: [
+        {
+          name: "deploy-v2.1",
+          title: "Deploy v2.1",
+          description: "Zero-downtime deploy checklist",
+          version: 4,
+          updated_at: "2026-11-14T01:20:00Z",
+          skill_meta: {
+            name: "Deploy v2.1",
+            description: "Zero-downtime deploy checklist",
+            trigger: "/deploy",
+            argument_hint: "[service]",
+          },
+        },
+        {
+          name: "SwiftAudit.check",
+          title: "Leak owner@example.com",
+          description: "Token my_ac_secret_1234567890",
+          version: 2,
+          updated_at: "2026-11-14T01:30:00Z",
+          skill_meta: {
+            name: "SwiftAudit",
+            description: "Clean fallback",
+            trigger: "/swift-audit",
+          },
+        },
+        {
+          name: "legacy.archived",
+          title: "Legacy",
+          description: "Retired playbook",
+          version: 7,
+          archived: true,
+          updated_at: "2026-11-10T00:00:00Z",
+          skill_meta: {
+            name: "Legacy",
+            description: "Retired playbook",
+            trigger: "/legacy",
+          },
+        },
+        {
+          name: "bad..slug",
+          version: 1,
+        },
+        {
+          name: "my_ac_secret_1234567890",
+          version: 1,
+        },
+      ],
+    });
+
+    expect(summary).toEqual({
+      total_skills: 3,
+      active_count: 2,
+      archived_count: 1,
+      remaining_active_quota: 48,
+      triggered_count: 2,
+      triggers: ["/deploy", "/swift-audit"],
+      items: [
+        {
+          name: "SwiftAudit.check",
+          title: "SwiftAudit.check",
+          description: "",
+          trigger: "/swift-audit",
+          argument_hint: null,
+          version: 2,
+          archived: false,
+          updated_at: "2026-11-14T01:30:00Z",
+        },
+        {
+          name: "deploy-v2.1",
+          title: "Deploy v2.1",
+          description: "Zero-downtime deploy checklist",
+          trigger: "/deploy",
+          argument_hint: "[service]",
+          version: 4,
+          archived: false,
+          updated_at: "2026-11-14T01:20:00Z",
+        },
+        {
+          name: "legacy.archived",
+          title: "Legacy",
+          description: "Retired playbook",
+          trigger: "/legacy",
+          argument_hint: null,
+          version: 7,
+          archived: true,
+          updated_at: "2026-11-10T00:00:00Z",
+        },
+      ],
+    });
+    expect(summarizePersonalSkillsLibrary(null)).toBeNull();
+
+    const originalFetch = globalThis.fetch;
+    const seenPaths: string[] = [];
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const u = new URL(typeof input === "string" ? input : input.toString());
+      seenPaths.push(u.pathname);
+      return Response.json({ ok: true, name: decodeURIComponent(u.pathname.split("/").pop()!), version: 2 });
+    }) as unknown as typeof fetch;
+
+    try {
+      const rest = new AgentChatREST({ baseUrl: "https://agents-chat.com", bearerToken: "jwt_owner_46" });
+      await rest.getPersonalSkill("deploy-v2.1");
+      await rest.savePersonalSkill("SwiftAudit.v2", {
+        body_markdown: "---\nname: SwiftAudit\ndescription: Audit Swift 6 concurrency\n---\n\n# Steps\n1. Check actors.\n",
+        if_match_version: 1,
+      });
+      expect(seenPaths).toEqual(["/api/skills/deploy-v2.1", "/api/skills/SwiftAudit.v2"]);
+
+      await expect(rest.getPersonalSkill("agent_key_1234567890")).rejects.toThrow("Invalid personal skill name");
+      await expect(rest.getPersonalSkill("skill_ac_secret_12345678")).rejects.toThrow("Invalid personal skill name");
+      await expect(
+        rest.savePersonalSkill("deploy-v2.1", {
+          body_markdown: "# Missing frontmatter",
+        }),
+      ).rejects.toThrow("YAML frontmatter");
+      await expect(
+        rest.savePersonalSkill("deploy-v2.1", {
+          body_markdown: "---\nname: deploy\ndescription: leak\n---\nenv_ac_secret_1234567890abcdef",
+        }),
+      ).rejects.toThrow("must not contain API keys");
+      expect(seenPaths).toHaveLength(2);
     } finally {
       globalThis.fetch = originalFetch;
     }

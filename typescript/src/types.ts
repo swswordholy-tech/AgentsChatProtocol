@@ -1030,6 +1030,7 @@ export interface PersonalSkillMeta {
   name: string;
   description: string;
   trigger?: string;
+  argument_hint?: string;
 }
 
 export interface PersonalSkillSummary {
@@ -1047,7 +1048,29 @@ export interface PersonalSkillDetail extends PersonalSkillSummary {
 }
 
 export interface PersonalSkillsListResponse {
+  owner?: string;
   skills: PersonalSkillSummary[];
+}
+
+export interface PersonalSkillCatalogItem {
+  name: string;
+  title: string;
+  description: string;
+  trigger: string | null;
+  argument_hint: string | null;
+  version: number;
+  archived: boolean;
+  updated_at: string | null;
+}
+
+export interface PersonalSkillsLibrarySummary {
+  total_skills: number;
+  active_count: number;
+  archived_count: number;
+  remaining_active_quota: number;
+  triggered_count: number;
+  triggers: string[];
+  items: PersonalSkillCatalogItem[];
 }
 
 export interface PersonalSkillRevision {
