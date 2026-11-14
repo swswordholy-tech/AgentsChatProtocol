@@ -9,6 +9,7 @@ import {
   filterWorkspaceEntitiesSince,
   isPrivateOrReservedHost,
   isValidCollaborationRoster,
+  mergeUniqueProposalBallots,
   parseChannelSkillFrontmatter,
   rankDiscoverableChannels,
   resolveAgentMention,
@@ -6084,6 +6085,64 @@ describe("AgentChatClient realtime collaboration WS events", () => {
       timeout: 0,
       error: 0,
       unobserved: 0,
+    });
+  });
+
+  test("Campaign #69: mergeUniqueProposalBallots & summarizeProposalsFeed align ballot deduplication, voter_type normalization, and fail-closed expires_at", () => {
+    const ballots = mergeUniqueProposalBallots([
+      { voter_id: "  alice  ", voter_type: "human", decision: "approve", reason: "  Ship it  " },
+      { voterId: "alice", voterType: "agent", decision: "reject", reason: "Duplicate ballot" },
+      { voter_id: "constructor", voter_type: "agent", decision: "approve" },
+      { voter_id: "__proto__", voter_type: "agent", decision: "approve" },
+      { voter_id: "bad\nid", voter_type: "agent", decision: "approve" },
+      { voter_id: "aiza-worker-1", voter_type: "spoofed_admin", decision: "abstain" },
+    ]);
+
+    expect(ballots).toEqual([
+      { voter_id: "alice", voter_type: "human", decision: "approve", reason: "Ship it" },
+      { voter_id: "aiza-worker-1", voter_type: "agent", decision: "abstain" },
+    ]);
+    expect(mergeUniqueProposalBallots(null)).toEqual([]);
+
+    const summary = summarizeProposalsFeed(
+      {
+        channel_id: "aiza-room-1",
+        can_propose: true,
+        read_only: false,
+        proposals: [
+          {
+            id: "aiza-prop-1",
+            channel_id: "aiza-room-1",
+            status: "pending",
+            expires_at: "not-a-valid-date",
+            votes: [
+              { voter_id: "aiza-worker-1", decision: "approve", reason: "AIza-Architecture-Overview verified" },
+            ],
+          },
+          {
+            id: "eyj-prop-2",
+            channel_id: "aiza-room-1",
+            status: "pending",
+            expires_at: "2026-11-15T10:00:00.000Z",
+            votes: [],
+          },
+        ],
+      },
+      Date.parse("2026-11-14T08:30:00.000Z"),
+      "aiza-room-1",
+    );
+
+    expect(summary).toEqual({
+      channel_id: "aiza-room-1",
+      can_propose: true,
+      read_only: false,
+      total_proposals: 2,
+      pending_count: 1,
+      passed_count: 0,
+      rejected_count: 0,
+      expired_count: 1,
+      pending_ids: ["eyj-prop-2"],
+      ballot_rationale_count: 1,
     });
   });
 });

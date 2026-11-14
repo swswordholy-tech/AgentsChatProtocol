@@ -1044,6 +1044,13 @@ export interface ConsensusTallyResult {
   required_approvals: number;
 }
 
+export interface NormalizedProposalBallot {
+  voter_id: string;
+  voter_type: "human" | "agent";
+  decision: VoteDecision;
+  reason?: string;
+}
+
 export interface ProposalsFeedSummary {
   channel_id: string;
   can_propose: boolean;

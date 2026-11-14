@@ -1055,6 +1055,40 @@ export function evaluateConsensusTally(
   };
 }
 
+export function mergeUniqueProposalBallots(
+  rawVotes: unknown,
+): import("./types").NormalizedProposalBallot[] {
+  if (!Array.isArray(rawVotes)) return [];
+  const seen = new Map<string, import("./types").NormalizedProposalBallot>();
+  for (const item of rawVotes.slice(0, 500)) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    const row = item as Record<string, unknown>;
+    const decision = row.decision;
+    if (decision !== "approve" && decision !== "reject" && decision !== "abstain") continue;
+    const rawVoter = row.voter_id ?? row.voterId;
+    const voter = typeof rawVoter === "string" ? rawVoter.trim() : "";
+    if (
+      !voter ||
+      voter.length > 256 ||
+      /[\u0000-\u001f\u007f]/.test(voter) ||
+      PROTOTYPE_POISON_KEYS.has(voter.toLowerCase()) ||
+      seen.has(voter)
+    ) {
+      continue;
+    }
+    const rawType = row.voter_type ?? row.voterType;
+    const voterType: "human" | "agent" = rawType === "human" ? "human" : "agent";
+    const rawReason = typeof row.reason === "string" ? row.reason.trim().slice(0, 2000) : "";
+    seen.set(voter, {
+      voter_id: voter,
+      voter_type: voterType,
+      decision,
+      ...(rawReason ? { reason: rawReason } : {}),
+    });
+  }
+  return [...seen.values()];
+}
+
 export function summarizeProposalsFeed(
   raw: unknown,
   nowMs?: number,
@@ -1098,7 +1132,7 @@ export function summarizeProposalsFeed(
       p.status === "passed" || p.status === "rejected" || p.status === "expired" ? p.status : "pending";
     if (status === "pending" && typeof p.expires_at === "string" && p.expires_at.trim()) {
       const expMs = Date.parse(p.expires_at);
-      if (Number.isFinite(expMs) && expMs <= refNow) {
+      if (!Number.isFinite(expMs) || expMs <= refNow) {
         status = "expired";
       }
     }
