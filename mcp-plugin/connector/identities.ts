@@ -35,21 +35,40 @@ export interface Identity {
   profile?: string;
 }
 
+function validIdentityId(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && !/\s|[\x00-\x1f\x7f]/.test(value) &&
+    !["__proto__", "constructor", "prototype"].includes(value.toLowerCase());
+}
+
+/** Validate the whole candidate set before exposing any credentials or replacing state. */
+function validateIdentities(identities: readonly Identity[]): void {
+  const bots = new Set<string>();
+  const agents = new Set<string>();
+  for (const id of identities) {
+    if (!id || !validIdentityId(id.botId) || !validIdentityId(id.agentId)) {
+      throw new Error("invalid identity botId or agentId");
+    }
+    if ([id.token, id.gatewayId, id.secret].some(value => typeof value !== "string" || !value.trim())) {
+      throw new Error("missing identity credentials");
+    }
+    if (bots.has(id.botId.trim()) || agents.has(id.agentId.trim())) {
+      throw new Error("duplicate identity botId or agentId — ambiguous routing");
+    }
+    bots.add(id.botId.trim());
+    agents.add(id.agentId.trim());
+  }
+}
+
 export class IdentityTable {
   private readonly byBot = new Map<string, Identity>();
 
   constructor(identities: Identity[]) {
-    for (const id of identities) {
-      if (this.byBot.has(id.botId)) {
-        throw new Error(`duplicate identity botId "${id.botId}" — ambiguous routing`);
-      }
-      this.byBot.set(id.botId, id);
-    }
+    this.replace(identities);
   }
 
   /** The identity fronting `botId`, or null when unregistered (fail closed). */
   forBot(botId: string): Identity | null {
-    return this.byBot.get(botId) ?? null;
+    return validIdentityId(botId) ? this.byBot.get(botId) ?? null : null;
   }
 
   isSingle(): boolean {
@@ -69,12 +88,13 @@ export class IdentityTable {
    * duplicate botIds the same way the constructor does.
    */
   replace(identities: Identity[]): void {
+    validateIdentities(identities);
     const next = new Map<string, Identity>();
     for (const id of identities) {
       if (next.has(id.botId)) {
         throw new Error(`duplicate identity botId "${id.botId}" — ambiguous routing`);
       }
-      next.set(id.botId, id);
+      next.set(id.botId, Object.freeze({ ...id }));
     }
     this.byBot.clear();
     for (const [k, v] of next) this.byBot.set(k, v);
@@ -83,7 +103,8 @@ export class IdentityTable {
 
 /** Platform hooks must never substitute another identity's credentials. */
 export function requireIdentity(identities: readonly Identity[], botId: string): Identity {
-  const id = identities.find(id => id.botId === botId);
+  validateIdentities(identities);
+  const id = validIdentityId(botId) ? identities.find(id => id.botId === botId) : undefined;
   if (!id) throw new Error(`unknown identity: ${botId}`);
   return id;
 }

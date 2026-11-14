@@ -38,6 +38,7 @@ export function sign(payload: string, secret: string): string {
 
 /** Constant-time check that `sigHex` is a valid HMAC of `payload` under ANY of `secrets`. */
 export function verifySignature(payload: string, sigHex: string, secrets: readonly string[]): boolean {
+  if (typeof sigHex !== "string" || !/^[0-9a-f]{64}$/i.test(sigHex)) return false;
   let sigBuf: Buffer;
   try {
     sigBuf = Buffer.from(sigHex, "hex");
@@ -59,7 +60,11 @@ export function verifySignature(payload: string, sigHex: string, secrets: readon
  * `base64url(f"{payload}:{exp}:{sig}")`, unpadded; `exp` is unix-seconds, 0 = never.
  */
 export function makeToken(payload: string, secret: string, ttlSeconds = 0): string {
-  const exp = ttlSeconds > 0 ? Math.floor(Date.now() / 1000) + ttlSeconds : 0;
+  if (!Number.isFinite(ttlSeconds) || ttlSeconds < 0) {
+    throw new RangeError("ttlSeconds must be finite and non-negative");
+  }
+  const exp = ttlSeconds > 0 ? Math.ceil(Math.floor(Date.now() / 1000) + ttlSeconds) : 0;
+  if (!Number.isSafeInteger(exp)) throw new RangeError("expiration exceeds safe integer range");
   const signed = `${payload}:${exp}`;
   const sig = hmacHex(signed, secret);
   return Buffer.from(`${signed}:${sig}`, "utf8").toString("base64url");
@@ -89,8 +94,10 @@ export function verifyToken(token: string, secrets: readonly string[]): string |
   const parts = decoded.split(":");
   if (parts.length < 3) return null;
   const sig = parts[parts.length - 1];
-  const exp = Number.parseInt(parts[parts.length - 2], 10);
-  if (!Number.isFinite(exp)) return null;
+  const expText = parts[parts.length - 2];
+  if (!/^\d+$/.test(expText)) return null;
+  const exp = Number(expText);
+  if (!Number.isSafeInteger(exp) || String(exp) !== expText) return null;
   const payload = parts.slice(0, -2).join(":");
   if (exp !== 0 && Math.floor(Date.now() / 1000) > exp) return null;
   const signed = `${payload}:${exp}`;

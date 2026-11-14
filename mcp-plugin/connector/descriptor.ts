@@ -37,6 +37,16 @@ export const SUPPORTED_OPS = ["send", "typing", "get_chat_info"] as const;
  * Single-tenant agentschat: narrow, honest capability set.
  */
 export function buildDescriptor(overrides: Partial<CapabilityDescriptor> = {}): CapabilityDescriptor {
+  const keys = new Set<string>();
+  for (const key of Object.keys(overrides)) {
+    const trimmed = key.trim();
+    if (!trimmed || ["__proto__", "constructor", "prototype"].includes(trimmed.toLowerCase()) ||
+        keys.has(trimmed)) throw new Error("invalid or duplicate descriptor override key");
+    keys.add(trimmed);
+  }
+  if ([...keys].some(key => !Object.hasOwn(overrides, key))) {
+    throw new Error("descriptor override keys must not contain surrounding whitespace");
+  }
   return {
     contract_version: CONTRACT_VERSION,
     platform: "agentschat",
