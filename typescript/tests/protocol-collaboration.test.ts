@@ -14,6 +14,7 @@ import {
   summarizeChannelWakeHealth,
   summarizeCloudAgentRoomPolicy,
   summarizeCloudAgentSpecialties,
+  summarizePersonalSkillDetail,
   summarizePersonalSkillsLibrary,
   summarizeProposalsFeed,
   summarizeStoryArtifactBundle,
@@ -4717,5 +4718,76 @@ describe("AgentChatClient realtime collaboration WS events", () => {
     for (const badCh of ["__proto__", "constructor", "prototype", "dm:pair", "direct_1", "room_mcp_at_1234567890"]) {
       await expect(rest.getChannelBrief(badCh)).rejects.toThrow("Invalid channel ID");
     }
+  });
+
+  test("summarizePersonalSkillDetail enforces UTF-8 byte budgets, PII/secret redaction, prototype-key rejection, and savePersonalSkill UTF-8 cap", async () => {
+    const cleanMd = "---\nname: release-check\ndescription: Pre-deploy SOP\ntrigger: /release\nargument-hint: <env>\n---\n\nNotify owner@example.com or +1 (415) 555-0199.\n";
+    const detail = summarizePersonalSkillDetail(
+      {
+        name: "release-check",
+        version: 5,
+        archived: false,
+        updated_at: "2026-11-14T04:15:00.000Z",
+        body_markdown: cleanMd,
+      },
+      "release-check",
+    );
+    expect(detail).not.toBeNull();
+    expect(detail!.title).toBe("release-check");
+    expect(detail!.description).toBe("Pre-deploy SOP");
+    expect(detail!.trigger).toBe("/release");
+    expect(detail!.argument_hint).toBe("<env>");
+    expect(detail!.has_redacted_secret).toBe(false);
+    expect(detail!.body_markdown).toContain("[redacted]");
+    expect(detail!.body_markdown).not.toContain("owner@example.com");
+    expect(detail!.body_markdown).not.toContain("555-0199");
+    expect(detail!.utf8_bytes).toBeGreaterThan(50);
+    expect(detail!.web_editor_remaining_bytes).toBe(48_000 - detail!.utf8_bytes);
+    expect(detail!.server_remaining_bytes).toBe(100_000 - detail!.utf8_bytes);
+
+    // Ordinary names with asia/eyj survive
+    expect(
+      summarizePersonalSkillDetail({
+        name: "eyj-notes",
+        version: 1,
+        body_markdown: "---\nname: eyj-notes\ndescription: Safe notes\n---\n\nBody\n",
+      })?.name,
+    ).toBe("eyj-notes");
+
+    // Legacy stored secret marks has_redacted_secret=true and replaces body with [redacted]
+    const leaked = summarizePersonalSkillDetail({
+      name: "legacy-secret",
+      version: 2,
+      body_markdown: "---\nname: legacy\ndescription: Leak\n---\n\naws=AKIAIOSFODNN7EXAMPLE\n",
+    });
+    expect(leaked?.has_redacted_secret).toBe(true);
+    expect(leaked?.body_markdown).toBe("[redacted]");
+
+    // Prototype & credential names rejected across detail, library, and REST methods
+    for (const badSlug of ["__proto__", "constructor", "prototype", "mcp_at_1234567890", "skill_rk_live_1234567890abcd"]) {
+      expect(summarizePersonalSkillDetail({ name: badSlug, version: 1, body_markdown: "x" })).toBeNull();
+    }
+    const lib = summarizePersonalSkillsLibrary({
+      skills: [
+        { name: "eyj-notes", version: 1, archived: false },
+        { name: "constructor", version: 1, archived: false },
+        { name: "prototype", version: 1, archived: false },
+      ],
+    });
+    expect(lib?.items.map((x) => x.name)).toEqual(["eyj-notes"]);
+
+    const rest = new AgentChatREST({ baseUrl: "https://agents-chat.com", bearerToken: "jwt_owner_55" });
+    for (const badSlug of ["constructor", "prototype", "__proto__", "mcp_rt_1234567890", "skill_glpat-1234567890abcdef"]) {
+      await expect(rest.getPersonalSkill(badSlug)).rejects.toThrow();
+      await expect(rest.getMemory(badSlug)).rejects.toThrow();
+    }
+
+    // Multibyte CJK body < 100k UTF-16 chars (~35k chars) but > 100k UTF-8 bytes (~105k bytes) rejected!
+    const multibyteOversize =
+      "---\nname: cjk-skill\ndescription: UTF-8 byte cap check\n---\n\n" + "测".repeat(35_000);
+    expect(multibyteOversize.length).toBeLessThan(100_000);
+    await expect(
+      rest.savePersonalSkill("cjk-skill", { body_markdown: multibyteOversize, if_match_version: 0 }),
+    ).rejects.toThrow("exceeds 100000 UTF-8 bytes");
   });
 });

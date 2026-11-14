@@ -71,7 +71,7 @@ const ROSTER_ROLES = new Set(["member", "moderator", "admin"]);
 const ROSTER_TYPES = new Set(["agent", "user", "unknown"]);
 const ROSTER_SCOPES = new Set(["owned", "unclaimed", "external"]);
 const SAFE_COLLAB_AGENT_ID_RE = /^[A-Za-z0-9_.-]{1,128}$/;
-const CREDENTIAL_PREFIX_RE = /^(?:mcp_(?:at|rt|code)_|ac_|agent_key_|sk[-_]|rk_(?:live|test)_|gh[pousr]_|github_pat_|glpat-|xox[baprs]-|(?:AKIA|ASIA)[0-9A-Z]{16}|(?:hf|npm)_|AIza|eyJ)/i;
+const CREDENTIAL_PREFIX_RE = /^(?:mcp_(?:at|rt|code)_|ac_|agent_key_|sk[-_]|rk_(?:live|test)_|gh[pousr]_|github_pat_|glpat-|xox[baprs]-|(?:AKIA|ASIA)[0-9A-Z]{16}|(?:hf|npm)_|(?:AIza|eyJ)(?:$|[A-Za-z0-9._-]{8,}))/i;
 const EMAIL_ID_RE = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i;
 const PHONE_ID_RE = /^\+?\d[\d ()-]{5,}\d$/;
 
@@ -1549,12 +1549,15 @@ export function summarizeChannelBriefReadiness(
 
 const PERSONAL_SKILL_SLUG_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/;
 const PERSONAL_SKILL_ACTIVE_QUOTA = 50;
+const PERSONAL_SKILL_WEB_BYTE_CAP = 48_000;
+const PERSONAL_SKILL_SERVER_BYTE_CAP = 100_000;
 
 function isValidPersonalSkillSlug(value: unknown): value is string {
   return (
     typeof value === "string" &&
     PERSONAL_SKILL_SLUG_RE.test(value) &&
     !value.includes("..") &&
+    !PROTOTYPE_POISON_KEYS.has(value.toLowerCase()) &&
     !CREDENTIAL_PREFIX_RE.test(value) &&
     !/^xox[baprs]-/i.test(value) &&
     !EMBEDDED_SECRET_TOKEN_RE.test(value) &&
@@ -1671,6 +1674,87 @@ export function summarizePersonalSkillsLibrary(
     triggered_count: triggeredCount,
     triggers: [...triggersSet].sort(),
     items,
+  };
+}
+
+export function summarizePersonalSkillDetail(
+  raw: unknown,
+  expectedName?: string,
+): import("./types").PersonalSkillDetailSummary | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const row = raw as Record<string, unknown>;
+  const name = typeof row.name === "string" ? row.name.trim() : "";
+  if (!isValidPersonalSkillSlug(name)) return null;
+  if (expectedName !== undefined && expectedName.trim() !== name) return null;
+  if (typeof row.body_markdown !== "string") return null;
+
+  const meta =
+    row.skill_meta && typeof row.skill_meta === "object" && !Array.isArray(row.skill_meta)
+      ? (row.skill_meta as Record<string, unknown>)
+      : null;
+  const fm = hasValidSkillFrontmatter(row.body_markdown)
+    ? (() => {
+        const match = row.body_markdown.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/);
+        const out: Record<string, string> = {};
+        if (match) {
+          for (const line of match[1].split(/\r?\n/)) {
+            const idx = line.indexOf(":");
+            if (idx <= 0) continue;
+            const k = line.slice(0, idx).trim();
+            const v = line.slice(idx + 1).trim().replace(/^["']|["']$/g, "");
+            if (k && v) out[k] = v;
+          }
+        }
+        return out;
+      })()
+    : {};
+
+  const version =
+    typeof row.version === "number" && Number.isSafeInteger(row.version) && row.version >= 1
+      ? row.version
+      : 1;
+  const archived = row.archived === true;
+  const updatedAt =
+    typeof row.updated_at === "string" &&
+    row.updated_at.length <= 64 &&
+    /^\d{4}-\d{2}-\d{2}T/.test(row.updated_at) &&
+    Number.isFinite(Date.parse(row.updated_at))
+      ? row.updated_at
+      : null;
+
+  const hasRedactedSecret =
+    row.body_markdown === "[redacted]" || EMBEDDED_SECRET_TOKEN_RE.test(row.body_markdown);
+  const safeBody = archived
+    ? ""
+    : hasRedactedSecret
+      ? "[redacted]"
+      : row.body_markdown
+          .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, "[redacted]")
+          .replace(/\+?\d[\d ()-]{5,}\d/g, "[redacted]")
+          .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "")
+          .slice(0, PERSONAL_SKILL_SERVER_BYTE_CAP);
+  const utf8Bytes = new TextEncoder().encode(safeBody).byteLength;
+
+  const title = cleanSkillFieldText(row.title ?? meta?.name ?? fm.name, 120) || name;
+  const description = cleanSkillFieldText(row.description ?? meta?.description ?? fm.description, 280);
+  const trigger = cleanSkillFieldText(meta?.trigger ?? fm.trigger, 120) || null;
+  const argumentHint =
+    cleanSkillFieldText(meta?.argument_hint ?? fm["argument-hint"] ?? fm.argument_hint, 120) || null;
+
+  return {
+    name,
+    title,
+    description,
+    trigger,
+    argument_hint: argumentHint,
+    version,
+    archived,
+    updated_at: updatedAt,
+    body_markdown: safeBody,
+    has_redacted_secret: hasRedactedSecret,
+    utf8_bytes: utf8Bytes,
+    web_editor_remaining_bytes: Math.max(0, PERSONAL_SKILL_WEB_BYTE_CAP - utf8Bytes),
+    server_remaining_bytes: Math.max(0, PERSONAL_SKILL_SERVER_BYTE_CAP - utf8Bytes),
   };
 }
 
@@ -3601,8 +3685,9 @@ export class AgentChatREST {
     if (!input?.body_markdown || typeof input.body_markdown !== "string" || !input.body_markdown.trim()) {
       throw new Error("Invalid personal skill body_markdown");
     }
-    if (input.body_markdown.length > 100_000) {
-      throw new Error("Personal skill body_markdown exceeds 100000 characters");
+    const utf8Bytes = new TextEncoder().encode(input.body_markdown).byteLength;
+    if (utf8Bytes > PERSONAL_SKILL_SERVER_BYTE_CAP) {
+      throw new Error("Personal skill body_markdown exceeds 100000 UTF-8 bytes");
     }
     if (!hasValidSkillFrontmatter(input.body_markdown)) {
       throw new Error("Personal skill body_markdown requires YAML frontmatter with name and description");

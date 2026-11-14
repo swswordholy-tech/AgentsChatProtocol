@@ -1096,6 +1096,22 @@ export interface PersonalSkillDetail extends PersonalSkillSummary {
   body_markdown: string;
 }
 
+export interface PersonalSkillDetailSummary {
+  name: string;
+  title: string;
+  description: string;
+  trigger: string | null;
+  argument_hint: string | null;
+  version: number;
+  archived: boolean;
+  updated_at: string | null;
+  body_markdown: string;
+  has_redacted_secret: boolean;
+  utf8_bytes: number;
+  web_editor_remaining_bytes: number;
+  server_remaining_bytes: number;
+}
+
 export interface PersonalSkillsListResponse {
   owner?: string;
   skills: PersonalSkillSummary[];
