@@ -639,6 +639,19 @@ export interface CloudAgentAuditFeed {
 
 export type CloudCliWakeStatus = "ok" | "auth_required" | "timeout" | "error";
 
+export type CloudWakeRuntimeType =
+  | "gemini"
+  | "claude"
+  | "codex"
+  | "hermes"
+  | "agy"
+  | "zcode"
+  | "dsh"
+  | "openclaw"
+  | "grok"
+  | "muse"
+  | "dot";
+
 export interface ChannelWakeHealthCounts {
   total_cloud_agents: number;
   ok: number;
@@ -662,6 +675,18 @@ export interface ChannelWakeHealth {
   channel_id: string;
   observation_only: true;
   counts: ChannelWakeHealthCounts;
+  agents: ChannelWakeHealthAgent[];
+}
+
+export interface ChannelWakeHealthDigest {
+  channel_id: string;
+  observation_only: true;
+  counts: ChannelWakeHealthCounts;
+  degraded_count: number;
+  healthy_ratio: number;
+  is_healthy: boolean;
+  attention_agent_ids: string[];
+  runtimes_present: CloudWakeRuntimeType[];
   agents: ChannelWakeHealthAgent[];
 }
 

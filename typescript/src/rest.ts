@@ -158,12 +158,14 @@ export function isValidCollaborationRoster(
 }
 
 const WORKSPACE_GRAPH_SCOPES = new Set(["channel", "objective", "agent"]);
+const PROTOTYPE_POISON_KEYS = new Set(["__proto__", "constructor", "prototype"]);
 
 function safeGraphId(value: unknown): value is string {
   return (
     typeof value === "string" &&
     value.length >= 1 &&
     value.length <= 160 &&
+    !PROTOTYPE_POISON_KEYS.has(value) &&
     !/[/\\?#&\s\u0000-\u001F\u007F]/.test(value) &&
     !value.includes("..") &&
     !CREDENTIAL_PREFIX_RE.test(value) &&
@@ -1026,8 +1028,158 @@ export function summarizePersonalSkillsLibrary(
 
 const AGENT_MEMORY_DEFAULT_CAP = 20;
 const AGENT_MEMORY_DEFAULT_BODY_CAP = 256_000;
-const PROTOTYPE_POISON_KEYS = new Set(["__proto__", "constructor", "prototype"]);
 const CLOUD_DIRECT_CHANNEL_RE = /^(?:dm[-_]|direct(?:$|[_:]))/i;
+const CLOUD_WAKE_RUNTIMES = new Set<import("./types").CloudWakeRuntimeType>([
+  "gemini",
+  "claude",
+  "codex",
+  "hermes",
+  "agy",
+  "zcode",
+  "dsh",
+  "openclaw",
+  "grok",
+  "muse",
+  "dot",
+]);
+const CLOUD_WAKE_AGENT_STATUSES = new Set([
+  "active",
+  "provisioning",
+  "expired",
+  "disabled",
+]);
+const CLOUD_WAKE_STATUSES = new Set<import("./types").CloudCliWakeStatus>([
+  "ok",
+  "auth_required",
+  "timeout",
+  "error",
+]);
+
+function scrubWakeAgentDisplayName(raw: unknown): string | undefined {
+  if (typeof raw !== "string") return undefined;
+  const cleaned = raw
+    .slice(0, 512)
+    .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, "")
+    .replace(/\+?\d[\d\s()-]{4,}\d/g, "")
+    .replace(
+      /(?:^|[^A-Za-z0-9])(?:ac_|agent_key_|sk[-_]|rk_(?:live|test)_|gh[pousr]_|github_pat_|glpat-|xox[baprs]-|(?:hf|npm)_|AIza)[A-Za-z0-9_-]+/gi,
+      " ",
+    )
+    .replace(/\bAKIA[0-9A-Z]{16}\b/g, "")
+    .replace(/\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)?\b/g, "")
+    .replace(/-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|$)/g, "")
+    .replace(/[\u0000-\u001f\u007f]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 80);
+  return cleaned.length > 0 ? cleaned : undefined;
+}
+
+export function summarizeChannelWakeHealth(
+  raw: unknown,
+): import("./types").ChannelWakeHealthDigest | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const payload = raw as Record<string, unknown>;
+  if (
+    !safeNonDmChannelId(payload.channel_id) ||
+    payload.observation_only !== true ||
+    !Array.isArray(payload.agents) ||
+    payload.agents.length > 500
+  ) {
+    return null;
+  }
+
+  const agents: import("./types").ChannelWakeHealthAgent[] = [];
+  const seenIds = new Set<string>();
+  const runtimesSet = new Set<import("./types").CloudWakeRuntimeType>();
+  const attentionAgentIds: string[] = [];
+  let ok = 0;
+  let authRequired = 0;
+  let timeout = 0;
+  let error = 0;
+  let unobserved = 0;
+
+  for (const item of payload.agents) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    const row = item as Record<string, unknown>;
+    const agentId = typeof row.agent_id === "string" ? row.agent_id.trim() : "";
+    if (!isSafeCloudRoomAgentId(agentId) || seenIds.has(agentId)) continue;
+    const runtime = typeof row.runtime === "string" ? row.runtime.trim() : "";
+    if (!CLOUD_WAKE_RUNTIMES.has(runtime as import("./types").CloudWakeRuntimeType)) continue;
+    const cloudStatus = typeof row.cloud_status === "string" ? row.cloud_status.trim() : "";
+    if (!CLOUD_WAKE_AGENT_STATUSES.has(cloudStatus)) continue;
+
+    seenIds.add(agentId);
+    runtimesSet.add(runtime as import("./types").CloudWakeRuntimeType);
+
+    const normalized: import("./types").ChannelWakeHealthAgent = {
+      agent_id: agentId,
+      runtime,
+      cloud_status: cloudStatus,
+    };
+    const safeName = scrubWakeAgentDisplayName(row.name);
+    if (safeName) normalized.name = safeName;
+
+    const wakeStatus =
+      typeof row.last_wake_status === "string" &&
+      CLOUD_WAKE_STATUSES.has(row.last_wake_status as import("./types").CloudCliWakeStatus)
+        ? (row.last_wake_status as import("./types").CloudCliWakeStatus)
+        : undefined;
+    if (wakeStatus) {
+      normalized.last_wake_status = wakeStatus;
+      if (wakeStatus === "ok") ok += 1;
+      else if (wakeStatus === "auth_required") authRequired += 1;
+      else if (wakeStatus === "timeout") timeout += 1;
+      else error += 1;
+    } else {
+      unobserved += 1;
+    }
+
+    if (
+      typeof row.last_wake_at === "string" &&
+      row.last_wake_at.length <= 64 &&
+      Number.isFinite(Date.parse(row.last_wake_at))
+    ) {
+      normalized.last_wake_at = row.last_wake_at;
+    }
+    if (
+      typeof row.last_duration_ms === "number" &&
+      Number.isFinite(row.last_duration_ms) &&
+      row.last_duration_ms >= 0 &&
+      row.last_duration_ms <= 86_400_000
+    ) {
+      normalized.last_duration_ms = Math.round(row.last_duration_ms);
+    }
+
+    if (cloudStatus === "disabled" || cloudStatus === "expired" || (wakeStatus && wakeStatus !== "ok")) {
+      attentionAgentIds.push(agentId);
+    }
+    agents.push(normalized);
+  }
+
+  const degradedCount = authRequired + timeout + error;
+  const observed = ok + degradedCount;
+  const healthyRatio = observed > 0 ? Math.round((ok / observed) * 1000) / 1000 : 1;
+
+  return {
+    channel_id: payload.channel_id,
+    observation_only: true,
+    counts: {
+      total_cloud_agents: agents.length,
+      ok,
+      auth_required: authRequired,
+      timeout,
+      error,
+      unobserved,
+    },
+    degraded_count: degradedCount,
+    healthy_ratio: healthyRatio,
+    is_healthy: degradedCount === 0 && attentionAgentIds.length === 0,
+    attention_agent_ids: attentionAgentIds,
+    runtimes_present: [...runtimesSet].sort(),
+    agents,
+  };
+}
 
 function isSafeCloudRoomAgentId(value: unknown): value is string {
   return (
@@ -4720,8 +4872,10 @@ export class AgentChatREST {
     if (
       !channelId ||
       !/^[A-Za-z0-9_][A-Za-z0-9_-]{0,127}$/.test(channelId) ||
+      PROTOTYPE_POISON_KEYS.has(channelId) ||
+      /^\d{6,}$/.test(channelId) ||
       channelId.startsWith("arena-") ||
-      /^(?:ac_|agent_key_|sk[-_]|gh[pousr]_|github_pat_|AIza|eyJ)/i.test(channelId) ||
+      CREDENTIAL_PREFIX_RE.test(channelId) ||
       EMBEDDED_SECRET_TOKEN_RE.test(channelId)
     ) {
       throw new Error("Invalid channel ID");
@@ -4759,12 +4913,43 @@ export class AgentChatREST {
 
     if (mode !== "prompt") {
       const oid = typeof input.objective_id === "string" ? input.objective_id.trim() : "";
-      if (!/^[A-Za-z0-9_-]{6,80}$/.test(oid) || /^ac_/i.test(oid) || EMBEDDED_SECRET_TOKEN_RE.test(oid)) {
+      if (
+        !/^[A-Za-z0-9_-]{6,80}$/.test(oid) ||
+        PROTOTYPE_POISON_KEYS.has(oid) ||
+        /^\d{6,}$/.test(oid) ||
+        CREDENTIAL_PREFIX_RE.test(oid) ||
+        EMBEDDED_SECRET_TOKEN_RE.test(oid)
+      ) {
         throw new Error("Invalid objective ID");
       }
       body.objective_id = oid;
       if (input.target_agents !== undefined) {
-        body.target_agents = input.target_agents;
+        if (!Array.isArray(input.target_agents) || input.target_agents.length > 10) {
+          throw new Error("Invalid target_agents");
+        }
+        const normalizedTargets: string[] = [];
+        const seenTargets = new Set<string>();
+        for (const rawTarget of input.target_agents) {
+          if (typeof rawTarget !== "string") throw new Error("Invalid target_agents");
+          const clean = rawTarget.trim().replace(/^@/, "");
+          if (
+            !/^[A-Za-z0-9._-]{1,128}$/.test(clean) ||
+            clean.includes("..") ||
+            PROTOTYPE_POISON_KEYS.has(clean) ||
+            /^\d{6,}$/.test(clean) ||
+            CREDENTIAL_PREFIX_RE.test(clean) ||
+            EMBEDDED_SECRET_TOKEN_RE.test(clean) ||
+            EMAIL_ID_RE.test(clean) ||
+            PHONE_ID_RE.test(clean)
+          ) {
+            throw new Error("Invalid target_agents");
+          }
+          if (!seenTargets.has(clean)) {
+            seenTargets.add(clean);
+            normalizedTargets.push(clean);
+          }
+        }
+        body.target_agents = normalizedTargets;
       }
       if (mode === "okr_watch") {
         if (input.watch_idle !== undefined) body.watch_idle = Boolean(input.watch_idle);

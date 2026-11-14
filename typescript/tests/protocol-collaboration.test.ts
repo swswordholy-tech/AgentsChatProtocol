@@ -10,6 +10,7 @@ import {
   summarizeChannelBriefReadiness,
   summarizeChannelOkrSnapshot,
   summarizeChannelThreads,
+  summarizeChannelWakeHealth,
   summarizeCloudAgentRoomPolicy,
   summarizePersonalSkillsLibrary,
   summarizeProposalsFeed,
@@ -4013,5 +4014,135 @@ describe("AgentChatClient realtime collaboration WS events", () => {
     await expect(rest.wakeCloudAgent("glpat-1234567890abcdef")).rejects.toThrow("Invalid cloud agent ID");
     await expect(rest.wakeCloudAgent("codex-cloud-01", { channel_id: "room..escape" })).rejects.toThrow("Invalid channel ID");
     await expect(rest.wakeCloudAgent("codex-cloud-01", { channel_id: "__proto__" })).rejects.toThrow("Invalid channel ID");
+  });
+
+  test("summarizeChannelWakeHealth supports all 11 runtimes, scrubs secret display names, recomputes counts, and createCloudAgentLoop blocks multi-cloud credentials", async () => {
+    const digest = summarizeChannelWakeHealth({
+      channel_id: "room-wake-11",
+      observation_only: true,
+      counts: {
+        total_cloud_agents: 99,
+        ok: 99,
+        auth_required: 0,
+        timeout: 0,
+        error: 0,
+        unobserved: 0,
+      },
+      agents: [
+        {
+          agent_id: "codex-01",
+          name: "Codex Staff ops@corp.io glpat-1234567890abcdef",
+          runtime: "codex",
+          cloud_status: "active",
+          last_wake_status: "ok",
+          last_wake_at: "2026-11-14T02:20:00.000Z",
+          last_duration_ms: 1450.4,
+        },
+        {
+          agent_id: "openclaw-01",
+          name: "OpenClaw AKIAIOSFODNN7EXAMPLE",
+          runtime: "openclaw",
+          cloud_status: "active",
+          last_wake_status: "auth_required",
+          last_wake_at: "2026-11-14T02:21:00.000Z",
+          last_duration_ms: 320,
+        },
+        {
+          agent_id: "grok-01",
+          name: "sk-proj-1234567890abcdef",
+          runtime: "grok",
+          cloud_status: "active",
+        },
+        {
+          agent_id: "muse-01",
+          name: "Muse Disabled",
+          runtime: "muse",
+          cloud_status: "disabled",
+          last_wake_status: "ok",
+        },
+        {
+          agent_id: "dot-01",
+          name: "Dot Timeout",
+          runtime: "dot",
+          cloud_status: "active",
+          last_wake_status: "timeout",
+        },
+        // Filtered invalid entries
+        { agent_id: "__proto__", runtime: "codex", cloud_status: "active" },
+        { agent_id: "agent_key_1234567890", runtime: "claude", cloud_status: "active" },
+        { agent_id: "bot_ac_secret_12345678", runtime: "gemini", cloud_status: "active" },
+        { agent_id: "unknown-rt", runtime: "custom_shell", cloud_status: "active" },
+      ],
+    });
+
+    expect(digest).not.toBeNull();
+    expect(digest?.counts).toEqual({
+      total_cloud_agents: 5,
+      ok: 2,
+      auth_required: 1,
+      timeout: 1,
+      error: 0,
+      unobserved: 1,
+    });
+    expect(digest?.degraded_count).toBe(2);
+    expect(digest?.healthy_ratio).toBe(0.5);
+    expect(digest?.is_healthy).toBe(false);
+    expect(digest?.attention_agent_ids).toEqual(["openclaw-01", "muse-01", "dot-01"]);
+    expect(digest?.runtimes_present).toEqual(["codex", "dot", "grok", "muse", "openclaw"]);
+    expect(digest?.agents[0]?.name).toBe("Codex Staff");
+    expect(digest?.agents[0]?.last_duration_ms).toBe(1450);
+    expect(digest?.agents[1]?.name).toBe("OpenClaw");
+    // Pure secret display name is omitted completely after scrubbing
+    expect(digest?.agents[2]?.name).toBeUndefined();
+
+    expect(summarizeChannelWakeHealth({ channel_id: "dm-secret", observation_only: true, agents: [] })).toBeNull();
+    expect(summarizeChannelWakeHealth({ channel_id: "__proto__", observation_only: true, agents: [] })).toBeNull();
+    expect(summarizeChannelWakeHealth({ channel_id: "room-a", observation_only: false, agents: [] })).toBeNull();
+
+    const rest = new AgentChatREST({ baseUrl: "https://agents-chat.com", bearerToken: "jwt_owner_49" });
+    await expect(rest.getChannelWakeHealth("__proto__")).rejects.toThrow("Invalid channel ID");
+    await expect(rest.getChannelWakeHealth("dm-secret")).rejects.toThrow("Invalid channel ID");
+    await expect(rest.getChannelWakeHealth("glpat-1234567890abcdef")).rejects.toThrow("Invalid channel ID");
+
+    await expect(
+      rest.createCloudAgentLoop("codex-01", {
+        channel_id: "__proto__",
+        interval: "15m",
+        prompt: "Check tasks",
+      }),
+    ).rejects.toThrow("Invalid channel ID");
+    await expect(
+      rest.createCloudAgentLoop("codex-01", {
+        channel_id: "rk_live_1234567890abcdef",
+        interval: "15m",
+        prompt: "Check tasks",
+      }),
+    ).rejects.toThrow("Invalid channel ID");
+    await expect(
+      rest.createCloudAgentLoop("codex-01", {
+        channel_id: "room-wake-11",
+        mode: "okr_wake",
+        interval: "15m",
+        objective_id: "glpat-1234567890abcdef",
+      }),
+    ).rejects.toThrow("Invalid objective ID");
+    await expect(
+      rest.createCloudAgentLoop("codex-01", {
+        channel_id: "room-wake-11",
+        mode: "okr_wake",
+        interval: "15m",
+        objective_id: "obj_mwfs425r_lst0pz6f",
+        target_agents: ["@peer-ok", "peer..escape"],
+      }),
+    ).rejects.toThrow("Invalid target_agents");
+    await expect(
+      rest.createCloudAgentLoop("codex-01", {
+        channel_id: "room-wake-11",
+        mode: "okr_wake",
+        interval: "15m",
+        objective_id: "obj_mwfs425r_lst0pz6f",
+        target_agents: ["__proto__"],
+      }),
+    ).rejects.toThrow("Invalid target_agents");
   });
 });
