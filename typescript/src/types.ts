@@ -2688,3 +2688,8 @@ export interface DagTaskAssignment {
   matched_capabilities: number;
   required_capabilities: number;
 }
+
+export interface ExtractResolvedMentionsOptions {
+  senderId?: string | null;
+  displayNameOf?: (memberId: string) => string | undefined;
+}

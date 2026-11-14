@@ -4,8 +4,10 @@ import {
   AgentChatREST,
   computeLocalTaskActionability,
   evaluateConsensusTally,
+  extractResolvedMentions,
   isPrivateOrReservedHost,
   isValidCollaborationRoster,
+  resolveAgentMention,
   resolveInheritedObjectiveChannel,
   scheduleReadyDagTasks,
   summarizeAgentMemoryIndex,
@@ -5530,5 +5532,32 @@ describe("AgentChatClient realtime collaboration WS events", () => {
     expect(watch.ready_count).toBe(0);
     expect(watch.idle_agents).toEqual(["idle-dev"]);
     expect(watch.supply_starved).toBe(true);
+  });
+
+  test("Campaign #63: resolveAgentMention and extractResolvedMentions mirror server @mention wake semantics", () => {
+    const members = [
+      "tweed-reactive-lidar",
+      "tweed-reactive-lidar",
+      "bob",
+      "bobby",
+      "swswordholy@gmail.com",
+      "mr_0123456789abcdef0123",
+      "__proto__",
+      "mcp_at_secret123456",
+    ];
+    const dn = (id: string) => (id === "tweed-reactive-lidar" ? "Tweed" : undefined);
+
+    expect(resolveAgentMention("tweed.", members, dn)).toBe("tweed-reactive-lidar");
+    expect(resolveAgentMention("@Tweed.", members, dn)).toBe("tweed-reactive-lidar");
+    expect(resolveAgentMention("Bob", members, dn)).toBe("bob");
+    expect(resolveAgentMention("mr_0123456789abcdef0123", members, dn)).toBeNull();
+    expect(resolveAgentMention("mcp_at_secret123456", members, dn)).toBeNull();
+
+    const mentioned = extractResolvedMentions(
+      "请@tweed看一下，thanks @Bob. Also @Display Label(bobby) — email ops@tweed.io, cc @swswordholy@gmail.com",
+      members,
+      { senderId: "bob", displayNameOf: dn },
+    );
+    expect(mentioned).toEqual(["tweed-reactive-lidar", "bobby", "swswordholy@gmail.com"]);
   });
 });

@@ -3203,6 +3203,134 @@ export function scheduleReadyDagTasks(
   return assignments;
 }
 
+function isEligibleSdkMentionMemberId(id: unknown): id is string {
+  if (typeof id !== "string") return false;
+  const trimmed = id.trim();
+  if (!trimmed || trimmed !== id || trimmed.length > 256 || trimmed.includes("..")) return false;
+  if (/[\u0000-\u001f\u007f\s/\\]/.test(trimmed)) return false;
+  if (
+    PROTOTYPE_POISON_KEYS.has(trimmed.toLowerCase()) ||
+    /^mr_[0-9a-f]{16,}$/i.test(trimmed) ||
+    OKR_WATCH_CREDENTIAL_ID_RE.test(trimmed) ||
+    OKR_WATCH_AWS_KEY_ID_RE.test(trimmed)
+  ) {
+    return false;
+  }
+  return true;
+}
+
+function resolveSdkMentionCandidate(
+  candidate: string,
+  eligible: readonly string[],
+  displayNameOf?: (memberId: string) => string | undefined,
+): string | null {
+  if (!candidate) return null;
+  if (eligible.includes(candidate)) return candidate;
+  const lower = candidate.toLowerCase();
+
+  const ciExact = eligible.filter((id) => id.toLowerCase() === lower);
+  if (ciExact.length === 1) return ciExact[0]!;
+  if (ciExact.length > 1) return null;
+
+  const dnExact = eligible.filter((id) => (displayNameOf?.(id) || "").trim().toLowerCase() === lower);
+  if (dnExact.length === 1) return dnExact[0]!;
+  if (dnExact.length > 1) return null;
+
+  if (candidate.includes("@")) return null;
+
+  const prefixHits = eligible.filter(
+    (id) =>
+      id.toLowerCase().startsWith(lower) ||
+      (displayNameOf?.(id) || "").trim().toLowerCase().startsWith(lower),
+  );
+  if (prefixHits.length === 1) return prefixHits[0]!;
+  return null;
+}
+
+/**
+ * Pure @mention token resolver matching `Server/src/mention-resolver.ts`.
+ * Priority: exact ID → case-insensitive exact ID → unique display_name → unique ID/display_name prefix,
+ * with sentence-ending period fallback, duplicate member dedup, and zero guessing on ambiguity.
+ */
+export function resolveAgentMention(
+  token: unknown,
+  memberIds: unknown,
+  displayNameOf?: (memberId: string) => string | undefined,
+): string | null {
+  if (typeof token !== "string" || !Array.isArray(memberIds)) return null;
+  const cleaned = token.trim().replace(/^@+/, "");
+  if (
+    !cleaned ||
+    cleaned.length > 256 ||
+    /[\u0000-\u001f\u007f\s/\\]/.test(cleaned) ||
+    cleaned.includes("..") ||
+    PROTOTYPE_POISON_KEYS.has(cleaned.toLowerCase()) ||
+    /^mr_[0-9a-f]{16,}$/i.test(cleaned) ||
+    OKR_WATCH_CREDENTIAL_ID_RE.test(cleaned) ||
+    OKR_WATCH_AWS_KEY_ID_RE.test(cleaned)
+  ) {
+    return null;
+  }
+
+  const eligible: string[] = [];
+  const seen = new Set<string>();
+  for (const rawId of memberIds.slice(0, 2000)) {
+    if (!isEligibleSdkMentionMemberId(rawId) || seen.has(rawId)) continue;
+    seen.add(rawId);
+    eligible.push(rawId);
+  }
+  if (eligible.length === 0) return null;
+
+  const direct = resolveSdkMentionCandidate(cleaned, eligible, displayNameOf);
+  if (direct) return direct;
+
+  if (cleaned.endsWith(".")) {
+    const withoutDots = cleaned.replace(/\.+$/, "");
+    if (withoutDots) {
+      return resolveSdkMentionCandidate(withoutDots, eligible, displayNameOf);
+    }
+  }
+  return null;
+}
+
+/**
+ * Extracts and resolves all @mentions from message content with exact parity to `Hub.resolveMentionedIds`,
+ * including `@Display Name(agent-id)` canonicalization, inline CJK mentions, un-prefixed email filtering, and sender self-exclusion.
+ */
+export function extractResolvedMentions(
+  content: unknown,
+  memberIds: unknown,
+  options?: import("./types").ExtractResolvedMentionsOptions,
+): string[] {
+  if (typeof content !== "string" || !content || !Array.isArray(memberIds)) return [];
+  const eligibleSet = new Set<string>();
+  const eligibleList: string[] = [];
+  for (const rawId of memberIds.slice(0, 2000)) {
+    if (!isEligibleSdkMentionMemberId(rawId) || eligibleSet.has(rawId)) continue;
+    eligibleSet.add(rawId);
+    eligibleList.push(rawId);
+  }
+  if (eligibleList.length === 0) return [];
+
+  const senderId = typeof options?.senderId === "string" ? options.senderId.trim() : "";
+  const normalizedContent = content
+    .slice(0, 65536)
+    .replace(/@[^@\n()]+\(([^()\s]+)\)/g, (original, id: string) => (eligibleSet.has(id) ? `@${id}` : original));
+
+  const mentionRe = /@([A-Za-z0-9_.+\-@]+)/g;
+  const out: string[] = [];
+  const seen = new Set<string>();
+  let m: RegExpExecArray | null;
+  while ((m = mentionRe.exec(normalizedContent)) !== null) {
+    if (m.index > 0 && /[A-Za-z0-9._%+-]/.test(normalizedContent[m.index - 1]!)) continue;
+    const resolved = resolveAgentMention(m[1], eligibleList, options?.displayNameOf);
+    if (!resolved || (senderId && resolved === senderId) || seen.has(resolved)) continue;
+    seen.add(resolved);
+    out.push(resolved);
+  }
+  return out;
+}
+
 export interface RESTClientOptions {
   baseUrl: string; // e.g. "http://localhost:8080"
   bearerToken?: string;
