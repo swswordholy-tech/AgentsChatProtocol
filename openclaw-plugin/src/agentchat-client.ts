@@ -31,6 +31,7 @@ import type { ChatMessage, ClientOptions, MessageHandler } from "./agentchat-pro
  * which is exactly what we want for a long-lived chat bot.
  */
 const MAX_WS_PAYLOAD_BYTES = 2 * 1024 * 1024;
+const MAX_PENDING_OUTBOUND = 64;
 const DRAIN_MIN_DELAY_MS = 200;
 const DRAIN_JITTER_MS = 2_000;
 
@@ -42,6 +43,8 @@ export class AgentChatClient {
   private connectTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly messageHandlers: MessageHandler[] = [];
   private readonly joinedChannels = new Set<string>();
+  private readonly pendingOutbound: Record<string, unknown>[] = [];
+  private lastInboundAt = 0;
   private connectResolve: (() => void) | null = null;
   private connectReject: ((err: Error) => void) | null = null;
   private lifecyclePromise: Promise<void> | null = null;
@@ -117,6 +120,8 @@ export class AgentChatClient {
       this.fastReconnectPending = false;
       this.reconnectAttempt = 0;
       this.isReconnecting = false;
+      this.pendingOutbound.length = 0;
+      this.lastInboundAt = 0;
       this.connectResolve = resolve;
       this.connectReject = reject;
       this.lifecyclePromise = new Promise((lifecycleResolve, lifecycleReject) => {
@@ -145,6 +150,8 @@ export class AgentChatClient {
     this.ws?.close();
     this.ws = null;
     this.sessionId = null;
+    this.pendingOutbound.length = 0;
+    this.lastInboundAt = 0;
     // Resolve lifecycle immediately — caller asked to stop; don't make
     // them wait for the socket's close event (which may never fire if
     // the remote side was already gone).
@@ -161,30 +168,42 @@ export class AgentChatClient {
         ? String(threadId).trim()
         : undefined;
     this.debug("send:message", { channelId, length: content.length, ...(normalizedThread ? { threadId: normalizedThread } : {}) });
-    if (normalizedThread) {
-      this.send({
-        type: "thread_reply",
-        id: crypto.randomUUID(),
-        channel_id: channelId,
-        parent_id: normalizedThread,
-        sender_id: this.agentId,
-        sender_type: "agent",
-        content,
-        content_type: "text",
-        timestamp: new Date().toISOString(),
-      });
+    const frame: Record<string, unknown> = normalizedThread
+      ? {
+          type: "thread_reply",
+          id: crypto.randomUUID(),
+          channel_id: channelId,
+          parent_id: normalizedThread,
+          sender_id: this.agentId,
+          sender_type: "agent",
+          content,
+          content_type: "text",
+          timestamp: new Date().toISOString(),
+        }
+      : {
+          type: "message",
+          id: crypto.randomUUID(),
+          channel_id: channelId,
+          sender_id: this.agentId,
+          sender_type: "agent",
+          content,
+          content_type: "text",
+          timestamp: new Date().toISOString(),
+        };
+
+    if (this.ws?.readyState === WebSocket.OPEN && this.sessionId) {
+      this.ws.send(JSON.stringify(frame));
       return;
     }
-    this.send({
-      type: "message",
-      id: crypto.randomUUID(),
-      channel_id: channelId,
-      sender_id: this.agentId,
-      sender_type: "agent",
-      content,
-      content_type: "text",
-      timestamp: new Date().toISOString(),
-    });
+    if (!this.explicitlyDisconnected && (this.isReconnecting || (this.ws !== null && !this.connectSettled))) {
+      if (this.pendingOutbound.length >= MAX_PENDING_OUTBOUND) {
+        this.pendingOutbound.shift();
+      }
+      this.pendingOutbound.push(frame);
+      this.debug("send:queued_for_reconnect", { channelId, queued: this.pendingOutbound.length });
+      return;
+    }
+    throw new Error("AgentChat WebSocket is not connected");
   }
 
   joinChannel(channelId: string) {
@@ -279,6 +298,7 @@ export class AgentChatClient {
   }
 
   private handleMessage(raw: string) {
+    this.lastInboundAt = Date.now();
     let data: Record<string, unknown>;
     try {
       const parsed = JSON.parse(raw);
@@ -297,6 +317,7 @@ export class AgentChatClient {
       case "auth_ok":
         this.clearConnectTimer();
         this.sessionId = String(data.session_id ?? "");
+        this.lastInboundAt = Date.now();
         this.debug("auth:ok", { sessionId: this.sessionId, wasReconnect: this.isReconnecting });
         this.startHeartbeat();
         if (this.isReconnecting) {
@@ -307,6 +328,7 @@ export class AgentChatClient {
         } else {
           this.resolveConnect();
         }
+        this.flushPendingOutbound();
         break;
       case "auth_error": {
         this.clearConnectTimer();
@@ -316,6 +338,7 @@ export class AgentChatClient {
         // Terminal credential rejection — stop reconnect loops immediately.
         this.explicitlyDisconnected = true;
         this.fastReconnectPending = false;
+        this.pendingOutbound.length = 0;
         if (this.reconnectTimer) {
           clearTimeout(this.reconnectTimer);
           this.reconnectTimer = null;
@@ -335,7 +358,7 @@ export class AgentChatClient {
       }
       case "channel_created":
         if (typeof data.channel_id === "string" && data.channel_id.length > 0) {
-          this.joinedChannels.add(data.channel_id);
+          this.joinChannel(data.channel_id);
         }
         break;
       case "please_reconnect":
@@ -348,7 +371,8 @@ export class AgentChatClient {
         break;
       case "message":
       case "thread_reply": {
-        const rawThreadId = data.thread_id ?? data.parent_id ?? data.in_reply_to;
+        if (data.content === "__typing__") break;
+        const rawThreadId = data.thread_id ?? data.parent_id ?? data.reply_to ?? data.in_reply_to;
         const threadId =
           (typeof rawThreadId === "string" && rawThreadId.length > 0) || typeof rawThreadId === "number"
             ? rawThreadId
@@ -469,9 +493,30 @@ export class AgentChatClient {
     this.reconnectTimer.unref?.();
   }
 
+  private flushPendingOutbound() {
+    if (!this.sessionId || this.ws?.readyState !== WebSocket.OPEN || this.pendingOutbound.length === 0) return;
+    const batch = this.pendingOutbound.splice(0);
+    for (const frame of batch) {
+      this.ws.send(JSON.stringify(frame));
+    }
+  }
+
   private startHeartbeat() {
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
+    if (!Number.isFinite(this.heartbeatInterval) || this.heartbeatInterval <= 0) return;
     this.heartbeatTimer = setInterval(() => {
+      if (
+        this.lastInboundAt > 0 &&
+        Date.now() - this.lastInboundAt > this.heartbeatInterval * 3
+      ) {
+        this.debug("heartbeat:stale_timeout", { idleMs: Date.now() - this.lastInboundAt });
+        try {
+          this.ws?.terminate();
+        } catch {
+          this.ws?.close();
+        }
+        return;
+      }
       this.send({ type: "ping", timestamp: new Date().toISOString() });
     }, this.heartbeatInterval);
     this.heartbeatTimer.unref?.();

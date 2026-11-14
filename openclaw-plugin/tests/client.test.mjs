@@ -99,6 +99,10 @@ test("malformed JSON frames, throwing handlers, inbound/outbound thread_reply, a
 
     await new Promise((r) => setTimeout(r, 30));
     assert.deepEqual(client.getJoinedChannels(), ["room-main", "room-dynamic"]);
+    assert.ok(
+      serverReceived.some((m) => m.type === "join_channel" && m.channel_id === "room-dynamic"),
+      "channel_created must immediately send join_channel over the live WebSocket",
+    );
     assert.equal(delivered.length, 1);
     assert.equal(delivered[0].id, "tr-1");
     assert.equal(delivered[0].thread_id, "root-msg-99");
@@ -318,6 +322,99 @@ test("post-auth_ok socket error rejects waitUntilClosed() when reconnect is expl
     client.ws.onerror?.(new Error("read ECONNRESET"));
     serverSocket.terminate();
     await assert.rejects(() => waitPromise, /WebSocket error/i);
+  } finally {
+    client.disconnect();
+    await srv.close();
+  }
+});
+
+test("skips __typing__ frames, queues sendMessage during transient reconnect, throws when disconnected, and recovers stale half-open sockets", async () => {
+  const serverReceived = [];
+  let connections = 0;
+  const sockets = [];
+  const srv = await startMockServer((ws) => {
+    connections += 1;
+    const connNum = connections;
+    sockets.push(ws);
+    ws.on("message", (raw) => {
+      const parsed = JSON.parse(String(raw));
+      serverReceived.push({ connNum, frame: parsed });
+      if (parsed.type === "auth") {
+        ws.send(JSON.stringify({ type: "auth_ok", session_id: `sess-q-${connNum}` }));
+      } else if (parsed.type === "ping" && connNum >= 2) {
+        // Connection #1 intentionally blackholes pings (half-open); #2+ responds with pong
+        ws.send(JSON.stringify({ type: "pong" }));
+      }
+    });
+  });
+
+  const delivered = [];
+  const client = new AgentChatClient({
+    url: srv.url,
+    agentId: "bot-queue-stale",
+    heartbeatInterval: 20,
+    initialReconnectDelayMs: 20,
+    maxReconnectDelayMs: 40,
+    onReconnect: () => {
+      client.joinChannel("room-q");
+    },
+  });
+  client.onMessage((msg) => delivered.push(msg));
+
+  try {
+    await client.connect();
+    client.joinChannel("room-q");
+
+    // Ephemeral __typing__ must not fire messageHandlers; reply_to maps to thread_id
+    sockets[0].send(JSON.stringify({
+      type: "message",
+      id: "typing-1",
+      channel_id: "room-q",
+      sender_id: "alice",
+      content: "__typing__",
+    }));
+    sockets[0].send(JSON.stringify({
+      type: "message",
+      id: "real-1",
+      channel_id: "room-q",
+      sender_id: "alice",
+      reply_to: "parent-42",
+      content: "hi",
+    }));
+    await new Promise((r) => setTimeout(r, 25));
+    assert.equal(delivered.length, 1);
+    assert.equal(delivered[0].id, "real-1");
+    assert.equal(delivered[0].thread_id, "parent-42");
+
+    // Connection #1 stops sending anything -> stale heartbeat (> 60ms) terminates and reconnects to #2!
+    const deadline = Date.now() + 1000;
+    while (connections < 2 && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 15));
+    }
+    assert.ok(connections >= 2, "stale half-open socket must trigger heartbeat termination and reconnect");
+
+    // Now drop connection #2 and call sendMessage while reconnecting -> must flush on connection #3!
+    sockets[1].close();
+    await new Promise((r) => setTimeout(r, 5));
+    client.sendMessage("room-q", "buffered-during-reconnect");
+    const flushDeadline = Date.now() + 1000;
+    while (
+      !serverReceived.some((x) => x.frame.type === "message" && x.frame.content === "buffered-during-reconnect") &&
+      Date.now() < flushDeadline
+    ) {
+      await new Promise((r) => setTimeout(r, 15));
+    }
+    const flushedIdx = serverReceived.findIndex(
+      (x) => x.frame.type === "message" && x.frame.content === "buffered-during-reconnect",
+    );
+    const rejoinIdx = serverReceived.findIndex(
+      (x) => x.connNum === 3 && x.frame.type === "join_channel" && x.frame.channel_id === "room-q",
+    );
+    assert.ok(flushedIdx > rejoinIdx && rejoinIdx >= 0, "queued message must flush after onReconnect join_channel");
+
+    // Explicit disconnect() rejects further sendMessage calls instead of silently dropping
+    client.disconnect();
+    assert.throws(() => client.sendMessage("room-q", "after-stop"), /not connected/i);
   } finally {
     client.disconnect();
     await srv.close();

@@ -2054,6 +2054,19 @@ function buildWakePayload(msg, opts = {}) {
 function signWakeBody(body, secret) {
   return createHmac("sha256", secret).update(body, "utf8").digest("hex");
 }
+function sanitizeWakeLogUrl(rawUrl) {
+  try {
+    const parsed = new URL(rawUrl);
+    parsed.username = "";
+    parsed.password = "";
+    if (parsed.search)
+      parsed.search = "?[REDACTED]";
+    parsed.hash = "";
+    return redactSecrets2(parsed.toString());
+  } catch {
+    return redactSecrets2(String(rawUrl || "")).slice(0, 120);
+  }
+}
 async function fireWake(msg, cfg) {
   const log = cfg.logger ?? (() => {});
   const url = (cfg.url ?? "").trim();
@@ -2064,6 +2077,7 @@ async function fireWake(msg, cfg) {
   const headers = { "Content-Type": "application/json" };
   if (cfg.secret)
     headers[WAKE_SIG_HEADER] = signWakeBody(body, cfg.secret);
+  const safeLogUrl = sanitizeWakeLogUrl(url);
   const doPost = async () => {
     const f = cfg.fetchImpl ?? fetch;
     const ctrl = new AbortController;
@@ -2072,7 +2086,8 @@ async function fireWake(msg, cfg) {
     try {
       const res = await f(url, { method: "POST", headers, body, signal: ctrl.signal });
       if (!res.ok)
-        log(`[agentchat] wake POST ${url} → HTTP ${res.status}`);
+        log(`[agentchat] wake POST ${safeLogUrl} → HTTP ${res.status}`);
+      await res.body?.cancel().catch(() => {});
     } finally {
       clearTimeout(t);
     }
@@ -2083,7 +2098,7 @@ async function fireWake(msg, cfg) {
     try {
       await doPost();
     } catch (e2) {
-      log(`[agentchat] wake POST ${url} failed: ${e2}`);
+      log(`[agentchat] wake POST ${safeLogUrl} failed: ${redactSecrets2(String(e2)).slice(0, 200)}`);
     }
   }
 }
@@ -2116,7 +2131,7 @@ function grokBearerFromGatewayConfig(cfg) {
 }
 function grokPortFromGatewayConfig(cfg, fallback = 1340) {
   const p = cfg?.port;
-  return typeof p === "number" && p > 0 ? p : fallback;
+  return typeof p === "number" && Number.isInteger(p) && p >= 1 && p <= 65535 ? p : fallback;
 }
 var GROK_GATEWAY_PATH_CANDIDATES = [
   join3(process.env.HOME || process.env.USERPROFILE || homedir(), ".grok", "gateway.json"),
@@ -2186,6 +2201,7 @@ async function fireGrokWake(msg, cfg) {
       });
       if (!res.ok)
         log(`[agentchat] grok wake POST ${url} → HTTP ${res.status}`);
+      await res.body?.cancel().catch(() => {});
     } finally {
       clearTimeout(t);
     }
@@ -2196,7 +2212,7 @@ async function fireGrokWake(msg, cfg) {
     try {
       await doPost();
     } catch (e2) {
-      log(`[agentchat] grok wake POST ${url} failed: ${e2}`);
+      log(`[agentchat] grok wake POST ${url} failed: ${redactSecrets2(String(e2)).slice(0, 200)}`);
     }
   }
 }
@@ -2230,7 +2246,7 @@ async function fireAntigravityWake(msg, cfg) {
     addresses.push(cfg.lsAddress.trim());
   }
   for (const p of cfg.ports ?? []) {
-    if (typeof p === "number" && p > 0) {
+    if (typeof p === "number" && Number.isInteger(p) && p >= 1 && p <= 65535) {
       const addr = `127.0.0.1:${p}`;
       if (!addresses.includes(addr))
         addresses.push(addr);
@@ -2266,6 +2282,7 @@ async function fireAntigravityWake(msg, cfg) {
         body,
         signal: ctrl.signal
       });
+      await res.body?.cancel().catch(() => {});
       if (res.ok) {
         return true;
       }
@@ -2389,7 +2406,7 @@ function fireZcodeWake(msg, cfg) {
         const res = await cfg.runCommandImpl(resolved.cmd, resolved.args, { cwd: cfg.workspacePath, env, timeoutMs });
         succeeded = res.code === 0;
         if (!succeeded) {
-          log(`[agentchat] zcode wake (${sessionId}) exited with code ${res.code}${res.stderr ? `: ${res.stderr.slice(0, 200)}` : ""}`);
+          log(`[agentchat] zcode wake (${sessionId}) exited with code ${res.code}${res.stderr ? `: ${redactSecrets2(res.stderr).slice(0, 200)}` : ""}`);
         }
         return;
       }
@@ -2435,13 +2452,13 @@ function fireZcodeWake(msg, cfg) {
           clearTimers();
           succeeded = code === 0;
           if (!succeeded) {
-            log(`[agentchat] zcode wake (${sessionId}) exited code=${code}${stderr ? `: ${stderr.trim().slice(0, 200)}` : ""}`);
+            log(`[agentchat] zcode wake (${sessionId}) exited code=${code}${stderr ? `: ${redactSecrets2(stderr.trim()).slice(0, 200)}` : ""}`);
           }
           resolve2();
         });
       });
     } catch (e) {
-      log(`[agentchat] zcode wake failed (${sessionId}): ${e}`);
+      log(`[agentchat] zcode wake failed (${sessionId}): ${redactSecrets2(String(e)).slice(0, 200)}`);
     }
   };
   const next = prev.then(runTurn, runTurn);

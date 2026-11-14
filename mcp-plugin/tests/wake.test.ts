@@ -16,7 +16,7 @@
  * a real wake from a forged POST. The channel-owning agent's ac_ key stays local.
  */
 import { describe, expect, test } from "bun:test";
-import { buildWakePayload, fireZcodeWake, resolveEnvWakeId, resolveWindowsCliSpawn, signWakeBody, verifyWakeSignature, WAKE_ID_HEADER, WAKE_SIG_HEADER } from "../src/wake.ts";
+import { buildWakePayload, fireWake, fireZcodeWake, grokPortFromGatewayConfig, resolveEnvWakeId, resolveWindowsCliSpawn, sanitizeWakeLogUrl, signWakeBody, verifyWakeSignature, WAKE_ID_HEADER, WAKE_SIG_HEADER } from "../src/wake.ts";
 
 const MSG = {
   type: "message",
@@ -101,6 +101,52 @@ describe("signWakeBody / verifyWakeSignature — HMAC over the raw body", () => 
   test("tampered body fails (signature is over the exact bytes)", () => {
     const sig = signWakeBody('{"a":1}', "s");
     expect(verifyWakeSignature('{"a":2}', sig, ["s"])).toBe(false);
+  });
+
+  test("rejects malleable non-hex suffixes, prefixes, and wrong-length signatures", () => {
+    const body = '{"a":1}';
+    const sig = signWakeBody(body, "s");
+    expect(verifyWakeSignature(body, `${sig}_extra`, ["s"])).toBe(false);
+    expect(verifyWakeSignature(body, `sha256=${sig}`, ["s"])).toBe(false);
+    expect(verifyWakeSignature(body, sig.slice(0, 62), ["s"])).toBe(false);
+    expect(verifyWakeSignature(body, "", ["s"])).toBe(false);
+  });
+
+  test("grokPortFromGatewayConfig, sanitizeWakeLogUrl, fireWake body drain & fireZcodeWake stderr redaction", async () => {
+    expect(grokPortFromGatewayConfig({ port: 1340 })).toBe(1340);
+    expect(grokPortFromGatewayConfig({ port: Infinity })).toBe(1340);
+    expect(grokPortFromGatewayConfig({ port: NaN })).toBe(1340);
+    expect(grokPortFromGatewayConfig({ port: 0 })).toBe(1340);
+    expect(grokPortFromGatewayConfig({ port: 70000 })).toBe(1340);
+    expect(grokPortFromGatewayConfig({ port: 1340.5 })).toBe(1340);
+
+    expect(sanitizeWakeLogUrl("https://user:pass@hook.example.com/wake?token=secret123#frag")).toBe(
+      "https://hook.example.com/wake?[REDACTED]",
+    );
+
+    let canceled = 0;
+    const wakeLogs: string[] = [];
+    await fireWake(MSG, {
+      url: "https://user:pass@hook.example.com/wake?secret=my_hook_token",
+      fetchImpl: (async () => ({
+        ok: false,
+        status: 502,
+        body: { cancel: async () => { canceled++; } },
+      })) as any,
+      logger: (m) => wakeLogs.push(m),
+    });
+    expect(canceled).toBe(1);
+    expect(wakeLogs.join("\n")).not.toContain("my_hook_token");
+    expect(wakeLogs.join("\n")).not.toContain("pass");
+
+    const zLogs: string[] = [];
+    await fireZcodeWake(MSG, {
+      sessionId: "sess_redact_stderr",
+      runCommandImpl: async () => ({ code: 1, stderr: "fatal auth error with ac_supersecrettoken123456" }),
+      logger: (m) => zLogs.push(m),
+    });
+    expect(zLogs.join("\n")).not.toContain("ac_supersecrettoken123456");
+    expect(zLogs.join("\n")).toContain("ac_***REDACTED***");
   });
 
   test("the signature header name is the contract", () => {

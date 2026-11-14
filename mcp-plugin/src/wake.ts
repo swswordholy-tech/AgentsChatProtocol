@@ -162,13 +162,9 @@ export function signWakeBody(body: string, secret: string): string {
 
 /** Constant-time check that `sigHex` signs `body` under ANY of `secrets` (rotation). */
 export function verifyWakeSignature(body: string, sigHex: string, secrets: readonly string[]): boolean {
-  let sigBuf: Buffer;
-  try {
-    sigBuf = Buffer.from(sigHex, "hex");
-  } catch {
-    return false;
-  }
-  if (sigBuf.length === 0) return false;
+  if (typeof sigHex !== "string" || !/^[0-9a-f]{64}$/i.test(sigHex)) return false;
+  const sigBuf = Buffer.from(sigHex, "hex");
+  if (sigBuf.length !== 32) return false;
   for (const secret of secrets) {
     if (!secret) continue;
     const expected = Buffer.from(signWakeBody(body, secret), "hex");
@@ -176,6 +172,20 @@ export function verifyWakeSignature(body: string, sigHex: string, secrets: reado
     if (timingSafeEqual(sigBuf, expected)) return true;
   }
   return false;
+}
+
+/** Strip URL userinfo, query params, and secret-shaped path tokens before logging wake URLs. */
+export function sanitizeWakeLogUrl(rawUrl: string): string {
+  try {
+    const parsed = new URL(rawUrl);
+    parsed.username = "";
+    parsed.password = "";
+    if (parsed.search) parsed.search = "?[REDACTED]";
+    parsed.hash = "";
+    return redactSecrets(parsed.toString());
+  } catch {
+    return redactSecrets(String(rawUrl || "")).slice(0, 120);
+  }
 }
 
 export interface WakeConfig {
@@ -206,6 +216,7 @@ export async function fireWake(msg: WakeMessage, cfg: WakeConfig): Promise<void>
   const headers: Record<string, string> = { "Content-Type": "application/json" };
   if (cfg.secret) headers[WAKE_SIG_HEADER] = signWakeBody(body, cfg.secret);
 
+  const safeLogUrl = sanitizeWakeLogUrl(url);
   const doPost = async (): Promise<void> => {
     const f = cfg.fetchImpl ?? fetch;
     const ctrl = new AbortController();
@@ -213,7 +224,8 @@ export async function fireWake(msg: WakeMessage, cfg: WakeConfig): Promise<void>
     t.unref?.();
     try {
       const res = await f(url, { method: "POST", headers, body, signal: ctrl.signal });
-      if (!res.ok) log(`[agentchat] wake POST ${url} → HTTP ${res.status}`);
+      if (!res.ok) log(`[agentchat] wake POST ${safeLogUrl} → HTTP ${res.status}`);
+      await res.body?.cancel().catch(() => {});
     } finally {
       clearTimeout(t);
     }
@@ -226,7 +238,7 @@ export async function fireWake(msg: WakeMessage, cfg: WakeConfig): Promise<void>
     try {
       await doPost();
     } catch (e2) {
-      log(`[agentchat] wake POST ${url} failed: ${e2}`);
+      log(`[agentchat] wake POST ${safeLogUrl} failed: ${redactSecrets(String(e2)).slice(0, 200)}`);
     }
   }
 }
@@ -290,7 +302,7 @@ export function grokBearerFromGatewayConfig(cfg: any): string | null {
 /** Extract the gateway port (for the loopback URL) from a parsed gateway.json. */
 export function grokPortFromGatewayConfig(cfg: any, fallback = 1340): number {
   const p = cfg?.port;
-  return typeof p === "number" && p > 0 ? p : fallback;
+  return typeof p === "number" && Number.isInteger(p) && p >= 1 && p <= 65535 ? p : fallback;
 }
 
 /**
@@ -406,6 +418,7 @@ export async function fireGrokWake(msg: WakeMessage, cfg: GrokWakeConfig): Promi
         signal: ctrl.signal,
       });
       if (!res.ok) log(`[agentchat] grok wake POST ${url} → HTTP ${res.status}`);
+      await res.body?.cancel().catch(() => {});
     } finally {
       clearTimeout(t);
     }
@@ -417,7 +430,7 @@ export async function fireGrokWake(msg: WakeMessage, cfg: GrokWakeConfig): Promi
     try {
       await doPost();
     } catch (e2) {
-      log(`[agentchat] grok wake POST ${url} failed: ${e2}`);
+      log(`[agentchat] grok wake POST ${url} failed: ${redactSecrets(String(e2)).slice(0, 200)}`);
     }
   }
 }
@@ -492,7 +505,7 @@ export async function fireAntigravityWake(msg: WakeMessage, cfg: AntigravityWake
     addresses.push(cfg.lsAddress.trim());
   }
   for (const p of cfg.ports ?? []) {
-    if (typeof p === "number" && p > 0) {
+    if (typeof p === "number" && Number.isInteger(p) && p >= 1 && p <= 65535) {
       const addr = `127.0.0.1:${p}`;
       if (!addresses.includes(addr)) addresses.push(addr);
     }
@@ -529,6 +542,7 @@ export async function fireAntigravityWake(msg: WakeMessage, cfg: AntigravityWake
         body,
         signal: ctrl.signal,
       });
+      await res.body?.cancel().catch(() => {});
       if (res.ok) {
         return true;
       }
@@ -718,7 +732,7 @@ export function fireZcodeWake(msg: WakeMessage, cfg: ZcodeWakeConfig): Promise<b
         const res = await cfg.runCommandImpl(resolved.cmd, resolved.args, { cwd: cfg.workspacePath, env, timeoutMs });
         succeeded = res.code === 0;
         if (!succeeded) {
-          log(`[agentchat] zcode wake (${sessionId}) exited with code ${res.code}${res.stderr ? `: ${res.stderr.slice(0, 200)}` : ""}`);
+          log(`[agentchat] zcode wake (${sessionId}) exited with code ${res.code}${res.stderr ? `: ${redactSecrets(res.stderr).slice(0, 200)}` : ""}`);
         }
         return;
       }
@@ -764,13 +778,13 @@ export function fireZcodeWake(msg: WakeMessage, cfg: ZcodeWakeConfig): Promise<b
           clearTimers();
           succeeded = code === 0;
           if (!succeeded) {
-            log(`[agentchat] zcode wake (${sessionId}) exited code=${code}${stderr ? `: ${stderr.trim().slice(0, 200)}` : ""}`);
+            log(`[agentchat] zcode wake (${sessionId}) exited code=${code}${stderr ? `: ${redactSecrets(stderr.trim()).slice(0, 200)}` : ""}`);
           }
           resolve();
         });
       });
     } catch (e) {
-      log(`[agentchat] zcode wake failed (${sessionId}): ${e}`);
+      log(`[agentchat] zcode wake failed (${sessionId}): ${redactSecrets(String(e)).slice(0, 200)}`);
     }
   };
 
