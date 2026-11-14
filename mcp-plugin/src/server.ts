@@ -142,6 +142,7 @@ import {
 
 // --- Config: CLI args > env vars > profile file > defaults ---
 import { readFileSync, existsSync, writeFileSync, mkdirSync, readdirSync } from "fs";
+import { homedir } from "os";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
 // Atomic + 0600-by-construction profile writer. Lives in its own module so the
@@ -237,8 +238,8 @@ Options:
   --reply-to <id>    Optional target message ID for --send.
   --wake-once        Wait via HTTPS SSE + REST cursor for the next @mention or DM, print wake JSON + prompt, advance per-channel cursor, and exit 0.
   --channel <ids>    Comma-separated channels to join/watch with --wake-once (default: welcome + all joined channels).
-  --timeout <sec>    Max wait time in seconds per --wake-once window (default: 240).
-  --max-idle <sec>   Auto-hibernate and stop re-arming after <sec> of continuous silence (default: 3600 = 1 hour).
+  --timeout <sec>    Max wait time in seconds per --wake-once window (default: 240; pass 0 to listen continuously).
+  --max-idle <sec>   Auto-hibernate and stop re-arming after <sec> of continuous silence (default: never / 0; e.g. 1h, 3h, never).
   --accept-terms     Deprecated compatibility flag; Terms are a nonblocking notice.
                      No acceptance flag or AGENTSCHAT_ACCEPT_TERMS is needed.
   --id <id>          Existing agent ID paired with the token (or AGENTCHAT_AGENT_ID)
@@ -304,7 +305,7 @@ if (codexIdentity) {
   delete process.env.AGENTCHAT_TOKEN;
   process.env.AGENTSCHAT_EXPECT_AGENT_ID = codexIdentity.agentId;
 }
-const homeDir = process.env.HOME || process.env.USERPROFILE || ".";
+const homeDir = process.env.HOME || process.env.USERPROFILE || homedir() || ".";
 const configDir = join(homeDir, ".agentschat");
 const legacyConfigDir = join(homeDir, ".agentchat");
 const profileDirs = [configDir, legacyConfigDir];
@@ -4799,8 +4800,8 @@ const handleToolCall = async (request: any): Promise<any> => {
 
   if (name === "sync_skill") {
     const a = (args || {}) as { chat_id?: string; doc_id?: string; name?: string; dir?: string };
-    const home = process.env.HOME || process.env.USERPROFILE || ".";
-    const cacheDir = (a.dir && String(a.dir).trim()) || `${home}/.agentchat/skills`;
+    const home = process.env.HOME || process.env.USERPROFILE || homedir() || ".";
+    const cacheDir = (a.dir && String(a.dir).trim()) || join(home, ".agentchat", "skills");
     const safe = (s: string) => String(s).replace(/[^A-Za-z0-9_.-]/g, "_");
     // PERSONAL skill: sync_skill({name}) — version from GET /api/skills (cheap,
     // no body), body from GET /api/skills/:name only when missing/stale.
@@ -4810,7 +4811,7 @@ const handleToolCall = async (request: any): Promise<any> => {
         return { content: [{ type: "text", text: slugCheck.error }], isError: true };
       }
       const pSlug = slugCheck.value;
-      const pBase = `${cacheDir}/personal__${safe(pSlug)}`;
+      const pBase = join(cacheDir, `personal__${safe(pSlug)}`);
       const pMd = `${pBase}.md`; const pMeta = `${pBase}.json`;
       try {
         const listR = await apiFetch(`${REST_URL}/api/skills`, { headers: { "Authorization": `Bearer ${TOKEN}` } });

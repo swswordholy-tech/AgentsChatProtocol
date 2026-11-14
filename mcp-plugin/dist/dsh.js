@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 
 // dsh/src/cli.ts
-import { existsSync as existsSync5, mkdirSync as mkdirSync3, readFileSync as readFileSync5, writeFileSync as writeFileSync2 } from "node:fs";
+import { existsSync as existsSync6, mkdirSync as mkdirSync3, readFileSync as readFileSync6, writeFileSync as writeFileSync2 } from "node:fs";
 import { spawn } from "node:child_process";
-import { dirname as dirname2, join as join5 } from "node:path";
-import { homedir as homedir4 } from "node:os";
+import { dirname as dirname2, join as join6 } from "node:path";
+import { homedir as homedir5 } from "node:os";
 
 // muse/src/policy.ts
 var MAX_HISTORY_MESSAGES = 50;
@@ -503,7 +503,8 @@ function loadSessionBinds(configDir) {
 
 // src/session-route.ts
 function agentschatConfigDir(env = process.env) {
-  return env.AGENTSCHAT_CONFIG_DIR ?? join3(homedir2(), ".agentschat");
+  const home = env.HOME || env.USERPROFILE || homedir2();
+  return env.AGENTSCHAT_CONFIG_DIR ?? join3(home, ".agentschat");
 }
 function profilePathForName(configDir, name) {
   if (!name || name.includes("/") || name.includes("\\"))
@@ -546,16 +547,89 @@ function resolveSessionForAgent(agentId, opts = {}) {
   return;
 }
 
-// dsh/src/patch.ts
-import { existsSync as existsSync4, mkdirSync as mkdirSync2, readFileSync as readFileSync4, writeFileSync } from "node:fs";
-import { dirname, join as join4 } from "node:path";
+// src/wake.ts
+import { existsSync as existsSync4, readFileSync as readFileSync4 } from "node:fs";
 import { homedir as homedir3 } from "node:os";
-function resolveDshPatchPath(opts = {}) {
-  const home = opts.dshHome ?? process.env.DSH_HOME ?? join4(homedir3(), ".dsh");
-  if (opts.dshProfile) {
-    return join4(home, "profiles", opts.dshProfile, "cordis.patch.yml");
+import { join as join4, win32 as pathWin32 } from "node:path";
+var GROK_GATEWAY_PATH_CANDIDATES = [
+  join4(process.env.HOME || process.env.USERPROFILE || homedir3(), ".grok", "gateway.json"),
+  "/home/box/sand-data/gateway.json"
+];
+var zcodeSessionQueues = new Map;
+function resolveWindowsCliSpawn(cmd, args, opts) {
+  const platform = opts?.platform ?? process.platform;
+  const trimmed = (cmd || "").trim();
+  if (!trimmed)
+    return { cmd, args };
+  const execPath = opts?.execPath ?? process.execPath;
+  if (/\.(?:cjs|mjs|js)$/i.test(trimmed)) {
+    return { cmd: execPath, args: [trimmed, ...args] };
   }
-  return join4(home, "cordis.patch.yml");
+  if (platform !== "win32") {
+    return { cmd: trimmed, args };
+  }
+  const env = opts?.env ?? process.env;
+  const exists = opts?.existsImpl ?? existsSync4;
+  const readText = opts?.readTextImpl ?? ((p) => readFileSync4(p, "utf8"));
+  const hasSep = /[\\/]/.test(trimmed) || /^[A-Za-z]:/.test(trimmed);
+  const hasWinExt = /\.(?:exe|cmd|bat)$/i.test(trimmed);
+  const candidates = [];
+  if (hasSep) {
+    if (hasWinExt) {
+      candidates.push(trimmed);
+    } else {
+      candidates.push(`${trimmed}.exe`, `${trimmed}.cmd`, trimmed);
+    }
+  } else {
+    const rawPath = env.PATH ?? env.Path ?? env.path ?? "";
+    for (const rawDir of rawPath.split(";")) {
+      const dir = rawDir.trim().replace(/^"+|"+$/g, "");
+      if (!dir)
+        continue;
+      if (hasWinExt) {
+        candidates.push(pathWin32.join(dir, trimmed));
+      } else {
+        candidates.push(pathWin32.join(dir, `${trimmed}.exe`), pathWin32.join(dir, `${trimmed}.cmd`));
+      }
+    }
+  }
+  for (const candidate of candidates) {
+    if (!exists(candidate))
+      continue;
+    if (/\.exe$/i.test(candidate)) {
+      return { cmd: candidate, args };
+    }
+    if (/\.(?:cmd|bat)$/i.test(candidate)) {
+      try {
+        const content = readText(candidate);
+        const m = content.match(/%(?:~)?dp0%?[\\/]([^"\r\n]+?\.(?:cjs|mjs|js))/i);
+        if (m && m[1]) {
+          const cmdDir = pathWin32.dirname(candidate);
+          const scriptPath = pathWin32.resolve(cmdDir, m[1].replace(/\//g, "\\"));
+          if (exists(scriptPath)) {
+            const bundledNode = pathWin32.join(cmdDir, "node.exe");
+            const runner = exists(bundledNode) ? bundledNode : execPath;
+            return { cmd: runner, args: [scriptPath, ...args] };
+          }
+        }
+      } catch {}
+      return { cmd: candidate, args };
+    }
+    return { cmd: candidate, args };
+  }
+  return { cmd: trimmed, args };
+}
+
+// dsh/src/patch.ts
+import { existsSync as existsSync5, mkdirSync as mkdirSync2, readFileSync as readFileSync5, writeFileSync } from "node:fs";
+import { dirname, join as join5 } from "node:path";
+import { homedir as homedir4 } from "node:os";
+function resolveDshPatchPath(opts = {}) {
+  const home = opts.dshHome ?? process.env.DSH_HOME ?? join5(homedir4(), ".dsh");
+  if (opts.dshProfile) {
+    return join5(home, "profiles", opts.dshProfile, "cordis.patch.yml");
+  }
+  return join5(home, "cordis.patch.yml");
 }
 function buildMcpAgentsChatArgs(opts = {}) {
   const pkg = opts.packageSpec ?? "agentschat-mcp@latest";
@@ -630,7 +704,7 @@ ${renderMcpAgentsChatEntry("    ", opts)}
 }
 function applyDshCordisPatchFile(opts = {}) {
   const patchPath = resolveDshPatchPath(opts);
-  const existing = existsSync4(patchPath) ? readFileSync4(patchPath, "utf8") : "";
+  const existing = existsSync5(patchPath) ? readFileSync5(patchPath, "utf8") : "";
   const { content, changed } = mergeDshCordisPatch(existing, opts);
   if (changed) {
     mkdirSync2(dirname(patchPath), { recursive: true });
@@ -640,7 +714,7 @@ function applyDshCordisPatchFile(opts = {}) {
 }
 
 // dsh/src/cli.ts
-var DSH_PROFILE_PATH = join5(homedir4(), ".agentschat", "dsh.json");
+var DSH_PROFILE_PATH = join6(homedir5(), ".agentschat", "dsh.json");
 var DEFAULT_WS_URL = "wss://agents-chat.com/ws";
 var DEFAULT_REST_URL = "https://agents-chat.com";
 function arg(name, argv) {
@@ -653,8 +727,8 @@ function has(name, argv) {
 function loadDshConfig(env = process.env, profilePath = DSH_PROFILE_PATH) {
   let profile = {};
   try {
-    if (existsSync5(profilePath)) {
-      profile = JSON.parse(readFileSync5(profilePath, "utf8"));
+    if (existsSync6(profilePath)) {
+      profile = JSON.parse(readFileSync6(profilePath, "utf8"));
     }
   } catch {
     profile = {};
@@ -706,9 +780,11 @@ async function runDshHeadlessResponder(prompt, opts = {}) {
   const dshProfile = opts.dshProfile ?? process.env.DSH_PROFILE ?? "headless";
   const timeoutMs = opts.timeoutMs ?? 120000;
   return new Promise((resolve) => {
-    const child = spawn(dshBin, ["--profile", dshProfile, prompt], {
+    const resolved = resolveWindowsCliSpawn(dshBin, ["--profile", dshProfile, prompt], { env: process.env });
+    const child = spawn(resolved.cmd, resolved.args, {
       stdio: ["ignore", "pipe", "pipe"],
-      env: process.env
+      env: process.env,
+      windowsHide: true
     });
     let stdout = "";
     let stderr = "";
@@ -796,7 +872,7 @@ DeepSeek Harness (dsh) integration for AgentsChat:
     }
     if (primaryConfig?.defaultChannelId)
       wakeChannels.push(primaryConfig.defaultChannelId);
-    const queueFile = process.env.DSH_WAKE_QUEUE ?? join5(homedir4(), ".agentschat", "dsh-wake-queue.jsonl");
+    const queueFile = process.env.DSH_WAKE_QUEUE ?? join6(homedir5(), ".agentschat", "dsh-wake-queue.jsonl");
     const wakeUrl = process.env.DSH_WAKE_URL ?? process.env.AGENTCHAT_WAKE_URL;
     const wakeSecret = process.env.DSH_WAKE_SECRET ?? process.env.AGENTCHAT_WAKE_SECRET;
     const connectedAgentIds = new Set;
@@ -851,11 +927,11 @@ DeepSeek Harness (dsh) integration for AgentsChat:
           if (!sid.startsWith("session-") || !profName)
             continue;
           const base = profName.replace(/\.json$/, "").replace(/[^a-zA-Z0-9_-]/g, "_");
-          const candidates = [join5(cfgDir, "profiles", `${base}.json`), join5(cfgDir, `${base}.json`)];
-          const profPath = candidates.find((p) => existsSync5(p));
+          const candidates = [join6(cfgDir, "profiles", `${base}.json`), join6(cfgDir, `${base}.json`)];
+          const profPath = candidates.find((p) => existsSync6(p));
           if (!profPath)
             continue;
-          const raw = JSON.parse(readFileSync5(profPath, "utf8"));
+          const raw = JSON.parse(readFileSync6(profPath, "utf8"));
           const botAgentId = typeof raw.agent_id === "string" ? raw.agent_id : typeof raw.agentId === "string" ? raw.agentId : "";
           const botToken = typeof raw.token === "string" ? raw.token : "";
           const botWsUrl = typeof raw.server === "string" && /^wss?:\/\//i.test(raw.server) ? raw.server : defaultWsUrl;

@@ -22,6 +22,7 @@ import { TypingHeartbeat } from "../../muse/src/typing.ts";
 import { appendWakeQueue, buildWakePayload, fireWake } from "../../muse/src/wake.ts";
 import { agentschatConfigDir, resolveSessionForAgent } from "../../src/session-route.ts";
 import { loadSessionBinds } from "../../src/session-bind.ts";
+import { resolveWindowsCliSpawn } from "../../src/wake.ts";
 import { applyDshCordisPatchFile } from "./patch.ts";
 
 export const DSH_PROFILE_PATH = join(homedir(), ".agentschat", "dsh.json");
@@ -117,9 +118,11 @@ export async function runDshHeadlessResponder(
   const timeoutMs = opts.timeoutMs ?? 120_000;
 
   return new Promise((resolve) => {
-    const child = spawn(dshBin, ["--profile", dshProfile, prompt], {
+    const resolved = resolveWindowsCliSpawn(dshBin, ["--profile", dshProfile, prompt], { env: process.env });
+    const child = spawn(resolved.cmd, resolved.args, {
       stdio: ["ignore", "pipe", "pipe"],
       env: process.env,
+      windowsHide: true,
     });
     let stdout = "";
     let stderr = "";

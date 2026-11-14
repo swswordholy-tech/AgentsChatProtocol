@@ -23,6 +23,9 @@
  * timeout, then drop with a stderr note.
  */
 import { createHmac, timingSafeEqual } from "node:crypto";
+import { existsSync, readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join, win32 as pathWin32 } from "node:path";
 import { redactSecrets } from "./redact.ts";
 
 /** Signature header the receiver reads to verify a wake POST. */
@@ -300,7 +303,7 @@ export function grokPortFromGatewayConfig(cfg: any, fallback = 1340): number {
  * error — fail closed, no wake.
  */
 export const GROK_GATEWAY_PATH_CANDIDATES = [
-  `${process.env.HOME}/.grok/gateway.json`,
+  join(process.env.HOME || process.env.USERPROFILE || homedir(), ".grok", "gateway.json"),
   "/home/box/sand-data/gateway.json",
 ] as const;
 
@@ -566,6 +569,94 @@ export interface ZcodeWakeConfig {
 
 const zcodeSessionQueues = new Map<string, Promise<void>>();
 
+export interface ResolveWindowsCliOptions {
+  platform?: NodeJS.Platform;
+  env?: Record<string, string | undefined>;
+  execPath?: string;
+  existsImpl?: (path: string) => boolean;
+  readTextImpl?: (path: string) => string;
+}
+
+/**
+ * Safely resolve a CLI command on Windows (`win32`) without `shell: true`
+ * (preventing Node CVE-2024-27980 `EINVAL` / `ENOENT` on npm `.cmd` shims AND
+ * preventing `cmd.exe` `%VAR%` / `&` metacharacter injection on user prompts).
+ *
+ * Resolution order on `win32`:
+ *  1. `.js` / `.cjs` / `.mjs` script -> `{ cmd: execPath, args: [script, ...args] }`
+ *  2. `<cmd>.exe` (explicit path or on `PATH`) -> `{ cmd: exePath, args }`
+ *  3. npm `<cmd>.cmd` shim wrapping a JS/CJS/MJS script (`"%~dp0\...\cli.js" %*`
+ *     or `"%dp0%\...\cli.cjs" %*`) -> `{ cmd: execPath, args: [resolvedJsPath, ...args] }`
+ */
+export function resolveWindowsCliSpawn(
+  cmd: string,
+  args: string[],
+  opts?: ResolveWindowsCliOptions,
+): { cmd: string; args: string[] } {
+  const platform = opts?.platform ?? process.platform;
+  const trimmed = (cmd || "").trim();
+  if (!trimmed) return { cmd, args };
+  const execPath = opts?.execPath ?? process.execPath;
+  if (/\.(?:cjs|mjs|js)$/i.test(trimmed)) {
+    return { cmd: execPath, args: [trimmed, ...args] };
+  }
+  if (platform !== "win32") {
+    return { cmd: trimmed, args };
+  }
+
+  const env = opts?.env ?? process.env;
+  const exists = opts?.existsImpl ?? existsSync;
+  const readText = opts?.readTextImpl ?? ((p: string) => readFileSync(p, "utf8"));
+  const hasSep = /[\\/]/.test(trimmed) || /^[A-Za-z]:/.test(trimmed);
+  const hasWinExt = /\.(?:exe|cmd|bat)$/i.test(trimmed);
+
+  const candidates: string[] = [];
+  if (hasSep) {
+    if (hasWinExt) {
+      candidates.push(trimmed);
+    } else {
+      candidates.push(`${trimmed}.exe`, `${trimmed}.cmd`, trimmed);
+    }
+  } else {
+    const rawPath = env.PATH ?? env.Path ?? env.path ?? "";
+    for (const rawDir of rawPath.split(";")) {
+      const dir = rawDir.trim().replace(/^"+|"+$/g, "");
+      if (!dir) continue;
+      if (hasWinExt) {
+        candidates.push(pathWin32.join(dir, trimmed));
+      } else {
+        candidates.push(pathWin32.join(dir, `${trimmed}.exe`), pathWin32.join(dir, `${trimmed}.cmd`));
+      }
+    }
+  }
+
+  for (const candidate of candidates) {
+    if (!exists(candidate)) continue;
+    if (/\.exe$/i.test(candidate)) {
+      return { cmd: candidate, args };
+    }
+    if (/\.(?:cmd|bat)$/i.test(candidate)) {
+      try {
+        const content = readText(candidate);
+        const m = content.match(/%(?:~)?dp0%?[\\/]([^"\r\n]+?\.(?:cjs|mjs|js))/i);
+        if (m && m[1]) {
+          const cmdDir = pathWin32.dirname(candidate);
+          const scriptPath = pathWin32.resolve(cmdDir, m[1].replace(/\//g, "\\"));
+          if (exists(scriptPath)) {
+            const bundledNode = pathWin32.join(cmdDir, "node.exe");
+            const runner = exists(bundledNode) ? bundledNode : execPath;
+            return { cmd: runner, args: [scriptPath, ...args] };
+          }
+        }
+      } catch {}
+      return { cmd: candidate, args };
+    }
+    return { cmd: candidate, args };
+  }
+
+  return { cmd: trimmed, args };
+}
+
 /**
  * Resolve the executable command + prefix args for `zcode` CLI.
  * Supports `zcode` on PATH or macOS `/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs`.
@@ -573,18 +664,19 @@ const zcodeSessionQueues = new Map<string, Promise<void>>();
 export async function resolveZcodeCommand(explicitBin?: string): Promise<{ cmd: string; prefixArgs: string[] }> {
   const fromArg = (explicitBin ?? process.env.ZCODE_BIN ?? "").trim();
   if (fromArg) {
-    if (fromArg.endsWith(".cjs") || fromArg.endsWith(".js")) {
-      return { cmd: "node", prefixArgs: [fromArg] };
+    if (/\.(?:cjs|mjs|js)$/i.test(fromArg)) {
+      return { cmd: process.execPath, prefixArgs: [fromArg] };
     }
     return { cmd: fromArg, prefixArgs: [] };
   }
-  const macAppBundleCjs = "/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs";
-  try {
-    const { existsSync } = await import("node:fs");
-    if (existsSync(macAppBundleCjs)) {
-      return { cmd: "node", prefixArgs: [macAppBundleCjs] };
-    }
-  } catch {}
+  if (process.platform === "darwin") {
+    const macAppBundleCjs = "/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs";
+    try {
+      if (existsSync(macAppBundleCjs)) {
+        return { cmd: process.execPath, prefixArgs: [macAppBundleCjs] };
+      }
+    } catch {}
+  }
   return { cmd: "zcode", prefixArgs: [] };
 }
 
@@ -608,9 +700,9 @@ export function fireZcodeWake(msg: WakeMessage, cfg: ZcodeWakeConfig): Promise<b
   const runTurn = async (): Promise<void> => {
     try {
       const { cmd, prefixArgs } = await resolveZcodeCommand(cfg.zcodeBin);
-      const args = [...prefixArgs, "-p", prompt, "--resume", sessionId];
+      const rawArgs = [...prefixArgs, "-p", prompt, "--resume", sessionId];
       if (cfg.workspacePath && cfg.workspacePath.trim()) {
-        args.push("--cwd", cfg.workspacePath.trim());
+        rawArgs.push("--cwd", cfg.workspacePath.trim());
       }
       const env: Record<string, string | undefined> = {
         ...process.env,
@@ -619,10 +711,11 @@ export function fireZcodeWake(msg: WakeMessage, cfg: ZcodeWakeConfig): Promise<b
         ZCODE_SESSION_ID: sessionId,
         ...(cfg.profileName ? { AGENTSCHAT_PROFILE: cfg.profileName } : {}),
       };
+      const resolved = resolveWindowsCliSpawn(cmd, rawArgs, { env });
       const timeoutMs = cfg.timeoutMs ?? 180_000;
 
       if (cfg.runCommandImpl) {
-        const res = await cfg.runCommandImpl(cmd, args, { cwd: cfg.workspacePath, env, timeoutMs });
+        const res = await cfg.runCommandImpl(resolved.cmd, resolved.args, { cwd: cfg.workspacePath, env, timeoutMs });
         succeeded = res.code === 0;
         if (!succeeded) {
           log(`[agentchat] zcode wake (${sessionId}) exited with code ${res.code}${res.stderr ? `: ${res.stderr.slice(0, 200)}` : ""}`);
@@ -632,10 +725,11 @@ export function fireZcodeWake(msg: WakeMessage, cfg: ZcodeWakeConfig): Promise<b
 
       const { spawn } = await import("node:child_process");
       await new Promise<void>((resolve) => {
-        const child = spawn(cmd, args, {
+        const child = spawn(resolved.cmd, resolved.args, {
           cwd: cfg.workspacePath || process.cwd(),
           env: env as NodeJS.ProcessEnv,
           stdio: ["ignore", "ignore", "pipe"],
+          windowsHide: true,
         });
         let stderr = "";
         child.stderr?.on("data", (chunk) => {

@@ -11,11 +11,14 @@
  *     node scripts/muse-wake-receiver.mjs   # listens on 127.0.0.1:18766
  */
 import { createServer } from "node:http";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { appendWakeQueue, verifyWakeSignature, WAKE_SIG_HEADER } from "../src/wake.ts";
 
 const PORT = Number(process.env.MUSE_WAKE_PORT ?? 18766);
 const SECRET = process.env.MUSE_WAKE_SECRET ?? "";
-const QUEUE = process.env.MUSE_WAKE_QUEUE ?? `${process.env.HOME}/.agentschat/muse-wake-queue.jsonl`;
+const HOME = process.env.HOME || process.env.USERPROFILE || homedir();
+const QUEUE = process.env.MUSE_WAKE_QUEUE ?? join(HOME, ".agentschat", "muse-wake-queue.jsonl");
 
 const server = createServer((req, res) => {
   if (req.method !== "POST" || req.url !== "/wake") {

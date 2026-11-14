@@ -525,4 +525,42 @@ describe("rest-cli (--join, --send, --wake-once) & unified per-channel cursor", 
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  test("DEFAULT_MAX_IDLE_MS defaults to 0 (infinite standby) so --wake-once never auto-hibernates after 1h unless --max-idle is explicitly set", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "rest-cli-inf-standby-"));
+    try {
+      const cursorFile = join(dir, "last-seen-msg-ts-bot-inf.json");
+      let currentMs = Date.parse("2026-11-14T12:00:00.000Z");
+      writeFileSync(
+        cursorFile,
+        JSON.stringify({
+          [CURSOR_INIT_KEY]: "2026-11-14T12:00:00.000Z",
+          [CURSOR_LAST_ACTIVE_KEY]: "2026-11-14T12:00:00.000Z",
+          welcome: "2026-11-14T12:00:00.000Z",
+        }),
+      );
+      // 3 hours later with NO explicit maxIdleMs -> must return idle_timeout + should_rearm: true (NOT hibernate!)
+      currentMs = Date.parse("2026-11-14T15:05:00.000Z");
+      const ev = await wakeOnce({
+        restUrl: "https://agents-chat.com",
+        configDir: dir,
+        agentId: "bot-inf",
+        token: "ac_test_token_123456",
+        channels: ["welcome"],
+        timeoutMs: 15,
+        pollIntervalMs: 50,
+        enableSse: false,
+        nowIso: () => new Date(currentMs).toISOString(),
+        fetchImpl: (async (url: any) => {
+          if (String(url).endsWith("/api/channels/mine")) return Response.json({ channels: [{ id: "welcome" }] });
+          return Response.json({ messages: [] });
+        }) as any,
+      });
+      expect(ev.event).toBe("idle_timeout");
+      expect(ev.should_rearm).toBe(true);
+      expect(ev.max_idle_ms).toBe(0);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });

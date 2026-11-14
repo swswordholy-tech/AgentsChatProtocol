@@ -16,7 +16,7 @@
  * a real wake from a forged POST. The channel-owning agent's ac_ key stays local.
  */
 import { describe, expect, test } from "bun:test";
-import { buildWakePayload, fireZcodeWake, resolveEnvWakeId, signWakeBody, verifyWakeSignature, WAKE_ID_HEADER, WAKE_SIG_HEADER } from "../src/wake.ts";
+import { buildWakePayload, fireZcodeWake, resolveEnvWakeId, resolveWindowsCliSpawn, signWakeBody, verifyWakeSignature, WAKE_ID_HEADER, WAKE_SIG_HEADER } from "../src/wake.ts";
 
 const MSG = {
   type: "message",
@@ -168,5 +168,63 @@ describe("resolveEnvWakeId — explicit stdio REST wake attribution", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("resolveWindowsCliSpawn — safe shell:false Windows .exe/.cmd resolution", () => {
+  test("passes commands unchanged on non-win32 except explicit .js/.cjs/.mjs entrypoints", () => {
+    expect(resolveWindowsCliSpawn("codex", ["app-server"], { platform: "darwin" })).toEqual({
+      cmd: "codex",
+      args: ["app-server"],
+    });
+    expect(
+      resolveWindowsCliSpawn("/opt/zcode/zcode.cjs", ["-p", "hi"], {
+        platform: "linux",
+        execPath: "/usr/bin/node",
+      }),
+    ).toEqual({
+      cmd: "/usr/bin/node",
+      args: ["/opt/zcode/zcode.cjs", "-p", "hi"],
+    });
+  });
+
+  test("unwraps npm .cmd shim to node.exe + resolved JS script with zero cmd.exe metacharacter exposure, and prefers .exe when present", () => {
+    const npmDir = "C:\\Users\\Boss\\AppData\\Roaming\\npm";
+    const codexCmd = `${npmDir}\\codex.cmd`;
+    const codexJs = `${npmDir}\\node_modules\\@openai\\codex\\bin\\codex.js`;
+    const zcodeExe = "C:\\Program Files\\ZCode\\zcode.exe";
+    const files = new Map<string, string>([
+      [
+        codexCmd,
+        `@ECHO off\r\nSET dp0=%~dp0\r\n"%_prog%"  "%dp0%\\node_modules\\@openai\\codex\\bin\\codex.js" %*\r\n`,
+      ],
+      [codexJs, "// codex cli"],
+      [zcodeExe, "MZ"],
+    ]);
+    const promptWithMetachars = `100% safe & calc.exe | "%APPDATA%" ^ !PATH!`;
+
+    const resolvedCmd = resolveWindowsCliSpawn("codex", ["app-server", "--listen", "stdio://"], {
+      platform: "win32",
+      env: { Path: `C:\\Windows\\System32;${npmDir}` },
+      execPath: "C:\\Program Files\\nodejs\\node.exe",
+      existsImpl: (p) => files.has(p),
+      readTextImpl: (p) => files.get(p) || "",
+    });
+    expect(resolvedCmd).toEqual({
+      cmd: "C:\\Program Files\\nodejs\\node.exe",
+      args: [codexJs, "app-server", "--listen", "stdio://"],
+    });
+
+    const resolvedExe = resolveWindowsCliSpawn("zcode", ["-p", promptWithMetachars, "--resume", "sess_1"], {
+      platform: "win32",
+      env: { PATH: `C:\\Program Files\\ZCode;${npmDir}` },
+      execPath: "C:\\Program Files\\nodejs\\node.exe",
+      existsImpl: (p) => files.has(p),
+      readTextImpl: (p) => files.get(p) || "",
+    });
+    expect(resolvedExe).toEqual({
+      cmd: zcodeExe,
+      args: ["-p", promptWithMetachars, "--resume", "sess_1"],
+    });
   });
 });

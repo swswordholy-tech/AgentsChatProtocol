@@ -1935,6 +1935,9 @@ function annotateTools(tools) {
 
 // src/wake.ts
 import { createHmac, timingSafeEqual } from "node:crypto";
+import { existsSync as existsSync2, readFileSync as readFileSync3 } from "node:fs";
+import { homedir } from "node:os";
+import { join as join3, win32 as pathWin32 } from "node:path";
 
 // src/redact.ts
 function redactSecrets2(text, opts) {
@@ -2087,7 +2090,7 @@ function grokPortFromGatewayConfig(cfg, fallback = 1340) {
   return typeof p === "number" && p > 0 ? p : fallback;
 }
 var GROK_GATEWAY_PATH_CANDIDATES = [
-  `${process.env.HOME}/.grok/gateway.json`,
+  join3(process.env.HOME || process.env.USERPROFILE || homedir(), ".grok", "gateway.json"),
   "/home/box/sand-data/gateway.json"
 ];
 function resolveGrokGatewayPath(explicit, exists) {
@@ -2126,8 +2129,8 @@ async function fireGrokWake(msg, cfg) {
   }
   let gwcfg;
   try {
-    const { readFileSync: readFileSync3 } = await import("node:fs");
-    gwcfg = JSON.parse(readFileSync3(cfg.gatewayConfigPath, "utf8"));
+    const { readFileSync: readFileSync4 } = await import("node:fs");
+    gwcfg = JSON.parse(readFileSync4(cfg.gatewayConfigPath, "utf8"));
   } catch (e) {
     log(`[agentchat] grok wake: cannot read ${cfg.gatewayConfigPath}: ${e}`);
     return;
@@ -2246,21 +2249,85 @@ async function fireAntigravityWake(msg, cfg) {
   return false;
 }
 var zcodeSessionQueues = new Map;
+function resolveWindowsCliSpawn(cmd, args, opts) {
+  const platform = opts?.platform ?? process.platform;
+  const trimmed = (cmd || "").trim();
+  if (!trimmed)
+    return { cmd, args };
+  const execPath = opts?.execPath ?? process.execPath;
+  if (/\.(?:cjs|mjs|js)$/i.test(trimmed)) {
+    return { cmd: execPath, args: [trimmed, ...args] };
+  }
+  if (platform !== "win32") {
+    return { cmd: trimmed, args };
+  }
+  const env = opts?.env ?? process.env;
+  const exists = opts?.existsImpl ?? existsSync2;
+  const readText = opts?.readTextImpl ?? ((p) => readFileSync3(p, "utf8"));
+  const hasSep = /[\\/]/.test(trimmed) || /^[A-Za-z]:/.test(trimmed);
+  const hasWinExt = /\.(?:exe|cmd|bat)$/i.test(trimmed);
+  const candidates = [];
+  if (hasSep) {
+    if (hasWinExt) {
+      candidates.push(trimmed);
+    } else {
+      candidates.push(`${trimmed}.exe`, `${trimmed}.cmd`, trimmed);
+    }
+  } else {
+    const rawPath = env.PATH ?? env.Path ?? env.path ?? "";
+    for (const rawDir of rawPath.split(";")) {
+      const dir = rawDir.trim().replace(/^"+|"+$/g, "");
+      if (!dir)
+        continue;
+      if (hasWinExt) {
+        candidates.push(pathWin32.join(dir, trimmed));
+      } else {
+        candidates.push(pathWin32.join(dir, `${trimmed}.exe`), pathWin32.join(dir, `${trimmed}.cmd`));
+      }
+    }
+  }
+  for (const candidate of candidates) {
+    if (!exists(candidate))
+      continue;
+    if (/\.exe$/i.test(candidate)) {
+      return { cmd: candidate, args };
+    }
+    if (/\.(?:cmd|bat)$/i.test(candidate)) {
+      try {
+        const content = readText(candidate);
+        const m = content.match(/%(?:~)?dp0%?[\\/]([^"\r\n]+?\.(?:cjs|mjs|js))/i);
+        if (m && m[1]) {
+          const cmdDir = pathWin32.dirname(candidate);
+          const scriptPath = pathWin32.resolve(cmdDir, m[1].replace(/\//g, "\\"));
+          if (exists(scriptPath)) {
+            const bundledNode = pathWin32.join(cmdDir, "node.exe");
+            const runner = exists(bundledNode) ? bundledNode : execPath;
+            return { cmd: runner, args: [scriptPath, ...args] };
+          }
+        }
+      } catch {}
+      return { cmd: candidate, args };
+    }
+    return { cmd: candidate, args };
+  }
+  return { cmd: trimmed, args };
+}
 async function resolveZcodeCommand(explicitBin) {
   const fromArg = (explicitBin ?? process.env.ZCODE_BIN ?? "").trim();
   if (fromArg) {
-    if (fromArg.endsWith(".cjs") || fromArg.endsWith(".js")) {
-      return { cmd: "node", prefixArgs: [fromArg] };
+    if (/\.(?:cjs|mjs|js)$/i.test(fromArg)) {
+      return { cmd: process.execPath, prefixArgs: [fromArg] };
     }
     return { cmd: fromArg, prefixArgs: [] };
   }
-  const macAppBundleCjs = "/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs";
-  try {
-    const { existsSync: existsSync2 } = await import("node:fs");
-    if (existsSync2(macAppBundleCjs)) {
-      return { cmd: "node", prefixArgs: [macAppBundleCjs] };
-    }
-  } catch {}
+  if (process.platform === "darwin") {
+    const macAppBundleCjs = "/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs";
+    try {
+      if (existsSync2(macAppBundleCjs)) {
+        return { cmd: process.execPath, prefixArgs: [macAppBundleCjs] };
+      }
+    } catch {}
+  }
   return { cmd: "zcode", prefixArgs: [] };
 }
 function fireZcodeWake(msg, cfg) {
@@ -2276,9 +2343,9 @@ function fireZcodeWake(msg, cfg) {
   const runTurn = async () => {
     try {
       const { cmd, prefixArgs } = await resolveZcodeCommand(cfg.zcodeBin);
-      const args = [...prefixArgs, "-p", prompt, "--resume", sessionId];
+      const rawArgs = [...prefixArgs, "-p", prompt, "--resume", sessionId];
       if (cfg.workspacePath && cfg.workspacePath.trim()) {
-        args.push("--cwd", cfg.workspacePath.trim());
+        rawArgs.push("--cwd", cfg.workspacePath.trim());
       }
       const env = {
         ...process.env,
@@ -2287,9 +2354,10 @@ function fireZcodeWake(msg, cfg) {
         ZCODE_SESSION_ID: sessionId,
         ...cfg.profileName ? { AGENTSCHAT_PROFILE: cfg.profileName } : {}
       };
+      const resolved = resolveWindowsCliSpawn(cmd, rawArgs, { env });
       const timeoutMs = cfg.timeoutMs ?? 180000;
       if (cfg.runCommandImpl) {
-        const res = await cfg.runCommandImpl(cmd, args, { cwd: cfg.workspacePath, env, timeoutMs });
+        const res = await cfg.runCommandImpl(resolved.cmd, resolved.args, { cwd: cfg.workspacePath, env, timeoutMs });
         succeeded = res.code === 0;
         if (!succeeded) {
           log(`[agentchat] zcode wake (${sessionId}) exited with code ${res.code}${res.stderr ? `: ${res.stderr.slice(0, 200)}` : ""}`);
@@ -2298,10 +2366,11 @@ function fireZcodeWake(msg, cfg) {
       }
       const { spawn } = await import("node:child_process");
       await new Promise((resolve2) => {
-        const child = spawn(cmd, args, {
+        const child = spawn(resolved.cmd, resolved.args, {
           cwd: cfg.workspacePath || process.cwd(),
           env,
-          stdio: ["ignore", "ignore", "pipe"]
+          stdio: ["ignore", "ignore", "pipe"],
+          windowsHide: true
         });
         let stderr = "";
         child.stderr?.on("data", (chunk) => {
@@ -2358,40 +2427,53 @@ function fireZcodeWake(msg, cfg) {
 
 // src/session-bind.ts
 import { createHash } from "node:crypto";
-import { closeSync, existsSync as existsSync3, mkdirSync, openSync, readFileSync as readFileSync4, readSync, readdirSync as readdirSync2, statSync as statSync2, unlinkSync as unlinkSync2 } from "node:fs";
-import { homedir, tmpdir } from "node:os";
-import { join as join3 } from "node:path";
+import { closeSync, existsSync as existsSync4, mkdirSync, openSync, readFileSync as readFileSync5, readSync, readdirSync as readdirSync2, statSync as statSync2, unlinkSync as unlinkSync2 } from "node:fs";
+import { homedir as homedir2, tmpdir } from "node:os";
+import { join as join4 } from "node:path";
 import { spawnSync } from "node:child_process";
 
 // src/profile-store.ts
-import { existsSync as existsSync2, writeFileSync, renameSync, chmodSync, unlinkSync, statSync, readdirSync, readFileSync as readFileSync3 } from "fs";
+import { existsSync as existsSync3, writeFileSync, renameSync, copyFileSync, chmodSync, unlinkSync, statSync, readdirSync, readFileSync as readFileSync4 } from "fs";
 var defaultWarn = (m) => process.stderr.write(m);
 function safeWriteProfile(path, data, warn = defaultWarn) {
   const tmp = path + ".tmp";
   try {
-    if (existsSync2(tmp))
+    if (existsSync3(tmp))
       unlinkSync(tmp);
   } catch (e) {
     warn(`[agentchat] WARNING: stale ${tmp} could not be removed: ${e}
 `);
   }
   writeFileSync(tmp, JSON.stringify(data, null, 2), { mode: 384 });
-  renameSync(tmp, path);
   try {
-    chmodSync(path, 384);
-  } catch (e) {
-    warn(`[agentchat] WARNING: could not chmod ${path} to 0600: ${e}
-`);
+    renameSync(tmp, path);
+  } catch (err) {
+    if (process.platform === "win32" && (err?.code === "EPERM" || err?.code === "EACCES")) {
+      copyFileSync(tmp, path);
+      try {
+        unlinkSync(tmp);
+      } catch {}
+    } else {
+      throw err;
+    }
   }
-  try {
-    const mode = statSync(path).mode & 511;
-    if (mode !== 384) {
-      warn(`[agentchat] WARNING: ${path} is mode ${mode.toString(8)}, expected 600 — it holds your agent key. Fix: chmod 600 ${path}
+  if (process.platform !== "win32") {
+    try {
+      chmodSync(path, 384);
+    } catch (e) {
+      warn(`[agentchat] WARNING: could not chmod ${path} to 0600: ${e}
 `);
     }
-  } catch (e) {
-    warn(`[agentchat] WARNING: could not verify permissions of ${path}: ${e}
+    try {
+      const mode = statSync(path).mode & 511;
+      if (mode !== 384) {
+        warn(`[agentchat] WARNING: ${path} is mode ${mode.toString(8)}, expected 600 — it holds your agent key. Fix: chmod 600 ${path}
 `);
+      }
+    } catch (e) {
+      warn(`[agentchat] WARNING: could not verify permissions of ${path}: ${e}
+`);
+    }
   }
 }
 var NON_PROFILE_JSON_FILES = new Set([
@@ -2426,20 +2508,20 @@ function resolveLockDir(homeDir, env = process.env) {
     return explicit;
   const hash = createHash("sha256").update(homeDir || ".").digest("hex").slice(0, 12);
   const baseTmp = process.platform === "win32" ? tmpdir() : "/tmp";
-  return join3(baseTmp, `agentschat-locks-${hash}`);
+  return join4(baseTmp, `agentschat-locks-${hash}`);
 }
 function lockFilePath(lockDir, agentId) {
   const safe = String(agentId || "").trim().replace(/[^a-zA-Z0-9_-]/g, "_");
-  return join3(lockDir, `${safe}.lock`);
+  return join4(lockDir, `${safe}.lock`);
 }
 function readAgentLock(lockDir, agentId) {
   if (!agentId)
     return null;
   const file = lockFilePath(lockDir, agentId);
-  if (!existsSync3(file))
+  if (!existsSync4(file))
     return null;
   try {
-    const raw = JSON.parse(readFileSync4(file, "utf8"));
+    const raw = JSON.parse(readFileSync5(file, "utf8"));
     if (!raw || typeof raw !== "object" || typeof raw.pid !== "number" || typeof raw.agentId !== "string") {
       return null;
     }
@@ -2532,11 +2614,11 @@ function parseSessionBinds(raw) {
 function loadSessionBinds(configDir) {
   const merged = {};
   for (const filename of [LEGACY_AGY_BINDS_FILENAME, DEFAULT_SESSION_BINDS_FILENAME]) {
-    const path = join3(configDir, filename);
-    if (!existsSync3(path))
+    const path = join4(configDir, filename);
+    if (!existsSync4(path))
       continue;
     try {
-      Object.assign(merged, parseSessionBinds(JSON.parse(readFileSync4(path, "utf8"))));
+      Object.assign(merged, parseSessionBinds(JSON.parse(readFileSync5(path, "utf8"))));
     } catch {}
   }
   return merged;
@@ -2545,11 +2627,11 @@ function resolveAgentIdForProfileName(configDir, name) {
   if (!name || name.includes("/") || name.includes("\\"))
     return null;
   const base = name.replace(/\.json$/, "").replace(/[^a-zA-Z0-9_-]/g, "_");
-  for (const candidate of [join3(configDir, "profiles", `${base}.json`), join3(configDir, `${base}.json`)]) {
-    if (!existsSync3(candidate))
+  for (const candidate of [join4(configDir, "profiles", `${base}.json`), join4(configDir, `${base}.json`)]) {
+    if (!existsSync4(candidate))
       continue;
     try {
-      const parsed = JSON.parse(readFileSync4(candidate, "utf8"));
+      const parsed = JSON.parse(readFileSync5(candidate, "utf8"));
       if (typeof parsed?.agent_id === "string" && parsed.agent_id.trim()) {
         return parsed.agent_id.trim();
       }
@@ -2570,11 +2652,11 @@ function saveSessionBind(configDir, sessionId, profileName) {
       return false;
     return resolveAgentIdForProfileName(configDir, existingProf) === targetAgentId;
   };
-  const path = join3(configDir, DEFAULT_SESSION_BINDS_FILENAME);
+  const path = join4(configDir, DEFAULT_SESSION_BINDS_FILENAME);
   let current = {};
-  if (existsSync3(path)) {
+  if (existsSync4(path)) {
     try {
-      current = parseSessionBinds(JSON.parse(readFileSync4(path, "utf8")));
+      current = parseSessionBinds(JSON.parse(readFileSync5(path, "utf8")));
     } catch {}
   }
   for (const [existingSid, existingProf] of Object.entries(current)) {
@@ -2586,10 +2668,10 @@ function saveSessionBind(configDir, sessionId, profileName) {
   current[sid] = prof;
   mkdirSync(configDir, { recursive: true });
   safeWriteProfile(path, current);
-  const legacyPath = join3(configDir, LEGACY_AGY_BINDS_FILENAME);
-  if (existsSync3(legacyPath)) {
+  const legacyPath = join4(configDir, LEGACY_AGY_BINDS_FILENAME);
+  if (existsSync4(legacyPath)) {
     try {
-      const legacy = parseSessionBinds(JSON.parse(readFileSync4(legacyPath, "utf8")));
+      const legacy = parseSessionBinds(JSON.parse(readFileSync5(legacyPath, "utf8")));
       let changed = false;
       for (const [existingSid, existingProf] of Object.entries(legacy)) {
         if (existingSid !== sid && isSameProfileOrAgent(existingProf)) {
@@ -2608,11 +2690,11 @@ function removeSessionBind(configDir, sessionId) {
     return false;
   let removed = false;
   for (const filename of [DEFAULT_SESSION_BINDS_FILENAME, LEGACY_AGY_BINDS_FILENAME]) {
-    const path = join3(configDir, filename);
-    if (!existsSync3(path))
+    const path = join4(configDir, filename);
+    if (!existsSync4(path))
       continue;
     try {
-      const current = parseSessionBinds(JSON.parse(readFileSync4(path, "utf8")));
+      const current = parseSessionBinds(JSON.parse(readFileSync5(path, "utf8")));
       if (sid in current) {
         delete current[sid];
         safeWriteProfile(path, current);
@@ -2708,6 +2790,161 @@ function parseAntigravityLsofOutput(stdout, appDataDir = "antigravity") {
   const openConversations = presenceConversations.length > 0 ? presenceConversations : dbConversations;
   return { ports, openConversations };
 }
+function extractCliFlagValue(cmd, flag) {
+  const re = new RegExp(`${flag}(?:=|\\s+)(?:"([^"]+)"|'([^']+)'|([^\\s"']+))`);
+  const m = cmd.match(re);
+  return (m?.[1] ?? m?.[2] ?? m?.[3] ?? "").trim();
+}
+function parseWindowsNetstatOutput(stdout, targetPid) {
+  if (!stdout || !Number.isFinite(targetPid) || targetPid <= 0)
+    return [];
+  const ports = [];
+  for (const line of stdout.split(/\r?\n/)) {
+    const m = line.match(/^\s*TCP\s+(?:127\.0\.0\.1|\[::1\]):(\d+)\s+(?:0\.0\.0\.0:0|\[::\]:0|\*:\*)\s+\S+\s+(\d+)\s*$/i);
+    if (!m)
+      continue;
+    const port = Number(m[1]);
+    const pid = Number(m[2]);
+    if (pid === targetPid && port > 0 && !ports.includes(port)) {
+      ports.push(port);
+    }
+  }
+  ports.sort((a, b) => b - a);
+  return ports;
+}
+function parseWindowsAntigravityProbeJson(stdout, netstatStdout = "") {
+  const trimmed = (stdout || "").trim();
+  if (!trimmed || trimmed === "{}")
+    return null;
+  let parsed;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {
+    return null;
+  }
+  const lsPid = Number(parsed?.lsPid);
+  const lsCmd = typeof parsed?.lsCmd === "string" ? parsed.lsCmd : "";
+  if (!Number.isFinite(lsPid) || lsPid <= 0 || !lsCmd)
+    return null;
+  const csrfToken = extractCliFlagValue(lsCmd, "--csrf_token");
+  if (!csrfToken)
+    return null;
+  const portSet = new Set;
+  const rawPorts = Array.isArray(parsed?.ports) ? parsed.ports : typeof parsed?.ports === "number" ? [parsed.ports] : [];
+  for (const p of rawPorts) {
+    const num = Number(p);
+    if (Number.isFinite(num) && num > 0)
+      portSet.add(num);
+  }
+  if (portSet.size === 0 && netstatStdout) {
+    for (const p of parseWindowsNetstatOutput(netstatStdout, lsPid)) {
+      portSet.add(p);
+    }
+  }
+  const ports = [...portSet].sort((a, b) => b - a);
+  const uuidRe = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  const toUuidList = (val) => {
+    const arr = Array.isArray(val) ? val : typeof val === "string" ? [val] : [];
+    const out = [];
+    for (const item of arr) {
+      const s = String(item || "").trim();
+      if (uuidRe.test(s) && !out.includes(s))
+        out.push(s);
+    }
+    return out;
+  };
+  const lockedPresence = toUuidList(parsed?.lockedPresence);
+  const lockedDbs = toUuidList(parsed?.lockedDbs);
+  const openConversations = lockedPresence.length > 0 ? lockedPresence : lockedDbs;
+  return { lsPid, csrfToken, ports, openConversations };
+}
+function runWindowsPowerShell(script, timeoutMs = 4000) {
+  for (const bin of ["powershell.exe", "pwsh.exe", "pwsh"]) {
+    const res = spawnSync(bin, ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script], { encoding: "utf8", timeout: timeoutMs, windowsHide: true });
+    if (!res.error && res.status === 0 && typeof res.stdout === "string") {
+      return res.stdout;
+    }
+    if (!res.error)
+      break;
+  }
+  return null;
+}
+function discoverWindowsAntigravityHost(currentPid) {
+  const psScript = [
+    "$ErrorActionPreference = 'SilentlyContinue'",
+    `$p = ${Math.trunc(currentPid)}`,
+    "$lsPid = 0",
+    "$lsCmd = ''",
+    "for ($h = 0; $h -lt 8 -and $p -gt 0; $h++) {",
+    '  $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$p"',
+    "  if (-not $proc) { break }",
+    "  $cmd = [string]$proc.CommandLine",
+    "  $name = [string]$proc.Name",
+    "  if ($h -gt 0 -and ($cmd -match 'bun(?:\\.exe)?\\s+test' -or $cmd -match 'node(?:\\.exe)?\\s+--test')) { break }",
+    "  if (($cmd -match 'language_server' -or $name -match 'language_server') -and $cmd -match '--csrf_token') {",
+    "    $lsPid = [int]$proc.ProcessId",
+    "    $lsCmd = $cmd",
+    "    break",
+    "  }",
+    "  $nextP = [int]$proc.ParentProcessId",
+    "  if ($nextP -le 0 -or $nextP -eq $p) { break }",
+    "  $p = $nextP",
+    "}",
+    "if ($lsPid -le 0) { Write-Output '{}'; exit 0 }",
+    "$ports = @()",
+    "if (Get-Command Get-NetTCPConnection -ErrorAction SilentlyContinue) {",
+    "  $ports = @(Get-NetTCPConnection -OwningProcess $lsPid -State Listen | Where-Object { $_.LocalAddress -eq '127.0.0.1' -or $_.LocalAddress -eq '::1' } | ForEach-Object { [int]$_.LocalPort } | Select-Object -Unique)",
+    "}",
+    "$appDir = 'antigravity'",
+    `if ($lsCmd -match '--app_data_dir(?:=|\\s+)(?:"([^"]+)"|''([^'']+)''|([^\\s"'']+))') {`,
+    "  $appDir = if ($Matches[1]) { $Matches[1] } elseif ($Matches[2]) { $Matches[2] } else { $Matches[3] }",
+    "}",
+    "$homeDir = if ($env:USERPROFILE) { $env:USERPROFILE } else { [Environment]::GetFolderPath('UserProfile') }",
+    "$baseDir = Join-Path (Join-Path $homeDir '.gemini') $appDir",
+    "$lockedPresence = @()",
+    "$presDir = Join-Path $baseDir 'presence'",
+    "if (Test-Path -LiteralPath $presDir) {",
+    "  Get-ChildItem -LiteralPath $presDir -Filter '*.lock' -File | ForEach-Object {",
+    "    if ($_.BaseName -match '^[0-9a-fA-F-]{36}$') {",
+    "      try {",
+    "        $s = [System.IO.File]::Open($_.FullName, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::None)",
+    "        $s.Dispose()",
+    "      } catch [System.IO.IOException] {",
+    "        $lockedPresence += $_.BaseName",
+    "      } catch {}",
+    "    }",
+    "  }",
+    "}",
+    "$lockedDbs = @()",
+    "if ($lockedPresence.Count -eq 0 -and $appDir -ne 'antigravity-cli') {",
+    "  $convDir = Join-Path $baseDir 'conversations'",
+    "  if (Test-Path -LiteralPath $convDir) {",
+    "    Get-ChildItem -LiteralPath $convDir -Filter '*.db' -File | ForEach-Object {",
+    "      if ($_.BaseName -match '^[0-9a-fA-F-]{36}$') {",
+    "        try {",
+    "          $s = [System.IO.File]::Open($_.FullName, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::None)",
+    "          $s.Dispose()",
+    "        } catch [System.IO.IOException] {",
+    "          $lockedDbs += $_.BaseName",
+    "        } catch {}",
+    "      }",
+    "    }",
+    "  }",
+    "}",
+    "[pscustomobject]@{ lsPid = $lsPid; lsCmd = $lsCmd; ports = $ports; lockedPresence = $lockedPresence; lockedDbs = $lockedDbs } | ConvertTo-Json -Compress"
+  ].join("; ");
+  const stdout = runWindowsPowerShell(psScript, 4000);
+  if (!stdout)
+    return null;
+  let info = parseWindowsAntigravityProbeJson(stdout);
+  if (info && info.ports.length === 0) {
+    const ns = spawnSync("netstat", ["-ano"], { encoding: "utf8", timeout: 2000, windowsHide: true });
+    if (ns.status === 0 && ns.stdout) {
+      info = parseWindowsAntigravityProbeJson(stdout, ns.stdout);
+    }
+  }
+  return info;
+}
 function discoverAntigravityHost(opts) {
   if (!opts?.currentPid) {
     const envAddr = process.env.ANTIGRAVITY_LS_ADDRESS?.trim() || "";
@@ -2728,7 +2965,13 @@ function discoverAntigravityHost(opts) {
   if (cachedAgyHost && now - cachedAgyHost.at < cacheMs)
     return cachedAgyHost.info;
   try {
-    let pid = opts?.currentPid ?? process.pid;
+    const startPid = opts?.currentPid ?? process.pid;
+    if (process.platform === "win32") {
+      const winInfo = discoverWindowsAntigravityHost(startPid);
+      cachedAgyHost = { at: now, info: winInfo };
+      return winInfo;
+    }
+    let pid = startPid;
     let lsPid = 0;
     let lsCmd = "";
     for (let hop = 0;hop < 4 && pid > 1; hop++) {
@@ -2754,14 +2997,12 @@ function discoverAntigravityHost(opts) {
       cachedAgyHost = { at: now, info: null };
       return null;
     }
-    const csrfMatch = lsCmd.match(/--csrf_token[=\s]+([^\s]+)/);
-    const csrfToken = csrfMatch?.[1]?.trim() || "";
+    const csrfToken = extractCliFlagValue(lsCmd, "--csrf_token");
     if (!csrfToken) {
       cachedAgyHost = { at: now, info: null };
       return null;
     }
-    const appDirMatch = lsCmd.match(/--app_data_dir[=\s]+([^\s]+)/);
-    const appDataDir = appDirMatch?.[1]?.trim() || "antigravity";
+    const appDataDir = extractCliFlagValue(lsCmd, "--app_data_dir") || "antigravity";
     const lsof = spawnSync("lsof", ["-Pan", "-p", String(lsPid)], { encoding: "utf8", timeout: 1500 });
     const { ports, openConversations } = lsof.status === 0 && lsof.stdout ? parseAntigravityLsofOutput(lsof.stdout, appDataDir) : { ports: [], openConversations: [] };
     const info = { lsPid, csrfToken, ports, openConversations };
@@ -2773,8 +3014,9 @@ function discoverAntigravityHost(opts) {
   }
 }
 function detectAntigravityCallerSession(opts) {
-  const brainDir = opts?.brainDir?.trim() || process.env.AGENTSCHAT_AGY_BRAIN_DIR?.trim() || join3(homedir(), ".gemini", "antigravity", "brain");
-  if (!existsSync3(brainDir))
+  const home = process.env.HOME || process.env.USERPROFILE || homedir2();
+  const brainDir = opts?.brainDir?.trim() || process.env.AGENTSCHAT_AGY_BRAIN_DIR?.trim() || join4(home, ".gemini", "antigravity", "brain");
+  if (!existsSync4(brainDir))
     return null;
   const nowMs = opts?.nowMs ?? Date.now();
   const maxAgeMs = opts?.maxAgeMs ?? 30000;
@@ -2809,7 +3051,7 @@ function detectAntigravityCallerSession(opts) {
   let bestMtime = -1;
   const recentCids = [];
   for (const cid of candidateSet) {
-    const transcriptPath = join3(brainDir, cid, ".system_generated", "logs", "transcript.jsonl");
+    const transcriptPath = join4(brainDir, cid, ".system_generated", "logs", "transcript.jsonl");
     let st;
     try {
       st = statSync2(transcriptPath);
@@ -2872,6 +3114,9 @@ function detectAntigravityCallerSession(opts) {
   return null;
 }
 var cachedIsDshHost = null;
+function matchesDshCommandLine(cmd) {
+  return cmd.includes("@deepseek-ai") || cmd.includes("/.dsh/") || cmd.toLowerCase().includes("\\.dsh\\") || /\bdsh(?:\.cmd|\.exe)?\b/i.test(cmd);
+}
 function isDshHostProcess(opts) {
   const env = opts?.env ?? process.env;
   if (env.AGENTSCHAT_DSH_HOME?.trim() || env.DSH_HOME?.trim() || env.AGENTSCHAT_DSH_HEALTH_URL?.trim()) {
@@ -2883,6 +3128,35 @@ function isDshHostProcess(opts) {
     return cachedIsDshHost.value;
   try {
     let pid = opts?.currentPid ?? process.pid;
+    if (process.platform === "win32") {
+      const psOut = runWindowsPowerShell([
+        "$ErrorActionPreference = 'SilentlyContinue'",
+        `$p = ${Math.trunc(pid)}`,
+        "for ($h = 0; $h -lt 8 -and $p -gt 0; $h++) {",
+        '  $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$p"',
+        "  if (-not $proc) { break }",
+        '  Write-Output "$($proc.ParentProcessId)`t$($proc.CommandLine)"',
+        "  $nextP = [int]$proc.ParentProcessId",
+        "  if ($nextP -le 0 -or $nextP -eq $p) { break }",
+        "  $p = $nextP",
+        "}"
+      ].join("; "), 2500);
+      if (psOut) {
+        const lines = psOut.split(/\r?\n/).filter(Boolean);
+        for (let hop = 0;hop < lines.length; hop++) {
+          const tab = lines[hop].indexOf("\t");
+          const cmd = tab >= 0 ? lines[hop].slice(tab + 1) : lines[hop];
+          if (hop > 0 && (/bun(?:\.exe)?\s+test/i.test(cmd) || /node(?:\.exe)?\s+--test/i.test(cmd)))
+            break;
+          if (matchesDshCommandLine(cmd)) {
+            cachedIsDshHost = { at: now, value: true };
+            return true;
+          }
+        }
+      }
+      cachedIsDshHost = { at: now, value: false };
+      return false;
+    }
     for (let hop = 0;hop < 4 && pid > 1; hop++) {
       const ps = spawnSync("ps", ["-ww", "-p", String(pid), "-o", "ppid=,command="], {
         encoding: "utf8",
@@ -2898,7 +3172,7 @@ function isDshHostProcess(opts) {
       const cmd = m[2];
       if (hop > 0 && (cmd.includes("bun test") || cmd.includes("node --test")))
         break;
-      if (cmd.includes("@deepseek-ai") || cmd.includes("/.dsh/") || /\bdsh\b/.test(cmd)) {
+      if (matchesDshCommandLine(cmd)) {
         cachedIsDshHost = { at: now, value: true };
         return true;
       }
@@ -2912,7 +3186,7 @@ function sessionDirMtime(dir) {
   let newest = 0;
   for (const file of ["session.v4.jsonl.zstd", "session.v4.jsonl"]) {
     try {
-      const mtime = statSync2(join3(dir, file)).mtimeMs;
+      const mtime = statSync2(join4(dir, file)).mtimeMs;
       if (mtime > newest)
         newest = mtime;
     } catch {}
@@ -2922,20 +3196,20 @@ function sessionDirMtime(dir) {
 function sessionLogMtime(dshHome, sid) {
   let projects;
   try {
-    projects = readdirSync2(join3(dshHome, "sessions"));
+    projects = readdirSync2(join4(dshHome, "sessions"));
   } catch {
     return 0;
   }
   let newest = 0;
   for (const project of projects) {
-    const mtime = sessionDirMtime(join3(dshHome, "sessions", project, sid));
+    const mtime = sessionDirMtime(join4(dshHome, "sessions", project, sid));
     if (mtime > newest)
       newest = mtime;
   }
   return newest;
 }
 function newestSessionLog(dshHome, nowMs, maxAgeMs) {
-  const root = join3(dshHome, "sessions");
+  const root = join4(dshHome, "sessions");
   let projects;
   try {
     projects = readdirSync2(root);
@@ -2946,14 +3220,14 @@ function newestSessionLog(dshHome, nowMs, maxAgeMs) {
   for (const project of projects) {
     let entries;
     try {
-      entries = readdirSync2(join3(root, project));
+      entries = readdirSync2(join4(root, project));
     } catch {
       continue;
     }
     for (const entry of entries) {
       if (!entry.startsWith("session-"))
         continue;
-      const mtime = sessionDirMtime(join3(root, project, entry));
+      const mtime = sessionDirMtime(join4(root, project, entry));
       if (mtime === 0 || nowMs - mtime > maxAgeMs)
         continue;
       if (best === null || mtime > best.mtime)
@@ -2967,7 +3241,7 @@ async function detectDshCallerSession(opts) {
   if (!opts?.dshHome && !opts?.healthUrl && !isDshHostProcess({ env })) {
     return null;
   }
-  const dshHome = opts?.dshHome?.trim() || env.AGENTSCHAT_DSH_HOME?.trim() || env.DSH_HOME?.trim() || join3(homedir(), ".dsh");
+  const dshHome = opts?.dshHome?.trim() || env.AGENTSCHAT_DSH_HOME?.trim() || env.DSH_HOME?.trim() || join4(homedir2(), ".dsh");
   const healthUrl = opts?.healthUrl?.trim() || env.AGENTSCHAT_DSH_HEALTH_URL?.trim() || "http://127.0.0.1:8799/health";
   const nowMs = opts?.nowMs ?? Date.now();
   try {
@@ -3003,13 +3277,13 @@ async function detectDshCallerSession(opts) {
 }
 
 // src/session-route.ts
-import { existsSync as existsSync5, readFileSync as readFileSync6 } from "node:fs";
-import { homedir as homedir2 } from "node:os";
-import { join as join5 } from "node:path";
+import { existsSync as existsSync6, readFileSync as readFileSync7 } from "node:fs";
+import { homedir as homedir3 } from "node:os";
+import { join as join6 } from "node:path";
 
 // src/session-bind.ts
-import { closeSync as closeSync2, existsSync as existsSync4, mkdirSync as mkdirSync2, openSync as openSync2, readFileSync as readFileSync5, readSync as readSync2, readdirSync as readdirSync3, statSync as statSync3, unlinkSync as unlinkSync3 } from "node:fs";
-import { join as join4 } from "node:path";
+import { closeSync as closeSync2, existsSync as existsSync5, mkdirSync as mkdirSync2, openSync as openSync2, readFileSync as readFileSync6, readSync as readSync2, readdirSync as readdirSync3, statSync as statSync3, unlinkSync as unlinkSync3 } from "node:fs";
+import { join as join5 } from "node:path";
 var DEFAULT_SESSION_BINDS_FILENAME2 = "session-binds.json";
 var LEGACY_AGY_BINDS_FILENAME2 = "agy-binds.json";
 function parseSessionBinds2(raw) {
@@ -3031,11 +3305,11 @@ function parseSessionBinds2(raw) {
 function loadSessionBinds2(configDir) {
   const merged = {};
   for (const filename of [LEGACY_AGY_BINDS_FILENAME2, DEFAULT_SESSION_BINDS_FILENAME2]) {
-    const path = join4(configDir, filename);
-    if (!existsSync4(path))
+    const path = join5(configDir, filename);
+    if (!existsSync5(path))
       continue;
     try {
-      Object.assign(merged, parseSessionBinds2(JSON.parse(readFileSync5(path, "utf8"))));
+      Object.assign(merged, parseSessionBinds2(JSON.parse(readFileSync6(path, "utf8"))));
     } catch {}
   }
   return merged;
@@ -3043,21 +3317,22 @@ function loadSessionBinds2(configDir) {
 
 // src/session-route.ts
 function agentschatConfigDir(env = process.env) {
-  return env.AGENTSCHAT_CONFIG_DIR ?? join5(homedir2(), ".agentschat");
+  const home = env.HOME || env.USERPROFILE || homedir3();
+  return env.AGENTSCHAT_CONFIG_DIR ?? join6(home, ".agentschat");
 }
 function profilePathForName(configDir, name) {
   if (!name || name.includes("/") || name.includes("\\"))
     return;
   const base = name.replace(/\.json$/, "").replace(/[^a-zA-Z0-9_-]/g, "_");
-  const nested = join5(configDir, "profiles", `${base}.json`);
-  if (existsSync5(nested))
+  const nested = join6(configDir, "profiles", `${base}.json`);
+  if (existsSync6(nested))
     return nested;
-  const flat = join5(configDir, `${base}.json`);
-  return existsSync5(flat) ? flat : undefined;
+  const flat = join6(configDir, `${base}.json`);
+  return existsSync6(flat) ? flat : undefined;
 }
 function readAgentId(path) {
   try {
-    const parsed = JSON.parse(readFileSync6(path, "utf8"));
+    const parsed = JSON.parse(readFileSync7(path, "utf8"));
     return typeof parsed.agent_id === "string" && parsed.agent_id ? parsed.agent_id : undefined;
   } catch {
     return;
@@ -3119,6 +3394,7 @@ class HeartbeatMonitor {
     this.connectingSince = null;
     this.reconnecting = false;
     this.timer = setInterval(() => this.tick(), this.pingInterval);
+    this.timer?.unref?.();
   }
   stop() {
     if (this.timer) {
@@ -3310,40 +3586,54 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema
 } from "@modelcontextprotocol/sdk/types.js";
-import { readFileSync as readFileSync11, existsSync as existsSync8, writeFileSync as writeFileSync6, mkdirSync as mkdirSync4, readdirSync as readdirSync5 } from "fs";
-import { join as join8, dirname as dirname2 } from "path";
+import { readFileSync as readFileSync12, existsSync as existsSync9, writeFileSync as writeFileSync6, mkdirSync as mkdirSync4, readdirSync as readdirSync5 } from "fs";
+import { homedir as homedir5 } from "os";
+import { join as join10, dirname as dirname2 } from "path";
 import { fileURLToPath } from "url";
 
 // src/profile-store.ts
-import { existsSync as existsSync6, writeFileSync as writeFileSync2, renameSync as renameSync2, chmodSync as chmodSync2, unlinkSync as unlinkSync4, statSync as statSync4, readdirSync as readdirSync4, readFileSync as readFileSync7 } from "fs";
-import { join as join6, resolve as resolve2 } from "path";
+import { existsSync as existsSync7, writeFileSync as writeFileSync2, renameSync as renameSync2, copyFileSync as copyFileSync2, chmodSync as chmodSync2, unlinkSync as unlinkSync4, statSync as statSync4, readdirSync as readdirSync4, readFileSync as readFileSync8 } from "fs";
+import { join as join7, resolve as resolve2 } from "path";
 var defaultWarn2 = (m) => process.stderr.write(m);
 function safeWriteProfile2(path, data, warn = defaultWarn2) {
   const tmp = path + ".tmp";
   try {
-    if (existsSync6(tmp))
+    if (existsSync7(tmp))
       unlinkSync4(tmp);
   } catch (e) {
     warn(`[agentchat] WARNING: stale ${tmp} could not be removed: ${e}
 `);
   }
   writeFileSync2(tmp, JSON.stringify(data, null, 2), { mode: 384 });
-  renameSync2(tmp, path);
   try {
-    chmodSync2(path, 384);
-  } catch (e) {
-    warn(`[agentchat] WARNING: could not chmod ${path} to 0600: ${e}
-`);
+    renameSync2(tmp, path);
+  } catch (err) {
+    if (process.platform === "win32" && (err?.code === "EPERM" || err?.code === "EACCES")) {
+      copyFileSync2(tmp, path);
+      try {
+        unlinkSync4(tmp);
+      } catch {}
+    } else {
+      throw err;
+    }
   }
-  try {
-    const mode = statSync4(path).mode & 511;
-    if (mode !== 384) {
-      warn(`[agentchat] WARNING: ${path} is mode ${mode.toString(8)}, expected 600 — it holds your agent key. Fix: chmod 600 ${path}
+  if (process.platform !== "win32") {
+    try {
+      chmodSync2(path, 384);
+    } catch (e) {
+      warn(`[agentchat] WARNING: could not chmod ${path} to 0600: ${e}
 `);
     }
-  } catch (e) {
-    warn(`[agentchat] WARNING: could not verify permissions of ${path}: ${e}
+    try {
+      const mode = statSync4(path).mode & 511;
+      if (mode !== 384) {
+        warn(`[agentchat] WARNING: ${path} is mode ${mode.toString(8)}, expected 600 — it holds your agent key. Fix: chmod 600 ${path}
 `);
+      }
+    } catch (e) {
+      warn(`[agentchat] WARNING: could not verify permissions of ${path}: ${e}
+`);
+    }
   }
 }
 var NON_PROFILE_JSON_FILES2 = new Set([
@@ -3357,11 +3647,11 @@ var NON_PROFILE_JSON_FILES2 = new Set([
   "config.json"
 ]);
 function findDefaultProfileCollision(configDir, defaultProfilePath) {
-  if (!defaultProfilePath || !existsSync6(defaultProfilePath))
+  if (!defaultProfilePath || !existsSync7(defaultProfilePath))
     return null;
   let defParsed;
   try {
-    defParsed = JSON.parse(readFileSync7(defaultProfilePath, "utf8"));
+    defParsed = JSON.parse(readFileSync8(defaultProfilePath, "utf8"));
   } catch {
     return null;
   }
@@ -3372,8 +3662,8 @@ function findDefaultProfileCollision(configDir, defaultProfilePath) {
   if (!defAgentId && !defDisplayName)
     return null;
   const resolvedDefault = resolve2(defaultProfilePath);
-  for (const dir of [join6(configDir, "profiles"), configDir]) {
-    if (!existsSync6(dir))
+  for (const dir of [join7(configDir, "profiles"), configDir]) {
+    if (!existsSync7(dir))
       continue;
     let files = [];
     try {
@@ -3384,7 +3674,7 @@ function findDefaultProfileCollision(configDir, defaultProfilePath) {
     for (const file of files) {
       if (NON_PROFILE_JSON_FILES2.has(file))
         continue;
-      const candidatePath = join6(dir, file);
+      const candidatePath = join7(dir, file);
       if (resolve2(candidatePath) === resolvedDefault)
         continue;
       const baseName = file.replace(/\.json$/, "");
@@ -3392,7 +3682,7 @@ function findDefaultProfileCollision(configDir, defaultProfilePath) {
         continue;
       let candidate;
       try {
-        candidate = JSON.parse(readFileSync7(candidatePath, "utf8"));
+        candidate = JSON.parse(readFileSync8(candidatePath, "utf8"));
       } catch {
         continue;
       }
@@ -3496,10 +3786,10 @@ function expectedAgentIdViolation(expected, liveAgentId) {
 }
 
 // src/read-cursor.ts
-import { readFileSync as readFileSync8, writeFileSync as writeFileSync3 } from "fs";
+import { readFileSync as readFileSync9, writeFileSync as writeFileSync3 } from "fs";
 function loadCursor(file, warn) {
   try {
-    return new Map(Object.entries(JSON.parse(readFileSync8(file, "utf-8"))));
+    return new Map(Object.entries(JSON.parse(readFileSync9(file, "utf-8"))));
   } catch (e) {
     if (e?.code !== "ENOENT") {
       warn(`[agentchat] WARNING: could not read ${file} — resetting that state: ${e}
@@ -3528,8 +3818,8 @@ function flushCursor(state, persist) {
 }
 
 // src/rest-cli.ts
-import { existsSync as existsSync7, mkdirSync as mkdirSync3, readFileSync as readFileSync10, writeFileSync as writeFileSync5 } from "node:fs";
-import { dirname, join as join7 } from "node:path";
+import { existsSync as existsSync8, mkdirSync as mkdirSync3, readFileSync as readFileSync11, writeFileSync as writeFileSync5 } from "node:fs";
+import { dirname, join as join9 } from "node:path";
 
 // src/mentions.ts
 function matchesMention2(content, agentId) {
@@ -3543,10 +3833,10 @@ function matchesMention2(content, agentId) {
 }
 
 // src/read-cursor.ts
-import { readFileSync as readFileSync9, writeFileSync as writeFileSync4 } from "fs";
+import { readFileSync as readFileSync10, writeFileSync as writeFileSync4 } from "fs";
 function loadCursor2(file, warn) {
   try {
-    return new Map(Object.entries(JSON.parse(readFileSync9(file, "utf-8"))));
+    return new Map(Object.entries(JSON.parse(readFileSync10(file, "utf-8"))));
   } catch (e) {
     if (e?.code !== "ENOENT") {
       warn(`[agentchat] WARNING: could not read ${file} — resetting that state: ${e}
@@ -3586,6 +3876,8 @@ function normalizeTimestampForCursor2(ts, mode) {
 }
 
 // src/wake.ts
+import { homedir as homedir4 } from "node:os";
+import { join as join8, win32 as pathWin322 } from "node:path";
 var NATIVE_WAKE_CONTENT_MAX2 = 4000;
 function formatWakeAttachments2(attachments) {
   if (!Array.isArray(attachments) || attachments.length === 0)
@@ -3610,7 +3902,7 @@ function formatWakeAttachments2(attachments) {
   return lines.length > 0 ? ` [附件: ${lines.join("; ")}]` : "";
 }
 var GROK_GATEWAY_PATH_CANDIDATES2 = [
-  `${process.env.HOME}/.grok/gateway.json`,
+  join8(process.env.HOME || process.env.USERPROFILE || homedir4(), ".grok", "gateway.json"),
   "/home/box/sand-data/gateway.json"
 ];
 function buildWakePrompt2(msg, contextPrefix = "") {
@@ -3636,7 +3928,7 @@ var zcodeSessionQueues2 = new Map;
 var CURSOR_INIT_KEY = "__init_ts__";
 var CURSOR_LAST_ACTIVE_KEY = "__last_active_ts__";
 var CURSOR_MAX_IDLE_KEY = "__max_idle_ms__";
-var DEFAULT_MAX_IDLE_MS = 60 * 60 * 1000;
+var DEFAULT_MAX_IDLE_MS = 0;
 function parseMaxIdleMs(raw) {
   if (raw === undefined || raw === null)
     return;
@@ -3715,10 +4007,10 @@ function sleepAbortable(ms, signal) {
   });
 }
 function loadSeenIds(file) {
-  if (!existsSync7(file))
+  if (!existsSync8(file))
     return [];
   try {
-    const parsed = JSON.parse(readFileSync10(file, "utf8"));
+    const parsed = JSON.parse(readFileSync11(file, "utf8"));
     return Array.isArray(parsed) ? parsed.filter((x) => typeof x === "string") : [];
   } catch {
     return [];
@@ -3732,10 +4024,10 @@ function saveSeenIds(file, ids) {
   } catch {}
 }
 function loadJsonMap(file) {
-  if (!existsSync7(file))
+  if (!existsSync8(file))
     return {};
   try {
-    const raw = JSON.parse(readFileSync10(file, "utf8"));
+    const raw = JSON.parse(readFileSync11(file, "utf8"));
     if (!raw || typeof raw !== "object" || Array.isArray(raw))
       return {};
     return raw;
@@ -3755,7 +4047,7 @@ function advanceChannelReadCursor(opts) {
     return;
   const warn = opts.warn ?? ((m) => process.stderr.write(m));
   mkdirSync3(configDir, { recursive: true });
-  const lastSeenFile = join7(configDir, `last-seen-msg-ts-${agentId}.json`);
+  const lastSeenFile = join9(configDir, `last-seen-msg-ts-${agentId}.json`);
   const cursor = loadCursor2(lastSeenFile, warn);
   const prev = cursor.get(channelId) || "";
   const nextNorm = normalizeTimestampForCursor2(timestamp, "after") || timestamp;
@@ -3768,7 +4060,7 @@ function advanceChannelReadCursor(opts) {
     cursor.set(channelId, timestamp);
   }
   persistCursor2(lastSeenFile, cursor, warn);
-  const readCursorsFile = join7(configDir, "read-cursors.json");
+  const readCursorsFile = join9(configDir, "read-cursors.json");
   const readCursors = loadJsonMap(readCursorsFile);
   const scopedKey = `${agentId}:${channelId}`;
   const prevRead = readCursors[scopedKey] || readCursors[channelId] || "";
@@ -3912,14 +4204,14 @@ async function wakeOnce(opts) {
   const pollIntervalMs = opts.pollIntervalMs ?? 15000;
   const enableSse = opts.enableSse ?? true;
   mkdirSync3(configDir, { recursive: true });
-  const lastSeenFile = join7(configDir, `last-seen-msg-ts-${agentId}.json`);
-  const seenIdsFile = join7(configDir, `wake-seen-ids-${agentId}.json`);
-  const mentionTsFile = join7(configDir, "mention-timestamps.json");
-  const wakePidFile = join7(configDir, `wake-once-${agentId}.pid`);
+  const lastSeenFile = join9(configDir, `last-seen-msg-ts-${agentId}.json`);
+  const seenIdsFile = join9(configDir, `wake-seen-ids-${agentId}.json`);
+  const mentionTsFile = join9(configDir, "mention-timestamps.json");
+  const wakePidFile = join9(configDir, `wake-once-${agentId}.pid`);
   if (!opts.fetchImpl) {
     try {
-      if (existsSync7(wakePidFile)) {
-        const oldPid = parseInt(readFileSync10(wakePidFile, "utf-8").trim(), 10);
+      if (existsSync8(wakePidFile)) {
+        const oldPid = parseInt(readFileSync11(wakePidFile, "utf-8").trim(), 10);
         if (Number.isFinite(oldPid) && oldPid > 1 && oldPid !== process.pid) {
           try {
             process.kill(oldPid, "SIGTERM");
@@ -4374,7 +4666,7 @@ function parseArgs() {
 var cliArgs = parseArgs();
 var isOneShotCli = Boolean(cliArgs.registerOnly || cliArgs.join || cliArgs.send || cliArgs.wakeOnce);
 if (process.argv.includes("--help") || process.argv.includes("-h")) {
-  const localOnboardingPath = join8(dirname2(fileURLToPath(import.meta.url)), "..", "skills", "onboarding.md");
+  const localOnboardingPath = join10(dirname2(fileURLToPath(import.meta.url)), "..", "skills", "onboarding.md");
   console.log(`agentschat-mcp v${package_default.version} \u2014 AgentsChat MCP and host bridges
 
 Usage: claude mcp add agentschat -- npx -y agentschat-mcp@latest --profile <Bot> [options]
@@ -4402,8 +4694,8 @@ Options:
   --reply-to <id>    Optional target message ID for --send.
   --wake-once        Wait via HTTPS SSE + REST cursor for the next @mention or DM, print wake JSON + prompt, advance per-channel cursor, and exit 0.
   --channel <ids>    Comma-separated channels to join/watch with --wake-once (default: welcome + all joined channels).
-  --timeout <sec>    Max wait time in seconds per --wake-once window (default: 240).
-  --max-idle <sec>   Auto-hibernate and stop re-arming after <sec> of continuous silence (default: 3600 = 1 hour).
+  --timeout <sec>    Max wait time in seconds per --wake-once window (default: 240; pass 0 to listen continuously).
+  --max-idle <sec>   Auto-hibernate and stop re-arming after <sec> of continuous silence (default: never / 0; e.g. 1h, 3h, never).
   --accept-terms     Deprecated compatibility flag; Terms are a nonblocking notice.
                      No acceptance flag or AGENTSCHAT_ACCEPT_TERMS is needed.
   --id <id>          Existing agent ID paired with the token (or AGENTCHAT_AGENT_ID)
@@ -4460,9 +4752,9 @@ if (codexIdentity) {
   delete process.env.AGENTCHAT_TOKEN;
   process.env.AGENTSCHAT_EXPECT_AGENT_ID = codexIdentity.agentId;
 }
-var homeDir = process.env.HOME || process.env.USERPROFILE || ".";
-var configDir = join8(homeDir, ".agentschat");
-var legacyConfigDir = join8(homeDir, ".agentchat");
+var homeDir = process.env.HOME || process.env.USERPROFILE || homedir5() || ".";
+var configDir = join10(homeDir, ".agentschat");
+var legacyConfigDir = join10(homeDir, ".agentchat");
 var profileDirs = [configDir, legacyConfigDir];
 var lockDir = resolveLockDir(homeDir, process.env);
 var lockOwnerPid = Number(process.env.AGENTSCHAT_LOCK_OWNER_PID) || null;
@@ -4479,24 +4771,24 @@ function ensureRuntimeSession() {
 var dshRouteWarned = false;
 function profileNameToPaths(name) {
   if (name.startsWith("~/"))
-    return [join8(homeDir, name.slice(2))];
+    return [join10(homeDir, name.slice(2))];
   if (name.includes("/") || name.includes("\\"))
     return [name];
   name = name.replace(/\.json$/, "");
   const safeName = name.replace(/[^a-zA-Z0-9_-]/g, "_");
-  return profileDirs.map((dir) => join8(dir, `${safeName}.json`));
+  return profileDirs.map((dir) => join10(dir, `${safeName}.json`));
 }
 function nameToPath(name) {
   const candidates = profileNameToPaths(name);
-  const nested = join8(configDir, "profiles", name.replace(/\.json$/, "") + ".json");
-  if (!name.includes("/") && !name.includes("\\") && existsSync8(nested))
+  const nested = join10(configDir, "profiles", name.replace(/\.json$/, "") + ".json");
+  if (!name.includes("/") && !name.includes("\\") && existsSync9(nested))
     return nested;
-  return candidates.find((path) => existsSync8(path)) || candidates[0];
+  return candidates.find((path) => existsSync9(path)) || candidates[0];
 }
 function listProfileFiles() {
   const seen = new Set;
   const profiles = [];
-  for (const dir of [join8(configDir, "profiles"), ...profileDirs]) {
+  for (const dir of [join10(configDir, "profiles"), ...profileDirs]) {
     let files = [];
     try {
       files = readdirSync5(dir).filter((f) => f.endsWith(".json"));
@@ -4508,7 +4800,7 @@ function listProfileFiles() {
       if (seen.has(name))
         continue;
       seen.add(name);
-      profiles.push({ name, path: join8(dir, file) });
+      profiles.push({ name, path: join10(dir, file) });
     }
   }
   return profiles;
@@ -4533,9 +4825,9 @@ function resolveProfile() {
   let binds = {};
   if (!grokToken && conversationId) {
     const bindPath = resolveGrokBindsPath(configDir, process.env.AGENTCHAT_GROK_BINDS);
-    if (existsSync8(bindPath)) {
+    if (existsSync9(bindPath)) {
       try {
-        const parsed = parseGrokBindsText(readFileSync11(bindPath, "utf-8"));
+        const parsed = parseGrokBindsText(readFileSync12(bindPath, "utf-8"));
         binds = parsed.binds;
         if (parsed.malformed) {
           process.stderr.write(`[agentchat] WARNING: grok-binds file is malformed (${bindPath}); ignoring.
@@ -4571,7 +4863,7 @@ function resolveProfile() {
     const boundProfile = sessionBinds[bootSession.sessionId];
     if (boundProfile) {
       const boundPath = nameToPath(boundProfile);
-      if (existsSync8(boundPath)) {
+      if (existsSync9(boundPath)) {
         process.stderr.write(`[agentchat] session-bind (${bootSession.runtime}): ${bootSession.sessionId} \u2192 profile "${boundProfile}"
 `);
         return { path: boundPath, source: "session-bind", declaredName: boundProfile };
@@ -4625,7 +4917,7 @@ if (hasToken && !explicitAgentId && profileSource === "default") {
   process.exit(1);
 }
 var identity = decideIdentity({
-  profileExists: existsSync8(profileFile),
+  profileExists: existsSync9(profileFile),
   source: profileSource,
   profileFile,
   cliName: cliArgs.name,
@@ -4636,7 +4928,7 @@ var identity = decideIdentity({
 });
 function readIdentityProfile(file) {
   try {
-    return JSON.parse(readFileSync11(file, "utf-8"));
+    return JSON.parse(readFileSync12(file, "utf-8"));
   } catch {
     throw new Error(`Cannot read identity profile at ${file}. Repair its JSON/permissions or select --profile <valid-name>.`);
   }
@@ -4851,7 +5143,7 @@ if (!anonymousMode && AGENT_ID && !isOneShotCli && !toolOnlyMode) {
       runtimeSession = { sessionId: resolvedSid, runtime: "antigravity" };
       if (profileSource === "default" && existingAgentRoute?.profileName && existingAgentRoute.profileName !== activeName) {
         const aliasPath = nameToPath(existingAgentRoute.profileName);
-        if (existsSync8(aliasPath)) {
+        if (existsSync9(aliasPath)) {
           activeProfileFile = aliasPath;
           activeName = existingAgentRoute.profileName;
         }
@@ -4873,7 +5165,7 @@ if (!anonymousMode && AGENT_ID && !isOneShotCli && !toolOnlyMode) {
   }
 }
 var identityGateMessage = "";
-var identityGuardFile = join8(configDir, IDENTITY_GUARD_FILENAME);
+var identityGuardFile = join10(configDir, IDENTITY_GUARD_FILENAME);
 function persistGuardRecord(rec) {
   try {
     mkdirSync4(configDir, { recursive: true });
@@ -4892,7 +5184,7 @@ function confirmLiveIdentityTrusted() {
 }
 var guardRecord = (() => {
   try {
-    return parseGuardRecord(readFileSync11(identityGuardFile, "utf-8"));
+    return parseGuardRecord(readFileSync12(identityGuardFile, "utf-8"));
   } catch {
     return emptyGuardRecord();
   }
@@ -5005,7 +5297,7 @@ if (TOKEN && TOKEN !== "dev-token") {
   if (cliArgs.registerOnly) {
     try {
       mkdirSync4(configDir, { recursive: true });
-      const lastSeenFile = join8(configDir, `last-seen-msg-ts-${AGENT_ID}.json`);
+      const lastSeenFile = join10(configDir, `last-seen-msg-ts-${AGENT_ID}.json`);
       const cursor = loadCursor(lastSeenFile, (m) => process.stderr.write(m));
       if (!cursor.get(CURSOR_INIT_KEY)) {
         cursor.set(CURSOR_INIT_KEY, new Date().toISOString());
@@ -7273,10 +7565,10 @@ function mimeFromPath(p, kindHint) {
   return MEDIA_MIME_BY_EXT[ext] ?? "application/octet-stream";
 }
 async function uploadLocalFile(path, kindHint) {
-  if (!existsSync8(path))
+  if (!existsSync9(path))
     throw new Error(`file not found: ${path}`);
   const mime = mimeFromPath(path, kindHint);
-  const buf = readFileSync11(path);
+  const buf = readFileSync12(path);
   const name = path.split("/").pop() || "upload";
   const form = new FormData;
   form.append("file", new Blob([new Uint8Array(buf)], { type: mime }), name);
@@ -7473,10 +7765,10 @@ HANDLERS.set("transcribe", async (args) => {
 });
 function loadGrokBinds() {
   const bindPath = resolveGrokBindsPath(configDir, process.env.AGENTCHAT_GROK_BINDS);
-  if (!existsSync8(bindPath))
+  if (!existsSync9(bindPath))
     return {};
   try {
-    return parseGrokBindsText(readFileSync11(bindPath, "utf-8")).binds;
+    return parseGrokBindsText(readFileSync12(bindPath, "utf-8")).binds;
   } catch {
     return {};
   }
@@ -7511,7 +7803,7 @@ function scheduleSlotLastSeenMessageTsSave(slot) {
   slot.lastSeenMessageTsTimer.unref?.();
 }
 function createProfileSlot(opts) {
-  const lastSeenFile = join8(configDir, `last-seen-msg-ts-${opts.agentId}.json`);
+  const lastSeenFile = join10(configDir, `last-seen-msg-ts-${opts.agentId}.json`);
   const slot = {
     profileName: opts.profileName,
     profileFile: opts.profileFile,
@@ -7762,7 +8054,7 @@ function formatProfileList() {
   const lines = profileEntries.map((entry) => {
     let entryAgentId = "";
     try {
-      const parsed = JSON.parse(readFileSync11(entry.path, "utf-8"));
+      const parsed = JSON.parse(readFileSync12(entry.path, "utf-8"));
       if (typeof parsed?.agent_id === "string")
         entryAgentId = parsed.agent_id;
     } catch {}
@@ -7795,7 +8087,7 @@ async function registerAndConnectProfile(displayName, bindSessionId) {
     };
   }
   const existingTargetFile = nameToPath(cleanName);
-  if (existsSync8(existingTargetFile)) {
+  if (existsSync9(existingTargetFile)) {
     return {
       content: [{
         type: "text",
@@ -7805,9 +8097,9 @@ async function registerAndConnectProfile(displayName, bindSessionId) {
     };
   }
   const existingDefaultPath = nameToPath("profile");
-  if (existsSync8(existingDefaultPath)) {
+  if (existsSync9(existingDefaultPath)) {
     try {
-      const defParsed = JSON.parse(readFileSync11(existingDefaultPath, "utf-8"));
+      const defParsed = JSON.parse(readFileSync12(existingDefaultPath, "utf-8"));
       const defDisplay = typeof defParsed?.display_name === "string" ? defParsed.display_name.trim().toLowerCase() : "";
       if (defDisplay && defDisplay === cleanName.toLowerCase()) {
         return {
@@ -7905,7 +8197,7 @@ async function handleProfileSwitchOrConnect(args) {
     return { content: [{ type: "text", text: switchGate.message }], isError: true };
   }
   const targetFile = nameToPath(profile_name);
-  if (!existsSync8(targetFile)) {
+  if (!existsSync9(targetFile)) {
     if (register) {
       return await registerAndConnectProfile(profile_name, explicitSessionId);
     }
@@ -7981,7 +8273,7 @@ function ensureGrokBoundIdentity() {
   if (!boundName)
     return;
   const boundPath = nameToPath(boundName);
-  if (!existsSync8(boundPath))
+  if (!existsSync9(boundPath))
     return;
   let boundProfile;
   try {
@@ -8104,7 +8396,7 @@ var handleToolCall = async (request) => {
           }
         } else if (!isProfileControlTool || name === "disconnect_profile") {
           const boundPath = nameToPath(boundProfileName);
-          if (existsSync8(boundPath)) {
+          if (existsSync9(boundPath)) {
             try {
               const candidate = readIdentityProfile(boundPath);
               const aliasSlot = candidate?.agent_id ? findSlotByAgentId(candidate.agent_id) : undefined;
@@ -8583,8 +8875,8 @@ ${idx}` }] };
     }
     if (name === "sync_skill") {
       const a = args || {};
-      const home = process.env.HOME || process.env.USERPROFILE || ".";
-      const cacheDir = a.dir && String(a.dir).trim() || `${home}/.agentchat/skills`;
+      const home = process.env.HOME || process.env.USERPROFILE || homedir5() || ".";
+      const cacheDir = a.dir && String(a.dir).trim() || join10(home, ".agentchat", "skills");
       const safe = (s) => String(s).replace(/[^A-Za-z0-9_.-]/g, "_");
       if (a.name && !a.chat_id) {
         const slugCheck = validatePersonalSkillSlugInput(a.name, "sync_skill");
@@ -8592,7 +8884,7 @@ ${idx}` }] };
           return { content: [{ type: "text", text: slugCheck.error }], isError: true };
         }
         const pSlug = slugCheck.value;
-        const pBase = `${cacheDir}/personal__${safe(pSlug)}`;
+        const pBase = join10(cacheDir, `personal__${safe(pSlug)}`);
         const pMd = `${pBase}.md`;
         const pMeta = `${pBase}.json`;
         try {
@@ -8614,7 +8906,7 @@ ${idx}` }] };
           const currentVersion = Number(meta.version ?? 0);
           let cachedVersion = null;
           try {
-            cachedVersion = Number(JSON.parse(readFileSync11(pMeta, "utf8")).version);
+            cachedVersion = Number(JSON.parse(readFileSync12(pMeta, "utf8")).version);
           } catch {}
           if (cachedVersion !== null && cachedVersion === currentVersion) {
             return { content: [{ type: "text", text: `up-to-date: personal skill "${pSlug}" v${currentVersion} already at ${pMd} \u2014 no download. Read that file to run it.` }] };
@@ -8667,7 +8959,7 @@ ${idx}` }] };
         const currentVersion = Number(meta.version ?? 0);
         let cachedVersion = null;
         try {
-          cachedVersion = Number(JSON.parse(readFileSync11(metaPath, "utf8")).version);
+          cachedVersion = Number(JSON.parse(readFileSync12(metaPath, "utf8")).version);
         } catch {}
         if (cachedVersion !== null && cachedVersion === currentVersion) {
           return { content: [{ type: "text", text: `up-to-date: "${a.doc_id}" v${currentVersion} already at ${mdPath} \u2014 no download. Read that file to run it.` }] };
@@ -10559,7 +10851,7 @@ ${list}` }] };
   }
 };
 server.setRequestHandler(CallToolRequestSchema, (request) => serializeCall(() => handleToolCall(request)));
-var mentionTsFile = join8(configDir, `mention-ts-${AGENT_ID}.json`);
+var mentionTsFile = join10(configDir, `mention-ts-${AGENT_ID}.json`);
 function loadMentionTimestamps() {
   return loadCursor(mentionTsFile, safeStderrWrite);
 }
@@ -10807,7 +11099,7 @@ function syncOpenBoundSessions() {
     if (!boundProf || profileSlots.has(boundProf))
       continue;
     const boundPath = nameToPath(boundProf);
-    if (!existsSync8(boundPath))
+    if (!existsSync9(boundPath))
       continue;
     try {
       const candidate = readIdentityProfile(boundPath);
@@ -11039,15 +11331,15 @@ ${context}
         if (process.env.AGENTCHAT_WAKE_MODE === "grok") {
           (async () => {
             try {
-              const { readFileSync: readFileSync12, existsSync: existsSync9 } = await import("fs");
-              const gwPath = resolveGrokGatewayPath(process.env.AGENTCHAT_GROK_GATEWAY, existsSync9);
+              const { readFileSync: readFileSync13, existsSync: existsSync10 } = await import("fs");
+              const gwPath = resolveGrokGatewayPath(process.env.AGENTCHAT_GROK_GATEWAY, existsSync10);
               let agentId = process.env.AGENTCHAT_GROK_AGENT_ID || "";
               if (!agentId) {
                 agentId = await resolveGrokAgentId({
                   explicitId: "",
                   agentschatName: slot.profile.display_name || slot.agentId,
                   listAgents: async () => {
-                    const gwcfg = JSON.parse(readFileSync12(gwPath, "utf8"));
+                    const gwcfg = JSON.parse(readFileSync13(gwPath, "utf8"));
                     const token = grokBearerFromGatewayConfig(gwcfg);
                     const port = grokPortFromGatewayConfig(gwcfg);
                     const res = await fetch(`http://127.0.0.1:${port}/api/listAgents`, {
@@ -11117,7 +11409,7 @@ ${context}
                   let soleMatchesAgent = false;
                   if (soleBoundProf) {
                     const p = nameToPath(soleBoundProf);
-                    if (existsSync8(p)) {
+                    if (existsSync9(p)) {
                       try {
                         soleMatchesAgent = readIdentityProfile(p)?.agent_id === slot.agentId;
                       } catch {}

@@ -432,6 +432,197 @@ export function parseAntigravityLsofOutput(
   return { ports, openConversations };
 }
 
+function extractCliFlagValue(cmd: string, flag: string): string {
+  const re = new RegExp(`${flag}(?:=|\\s+)(?:"([^"]+)"|'([^']+)'|([^\\s"']+))`);
+  const m = cmd.match(re);
+  return (m?.[1] ?? m?.[2] ?? m?.[3] ?? "").trim();
+}
+
+/**
+ * Parse Windows `netstat -ano` output into listening loopback (`127.0.0.1` / `[::1]`)
+ * TCP ports owned by `targetPid`, sorted descending so plaintext HTTP Connect-RPC
+ * ports allocated after HTTPS are tried first.
+ *
+ * Matches foreign address `0.0.0.0:0` / `[::]:0` / `*:*` rather than English
+ * `"LISTENING"` text so localized Windows builds (German, French, Spanish, Chinese, etc.)
+ * work identically.
+ */
+export function parseWindowsNetstatOutput(stdout: string, targetPid: number): number[] {
+  if (!stdout || !Number.isFinite(targetPid) || targetPid <= 0) return [];
+  const ports: number[] = [];
+  for (const line of stdout.split(/\r?\n/)) {
+    const m = line.match(
+      /^\s*TCP\s+(?:127\.0\.0\.1|\[::1\]):(\d+)\s+(?:0\.0\.0\.0:0|\[::\]:0|\*:\*)\s+\S+\s+(\d+)\s*$/i,
+    );
+    if (!m) continue;
+    const port = Number(m[1]);
+    const pid = Number(m[2]);
+    if (pid === targetPid && port > 0 && !ports.includes(port)) {
+      ports.push(port);
+    }
+  }
+  ports.sort((a, b) => b - a);
+  return ports;
+}
+
+/**
+ * Pure parser for the JSON emitted by `discoverWindowsAntigravityHost`'s PowerShell probe
+ * (`{ lsPid, lsCmd, ports, lockedPresence, lockedDbs }`), with optional `netstat -ano`
+ * fallback output when `Get-NetTCPConnection` is unavailable.
+ */
+export function parseWindowsAntigravityProbeJson(
+  stdout: string,
+  netstatStdout = "",
+): AntigravityHostInfo | null {
+  const trimmed = (stdout || "").trim();
+  if (!trimmed || trimmed === "{}") return null;
+  let parsed: any;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {
+    return null;
+  }
+  const lsPid = Number(parsed?.lsPid);
+  const lsCmd = typeof parsed?.lsCmd === "string" ? parsed.lsCmd : "";
+  if (!Number.isFinite(lsPid) || lsPid <= 0 || !lsCmd) return null;
+
+  const csrfToken = extractCliFlagValue(lsCmd, "--csrf_token");
+  if (!csrfToken) return null;
+
+  const portSet = new Set<number>();
+  const rawPorts = Array.isArray(parsed?.ports)
+    ? parsed.ports
+    : typeof parsed?.ports === "number"
+      ? [parsed.ports]
+      : [];
+  for (const p of rawPorts) {
+    const num = Number(p);
+    if (Number.isFinite(num) && num > 0) portSet.add(num);
+  }
+  if (portSet.size === 0 && netstatStdout) {
+    for (const p of parseWindowsNetstatOutput(netstatStdout, lsPid)) {
+      portSet.add(p);
+    }
+  }
+  const ports = [...portSet].sort((a, b) => b - a);
+
+  const uuidRe = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  const toUuidList = (val: unknown): string[] => {
+    const arr = Array.isArray(val) ? val : typeof val === "string" ? [val] : [];
+    const out: string[] = [];
+    for (const item of arr) {
+      const s = String(item || "").trim();
+      if (uuidRe.test(s) && !out.includes(s)) out.push(s);
+    }
+    return out;
+  };
+  const lockedPresence = toUuidList(parsed?.lockedPresence);
+  const lockedDbs = toUuidList(parsed?.lockedDbs);
+  const openConversations = lockedPresence.length > 0 ? lockedPresence : lockedDbs;
+
+  return { lsPid, csrfToken, ports, openConversations };
+}
+
+function runWindowsPowerShell(script: string, timeoutMs = 4000): string | null {
+  for (const bin of ["powershell.exe", "pwsh.exe", "pwsh"]) {
+    const res = spawnSync(
+      bin,
+      ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script],
+      { encoding: "utf8", timeout: timeoutMs, windowsHide: true },
+    );
+    if (!res.error && res.status === 0 && typeof res.stdout === "string") {
+      return res.stdout;
+    }
+    if (!res.error) break;
+  }
+  return null;
+}
+
+function discoverWindowsAntigravityHost(currentPid: number): AntigravityHostInfo | null {
+  // Walk up to 8 ancestor hops on Windows because npm/cmd shims (`language_server.exe` ->
+  // `cmd.exe` -> `node npx` -> `cmd.exe` -> `node server.js`) add extra intermediate hops.
+  // Active IDE windows hold an open OS file handle on `~/.gemini/<appDataDir>/presence/<uuid>.lock`
+  // while historical closed tabs leave unlocked `.lock` files on disk; probing with
+  // `[System.IO.File]::Open(..., FileShare.None)` triggers a kernel `SharingViolation`
+  // (`IOException`) if and only if another process currently holds an open handle, requiring
+  // zero administrator privileges and never mutating file contents or mtime.
+  const psScript = [
+    "$ErrorActionPreference = 'SilentlyContinue'",
+    `$p = ${Math.trunc(currentPid)}`,
+    "$lsPid = 0",
+    "$lsCmd = ''",
+    "for ($h = 0; $h -lt 8 -and $p -gt 0; $h++) {",
+    "  $proc = Get-CimInstance Win32_Process -Filter \"ProcessId=$p\"",
+    "  if (-not $proc) { break }",
+    "  $cmd = [string]$proc.CommandLine",
+    "  $name = [string]$proc.Name",
+    "  if ($h -gt 0 -and ($cmd -match 'bun(?:\\.exe)?\\s+test' -or $cmd -match 'node(?:\\.exe)?\\s+--test')) { break }",
+    "  if (($cmd -match 'language_server' -or $name -match 'language_server') -and $cmd -match '--csrf_token') {",
+    "    $lsPid = [int]$proc.ProcessId",
+    "    $lsCmd = $cmd",
+    "    break",
+    "  }",
+    "  $nextP = [int]$proc.ParentProcessId",
+    "  if ($nextP -le 0 -or $nextP -eq $p) { break }",
+    "  $p = $nextP",
+    "}",
+    "if ($lsPid -le 0) { Write-Output '{}'; exit 0 }",
+    "$ports = @()",
+    "if (Get-Command Get-NetTCPConnection -ErrorAction SilentlyContinue) {",
+    "  $ports = @(Get-NetTCPConnection -OwningProcess $lsPid -State Listen | Where-Object { $_.LocalAddress -eq '127.0.0.1' -or $_.LocalAddress -eq '::1' } | ForEach-Object { [int]$_.LocalPort } | Select-Object -Unique)",
+    "}",
+    "$appDir = 'antigravity'",
+    "if ($lsCmd -match '--app_data_dir(?:=|\\s+)(?:\"([^\"]+)\"|''([^'']+)''|([^\\s\"'']+))') {",
+    "  $appDir = if ($Matches[1]) { $Matches[1] } elseif ($Matches[2]) { $Matches[2] } else { $Matches[3] }",
+    "}",
+    "$homeDir = if ($env:USERPROFILE) { $env:USERPROFILE } else { [Environment]::GetFolderPath('UserProfile') }",
+    "$baseDir = Join-Path (Join-Path $homeDir '.gemini') $appDir",
+    "$lockedPresence = @()",
+    "$presDir = Join-Path $baseDir 'presence'",
+    "if (Test-Path -LiteralPath $presDir) {",
+    "  Get-ChildItem -LiteralPath $presDir -Filter '*.lock' -File | ForEach-Object {",
+    "    if ($_.BaseName -match '^[0-9a-fA-F-]{36}$') {",
+    "      try {",
+    "        $s = [System.IO.File]::Open($_.FullName, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::None)",
+    "        $s.Dispose()",
+    "      } catch [System.IO.IOException] {",
+    "        $lockedPresence += $_.BaseName",
+    "      } catch {}",
+    "    }",
+    "  }",
+    "}",
+    "$lockedDbs = @()",
+    "if ($lockedPresence.Count -eq 0 -and $appDir -ne 'antigravity-cli') {",
+    "  $convDir = Join-Path $baseDir 'conversations'",
+    "  if (Test-Path -LiteralPath $convDir) {",
+    "    Get-ChildItem -LiteralPath $convDir -Filter '*.db' -File | ForEach-Object {",
+    "      if ($_.BaseName -match '^[0-9a-fA-F-]{36}$') {",
+    "        try {",
+    "          $s = [System.IO.File]::Open($_.FullName, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::None)",
+    "          $s.Dispose()",
+    "        } catch [System.IO.IOException] {",
+    "          $lockedDbs += $_.BaseName",
+    "        } catch {}",
+    "      }",
+    "    }",
+    "  }",
+    "}",
+    "[pscustomobject]@{ lsPid = $lsPid; lsCmd = $lsCmd; ports = $ports; lockedPresence = $lockedPresence; lockedDbs = $lockedDbs } | ConvertTo-Json -Compress",
+  ].join("; ");
+
+  const stdout = runWindowsPowerShell(psScript, 4000);
+  if (!stdout) return null;
+
+  let info = parseWindowsAntigravityProbeJson(stdout);
+  if (info && info.ports.length === 0) {
+    const ns = spawnSync("netstat", ["-ano"], { encoding: "utf8", timeout: 2000, windowsHide: true });
+    if (ns.status === 0 && ns.stdout) {
+      info = parseWindowsAntigravityProbeJson(stdout, ns.stdout);
+    }
+  }
+  return info;
+}
+
 export function discoverAntigravityHost(opts?: {
   currentPid?: number;
   cacheMs?: number;
@@ -465,10 +656,17 @@ export function discoverAntigravityHost(opts?: {
   if (cachedAgyHost && now - cachedAgyHost.at < cacheMs) return cachedAgyHost.info;
 
   try {
-    // Walk at most 2 hops up from currentPid (direct parent or wrapper script's parent)
-    // using fast per-PID `ps -p` queries so we never scan the whole system process table
-    // or match an indirect test runner several hops below language_server.
-    let pid = opts?.currentPid ?? process.pid;
+    const startPid = opts?.currentPid ?? process.pid;
+    if (process.platform === "win32") {
+      const winInfo = discoverWindowsAntigravityHost(startPid);
+      cachedAgyHost = { at: now, info: winInfo };
+      return winInfo;
+    }
+
+    // Walk up from currentPid using fast per-PID `ps -p` queries so we never scan
+    // the whole system process table or match an indirect test runner several hops
+    // below language_server.
+    let pid = startPid;
     let lsPid = 0;
     let lsCmd = "";
     for (let hop = 0; hop < 4 && pid > 1; hop++) {
@@ -493,15 +691,13 @@ export function discoverAntigravityHost(opts?: {
       return null;
     }
 
-    const csrfMatch = lsCmd.match(/--csrf_token[=\s]+([^\s]+)/);
-    const csrfToken = csrfMatch?.[1]?.trim() || "";
+    const csrfToken = extractCliFlagValue(lsCmd, "--csrf_token");
     if (!csrfToken) {
       cachedAgyHost = { at: now, info: null };
       return null;
     }
 
-    const appDirMatch = lsCmd.match(/--app_data_dir[=\s]+([^\s]+)/);
-    const appDataDir = appDirMatch?.[1]?.trim() || "antigravity";
+    const appDataDir = extractCliFlagValue(lsCmd, "--app_data_dir") || "antigravity";
 
     const lsof = spawnSync("lsof", ["-Pan", "-p", String(lsPid)], { encoding: "utf8", timeout: 1500 });
     const { ports, openConversations } =
@@ -532,10 +728,11 @@ export function detectAntigravityCallerSession(opts?: {
   nowMs?: number;
   maxAgeMs?: number;
 }): string | null {
+  const home = process.env.HOME || process.env.USERPROFILE || homedir();
   const brainDir =
     opts?.brainDir?.trim() ||
     process.env.AGENTSCHAT_AGY_BRAIN_DIR?.trim() ||
-    join(homedir(), ".gemini", "antigravity", "brain");
+    join(home, ".gemini", "antigravity", "brain");
   if (!existsSync(brainDir)) return null;
 
   const nowMs = opts?.nowMs ?? Date.now();
@@ -639,6 +836,15 @@ export function detectAntigravityCallerSession(opts?: {
 
 let cachedIsDshHost: { at: number; value: boolean } | null = null;
 
+function matchesDshCommandLine(cmd: string): boolean {
+  return (
+    cmd.includes("@deepseek-ai") ||
+    cmd.includes("/.dsh/") ||
+    cmd.toLowerCase().includes("\\.dsh\\") ||
+    /\bdsh(?:\.cmd|\.exe)?\b/i.test(cmd)
+  );
+}
+
 /** Check if this MCP server was spawned by DeepSeek Harness (`dsh`). */
 export function isDshHostProcess(opts?: {
   currentPid?: number;
@@ -658,6 +864,37 @@ export function isDshHostProcess(opts?: {
   if (cachedIsDshHost && now - cachedIsDshHost.at < cacheMs) return cachedIsDshHost.value;
   try {
     let pid = opts?.currentPid ?? process.pid;
+    if (process.platform === "win32") {
+      const psOut = runWindowsPowerShell(
+        [
+          "$ErrorActionPreference = 'SilentlyContinue'",
+          `$p = ${Math.trunc(pid)}`,
+          "for ($h = 0; $h -lt 8 -and $p -gt 0; $h++) {",
+          "  $proc = Get-CimInstance Win32_Process -Filter \"ProcessId=$p\"",
+          "  if (-not $proc) { break }",
+          "  Write-Output \"$($proc.ParentProcessId)`t$($proc.CommandLine)\"",
+          "  $nextP = [int]$proc.ParentProcessId",
+          "  if ($nextP -le 0 -or $nextP -eq $p) { break }",
+          "  $p = $nextP",
+          "}",
+        ].join("; "),
+        2500,
+      );
+      if (psOut) {
+        const lines = psOut.split(/\r?\n/).filter(Boolean);
+        for (let hop = 0; hop < lines.length; hop++) {
+          const tab = lines[hop]!.indexOf("\t");
+          const cmd = tab >= 0 ? lines[hop]!.slice(tab + 1) : lines[hop]!;
+          if (hop > 0 && (/bun(?:\.exe)?\s+test/i.test(cmd) || /node(?:\.exe)?\s+--test/i.test(cmd))) break;
+          if (matchesDshCommandLine(cmd)) {
+            cachedIsDshHost = { at: now, value: true };
+            return true;
+          }
+        }
+      }
+      cachedIsDshHost = { at: now, value: false };
+      return false;
+    }
     for (let hop = 0; hop < 4 && pid > 1; hop++) {
       const ps = spawnSync("ps", ["-ww", "-p", String(pid), "-o", "ppid=,command="], {
         encoding: "utf8",
@@ -670,7 +907,7 @@ export function isDshHostProcess(opts?: {
       const ppid = Number(m[1]);
       const cmd = m[2]!;
       if (hop > 0 && (cmd.includes("bun test") || cmd.includes("node --test"))) break;
-      if (cmd.includes("@deepseek-ai") || cmd.includes("/.dsh/") || /\bdsh\b/.test(cmd)) {
+      if (matchesDshCommandLine(cmd)) {
         cachedIsDshHost = { at: now, value: true };
         return true;
       }

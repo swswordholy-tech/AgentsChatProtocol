@@ -12,6 +12,8 @@ import {
   findBoundSessionForProfile,
   loadSessionBinds,
   parseAntigravityLsofOutput,
+  parseWindowsAntigravityProbeJson,
+  parseWindowsNetstatOutput,
   readAgentLock,
   releaseAgentLock,
   removeSessionBind,
@@ -1186,5 +1188,60 @@ describe("multi-window lock & connect_profile / disconnect_profile integration t
     } finally {
       await mcp.close();
     }
+  });
+
+  test("Windows Antigravity & Codex probes parse quoted --csrf_token, locked presence UUIDs, localized netstat -ano ports, and codex.exe", async () => {
+    const { externalCodexPresent, parseProcesses } = await import("../codex/processes.ts");
+    const cidActive = "ba32c38a-052c-4291-86dd-373a68ea85a3";
+    const cidDb = "11111111-2222-4333-8444-555555555555";
+
+    const probeJson = JSON.stringify({
+      lsPid: 18420,
+      lsCmd: `"C:\\Users\\Boss\\AppData\\Local\\Programs\\Antigravity\\resources\\app\\extensions\\antigravity\\bin\\language_server_windows_x64.exe" --csrf_token "win-csrf-9988" --app_data_dir "antigravity"`,
+      ports: [51234, 51235],
+      lockedPresence: cidActive, // PowerShell ConvertTo-Json emits scalar string for single-element arrays sometimes
+      lockedDbs: [cidDb],
+    });
+    const parsed = parseWindowsAntigravityProbeJson(probeJson);
+    expect(parsed).toEqual({
+      lsPid: 18420,
+      csrfToken: "win-csrf-9988",
+      ports: [51235, 51234], // sorted descending so HTTP Connect-RPC port is tried before HTTPS
+      openConversations: [cidActive], // active presence lock preferred over cached SQLite db
+    });
+
+    // Fallback to localized Windows netstat -ano (e.g., German ABHÖREN / Chinese / English LISTENING) when Get-NetTCPConnection is unavailable
+    const netstatOut = [
+      "  Proto  Local Address          Foreign Address        State           PID",
+      "  TCP    127.0.0.1:60110        0.0.0.0:0              ABHÖREN         18420",
+      "  TCP    [::1]:60112            [::]:0                 LISTENING       18420",
+      "  TCP    127.0.0.1:60115        127.0.0.1:51234        ESTABLISHED     18420",
+      "  TCP    127.0.0.1:60999        0.0.0.0:0              LISTENING       9999",
+    ].join("\r\n");
+    expect(parseWindowsNetstatOutput(netstatOut, 18420)).toEqual([60112, 60110]);
+
+    const fallbackParsed = parseWindowsAntigravityProbeJson(
+      JSON.stringify({
+        lsPid: 18420,
+        lsCmd: `language_server_windows_x64.exe --csrf_token=tok_fallback`,
+        ports: [],
+        lockedPresence: [],
+        lockedDbs: [cidDb],
+      }),
+      netstatOut,
+    );
+    expect(fallbackParsed).toEqual({
+      lsPid: 18420,
+      csrfToken: "tok_fallback",
+      ports: [60112, 60110],
+      openConversations: [cidDb],
+    });
+
+    // Windows codex.exe process table (CRLF + .exe suffix)
+    const winPsRows = parseProcesses(
+      "  4000 1000 powershell.exe\r\n  5000 4000 node.exe\r\n  6000 5000 codex.exe\r\n  7000 1200 C:\\Users\\Boss\\AppData\\Roaming\\npm\\codex.exe\r\n",
+    );
+    expect(externalCodexPresent(winPsRows, 5000)).toBe(true);
+    expect(externalCodexPresent(winPsRows.slice(0, 3), 5000)).toBe(false);
   });
 });

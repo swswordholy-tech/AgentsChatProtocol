@@ -1,6 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { createInterface } from "node:readline";
+import { resolveWindowsCliSpawn } from "../src/wake.ts";
 import type { ThreadHistory } from "./thread-history.ts";
 import type { PermissionMode, ReasoningEffort } from "./config.ts";
 
@@ -57,7 +58,8 @@ export class AppServer {
         : JSON.stringify(value);
       args.push("-c", `mcp_servers.agentschat=${encode(entry)}`);
     }
-    this.child = spawn(this.bin, args, { env, stdio: "pipe" });
+    const resolved = resolveWindowsCliSpawn(this.bin, args, { env });
+    this.child = spawn(resolved.cmd, resolved.args, { env, stdio: "pipe", windowsHide: true });
     // Child diagnostics may contain account or MCP credentials; never relay raw stderr.
     this.child.stderr.on("data", (chunk: Buffer) => {
       if (this.initialized) return;

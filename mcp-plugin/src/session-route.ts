@@ -29,7 +29,8 @@ export interface AgentSessionRoute {
 
 /** Same config root the MCP server uses for profiles and `session-binds.json`. */
 export function agentschatConfigDir(env: Record<string, string | undefined> = process.env): string {
-  return env.AGENTSCHAT_CONFIG_DIR ?? join(homedir(), ".agentschat");
+  const home = env.HOME || env.USERPROFILE || homedir();
+  return env.AGENTSCHAT_CONFIG_DIR ?? join(home, ".agentschat");
 }
 
 /**

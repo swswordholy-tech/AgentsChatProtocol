@@ -15,7 +15,7 @@
  *    bare `catch {}` — the key could sit world-readable with nothing said. Never swallow
  *    it, and verify the result instead of assuming it took.
  */
-import { existsSync, writeFileSync, renameSync, chmodSync, unlinkSync, statSync, readdirSync, readFileSync } from "fs";
+import { existsSync, writeFileSync, renameSync, copyFileSync, chmodSync, unlinkSync, statSync, readdirSync, readFileSync } from "fs";
 import { join, resolve } from "path";
 
 /** Where diagnostics go. Injectable so tests can assert on them. */
@@ -35,23 +35,41 @@ export function safeWriteProfile(path: string, data: unknown, warn: Warn = defau
 
   // Created fresh → `mode` actually applies, so the key is 0600 from the instant it exists.
   writeFileSync(tmp, JSON.stringify(data, null, 2), { mode: 0o600 });
-  renameSync(tmp, path);
-
   try {
-    chmodSync(path, 0o600);
-  } catch (e) {
-    warn(`[agentchat] WARNING: could not chmod ${path} to 0600: ${e}\n`);
+    renameSync(tmp, path);
+  } catch (err: any) {
+    if (process.platform === "win32" && (err?.code === "EPERM" || err?.code === "EACCES")) {
+      // On Windows NTFS, antivirus or search indexers can momentarily hold `path` open,
+      // causing atomic MoveFileEx to return EPERM/EACCES. Fall back to copy+unlink when
+      // `path` is not a directory (`copyFileSync` still throws on directories).
+      copyFileSync(tmp, path);
+      try {
+        unlinkSync(tmp);
+      } catch {}
+    } else {
+      throw err;
+    }
   }
 
-  try {
-    const mode = statSync(path).mode & 0o777;
-    if (mode !== 0o600) {
-      warn(
-        `[agentchat] WARNING: ${path} is mode ${mode.toString(8)}, expected 600 — it holds your agent key. Fix: chmod 600 ${path}\n`,
-      );
+  // POSIX mode bits (0600) do not exist on Windows NTFS (`statSync().mode & 0o777` is always 0666);
+  // Windows protects `%USERPROFILE%\.agentschat` via user-profile NTFS ACL inheritance instead.
+  if (process.platform !== "win32") {
+    try {
+      chmodSync(path, 0o600);
+    } catch (e) {
+      warn(`[agentchat] WARNING: could not chmod ${path} to 0600: ${e}\n`);
     }
-  } catch (e) {
-    warn(`[agentchat] WARNING: could not verify permissions of ${path}: ${e}\n`);
+
+    try {
+      const mode = statSync(path).mode & 0o777;
+      if (mode !== 0o600) {
+        warn(
+          `[agentchat] WARNING: ${path} is mode ${mode.toString(8)}, expected 600 — it holds your agent key. Fix: chmod 600 ${path}\n`,
+        );
+      }
+    } catch (e) {
+      warn(`[agentchat] WARNING: could not verify permissions of ${path}: ${e}\n`);
+    }
   }
 }
 

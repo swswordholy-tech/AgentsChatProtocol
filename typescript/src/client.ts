@@ -47,6 +47,7 @@ export class AgentChatClient {
   private ws: WebSocket | null = null;
   private sessionId: string | null = null;
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  private connectTimer: ReturnType<typeof setTimeout> | null = null;
 
   private messageHandlers: MessageHandler[] = [];
   private proposalHandlers: ProposalHandler[] = [];
@@ -72,6 +73,7 @@ export class AgentChatClient {
   readonly token: string;
   readonly capabilities: string[];
   readonly heartbeatInterval: number;
+  readonly connectTimeoutMs: number;
 
   constructor(options: ClientOptions) {
     this.url = options.url;
@@ -79,12 +81,14 @@ export class AgentChatClient {
     this.token = options.token ?? "dev-token";
     this.capabilities = options.capabilities ?? [];
     this.heartbeatInterval = options.heartbeatInterval ?? 30_000;
+    this.connectTimeoutMs = options.connectTimeoutMs ?? 15_000;
   }
 
   // MARK: - Connection
 
   connect(): Promise<void> {
     this.stopHeartbeat();
+    this.stopConnectTimer();
     this.sessionId = null;
     if (this.ws) {
       const prev = this.ws;
@@ -101,6 +105,18 @@ export class AgentChatClient {
 
       const socket = new WebSocket(this.url);
       this.ws = socket;
+      if (this.connectTimeoutMs > 0) {
+        this.connectTimer = setTimeout(() => {
+          this.connectTimer = null;
+          if (this.ws !== socket || this.sessionId !== null) return;
+          this.ws = null;
+          this.rejectConnect(new Error(`WebSocket connect timed out after ${this.connectTimeoutMs}ms`));
+          try {
+            socket.close();
+          } catch {}
+        }, this.connectTimeoutMs);
+        (this.connectTimer as unknown as { unref?: () => void })?.unref?.();
+      }
       socket.onopen = () => {
         if (this.ws !== socket) return;
         this.handleOpen();
@@ -122,6 +138,7 @@ export class AgentChatClient {
 
   disconnect() {
     this.stopHeartbeat();
+    this.stopConnectTimer();
     const prev = this.ws;
     this.ws = null;
     this.sessionId = null;
@@ -420,7 +437,7 @@ export class AgentChatClient {
           content_type: data.content_type,
           timestamp: data.timestamp,
         };
-        for (const h of this.messageHandlers) h(msg);
+        this.invokeHandlers(this.messageHandlers, msg);
         break;
       }
 
@@ -437,7 +454,7 @@ export class AgentChatClient {
           ...(data.expires_at !== undefined ? { expires_at: data.expires_at } : {}),
           timestamp: data.timestamp ?? "",
         };
-        for (const h of this.proposalHandlers) h(proposal);
+        this.invokeHandlers(this.proposalHandlers, proposal);
         break;
       }
 
@@ -450,7 +467,7 @@ export class AgentChatClient {
           decision: data.decision,
           ...(data.reason !== undefined ? { reason: data.reason } : {}),
         };
-        for (const h of this.voteHandlers) h(vote);
+        this.invokeHandlers(this.voteHandlers, vote);
         break;
       }
 
@@ -463,7 +480,7 @@ export class AgentChatClient {
           abstain_count: data.abstain_count,
           total_voters: data.total_voters,
         };
-        for (const h of this.voteResultHandlers) h(result);
+        this.invokeHandlers(this.voteResultHandlers, result);
         break;
       }
 
@@ -475,55 +492,60 @@ export class AgentChatClient {
           display_name: data.display_name,
           capabilities: data.capabilities,
         };
-        for (const h of this.presenceHandlers) h(presence);
+        this.invokeHandlers(this.presenceHandlers, presence);
         break;
       }
 
       case "error":
-        for (const h of this.errorHandlers) h(data.code, data.message);
+        this.invokeHandlers(this.errorHandlers, data.code, data.message);
         if (!this.sessionId) {
+          const prev = this.ws;
+          this.ws = null;
           this.rejectConnect(new Error(`Auth failed: ${data.message}`));
+          try {
+            prev?.close();
+          } catch {}
         }
         break;
 
       case "reaction_update":
-        for (const h of this.reactionHandlers) h(data as ReactionUpdate);
+        this.invokeHandlers(this.reactionHandlers, data as ReactionUpdate);
         break;
 
       case "thread_reply":
-        for (const h of this.threadHandlers) h(data as ThreadReply);
+        this.invokeHandlers(this.threadHandlers, data as ThreadReply);
         break;
 
       case "thread_update":
-        for (const h of this.threadHandlers) h(data as ThreadUpdate);
+        this.invokeHandlers(this.threadHandlers, data as ThreadUpdate);
         break;
 
       case "message_edited":
-        for (const h of this.editHandlers) h(data as MessageEdited);
+        this.invokeHandlers(this.editHandlers, data as MessageEdited);
         break;
 
       case "message_deleted":
-        for (const h of this.deleteHandlers) h(data as MessageDeleted);
+        this.invokeHandlers(this.deleteHandlers, data as MessageDeleted);
         break;
 
       case "okr_updated":
-        for (const h of this.okrUpdatedHandlers) h(data as OkrUpdatedMessage);
+        this.invokeHandlers(this.okrUpdatedHandlers, data as OkrUpdatedMessage);
         break;
 
       case "task_assigned":
-        for (const h of this.taskAssignedHandlers) h(data as TaskAssignedMessage);
+        this.invokeHandlers(this.taskAssignedHandlers, data as TaskAssignedMessage);
         break;
 
       case "okr_thread_opened":
-        for (const h of this.okrThreadOpenedHandlers) h(data as OkrThreadOpenedMessage);
+        this.invokeHandlers(this.okrThreadOpenedHandlers, data as OkrThreadOpenedMessage);
         break;
 
       case "channel_doc_updated":
-        for (const h of this.channelDocUpdatedHandlers) h(data as ChannelDocUpdatedMessage);
+        this.invokeHandlers(this.channelDocUpdatedHandlers, data as ChannelDocUpdatedMessage);
         break;
 
       case "pin_update":
-        for (const h of this.pinUpdateHandlers) h(data as PinUpdate);
+        this.invokeHandlers(this.pinUpdateHandlers, data as PinUpdate);
         break;
 
       case "read_receipt_update": {
@@ -547,7 +569,7 @@ export class AgentChatClient {
           channel_id: String(data.channel_id ?? ""),
           receipts,
         };
-        for (const h of this.readReceiptHandlers) h(update);
+        this.invokeHandlers(this.readReceiptHandlers, update);
         break;
       }
 
@@ -559,7 +581,23 @@ export class AgentChatClient {
     }
   }
 
+  private invokeHandlers<T extends (...args: any[]) => void>(handlers: T[], ...args: Parameters<T>) {
+    for (const h of [...handlers]) {
+      try {
+        h(...args);
+      } catch {}
+    }
+  }
+
+  private stopConnectTimer() {
+    if (this.connectTimer) {
+      clearTimeout(this.connectTimer);
+      this.connectTimer = null;
+    }
+  }
+
   private resolveConnect() {
+    this.stopConnectTimer();
     const resolve = this.connectResolve;
     this.connectResolve = null;
     this.connectReject = null;
@@ -567,6 +605,7 @@ export class AgentChatClient {
   }
 
   private rejectConnect(err: Error) {
+    this.stopConnectTimer();
     const reject = this.connectReject;
     this.connectResolve = null;
     this.connectReject = null;
@@ -595,6 +634,7 @@ export class AgentChatClient {
     this.heartbeatTimer = setInterval(() => {
       this.send({ type: "ping", timestamp: new Date().toISOString() });
     }, this.heartbeatInterval);
+    (this.heartbeatTimer as unknown as { unref?: () => void })?.unref?.();
   }
 
   private send(data: Record<string, unknown>) {

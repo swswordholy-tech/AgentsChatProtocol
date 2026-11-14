@@ -26,14 +26,16 @@
  */
 import { spawn } from "node:child_process";
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync, appendFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const HOME = homedir();
+const HOME = process.env.HOME || process.env.USERPROFILE || homedir();
 const LOCK = process.env.MUSE_WAKE_ENSURE_LOCK ?? join(HOME, ".agentschat", "muse-wake-ensure.lock");
 const PIDFILE = process.env.MUSE_WAKE_PIDFILE ?? join(HOME, ".agentschat", "muse-wake.pid");
-const LOG = process.env.MUSE_WAKE_LOG ?? "/tmp/agentschat-muse-wake.log";
+const LOG =
+  process.env.MUSE_WAKE_LOG ??
+  (process.platform === "win32" ? join(tmpdir(), "agentschat-muse-wake.log") : "/tmp/agentschat-muse-wake.log");
 const PLUGIN_DIR = join(dirname(fileURLToPath(import.meta.url)), "..");
 
 function pidAlive(pid) {

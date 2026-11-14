@@ -6463,4 +6463,90 @@ describe("AgentChatClient realtime collaboration WS events", () => {
       globalThis.fetch = originalFetch;
     }
   });
+
+  test("Campaign #77: AgentChatClient enforces connectTimeoutMs and isolates throwing event/error callbacks", async () => {
+    const { AgentChatClient } = await import("../src/index");
+    const OriginalWS = globalThis.WebSocket;
+    const sockets: any[] = [];
+    class MockWS {
+      static CONNECTING = 0;
+      static OPEN = 1;
+      static CLOSING = 2;
+      static CLOSED = 3;
+      readyState = 0;
+      closed = false;
+      onopen: (() => void) | null = null;
+      onmessage: ((ev: { data: string }) => void) | null = null;
+      onclose: (() => void) | null = null;
+      onerror: (() => void) | null = null;
+      constructor(public url: string) {
+        sockets.push(this);
+      }
+      send(_raw: string) {}
+      close() {
+        this.closed = true;
+        this.readyState = 3;
+        this.onclose?.();
+      }
+    }
+    (globalThis as any).WebSocket = MockWS;
+
+    try {
+      const client = new AgentChatClient({
+        url: "wss://agents-chat.com/ws",
+        agentId: "sdk-bot-77",
+        token: "tok_77",
+        connectTimeoutMs: 40,
+      });
+
+      // 1. Half-open WS that never completes auth rejects after connectTimeoutMs and closes socket
+      const stalledConnect = client.connect();
+      sockets[0].readyState = 1;
+      sockets[0].onopen?.();
+      await expect(stalledConnect).rejects.toThrow("WebSocket connect timed out after 40ms");
+      expect(sockets[0].closed).toBe(true);
+      expect(client.isConnected).toBe(false);
+
+      // 2. Throwing onError callback does NOT swallow pre-auth rejectConnect or leave socket open
+      client.onError(() => {
+        throw new Error("boom in onError");
+      });
+      const failedAuth = client.connect();
+      sockets[1].readyState = 1;
+      sockets[1].onopen?.();
+      sockets[1].onmessage?.({ data: JSON.stringify({ type: "error", code: "AUTH_FAILED", message: "Invalid key" }) });
+      await expect(failedAuth).rejects.toThrow("Auth failed: Invalid key");
+      expect(sockets[1].closed).toBe(true);
+
+      // 3. Throwing onMessage callback does NOT prevent subsequent registered handlers from firing
+      const receivedBySecond: string[] = [];
+      client.onMessage(() => {
+        throw new Error("boom in first onMessage");
+      });
+      client.onMessage((m) => {
+        receivedBySecond.push(m.id);
+      });
+      const okConnect = client.connect();
+      sockets[2].readyState = 1;
+      sockets[2].onopen?.();
+      sockets[2].onmessage?.({ data: JSON.stringify({ type: "auth_ok", session_id: "sess-77" }) });
+      await okConnect;
+      sockets[2].onmessage?.({
+        data: JSON.stringify({
+          type: "message",
+          id: "msg-77",
+          channel_id: "room-77",
+          sender_id: "peer",
+          sender_type: "agent",
+          content: "hi",
+          content_type: "text",
+          timestamp: "2026-11-14T11:30:00Z",
+        }),
+      });
+      expect(receivedBySecond).toEqual(["msg-77"]);
+      client.disconnect();
+    } finally {
+      globalThis.WebSocket = OriginalWS;
+    }
+  });
 });

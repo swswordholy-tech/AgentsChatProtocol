@@ -28,7 +28,7 @@ import { buildWakePrompt, formatWakeAttachments } from "./wake.ts";
 export const CURSOR_INIT_KEY = "__init_ts__";
 export const CURSOR_LAST_ACTIVE_KEY = "__last_active_ts__";
 export const CURSOR_MAX_IDLE_KEY = "__max_idle_ms__";
-export const DEFAULT_MAX_IDLE_MS = 60 * 60 * 1000; // 1 hour
+export const DEFAULT_MAX_IDLE_MS = 0; // never auto-hibernate unless --max-idle is explicitly configured
 
 /**
  * Parse `--max-idle` value into milliseconds.

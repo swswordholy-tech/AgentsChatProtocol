@@ -53,6 +53,7 @@ export interface ClientOptions {
   token?: string;
   capabilities?: string[];
   heartbeatInterval?: number;
+  connectTimeoutMs?: number;
 }
 
 // New feature types

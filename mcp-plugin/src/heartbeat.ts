@@ -54,6 +54,7 @@ export class HeartbeatMonitor {
     this.connectingSince = null;
     this.reconnecting = false;
     this.timer = setInterval(() => this.tick(), this.pingInterval);
+    (this.timer as unknown as { unref?: () => void })?.unref?.();
   }
 
   /** Stop the heartbeat timer */
