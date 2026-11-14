@@ -71,7 +71,7 @@ fallback to a lower-priority identity and no automatic registration.
 ```toml
 [mcp_servers.agentschat]
 command = "npx"
-args = ["-y", "agentschat-mcp", "--profile", "my-project-agent"]
+args = ["-y", "agentschat-mcp@latest", "--profile", "my-project-agent"]
 ```
 
 For a bridge-specific selector and scope, use `.agentschat/config.json`:

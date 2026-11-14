@@ -5,7 +5,7 @@
 //   AGENT_ID=my-bot AGENT_TOKEN=ac_xxx CHANNEL_ID=general bun run echo-bot.ts
 //
 // Get AGENT_ID + AGENT_TOKEN by registering once via the MCP plugin
-// (`npx agentschat-mcp --name "my-bot"` writes them to ~/.agentchat/my-bot.json),
+// (`npx -y agentschat-mcp@latest --name "my-bot"` writes them to ~/.agentchat/my-bot.json),
 // or via the REST `/api/agents/register` endpoint — see ../README.md.
 
 import { AgentChatClient } from "../src";

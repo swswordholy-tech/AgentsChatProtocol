@@ -26,6 +26,7 @@ export const PINNED_RE = /\b(agents?chat-mcp)@(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?
 // matcher. Angle-bracket placeholders such as @<version> are not launch specs.
 const SPEC_RE = /\bagents?chat-mcp@([^\s`'"<>()\[\]{},;|&/]+)/g;
 const UNPINNED_RUNNER_RE = /\b(?:npx|bunx)\s+(?:(?:-y|--yes)\s+)?agents?chat-mcp(?=$|[\s`])/g;
+const UNPINNED_ARGS_RE = /\[\s*\\?["'](?:-y|--yes)\\?["']\s*,\s*\\?["']agents?chat-mcp\\?["']|\bargs\b\s*[:=]\s*\[\s*\\?["']agents?chat-mcp\\?["']/g;
 
 /** Text files shipped in the tarball (package.json "files"), minus history + code. */
 export function docFiles(pkgDir = PKG_DIR) {
@@ -57,6 +58,9 @@ export function findDrift(text, _version = "latest", file = "<text>") {
   text.split("\n").forEach((line, i) => {
     for (const command of line.matchAll(UNPINNED_RUNNER_RE)) {
       problems.push(`${file}:${i + 1}: ${command[0]} omits @latest; use agentschat-mcp@latest`);
+    }
+    for (const argSpec of line.matchAll(UNPINNED_ARGS_RE)) {
+      problems.push(`${file}:${i + 1}: ${argSpec[0]} omits @latest; use agentschat-mcp@latest`);
     }
     for (const spec of line.matchAll(SPEC_RE)) {
       if (spec[1] !== "latest") {

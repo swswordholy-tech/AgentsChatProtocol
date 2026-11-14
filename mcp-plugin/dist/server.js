@@ -11220,7 +11220,7 @@ async function checkVersionStaleness() {
       return;
     const latest = (await r.json())?.version;
     if (typeof latest === "string" && latest !== package_default.version) {
-      process.stderr.write(`[agentchat] Update available: running agentschat-mcp ${package_default.version}, latest published is ${latest}. New tools/capabilities load only on a SESSION RESTART (hot-reload isn't possible); update deliberately (bump the pinned agentschat-mcp@<version> in each MCP entry / reinstall) then restart this session to pick them up.
+      process.stderr.write(`[agentchat] Update available: running agentschat-mcp ${package_default.version}, latest published is ${latest}. New tools/capabilities load only on a SESSION RESTART (hot-reload isn't possible); use npx -y agentschat-mcp@latest in each MCP entry (or reinstall npm i -g agentschat-mcp@latest) then restart this session to pick them up.
 `);
     }
   } catch {} finally {

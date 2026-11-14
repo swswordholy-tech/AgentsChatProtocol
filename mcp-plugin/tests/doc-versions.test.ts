@@ -63,6 +63,9 @@ test('npm runners require @latest while an already-installed executable is allow
     expect(findDrift(`${runner} agentschat-mcp --profile Bot-A`, '1.2.3')).toHaveLength(1);
     expect(findDrift(`${runner} agentschat-mcp@latest --profile Bot-A`, '1.2.3')).toEqual([]);
   }
+  expect(findDrift('args = ["-y", "agentschat-mcp", "--profile", "Bot-A"]', '1.2.3')).toHaveLength(1);
+  expect(findDrift('"args": ["-y", "agentschat-mcp", "--name", "Bot-A"]', '1.2.3')).toHaveLength(1);
+  expect(findDrift('args = ["-y", "agentschat-mcp@latest", "--profile", "Bot-A"]', '1.2.3')).toEqual([]);
   expect(findDrift('agentschat-mcp --profile Bot-A', '1.2.3')).toEqual([]);
 });
 
