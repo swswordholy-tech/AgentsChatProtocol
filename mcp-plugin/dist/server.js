@@ -3816,10 +3816,22 @@ function expectedAgentIdViolation(expected, liveAgentId) {
 }
 
 // src/read-cursor.ts
-import { readFileSync as readFileSync9, writeFileSync as writeFileSync3 } from "fs";
+import { readFileSync as readFileSync9, renameSync as renameSync3, unlinkSync as unlinkSync5, writeFileSync as writeFileSync3 } from "fs";
+var tmpCounter = 0;
 function loadCursor(file, warn) {
   try {
-    return new Map(Object.entries(JSON.parse(readFileSync9(file, "utf-8"))));
+    const parsed = JSON.parse(readFileSync9(file, "utf-8"));
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error("cursor root must be a JSON object");
+    }
+    const entries = [];
+    for (const [k, v] of Object.entries(parsed)) {
+      if (typeof v !== "string") {
+        throw new Error(`cursor value for ${k} must be a string`);
+      }
+      entries.push([k, v]);
+    }
+    return new Map(entries);
   } catch (e) {
     if (e?.code !== "ENOENT") {
       warn(`[agentchat] WARNING: could not read ${file} — resetting that state: ${e}
@@ -3829,10 +3841,15 @@ function loadCursor(file, warn) {
   }
 }
 function persistCursor(file, cursor, warn) {
+  const tmp = `${file}.${process.pid}.${Date.now()}.${++tmpCounter}.tmp`;
   try {
-    writeFileSync3(file, JSON.stringify(Object.fromEntries(cursor)));
+    writeFileSync3(tmp, JSON.stringify(Object.fromEntries(cursor)), { mode: 384 });
+    renameSync3(tmp, file);
     return true;
   } catch (e) {
+    try {
+      unlinkSync5(tmp);
+    } catch {}
     warn(`[agentchat] WARNING: failed to persist read cursor to ${file}: ${e}
 `);
     return false;
@@ -3863,10 +3880,22 @@ function matchesMention2(content, agentId) {
 }
 
 // src/read-cursor.ts
-import { readFileSync as readFileSync10, writeFileSync as writeFileSync4 } from "fs";
+import { readFileSync as readFileSync10, renameSync as renameSync4, unlinkSync as unlinkSync6, writeFileSync as writeFileSync4 } from "fs";
+var tmpCounter2 = 0;
 function loadCursor2(file, warn) {
   try {
-    return new Map(Object.entries(JSON.parse(readFileSync10(file, "utf-8"))));
+    const parsed = JSON.parse(readFileSync10(file, "utf-8"));
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error("cursor root must be a JSON object");
+    }
+    const entries = [];
+    for (const [k, v] of Object.entries(parsed)) {
+      if (typeof v !== "string") {
+        throw new Error(`cursor value for ${k} must be a string`);
+      }
+      entries.push([k, v]);
+    }
+    return new Map(entries);
   } catch (e) {
     if (e?.code !== "ENOENT") {
       warn(`[agentchat] WARNING: could not read ${file} — resetting that state: ${e}
@@ -3876,10 +3905,15 @@ function loadCursor2(file, warn) {
   }
 }
 function persistCursor2(file, cursor, warn) {
+  const tmp = `${file}.${process.pid}.${Date.now()}.${++tmpCounter2}.tmp`;
   try {
-    writeFileSync4(file, JSON.stringify(Object.fromEntries(cursor)));
+    writeFileSync4(tmp, JSON.stringify(Object.fromEntries(cursor)), { mode: 384 });
+    renameSync4(tmp, file);
     return true;
   } catch (e) {
+    try {
+      unlinkSync6(tmp);
+    } catch {}
     warn(`[agentchat] WARNING: failed to persist read cursor to ${file}: ${e}
 `);
     return false;

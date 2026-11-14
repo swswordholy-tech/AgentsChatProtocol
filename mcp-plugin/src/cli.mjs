@@ -119,21 +119,30 @@ Source: https://github.com/swswordholy-tech/AgentsChatProtocol/tree/main/mcp-plu
 
 const filteredArgs = args.filter((a) => a !== "--supervise");
 
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
-}
-
 /**
  * Parent strips --supervise / AGENTCHAT_WAKE_SUPERVISE and respawns the same
  * runtime entry on crash until SIGTERM/SIGINT.
+ *
+ * Hardening invariants:
+ * 1. Backoff sleep is immediately interrupted on SIGTERM/SIGINT so service
+ *    managers (systemd/launchd/Docker) never wait up to 30s to SIGKILL.
+ * 2. When a child ran healthily (>= 60s default) before exiting, exponential
+ *    backoff resets to initialDelayMs so multi-day daemons don't stay pinned
+ *    at 30s restart latency forever.
  */
 async function runSupervised(childArgs) {
   let stopping = false;
   /** @type {import("node:child_process").ChildProcess | null} */
   let child = null;
+  /** @type {(() => void) | null} */
+  let cancelSleep = null;
 
   const requestStop = () => {
     stopping = true;
+    if (cancelSleep) {
+      cancelSleep();
+      cancelSleep = null;
+    }
     if (child && child.pid && !child.killed) {
       try {
         child.kill("SIGTERM");
@@ -145,14 +154,33 @@ async function runSupervised(childArgs) {
   process.on("SIGTERM", requestStop);
   process.on("SIGINT", requestStop);
 
+  const interruptibleSleep = (ms) =>
+    new Promise((resolve) => {
+      if (stopping) {
+        resolve();
+        return;
+      }
+      const timer = setTimeout(() => {
+        cancelSleep = null;
+        resolve();
+      }, ms);
+      cancelSleep = () => {
+        clearTimeout(timer);
+        resolve();
+      };
+    });
+
   const selfPath = fileURLToPath(import.meta.url);
   const childEnv = { ...process.env };
   delete childEnv.AGENTCHAT_WAKE_SUPERVISE;
 
-  let delayMs = 1000;
-  const maxDelayMs = 30_000;
+  const initialDelayMs = Math.max(10, Number(process.env.AGENTCHAT_SUPERVISE_INITIAL_DELAY_MS) || 1000);
+  const maxDelayMs = Math.max(initialDelayMs, Number(process.env.AGENTCHAT_SUPERVISE_MAX_DELAY_MS) || 30_000);
+  const healthyResetMs = Math.max(50, Number(process.env.AGENTCHAT_SUPERVISE_RESET_MS) || 60_000);
+  let delayMs = initialDelayMs;
 
   while (!stopping) {
+    const startedAt = Date.now();
     child = spawn(process.execPath, [selfPath, ...childArgs], {
       env: childEnv,
       stdio: "inherit",
@@ -164,10 +192,15 @@ async function runSupervised(childArgs) {
       });
       child.on("error", () => resolve(1));
     });
+    const ranMs = Date.now() - startedAt;
     child = null;
     if (stopping) process.exit(exitCode);
+    if (ranMs >= healthyResetMs) {
+      delayMs = initialDelayMs;
+    }
     process.stderr.write(`[agentchat] supervise: restarting after exit ${exitCode}\n`);
-    await sleep(delayMs);
+    await interruptibleSleep(delayMs);
+    if (stopping) process.exit(exitCode);
     delayMs = Math.min(delayMs * 2, maxDelayMs);
   }
   process.exit(0);

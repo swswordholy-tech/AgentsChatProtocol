@@ -558,10 +558,22 @@ function redactSecrets(text, opts) {
 }
 
 // src/read-cursor.ts
-import { readFileSync, writeFileSync } from "fs";
+import { readFileSync, renameSync, unlinkSync, writeFileSync } from "fs";
+var tmpCounter = 0;
 function loadCursor(file, warn) {
   try {
-    return new Map(Object.entries(JSON.parse(readFileSync(file, "utf-8"))));
+    const parsed = JSON.parse(readFileSync(file, "utf-8"));
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error("cursor root must be a JSON object");
+    }
+    const entries = [];
+    for (const [k, v] of Object.entries(parsed)) {
+      if (typeof v !== "string") {
+        throw new Error(`cursor value for ${k} must be a string`);
+      }
+      entries.push([k, v]);
+    }
+    return new Map(entries);
   } catch (e) {
     if (e?.code !== "ENOENT") {
       warn(`[agentchat] WARNING: could not read ${file} — resetting that state: ${e}
@@ -571,10 +583,15 @@ function loadCursor(file, warn) {
   }
 }
 function persistCursor(file, cursor, warn) {
+  const tmp = `${file}.${process.pid}.${Date.now()}.${++tmpCounter}.tmp`;
   try {
-    writeFileSync(file, JSON.stringify(Object.fromEntries(cursor)));
+    writeFileSync(tmp, JSON.stringify(Object.fromEntries(cursor)), { mode: 384 });
+    renameSync(tmp, file);
     return true;
   } catch (e) {
+    try {
+      unlinkSync(tmp);
+    } catch {}
     warn(`[agentchat] WARNING: failed to persist read cursor to ${file}: ${e}
 `);
     return false;

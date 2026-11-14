@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { flushCursor, loadCursor, persistCursor } from "../src/read-cursor.ts";
-import { mkdtempSync, rmSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, rmSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -93,5 +93,20 @@ describe("persistCursor reports failures instead of swallowing them", () => {
     expect(ok).toBe(true);
     expect(warnings).toEqual([]); // proves the warn assertion above isn't vacuous
     expect(JSON.parse(readFileSync(file, "utf-8"))).toEqual({ chan: "2026-07-10T00:00:00Z" });
+    // Atomic rename leaves zero stray .tmp siblings behind
+    expect(readdirSync(dir)).toEqual(["c.json"]);
+    if (process.platform !== "win32") {
+      expect(statSync(file).mode & 0o777).toBe(0o600);
+    }
+  });
+
+  test("loadCursor rejects non-object JSON roots and non-string cursor values with a warning", () => {
+    for (const badContent of ["null", "[1,2]", '"str"', JSON.stringify({ chan: 12345 })]) {
+      const file = join(dir, "bad-shape.json");
+      writeFileSync(file, badContent);
+      const warnings: string[] = [];
+      expect(loadCursor(file, (m) => warnings.push(m)).size).toBe(0);
+      expect(warnings.join("")).toMatch(/could not read/);
+    }
   });
 });
