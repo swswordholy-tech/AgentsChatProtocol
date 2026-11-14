@@ -159,16 +159,22 @@ export function isValidCollaborationRoster(
 
 const WORKSPACE_GRAPH_SCOPES = new Set(["channel", "objective", "agent"]);
 const PROTOTYPE_POISON_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+const JOINED_GRAPH_CREDENTIAL_ID_RE =
+  /(?:^|[^A-Za-z0-9])(?:mcp_(?:at|rt|code)_|ac_|agent_key_|sk[-_]|rk_(?:live|test)_|gh[pousr]_|github_pat_|glpat-|xox[baprs]-|hf_|npm_|(?:AIza|eyJ)[A-Za-z0-9]|(?:Bearer|Basic)(?:[._-]|$))/i;
+const JOINED_GRAPH_AWS_KEY_ID_RE = /(?:^|[^A-Za-z0-9])(?:AKIA|ASIA)[0-9A-Z]{16}(?![A-Za-z0-9])/;
 
 function safeGraphId(value: unknown): value is string {
   return (
     typeof value === "string" &&
     value.length >= 1 &&
     value.length <= 160 &&
-    !PROTOTYPE_POISON_KEYS.has(value) &&
+    !PROTOTYPE_POISON_KEYS.has(value.toLowerCase()) &&
+    !/^mr_[0-9a-f]{16,}$/i.test(value) &&
     !/[/\\?#&\s\u0000-\u001F\u007F]/.test(value) &&
     !value.includes("..") &&
     !CREDENTIAL_PREFIX_RE.test(value) &&
+    !JOINED_GRAPH_CREDENTIAL_ID_RE.test(value) &&
+    !JOINED_GRAPH_AWS_KEY_ID_RE.test(value) &&
     !EMAIL_ID_RE.test(value) &&
     !PHONE_ID_RE.test(value)
   );
@@ -190,7 +196,8 @@ export function summarizeWorkspaceGraphReadiness(
   if (
     typeof scope.type !== "string" ||
     !WORKSPACE_GRAPH_SCOPES.has(scope.type) ||
-    !safeGraphId(scope.id)
+    !safeGraphId(scope.id) ||
+    (scope.type === "channel" && DM_OR_DIRECT_CHANNEL_RE.test(scope.id))
   ) {
     return null;
   }
@@ -223,7 +230,7 @@ export function summarizeWorkspaceGraphReadiness(
   }
 
   const unchangedReferenceCount = Array.isArray(g.referenced_unchanged_ids)
-    ? g.referenced_unchanged_ids.slice(0, 5000).filter(safeGraphId).length
+    ? new Set(g.referenced_unchanged_ids.slice(0, 5000).filter(safeGraphId)).size
     : 0;
 
   const isIncremental =
@@ -304,14 +311,8 @@ export function summarizeWorkspaceGraphHierarchy(
     if (!rawNode || typeof rawNode !== "object") continue;
     const node = rawNode as Record<string, unknown>;
     if (node.type !== "objective" || !safeGraphId(node.id) || objectiveNodes.has(node.id)) continue;
-    const title =
-      typeof node.title === "string" && node.title.trim()
-        ? node.title.trim().slice(0, 200)
-        : node.id;
-    const status =
-      typeof node.status === "string" && node.status.trim()
-        ? node.status.trim().slice(0, 32)
-        : "active";
+    const title = sanitizeOkrWatchText(node.title, 200) || node.id;
+    const status = sanitizeOkrWatchText(node.status, 32) || "active";
     objectiveNodes.set(node.id, { id: node.id, title, status });
     if (safeGraphId(node.parent_id) && node.parent_id !== node.id) {
       parentByObjId.set(node.id, node.parent_id);
@@ -3495,17 +3496,8 @@ export class AgentChatREST {
     }
     const trimmedId = typeof id === "string" ? id.trim() : "";
     if (
-      !trimmedId ||
-      trimmedId.length > 160 ||
-      /[/\\?#&\s\u0000-\u001F\u007F]/.test(trimmedId) ||
-      trimmedId.includes("..") ||
-      CREDENTIAL_PREFIX_RE.test(trimmedId) ||
-      EMAIL_ID_RE.test(trimmedId) ||
-      PHONE_ID_RE.test(trimmedId) ||
+      !safeGraphId(trimmedId) ||
       (scope === "channel" && DM_OR_DIRECT_CHANNEL_RE.test(trimmedId)) ||
-      /(?:^|[^A-Za-z0-9])(?:sk[-_][A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9_]{8,}|github_pat_[A-Za-z0-9_]{8,}|AIza[A-Za-z0-9_-]{12,}|eyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,})/i.test(
-        trimmedId,
-      ) ||
       this.containsMemorySecretShape(trimmedId)
     ) {
       throw new Error("Invalid workspace graph ID");

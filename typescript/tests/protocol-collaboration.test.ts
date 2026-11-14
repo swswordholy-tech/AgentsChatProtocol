@@ -4932,4 +4932,88 @@ describe("AgentChatClient realtime collaboration WS events", () => {
       globalThis.fetch = originalFetch;
     }
   });
+
+  test("summarizeWorkspaceGraphReadiness, summarizeWorkspaceGraphHierarchy, and getWorkspaceGraph enforce DM scope rejection, unchanged ref dedup, pre-slice title scrubbing, and joined-credential guards", async () => {
+    const longPad = "P".repeat(220);
+    const rawGraph: WorkspaceGraph = {
+      scope: { type: "channel", id: "room-asia-pacific" },
+      nodes: [
+        {
+          type: "objective",
+          id: "eyj-notes",
+          title: `${longPad} mcp_at_1234567890abcdef ASIAIOSFODNN7EXAMPLE owner@example.com +1 (415) 555-0199`,
+          status: "active",
+        },
+        { type: "objective", id: "Constructor", title: "Case-insensitive poison", status: "active" },
+        { type: "objective", id: "obj_rk_live_1234567890", title: "Joined secret ID", status: "active" },
+        { type: "task", id: "aiza-guide", ready: true },
+        { type: "task", id: "aiza-guide", ready: true },
+        { type: "task", id: "task_glpat-1234567890", ready: true },
+      ],
+      edges: [],
+      sections: [
+        { id: "okr", title: "OKR", summary: { active_objectives: 1, active_tasks: 1, ready_tasks: 1 } },
+        { id: "docs", title: "Docs", summary: { docs_count: 2, skills_count: 1 } },
+        { id: "dag", title: "DAG", summary: { blocked_tasks: 0, unresolved_edges: 0, ready_tasks: 1 } },
+      ],
+      since: "2026-11-14T12:55:00.000Z",
+      referenced_unchanged_ids: [
+        "doc_sop",
+        "doc_sop", // duplicate unchanged ref must count once!
+        "__proto__",
+        "Constructor",
+        "mr_" + "a".repeat(64),
+        "obj_mcp_at_1234567890",
+      ],
+    };
+
+    const readiness = summarizeWorkspaceGraphReadiness(rawGraph);
+    expect(readiness).not.toBeNull();
+    expect(readiness!.ready_task_ids).toEqual(["aiza-guide"]);
+    expect(readiness!.unchanged_reference_count).toBe(1);
+
+    // DM channel scope rejected in summarizeWorkspaceGraphReadiness too!
+    for (const dmCh of ["dm-private", "dm_private", "dm:private", "direct:u1:u2", "direct_1"]) {
+      expect(summarizeWorkspaceGraphReadiness({ ...rawGraph, scope: { type: "channel", id: dmCh } })).toBeNull();
+    }
+
+    const hierarchy = summarizeWorkspaceGraphHierarchy(rawGraph);
+    expect(hierarchy).not.toBeNull();
+    expect(hierarchy!.root_objective_ids).toEqual(["eyj-notes"]);
+    const dumped = JSON.stringify(hierarchy);
+    for (const secret of ["mcp_at_", "ASIAIOSFODNN7EXAMPLE", "owner@example.com", "555-0199"]) {
+      expect(dumped).not.toContain(secret);
+    }
+
+    const originalFetch = globalThis.fetch;
+    let fetchCalls = 0;
+    globalThis.fetch = (async () => {
+      fetchCalls += 1;
+      return Response.json(rawGraph);
+    }) as unknown as typeof fetch;
+
+    try {
+      const rest = new AgentChatREST({ baseUrl: "https://agents-chat.com", bearerToken: "tok_57" });
+      for (const badId of [
+        "__proto__",
+        "constructor",
+        "prototype",
+        "Constructor",
+        "mr_" + "b".repeat(64),
+        "obj_mcp_at_1234567890",
+        "room_ASIAIOSFODNN7EXAMPLE",
+        "dm_pair",
+        "dm:pair",
+      ]) {
+        await expect(rest.getWorkspaceGraph("channel", badId)).rejects.toThrow("Invalid workspace graph ID");
+      }
+      expect(fetchCalls).toBe(0);
+
+      const ok = await rest.getWorkspaceGraph("channel", "room-asia-pacific");
+      expect(ok.scope.id).toBe("room-asia-pacific");
+      expect(fetchCalls).toBe(1);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
 });
