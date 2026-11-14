@@ -84,26 +84,51 @@ export class AgentChatClient {
   // MARK: - Connection
 
   connect(): Promise<void> {
+    this.stopHeartbeat();
+    this.sessionId = null;
+    if (this.ws) {
+      const prev = this.ws;
+      this.ws = null;
+      try {
+        prev.close();
+      } catch {}
+    }
+    this.rejectConnect(new Error("WebSocket superseded by a new connect() call"));
+
     return new Promise((resolve, reject) => {
       this.connectResolve = resolve;
       this.connectReject = reject;
 
-      this.ws = new WebSocket(this.url);
-      this.ws.onopen = () => this.handleOpen();
-      this.ws.onmessage = (event) => this.handleMessage(String(event.data));
-      this.ws.onclose = () => this.handleClose();
-      this.ws.onerror = (event) => reject(new Error("WebSocket error"));
+      const socket = new WebSocket(this.url);
+      this.ws = socket;
+      socket.onopen = () => {
+        if (this.ws !== socket) return;
+        this.handleOpen();
+      };
+      socket.onmessage = (event) => {
+        if (this.ws !== socket) return;
+        this.handleMessage(String(event.data));
+      };
+      socket.onclose = () => {
+        if (this.ws !== socket) return;
+        this.handleClose();
+      };
+      socket.onerror = () => {
+        if (this.ws !== socket) return;
+        this.rejectConnect(new Error("WebSocket error"));
+      };
     });
   }
 
   disconnect() {
-    if (this.heartbeatTimer) {
-      clearInterval(this.heartbeatTimer);
-      this.heartbeatTimer = null;
-    }
-    this.ws?.close();
+    this.stopHeartbeat();
+    const prev = this.ws;
     this.ws = null;
     this.sessionId = null;
+    this.rejectConnect(new Error("WebSocket disconnected"));
+    try {
+      prev?.close();
+    } catch {}
   }
 
   get isConnected(): boolean {
@@ -369,13 +394,19 @@ export class AgentChatClient {
   }
 
   private handleMessage(raw: string) {
-    const data = JSON.parse(raw);
+    let data: any;
+    try {
+      data = JSON.parse(raw);
+    } catch {
+      return;
+    }
+    if (!data || typeof data !== "object" || Array.isArray(data)) return;
 
     switch (data.type) {
       case "auth_ok":
-        this.sessionId = data.session_id;
+        this.sessionId = typeof data.session_id === "string" && data.session_id ? data.session_id : "authenticated";
         this.startHeartbeat();
-        this.connectResolve?.();
+        this.resolveConnect();
         break;
 
       case "message": {
@@ -450,8 +481,8 @@ export class AgentChatClient {
 
       case "error":
         for (const h of this.errorHandlers) h(data.code, data.message);
-        if (this.connectReject && !this.sessionId) {
-          this.connectReject(new Error(`Auth failed: ${data.message}`));
+        if (!this.sessionId) {
+          this.rejectConnect(new Error(`Auth failed: ${data.message}`));
         }
         break;
 
@@ -499,7 +530,14 @@ export class AgentChatClient {
         const receipts: Record<string, string> = {};
         if (data.receipts && typeof data.receipts === "object" && !Array.isArray(data.receipts)) {
           for (const [k, v] of Object.entries(data.receipts as Record<string, unknown>)) {
-            if (typeof v === "string" && k.trim() && v.trim()) {
+            if (
+              typeof v === "string" &&
+              k.trim() &&
+              v.trim() &&
+              k !== "__proto__" &&
+              k !== "constructor" &&
+              k !== "prototype"
+            ) {
               receipts[k] = v;
             }
           }
@@ -521,14 +559,39 @@ export class AgentChatClient {
     }
   }
 
-  private handleClose() {
+  private resolveConnect() {
+    const resolve = this.connectResolve;
+    this.connectResolve = null;
+    this.connectReject = null;
+    resolve?.();
+  }
+
+  private rejectConnect(err: Error) {
+    const reject = this.connectReject;
+    this.connectResolve = null;
+    this.connectReject = null;
+    reject?.(err);
+  }
+
+  private stopHeartbeat() {
     if (this.heartbeatTimer) {
       clearInterval(this.heartbeatTimer);
       this.heartbeatTimer = null;
     }
   }
 
+  private handleClose() {
+    this.stopHeartbeat();
+    this.ws = null;
+    const wasAuthenticated = this.sessionId !== null;
+    this.sessionId = null;
+    if (!wasAuthenticated) {
+      this.rejectConnect(new Error("WebSocket closed before authentication"));
+    }
+  }
+
   private startHeartbeat() {
+    this.stopHeartbeat();
     this.heartbeatTimer = setInterval(() => {
       this.send({ type: "ping", timestamp: new Date().toISOString() });
     }, this.heartbeatInterval);

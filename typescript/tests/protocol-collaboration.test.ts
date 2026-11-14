@@ -6326,4 +6326,90 @@ describe("AgentChatClient realtime collaboration WS events", () => {
       globalThis.fetch = originalFetch;
     }
   });
+
+  test("Campaign #73: AgentChatClient settles close-before-auth, isolates stale socket epochs, avoids heartbeat timer leaks, and guards malformed JSON/proto keys", async () => {
+    const { AgentChatClient } = await import("../src/index");
+    const OriginalWS = globalThis.WebSocket;
+    const sockets: any[] = [];
+    class MockWS {
+      static CONNECTING = 0;
+      static OPEN = 1;
+      static CLOSING = 2;
+      static CLOSED = 3;
+      readyState = 0;
+      sent: any[] = [];
+      onopen: (() => void) | null = null;
+      onmessage: ((ev: { data: string }) => void) | null = null;
+      onclose: (() => void) | null = null;
+      onerror: (() => void) | null = null;
+      constructor(public url: string) {
+        sockets.push(this);
+      }
+      send(raw: string) {
+        this.sent.push(JSON.parse(raw));
+      }
+      close() {
+        this.readyState = 3;
+        this.onclose?.();
+      }
+    }
+    (globalThis as any).WebSocket = MockWS;
+
+    try {
+      const client = new AgentChatClient({ url: "wss://agents-chat.com/ws", agentId: "sdk-bot-73", token: "tok_73", heartbeatInterval: 60_000 });
+
+      // 1. Server closes before auth_ok -> rejects promptly instead of hanging forever
+      const p1 = client.connect();
+      expect(sockets).toHaveLength(1);
+      sockets[0].close();
+      await expect(p1).rejects.toThrow("WebSocket closed before authentication");
+      expect(client.isConnected).toBe(false);
+
+      // 2. Reconnect supersedes pending socket cleanly and ignores stale callbacks
+      const p2 = client.connect();
+      const staleSocket = sockets[1];
+      const staleOnMessage = staleSocket.onmessage;
+      const p3 = client.connect();
+      await expect(p2).rejects.toThrow("WebSocket superseded");
+      const activeSocket = sockets[2];
+      activeSocket.readyState = 1;
+      activeSocket.onopen?.();
+      expect(activeSocket.sent[0]?.type).toBe("auth");
+
+      // Stale frame on superseded socket is ignored
+      staleOnMessage?.({ data: JSON.stringify({ type: "auth_ok", session_id: "stale-sess" }) });
+      expect(client.isConnected).toBe(false);
+
+      // Malformed JSON frame does not throw
+      expect(() => activeSocket.onmessage?.({ data: "{not-json" })).not.toThrow();
+
+      // Valid auth_ok resolves connect() and sets isConnected = true; duplicate auth_ok does not leak interval
+      activeSocket.onmessage?.({ data: JSON.stringify({ type: "auth_ok", session_id: "live-sess" }) });
+      await p3;
+      expect(client.isConnected).toBe(true);
+      const firstTimer = (client as any).heartbeatTimer;
+      activeSocket.onmessage?.({ data: JSON.stringify({ type: "auth_ok", session_id: "live-sess-2" }) });
+      expect((client as any).heartbeatTimer).not.toBeNull();
+      expect((client as any).heartbeatTimer).not.toBe(firstTimer);
+
+      // Prototype keys in read_receipt_update are stripped
+      let receivedReceipts: Record<string, string> = {};
+      client.onReadReceipt((u) => {
+        receivedReceipts = u.receipts;
+      });
+      activeSocket.onmessage?.({
+        data: '{"type":"read_receipt_update","channel_id":"room-1","receipts":{"bot-a":"m-9","__proto__":"polluted","constructor":"bad"}}',
+      });
+      expect(receivedReceipts).toEqual({ "bot-a": "m-9" });
+      expect(({} as any).polluted).toBeUndefined();
+
+      // Server-initiated close resets sessionId/isConnected and clears heartbeatTimer
+      activeSocket.close();
+      expect(client.isConnected).toBe(false);
+      expect((client as any).heartbeatTimer).toBeNull();
+      client.disconnect();
+    } finally {
+      globalThis.WebSocket = OriginalWS;
+    }
+  });
 });
