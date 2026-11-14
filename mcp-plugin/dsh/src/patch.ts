@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 
@@ -12,8 +12,12 @@ export interface DshPatchOptions {
 
 export function resolveDshPatchPath(opts: DshPatchOptions = {}): string {
   const home = opts.dshHome ?? process.env.DSH_HOME ?? join(homedir(), ".dsh");
-  if (opts.dshProfile) {
-    return join(home, "profiles", opts.dshProfile, "cordis.patch.yml");
+  if (opts.dshProfile !== undefined) {
+    const profile = opts.dshProfile.trim();
+    if (!profile || !/^[A-Za-z0-9._-]+$/.test(profile) || profile === "." || profile === "..") {
+      throw new Error("Invalid DSH profile name");
+    }
+    return join(home, "profiles", profile, "cordis.patch.yml");
   }
   return join(home, "cordis.patch.yml");
 }
@@ -84,11 +88,29 @@ export function mergeDshCordisPatch(existingContent: string, opts: DshPatchOptio
     return { content: `${prefix}${block}`, changed: true };
   }
 
-  // Case 2: File already has a top-level `- insert:` block (like ~/.dsh/cordis.patch.yml)
-  if (/^-\s*insert:\s*$/m.test(existingContent)) {
-    const normalized = existingContent.endsWith("\n") ? existingContent : `${existingContent}\n`;
+  // Case 2: File already has a top-level `- insert:` block (e.g. ~/.dsh/cordis.patch.yml).
+  // Splice inside THAT `- insert:` block (preserving its child indent and stopping before
+  // any subsequent top-level `- replace:` / `- delete:` block so multi-block files stay valid YAML).
+  const normalizedLines = existingContent.replace(/\r\n/g, "\n").split("\n");
+  const insertLineIdx = normalizedLines.findIndex((line) => /^-\s*insert:\s*(?:#.*)?$/.test(line));
+  if (insertLineIdx >= 0) {
+    let detectedIndent: string | null = null;
+    let lastBodyLineIdx = insertLineIdx;
+    for (let i = insertLineIdx + 1; i < normalizedLines.length; i++) {
+      const line = normalizedLines[i]!;
+      if (/^\s*$/.test(line) || /^\s*#/.test(line)) continue;
+      if (/^\S/.test(line)) break;
+      const itemMatch = line.match(/^([ \t]+)-\s+/);
+      if (itemMatch && detectedIndent === null) {
+        detectedIndent = itemMatch[1]!;
+      }
+      lastBodyLineIdx = i;
+    }
+    const entryLines = renderMcpAgentsChatEntry(detectedIndent ?? "    ", opts).split("\n");
+    normalizedLines.splice(lastBodyLineIdx + 1, 0, ...entryLines);
+    const merged = normalizedLines.join("\n");
     return {
-      content: `${normalized}${renderMcpAgentsChatEntry("    ", opts)}\n`,
+      content: merged.endsWith("\n") ? merged : `${merged}\n`,
       changed: true,
     };
   }
@@ -102,16 +124,39 @@ export function mergeDshCordisPatch(existingContent: string, opts: DshPatchOptio
   };
 }
 
+let dshPatchTmpSeq = 0;
+
 export function applyDshCordisPatchFile(opts: DshPatchOptions = {}): {
   patchPath: string;
   changed: boolean;
 } {
   const patchPath = resolveDshPatchPath(opts);
-  const existing = existsSync(patchPath) ? readFileSync(patchPath, "utf8") : "";
+  const existed = existsSync(patchPath);
+  const existing = existed ? readFileSync(patchPath, "utf8") : "";
   const { content, changed } = mergeDshCordisPatch(existing, opts);
   if (changed) {
     mkdirSync(dirname(patchPath), { recursive: true });
-    writeFileSync(patchPath, content, "utf8");
+    let mode = 0o600;
+    if (existed) {
+      try {
+        mode = statSync(patchPath).mode & 0o777;
+      } catch {}
+    }
+    const tmp = `${patchPath}.${process.pid}.${Date.now()}.${++dshPatchTmpSeq}.tmp`;
+    try {
+      writeFileSync(tmp, content, { encoding: "utf8", mode });
+      renameSync(tmp, patchPath);
+      if (process.platform !== "win32") {
+        try {
+          chmodSync(patchPath, mode);
+        } catch {}
+      }
+    } catch (err) {
+      try {
+        unlinkSync(tmp);
+      } catch {}
+      throw err;
+    }
   }
   return { patchPath, changed };
 }

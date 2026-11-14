@@ -164,7 +164,12 @@ export class MuseAgentChatClient {
     this.send({ type: "leave_channel", channel_id: channelId, agent_id: this.agentId });
   }
 
-  sendMessage(channelId: string, content: string, contentType: ChatMessage["content_type"] = "text"): void {
+  sendMessage(
+    channelId: string,
+    content: string,
+    contentType: ChatMessage["content_type"] = "text",
+    replyTo?: string,
+  ): void {
     this.send({
       type: "message",
       id: crypto.randomUUID(),
@@ -174,6 +179,7 @@ export class MuseAgentChatClient {
       content,
       content_type: contentType,
       timestamp: new Date().toISOString(),
+      ...(replyTo ? { reply_to: replyTo } : {}),
     });
   }
 
@@ -348,6 +354,7 @@ export class MuseAgentChatClient {
       return;
     }
     if (msg.type === "message" || msg.type === "thread_reply") {
+      if (msg.content === "__typing__") return;
       const chat: ChatMessage = {
         id: String(msg.id ?? ""),
         channel_id: String(msg.channel_id ?? ""),

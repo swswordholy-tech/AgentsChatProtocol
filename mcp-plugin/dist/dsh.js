@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 // dsh/src/cli.ts
-import { existsSync as existsSync6, mkdirSync as mkdirSync4, readFileSync as readFileSync6, renameSync as renameSync2, unlinkSync as unlinkSync3, writeFileSync as writeFileSync3 } from "node:fs";
+import { chmodSync as chmodSync3, existsSync as existsSync6, mkdirSync as mkdirSync4, readFileSync as readFileSync6, renameSync as renameSync3, unlinkSync as unlinkSync4, writeFileSync as writeFileSync3 } from "node:fs";
 import { spawn } from "node:child_process";
 import { dirname as dirname3, join as join6 } from "node:path";
 import { homedir as homedir5 } from "node:os";
@@ -79,7 +79,9 @@ class TypingHeartbeat {
     this.stop(channelId);
     this.pulse(channelId);
     const interval = setInterval(() => this.pulse(channelId), TYPING_HEARTBEAT_MS);
+    interval.unref?.();
     const cap = setTimeout(() => this.stop(channelId), TYPING_HEARTBEAT_MAX_MS);
+    cap.unref?.();
     this.timers.set(channelId, { interval, cap });
   }
   stop(channelId) {
@@ -145,8 +147,13 @@ class MuseBridge {
         context: buildContext(this.history.get(message.channel_id) ?? [], this.opts.agentId)
       };
       const reply = await this.opts.responder(ctx);
-      if (reply)
-        this.client.sendMessage(message.channel_id, reply);
+      if (reply) {
+        if (message.thread_id) {
+          this.client.sendMessage(message.channel_id, reply, "text", message.thread_id);
+        } else {
+          this.client.sendMessage(message.channel_id, reply);
+        }
+      }
     } finally {
       this.typing.stop(message.channel_id);
     }
@@ -305,7 +312,7 @@ class MuseAgentChatClient {
     this.sessionJoined.delete(channelId);
     this.send({ type: "leave_channel", channel_id: channelId, agent_id: this.agentId });
   }
-  sendMessage(channelId, content, contentType = "text") {
+  sendMessage(channelId, content, contentType = "text", replyTo) {
     this.send({
       type: "message",
       id: crypto.randomUUID(),
@@ -314,7 +321,8 @@ class MuseAgentChatClient {
       sender_type: "agent",
       content,
       content_type: contentType,
-      timestamp: new Date().toISOString()
+      timestamp: new Date().toISOString(),
+      ...replyTo ? { reply_to: replyTo } : {}
     });
   }
   sendTyping(channelId) {
@@ -479,6 +487,8 @@ class MuseAgentChatClient {
       return;
     }
     if (msg.type === "message" || msg.type === "thread_reply") {
+      if (msg.content === "__typing__")
+        return;
       const chat = {
         id: String(msg.id ?? ""),
         channel_id: String(msg.channel_id ?? ""),
@@ -538,6 +548,18 @@ function buildWakePayload(msg, opts = {}) {
     ...targetSessionId ? { target_session_id: targetSessionId } : {}
   };
 }
+function sanitizeWakeLogUrl(rawUrl) {
+  try {
+    const parsed = new URL(rawUrl);
+    parsed.username = "";
+    parsed.password = "";
+    parsed.search = "";
+    parsed.hash = "";
+    return parsed.toString();
+  } catch {
+    return redactSecrets(rawUrl.split(/[?#]/)[0] ?? "[invalid-url]");
+  }
+}
 function signWakeBody(body, secret) {
   return createHmac("sha256", secret).update(body, "utf8").digest("hex");
 }
@@ -546,6 +568,7 @@ async function fireWake(msg, cfg) {
   const url = (cfg.url ?? "").trim();
   if (!url)
     return;
+  const safeLogUrl = sanitizeWakeLogUrl(url);
   const body = JSON.stringify(buildWakePayload(msg, { targetSessionId: cfg.targetSessionId }));
   const headers = { "Content-Type": "application/json" };
   if (cfg.secret)
@@ -557,8 +580,11 @@ async function fireWake(msg, cfg) {
     t.unref?.();
     try {
       const res = await f(url, { method: "POST", headers, body, signal: ctrl.signal });
+      try {
+        await res?.body?.cancel?.();
+      } catch {}
       if (!res.ok)
-        log(`[muse-agentchat] wake POST ${url} → HTTP ${res.status}`);
+        log(`[muse-agentchat] wake POST ${safeLogUrl} → HTTP ${res.status}`);
     } finally {
       clearTimeout(t);
     }
@@ -569,7 +595,7 @@ async function fireWake(msg, cfg) {
     try {
       await doPost();
     } catch (e2) {
-      log(`[muse-agentchat] wake POST ${url} failed: ${e2}`);
+      log(`[muse-agentchat] wake POST ${safeLogUrl} failed: ${redactSecrets(String(e2))}`);
     }
   }
 }
@@ -794,13 +820,17 @@ function resolveWindowsCliSpawn(cmd, args, opts) {
 }
 
 // dsh/src/patch.ts
-import { existsSync as existsSync5, mkdirSync as mkdirSync3, readFileSync as readFileSync5, writeFileSync as writeFileSync2 } from "node:fs";
+import { chmodSync as chmodSync2, existsSync as existsSync5, mkdirSync as mkdirSync3, readFileSync as readFileSync5, renameSync as renameSync2, statSync as statSync2, unlinkSync as unlinkSync3, writeFileSync as writeFileSync2 } from "node:fs";
 import { dirname as dirname2, join as join5 } from "node:path";
 import { homedir as homedir4 } from "node:os";
 function resolveDshPatchPath(opts = {}) {
   const home = opts.dshHome ?? process.env.DSH_HOME ?? join5(homedir4(), ".dsh");
-  if (opts.dshProfile) {
-    return join5(home, "profiles", opts.dshProfile, "cordis.patch.yml");
+  if (opts.dshProfile !== undefined) {
+    const profile = opts.dshProfile.trim();
+    if (!profile || !/^[A-Za-z0-9._-]+$/.test(profile) || profile === "." || profile === "..") {
+      throw new Error("Invalid DSH profile name");
+    }
+    return join5(home, "profiles", profile, "cordis.patch.yml");
   }
   return join5(home, "cordis.patch.yml");
 }
@@ -854,12 +884,33 @@ ${renderMcpAgentsChatEntry("    ", opts)}
 `;
     return { content: `${prefix}${block2}`, changed: true };
   }
-  if (/^-\s*insert:\s*$/m.test(existingContent)) {
-    const normalized2 = existingContent.endsWith(`
-`) ? existingContent : `${existingContent}
-`;
+  const normalizedLines = existingContent.replace(/\r\n/g, `
+`).split(`
+`);
+  const insertLineIdx = normalizedLines.findIndex((line) => /^-\s*insert:\s*(?:#.*)?$/.test(line));
+  if (insertLineIdx >= 0) {
+    let detectedIndent = null;
+    let lastBodyLineIdx = insertLineIdx;
+    for (let i = insertLineIdx + 1;i < normalizedLines.length; i++) {
+      const line = normalizedLines[i];
+      if (/^\s*$/.test(line) || /^\s*#/.test(line))
+        continue;
+      if (/^\S/.test(line))
+        break;
+      const itemMatch = line.match(/^([ \t]+)-\s+/);
+      if (itemMatch && detectedIndent === null) {
+        detectedIndent = itemMatch[1];
+      }
+      lastBodyLineIdx = i;
+    }
+    const entryLines = renderMcpAgentsChatEntry(detectedIndent ?? "    ", opts).split(`
+`);
+    normalizedLines.splice(lastBodyLineIdx + 1, 0, ...entryLines);
+    const merged = normalizedLines.join(`
+`);
     return {
-      content: `${normalized2}${renderMcpAgentsChatEntry("    ", opts)}
+      content: merged.endsWith(`
+`) ? merged : `${merged}
 `,
       changed: true
     };
@@ -875,13 +926,35 @@ ${renderMcpAgentsChatEntry("    ", opts)}
     changed: true
   };
 }
+var dshPatchTmpSeq = 0;
 function applyDshCordisPatchFile(opts = {}) {
   const patchPath = resolveDshPatchPath(opts);
-  const existing = existsSync5(patchPath) ? readFileSync5(patchPath, "utf8") : "";
+  const existed = existsSync5(patchPath);
+  const existing = existed ? readFileSync5(patchPath, "utf8") : "";
   const { content, changed } = mergeDshCordisPatch(existing, opts);
   if (changed) {
     mkdirSync3(dirname2(patchPath), { recursive: true });
-    writeFileSync2(patchPath, content, "utf8");
+    let mode = 384;
+    if (existed) {
+      try {
+        mode = statSync2(patchPath).mode & 511;
+      } catch {}
+    }
+    const tmp = `${patchPath}.${process.pid}.${Date.now()}.${++dshPatchTmpSeq}.tmp`;
+    try {
+      writeFileSync2(tmp, content, { encoding: "utf8", mode });
+      renameSync2(tmp, patchPath);
+      if (process.platform !== "win32") {
+        try {
+          chmodSync2(patchPath, mode);
+        } catch {}
+      }
+    } catch (err) {
+      try {
+        unlinkSync3(tmp);
+      } catch {}
+      throw err;
+    }
   }
   return { patchPath, changed };
 }
@@ -938,8 +1011,10 @@ async function registerOnly(name, restUrl, profilePath = DSH_PROFILE_PATH) {
     body: JSON.stringify({ name, type: "agent", capabilities: ["chat"] }),
     signal: AbortSignal.timeout(15000)
   });
-  if (!res.ok)
-    throw new Error(`Registration failed: ${res.status} ${await res.text()}`);
+  if (!res.ok) {
+    const errText = redact((await res.text().catch(() => "")).slice(0, 300));
+    throw new Error(`Registration failed: ${res.status} ${errText}`);
+  }
   const data = await res.json();
   const agentId = data.agentId ?? data.agent_id ?? data.id;
   const token = data.agentKey ?? data.token ?? data.key;
@@ -949,10 +1024,15 @@ async function registerOnly(name, restUrl, profilePath = DSH_PROFILE_PATH) {
   const tmp = `${profilePath}.${process.pid}.${Date.now()}.tmp`;
   try {
     writeFileSync3(tmp, JSON.stringify({ agentId, token }, null, 2), { mode: 384 });
-    renameSync2(tmp, profilePath);
+    renameSync3(tmp, profilePath);
+    if (process.platform !== "win32") {
+      try {
+        chmodSync3(profilePath, 384);
+      } catch {}
+    }
   } catch (err) {
     try {
-      unlinkSync3(tmp);
+      unlinkSync4(tmp);
     } catch {}
     throw err;
   }
@@ -1004,13 +1084,13 @@ async function runDshHeadlessResponder(prompt, opts = {}) {
     });
     child.on("error", (err) => {
       clearTimers();
-      console.error(`[dsh] failed to spawn ${dshBin}: ${err.message}`);
+      console.error(`[dsh] failed to spawn ${dshBin}: ${redact(err.message)}`);
       resolve(null);
     });
     child.on("close", (code) => {
       clearTimers();
       if (code !== 0) {
-        console.error(`[dsh] exited with code ${code}: ${stderr.trim().slice(0, 300)}`);
+        console.error(`[dsh] exited with code ${code}: ${redact(stderr.trim().slice(0, 300))}`);
         resolve(null);
         return;
       }
@@ -1068,13 +1148,14 @@ DeepSeek Harness (dsh) integration for AgentsChat:
       console.log("[dsh-wake] No global dsh.json identity; watching session-binds.json for bound DSH sessions.");
     }
     const defaultWsUrl = primaryConfig?.wsUrl ?? process.env.AGENTCHAT_WS_URL ?? DEFAULT_WS_URL;
-    const wakeChannels = [];
+    const rawWakeChannels = [];
     for (let i = 0;i < argv.length; i++) {
       if (argv[i] === "--channel" && argv[i + 1])
-        wakeChannels.push(argv[i + 1]);
+        rawWakeChannels.push(argv[i + 1]);
     }
     if (primaryConfig?.defaultChannelId)
-      wakeChannels.push(primaryConfig.defaultChannelId);
+      rawWakeChannels.push(primaryConfig.defaultChannelId);
+    const wakeChannels = [...new Set(rawWakeChannels)];
     const queueFile = process.env.DSH_WAKE_QUEUE ?? join6(homedir5(), ".agentschat", "dsh-wake-queue.jsonl");
     const wakeUrl = process.env.DSH_WAKE_URL ?? process.env.AGENTCHAT_WAKE_URL;
     const wakeSecret = process.env.DSH_WAKE_SECRET ?? process.env.AGENTCHAT_WAKE_SECRET;
@@ -1210,13 +1291,14 @@ DeepSeek Harness (dsh) integration for AgentsChat:
     return;
   }
   if (has("--listen", argv)) {
-    const channels = [];
+    const rawChannels = [];
     for (let i = 0;i < argv.length; i++) {
       if (argv[i] === "--channel" && argv[i + 1])
-        channels.push(argv[i + 1]);
+        rawChannels.push(argv[i + 1]);
     }
     if (config.defaultChannelId)
-      channels.push(config.defaultChannelId);
+      rawChannels.push(config.defaultChannelId);
+    const channels = [...new Set(rawChannels)];
     const autoReply = arg("--auto-reply", argv);
     const dshProfile = arg("--dsh-profile", argv) ?? "headless";
     const channelKinds = {};

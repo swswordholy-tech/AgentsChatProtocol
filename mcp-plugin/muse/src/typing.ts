@@ -33,7 +33,9 @@ export class TypingHeartbeat {
     this.stop(channelId); // reset if one is already running for this channel
     this.pulse(channelId); // immediate first pulse
     const interval = setInterval(() => this.pulse(channelId), TYPING_HEARTBEAT_MS);
+    interval.unref?.();
     const cap = setTimeout(() => this.stop(channelId), TYPING_HEARTBEAT_MAX_MS);
+    cap.unref?.();
     this.timers.set(channelId, { interval, cap });
   }
 

@@ -30,6 +30,36 @@ test("HMAC sign/verify round-trips and rejects forgery", () => {
   assert.equal(verifyWakeSignature(body, sig, ["other", "secret"]), true);
   assert.equal(verifyWakeSignature(body, sig, ["other"]), false);
   assert.equal(verifyWakeSignature(body + "x", sig, ["secret"]), false);
+  // Strict 64-hex enforcement: reject non-hex trailing garbage that Buffer.from(..., 'hex') would truncate
+  assert.equal(verifyWakeSignature(body, `${sig}zzzz`, ["secret"]), false);
+});
+
+test("Campaign #93: fireWake drains response body and sanitizes URL query/secrets in error logs", async () => {
+  let cancelled = false;
+  const logs = [];
+  await fireWake(
+    { id: "m-drain", channel_id: "dm-1", sender_id: "bob", content: "hi" },
+    {
+      url: "https://user:pass@example.com/wake?token=ac_secret_999",
+      logger: (m) => logs.push(m),
+      fetchImpl: async () =>
+        new Response(
+          new ReadableStream({
+            start(ctrl) {
+              ctrl.enqueue(new TextEncoder().encode("err"));
+            },
+            cancel() {
+              cancelled = true;
+            },
+          }),
+          { status: 502 },
+        ),
+    },
+  );
+  assert.equal(cancelled, true);
+  assert.equal(logs.length, 1);
+  assert.ok(!logs[0].includes("ac_secret_999"));
+  assert.ok(!logs[0].includes("user:pass"));
 });
 
 test("fireWake posts signed payload once, and is best-effort on failure", async () => {

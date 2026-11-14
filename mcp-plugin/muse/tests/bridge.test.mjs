@@ -69,3 +69,38 @@ test("responder failure still stops typing indicator in finally", async () => {
   // Wait longer than typing interval safeguard or verify stopAll leaves 0 active timers
   bridge.stop();
 });
+
+test("Campaign #93: MuseAgentChatClient ignores __typing__ frames and MuseBridge forwards thread_id as reply_to", async () => {
+  const client = new MuseAgentChatClient({ url: "ws://127.0.0.1:1", agentId: "muse-bot", token: "x" });
+  const sent = [];
+  client.sendMessage = (channelId, content, contentType, replyTo) =>
+    sent.push({ channelId, content, contentType, replyTo });
+  let capturedHistory = [];
+  const bridge = new MuseBridge(client, {
+    agentId: "muse-bot",
+    channels: ["general"],
+    channelKinds: { general: "group" },
+    responder: async (ctx) => {
+      capturedHistory = ctx.history;
+      return "threaded-reply";
+    },
+  });
+
+  // Feed 60 ephemeral __typing__ frames over the client wire parser; none should enter bridge history!
+  for (let i = 0; i < 60; i++) {
+    client.handleMessage(
+      JSON.stringify({
+        type: "message",
+        id: `t-${i}`,
+        channel_id: "general",
+        sender_id: "alice",
+        content: "__typing__",
+      }),
+    );
+  }
+  await bridge.handleMessage(msg({ id: "real-1", content: "context line" }));
+  await bridge.handleMessage(msg({ id: "tr-2", content: "hey @muse-bot", thread_id: "root-msg-1" }));
+  assert.equal(capturedHistory.length, 2);
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].replyTo, "root-msg-1");
+});

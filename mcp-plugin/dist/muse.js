@@ -79,7 +79,9 @@ class TypingHeartbeat {
     this.stop(channelId);
     this.pulse(channelId);
     const interval = setInterval(() => this.pulse(channelId), TYPING_HEARTBEAT_MS);
+    interval.unref?.();
     const cap = setTimeout(() => this.stop(channelId), TYPING_HEARTBEAT_MAX_MS);
+    cap.unref?.();
     this.timers.set(channelId, { interval, cap });
   }
   stop(channelId) {
@@ -145,8 +147,13 @@ class MuseBridge {
         context: buildContext(this.history.get(message.channel_id) ?? [], this.opts.agentId)
       };
       const reply = await this.opts.responder(ctx);
-      if (reply)
-        this.client.sendMessage(message.channel_id, reply);
+      if (reply) {
+        if (message.thread_id) {
+          this.client.sendMessage(message.channel_id, reply, "text", message.thread_id);
+        } else {
+          this.client.sendMessage(message.channel_id, reply);
+        }
+      }
     } finally {
       this.typing.stop(message.channel_id);
     }
@@ -305,7 +312,7 @@ class MuseAgentChatClient {
     this.sessionJoined.delete(channelId);
     this.send({ type: "leave_channel", channel_id: channelId, agent_id: this.agentId });
   }
-  sendMessage(channelId, content, contentType = "text") {
+  sendMessage(channelId, content, contentType = "text", replyTo) {
     this.send({
       type: "message",
       id: crypto.randomUUID(),
@@ -314,7 +321,8 @@ class MuseAgentChatClient {
       sender_type: "agent",
       content,
       content_type: contentType,
-      timestamp: new Date().toISOString()
+      timestamp: new Date().toISOString(),
+      ...replyTo ? { reply_to: replyTo } : {}
     });
   }
   sendTyping(channelId) {
@@ -479,6 +487,8 @@ class MuseAgentChatClient {
       return;
     }
     if (msg.type === "message" || msg.type === "thread_reply") {
+      if (msg.content === "__typing__")
+        return;
       const chat = {
         id: String(msg.id ?? ""),
         channel_id: String(msg.channel_id ?? ""),
@@ -576,6 +586,18 @@ function buildWakePayload(msg, opts = {}) {
     ...targetSessionId ? { target_session_id: targetSessionId } : {}
   };
 }
+function sanitizeWakeLogUrl(rawUrl) {
+  try {
+    const parsed = new URL(rawUrl);
+    parsed.username = "";
+    parsed.password = "";
+    parsed.search = "";
+    parsed.hash = "";
+    return parsed.toString();
+  } catch {
+    return redactSecrets(rawUrl.split(/[?#]/)[0] ?? "[invalid-url]");
+  }
+}
 function signWakeBody(body, secret) {
   return createHmac("sha256", secret).update(body, "utf8").digest("hex");
 }
@@ -584,6 +606,7 @@ async function fireWake(msg, cfg) {
   const url = (cfg.url ?? "").trim();
   if (!url)
     return;
+  const safeLogUrl = sanitizeWakeLogUrl(url);
   const body = JSON.stringify(buildWakePayload(msg, { targetSessionId: cfg.targetSessionId }));
   const headers = { "Content-Type": "application/json" };
   if (cfg.secret)
@@ -595,8 +618,11 @@ async function fireWake(msg, cfg) {
     t.unref?.();
     try {
       const res = await f(url, { method: "POST", headers, body, signal: ctrl.signal });
+      try {
+        await res?.body?.cancel?.();
+      } catch {}
       if (!res.ok)
-        log(`[muse-agentchat] wake POST ${url} → HTTP ${res.status}`);
+        log(`[muse-agentchat] wake POST ${safeLogUrl} → HTTP ${res.status}`);
     } finally {
       clearTimeout(t);
     }
@@ -607,7 +633,7 @@ async function fireWake(msg, cfg) {
     try {
       await doPost();
     } catch (e2) {
-      log(`[muse-agentchat] wake POST ${url} failed: ${e2}`);
+      log(`[muse-agentchat] wake POST ${safeLogUrl} failed: ${redactSecrets(String(e2))}`);
     }
   }
 }

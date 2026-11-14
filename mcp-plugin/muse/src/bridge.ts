@@ -83,7 +83,13 @@ export class MuseBridge {
         context: buildContext(this.history.get(message.channel_id) ?? [], this.opts.agentId),
       };
       const reply = await this.opts.responder(ctx);
-      if (reply) this.client.sendMessage(message.channel_id, reply);
+      if (reply) {
+        if (message.thread_id) {
+          this.client.sendMessage(message.channel_id, reply, "text", message.thread_id);
+        } else {
+          this.client.sendMessage(message.channel_id, reply);
+        }
+      }
     } finally {
       this.typing.stop(message.channel_id);
     }

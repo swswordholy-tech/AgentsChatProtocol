@@ -83,18 +83,32 @@ export function buildWakePayload(
   };
 }
 
+function sanitizeWakeLogUrl(rawUrl: string): string {
+  try {
+    const parsed = new URL(rawUrl);
+    parsed.username = "";
+    parsed.password = "";
+    parsed.search = "";
+    parsed.hash = "";
+    return parsed.toString();
+  } catch {
+    return redactSecrets(rawUrl.split(/[?#]/)[0] ?? "[invalid-url]");
+  }
+}
+
 export function signWakeBody(body: string, secret: string): string {
   return createHmac("sha256", secret).update(body, "utf8").digest("hex");
 }
 
 export function verifyWakeSignature(body: string, sigHex: string, secrets: readonly string[]): boolean {
+  if (typeof sigHex !== "string" || !/^[0-9a-f]{64}$/i.test(sigHex)) return false;
   let sigBuf: Buffer;
   try {
     sigBuf = Buffer.from(sigHex, "hex");
   } catch {
     return false;
   }
-  if (sigBuf.length === 0) return false;
+  if (sigBuf.length !== 32) return false;
   for (const secret of secrets) {
     if (!secret) continue;
     const expected = Buffer.from(signWakeBody(body, secret), "hex");
@@ -129,6 +143,7 @@ export async function fireWake(msg: WakeMessage, cfg: WakeConfig): Promise<void>
   const log = cfg.logger ?? (() => {});
   const url = (cfg.url ?? "").trim();
   if (!url) return;
+  const safeLogUrl = sanitizeWakeLogUrl(url);
   const body = JSON.stringify(buildWakePayload(msg, { targetSessionId: cfg.targetSessionId }));
   const headers: Record<string, string> = { "Content-Type": "application/json" };
   if (cfg.secret) headers[WAKE_SIG_HEADER] = signWakeBody(body, cfg.secret);
@@ -139,7 +154,10 @@ export async function fireWake(msg: WakeMessage, cfg: WakeConfig): Promise<void>
     t.unref?.();
     try {
       const res = await f(url, { method: "POST", headers, body, signal: ctrl.signal });
-      if (!res.ok) log(`[muse-agentchat] wake POST ${url} → HTTP ${res.status}`);
+      try {
+        await (res as Response)?.body?.cancel?.();
+      } catch {}
+      if (!res.ok) log(`[muse-agentchat] wake POST ${safeLogUrl} → HTTP ${res.status}`);
     } finally {
       clearTimeout(t);
     }
@@ -150,7 +168,7 @@ export async function fireWake(msg: WakeMessage, cfg: WakeConfig): Promise<void>
     try {
       await doPost();
     } catch (e2) {
-      log(`[muse-agentchat] wake POST ${url} failed: ${e2}`);
+      log(`[muse-agentchat] wake POST ${safeLogUrl} failed: ${redactSecrets(String(e2))}`);
     }
   }
 }

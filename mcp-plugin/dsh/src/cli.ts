@@ -10,7 +10,7 @@
  *   npx -y agentschat-mcp@latest --dsh --listen [--channel <id> ...] [--dsh-profile <headless>] [--auto-reply <text>]
  *   npx -y agentschat-mcp@latest --dsh --send <channel-id> --text <text>
  */
-import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
@@ -96,7 +96,10 @@ async function registerOnly(name: string, restUrl: string, profilePath = DSH_PRO
     body: JSON.stringify({ name, type: "agent", capabilities: ["chat"] }),
     signal: AbortSignal.timeout(15_000),
   });
-  if (!res.ok) throw new Error(`Registration failed: ${res.status} ${await res.text()}`);
+  if (!res.ok) {
+    const errText = redact((await res.text().catch(() => "")).slice(0, 300));
+    throw new Error(`Registration failed: ${res.status} ${errText}`);
+  }
   const data = (await res.json()) as Record<string, unknown>;
   const agentId = (data.agentId ?? data.agent_id ?? data.id) as string | undefined;
   const token = (data.agentKey ?? data.token ?? data.key) as string | undefined;
@@ -106,6 +109,9 @@ async function registerOnly(name: string, restUrl: string, profilePath = DSH_PRO
   try {
     writeFileSync(tmp, JSON.stringify({ agentId, token }, null, 2), { mode: 0o600 });
     renameSync(tmp, profilePath);
+    if (process.platform !== "win32") {
+      try { chmodSync(profilePath, 0o600); } catch {}
+    }
   } catch (err) {
     try { unlinkSync(tmp); } catch {}
     throw err;
@@ -170,13 +176,13 @@ export async function runDshHeadlessResponder(
     });
     child.on("error", (err) => {
       clearTimers();
-      console.error(`[dsh] failed to spawn ${dshBin}: ${err.message}`);
+      console.error(`[dsh] failed to spawn ${dshBin}: ${redact(err.message)}`);
       resolve(null);
     });
     child.on("close", (code) => {
       clearTimers();
       if (code !== 0) {
-        console.error(`[dsh] exited with code ${code}: ${stderr.trim().slice(0, 300)}`);
+        console.error(`[dsh] exited with code ${code}: ${redact(stderr.trim().slice(0, 300))}`);
         resolve(null);
         return;
       }
@@ -242,11 +248,12 @@ DeepSeek Harness (dsh) integration for AgentsChat:
     }
     const defaultWsUrl = primaryConfig?.wsUrl ?? process.env.AGENTCHAT_WS_URL ?? DEFAULT_WS_URL;
 
-    const wakeChannels: string[] = [];
+    const rawWakeChannels: string[] = [];
     for (let i = 0; i < argv.length; i++) {
-      if (argv[i] === "--channel" && argv[i + 1]) wakeChannels.push(argv[i + 1]);
+      if (argv[i] === "--channel" && argv[i + 1]) rawWakeChannels.push(argv[i + 1]);
     }
-    if (primaryConfig?.defaultChannelId) wakeChannels.push(primaryConfig.defaultChannelId);
+    if (primaryConfig?.defaultChannelId) rawWakeChannels.push(primaryConfig.defaultChannelId);
+    const wakeChannels = [...new Set(rawWakeChannels)];
     const queueFile =
       process.env.DSH_WAKE_QUEUE ?? join(homedir(), ".agentschat", "dsh-wake-queue.jsonl");
     const wakeUrl = process.env.DSH_WAKE_URL ?? process.env.AGENTCHAT_WAKE_URL;
@@ -390,11 +397,12 @@ DeepSeek Harness (dsh) integration for AgentsChat:
   }
 
   if (has("--listen", argv)) {
-    const channels: string[] = [];
+    const rawChannels: string[] = [];
     for (let i = 0; i < argv.length; i++) {
-      if (argv[i] === "--channel" && argv[i + 1]) channels.push(argv[i + 1]);
+      if (argv[i] === "--channel" && argv[i + 1]) rawChannels.push(argv[i + 1]);
     }
-    if (config.defaultChannelId) channels.push(config.defaultChannelId);
+    if (config.defaultChannelId) rawChannels.push(config.defaultChannelId);
+    const channels = [...new Set(rawChannels)];
     const autoReply = arg("--auto-reply", argv);
     const dshProfile = arg("--dsh-profile", argv) ?? "headless";
     const channelKinds: Record<string, "direct" | "group"> = {};

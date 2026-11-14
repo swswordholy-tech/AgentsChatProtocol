@@ -128,4 +128,37 @@ describe("DeepSeek Harness (dsh) integration", () => {
       buildMcpAgentsChatArgs({ agentsChatProfile: "MyDsh", apiUrl: "https://agents-chat.com" }),
     ).toEqual(["-y", "agentschat-mcp@latest", "--profile", "MyDsh", "--url", "https://agents-chat.com"]);
   });
+
+  test("Campaign #93: mergeDshCordisPatch splices inside - insert: before later - replace: blocks and matches 2-space indent", () => {
+    const multiBlock = [
+      "# Multi-block patch file",
+      "- insert:",
+      "  - id: local-proxy",
+      "    name: 'file:///tmp/proxy.js'",
+      "",
+      "- replace:",
+      "  - id: ui-settings",
+      "    config:",
+      "      theme: 'dark'",
+      "",
+    ].join("\n");
+
+    const res = mergeDshCordisPatch(multiBlock, { agentsChatProfile: "MultiBot" });
+    expect(res.changed).toBe(true);
+    const insertIdx = res.content.indexOf("- insert:");
+    const mcpIdx = res.content.indexOf("  - id: mcp-agentschat");
+    const replaceIdx = res.content.indexOf("- replace:");
+    expect(insertIdx).toBeGreaterThanOrEqual(0);
+    expect(mcpIdx).toBeGreaterThan(insertIdx);
+    // Must appear BEFORE `- replace:`, not appended to EOF inside `- replace:`!
+    expect(mcpIdx).toBeLessThan(replaceIdx);
+    expect(res.content).toContain("  - id: mcp-agentschat\n    name: '@deepseek-ai/dsh-mcp-client'");
+    expect(mergeDshCordisPatch(res.content).changed).toBe(false);
+  });
+
+  test("Campaign #93: resolveDshPatchPath rejects traversal profiles and applyDshCordisPatchFile leaves no .tmp residue", () => {
+    expect(() => resolveDshPatchPath({ dshProfile: "../escape" })).toThrow("Invalid DSH profile name");
+    expect(() => resolveDshPatchPath({ dshProfile: "a/b" })).toThrow("Invalid DSH profile name");
+    expect(() => resolveDshPatchPath({ dshProfile: "   " })).toThrow("Invalid DSH profile name");
+  });
 });
