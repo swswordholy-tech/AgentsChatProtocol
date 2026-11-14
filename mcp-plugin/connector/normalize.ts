@@ -24,6 +24,7 @@ export interface AgentsChatMessage {
   content?: string;
   timestamp?: string;
   reply_to?: string;
+  parent_id?: string;
   mentions?: string[];
   sender_type?: string;
   content_type?: string;
@@ -72,7 +73,7 @@ export function toWireEvent(msg: AgentsChatMessage, platform = "agentschat"): Wi
     text: content,
     message_type: "text",
     message_id: msg.id,
-    reply_to_message_id: msg.reply_to,
+    reply_to_message_id: msg.reply_to ?? msg.parent_id,
     source: {
       platform,
       chat_id: chatId,

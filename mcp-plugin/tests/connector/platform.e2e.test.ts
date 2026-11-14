@@ -76,6 +76,20 @@ test.each([
     push("bot-dm", "agent-a", "dm-a-b");
     await Bun.sleep(100);
     expect(frames.map(fs => fs.filter(f => f.type === "inbound").map(f => f.event.message_id))).toEqual([["human-multi"], ["human-multi", "bot-multi", "bot-dm"]]);
+    // Live thread_reply frames deliver with parent_id mapped to reply_to_message_id.
+    const threadFrame = JSON.stringify({
+      type: "thread_reply",
+      id: "thread-1",
+      channel_id: "room",
+      parent_id: "human-multi",
+      sender_id: "human",
+      content: "@agent-a follow-up in thread",
+      timestamp: "2026-09-01T00:00:00.500Z",
+    });
+    for (const ws of platform.values()) ws.send(threadFrame);
+    await until(() => frames[0].some(f => f.event?.message_id === "thread-1"), "thread_reply delivery");
+    const deliveredThread = frames[0].find(f => f.event?.message_id === "thread-1");
+    expect(deliveredThread.event.reply_to_message_id).toBe("human-multi");
     // Separate gateways can safely omit botId; REST must use each connection's token.
     for (const i of [1, 0]) clients[i].send(JSON.stringify({ type: "outbound", requestId: `reply-${i}`, action: { op: "send", chat_id: "room", content: `reply-${i}` } }));
     await until(() => rest.length === 2, "REST replies");

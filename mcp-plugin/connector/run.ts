@@ -35,15 +35,14 @@ import WS from "ws";
 import { readFileSync } from "node:fs";
 import { startConnector, PlatformHttpError, PlatformNetworkError } from "./server.ts";
 import { requireIdentity, type Identity } from "./identities.ts";
-import { join } from "node:path";
 import { redactSecrets } from "../src/redact.ts";
 import { flushCursor, loadCursor, persistCursor } from "../src/read-cursor.ts";
 import { normalizeTimestampForCursor } from "../src/timestamps.ts";
 import { MessageDedup } from "../src/dedup.ts";
-import { planBackfill } from "./backfill.ts";
+import { planBackfill, safeCursorBotFile, selectChannelContextMessages } from "./backfill.ts";
 import { ingestAgentsChatFrame } from "./ingest.ts";
 import { HeartbeatMonitor, WS_CLOSED } from "../src/heartbeat.ts";
-import { computePleaseReconnectDelay } from "../src/reconnect.ts";
+import { resolveDrainReconnectDelay, withTimeoutController } from "../src/reconnect.ts";
 
 const log = (m: string) => process.stderr.write(`[agentschat-connector] ${m}\n`);
 
@@ -191,7 +190,7 @@ const cursors = new Map<string, CursorStore>();
 function cursorFor(id: Identity): CursorStore {
   let s = cursors.get(id.botId);
   if (s) return s;
-  const file = join(CURSOR_DIR, `last-seen-msg-ts-${id.botId}.json`);
+  const file = safeCursorBotFile(CURSOR_DIR, id.botId);
   s = { file, map: loadCursor(file, (m) => log(m.trimEnd())), state: { dirty: false }, timer: null };
   cursors.set(id.botId, s);
   return s;
@@ -355,7 +354,6 @@ function connectIdentity(id: Identity) {
 
   ws.on("open", () => {
     if (!currentIdentity(id) || socketsByBot.get(id.botId) !== ws) { ws.close(); return; }
-    backoffByBot.set(id.botId, 1000);
     try {
       ws.send(JSON.stringify({ type: "auth", agent_id: id.agentId, token: id.token, capabilities: ["chat"] }));
     } catch {}
@@ -370,8 +368,16 @@ function connectIdentity(id: Identity) {
     }
     if (data.type === "auth_ok") {
       hb.receivedPong(); // alive signal, same as stdio MCP
+      backoffByBot.set(id.botId, 1000);
       log(`connected to agentschat as ${id.agentId}`);
       void joinMemberships(ws, id);
+      return;
+    }
+    if (data.type === "auth_error") {
+      const reason = redactSecrets(String(data.error ?? data.reason ?? "rejected")).slice(0, 200);
+      log(`agentschat WS auth_error for ${id.botId}: ${reason}; backing off 30000ms`);
+      backoffByBot.set(id.botId, 30_000);
+      try { ws.close(); } catch {}
       return;
     }
     if (data.type === "channel_created" && data.channel_id) {
@@ -382,9 +388,7 @@ function connectIdentity(id: Identity) {
     if (data.type === "please_reconnect" || data.type === "shard_moved") {
       if (heartbeatForced) return;
       heartbeatForced = true;
-      const delay = computePleaseReconnectDelay(
-        data.type === "please_reconnect" ? data.drain_window_ms : 1500,
-      );
+      const delay = resolveDrainReconnectDelay(data);
       log(`agentschat WS ${data.type} for ${id.botId}; reconnecting after jitter ${delay}ms`);
       backoffByBot.set(id.botId, 1000);
       try {
@@ -396,7 +400,7 @@ function connectIdentity(id: Identity) {
       scheduleReconnect(id, delay);
       return;
     }
-    if (data.type === "message") {
+    if (data.type === "message" || data.type === "thread_reply") {
       hb.receivedPong(); // any live traffic counts as liveness
       if (!data.__source) data.__source = "live";
       // Cursor advances even when shared multiplex dedup skips broadcast.
@@ -469,22 +473,25 @@ const connector = startConnector({
     // failure returns null and the addressed message still delivers without it.
     async getChannelContext(botId, chatId, sinceTs, excludeId, signal) {
       const id = requireIdentity(identities, botId);
-      const res = await fetch(`${API}/api/channels/${encodeURIComponent(chatId)}/messages?limit=50`, {
-        signal,
-        headers: { Authorization: `Bearer ${id.token}` },
-      });
-      if (!res.ok) return null;
-      const msgs = (((await res.json()) as any)?.messages ?? [])
-        .filter((m: any) => m?.content && m.content !== "__typing__" && m?.id !== excludeId)
-        .sort((a: any, b: any) => String(a.timestamp ?? "").localeCompare(String(b.timestamp ?? "")));
-      const windowed = sinceTs ? msgs.filter((m: any) => String(m.timestamp ?? "") > sinceTs) : msgs;
-      const tail = windowed.slice(-10);
-      if (!tail.length) return null;
-      return tail.map((m: any) => ({
-        text: redactSecrets(String(m.content)).slice(0, 500),
-        user_name: m.sender_name ?? m.sender_id,
-        user_id: m.sender_id,
-      }));
+      const { signal: boundedSignal, cleanup } = withTimeoutController(signal, HTTP_TIMEOUT_MS);
+      let res: Response;
+      try {
+        res = await fetch(`${API}/api/channels/${encodeURIComponent(chatId)}/messages?limit=50`, {
+          signal: boundedSignal,
+          headers: { Authorization: `Bearer ${id.token}` },
+        });
+        if (!res.ok) return null;
+        const rawMsgs = (((await res.json()) as any)?.messages ?? []) as any[];
+        const tail = selectChannelContextMessages(rawMsgs, sinceTs, excludeId);
+        if (!tail.length) return null;
+        return tail.map((m: any) => ({
+          text: redactSecrets(String(m.content)).slice(0, 500),
+          user_name: m.sender_name ?? m.sender_id,
+          user_id: m.sender_id,
+        }));
+      } finally {
+        cleanup();
+      }
     },
   },
   logger: log,

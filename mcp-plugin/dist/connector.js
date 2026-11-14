@@ -93,7 +93,7 @@ function toWireEvent(msg, platform = "agentschat") {
     text: content,
     message_type: "text",
     message_id: msg.id,
-    reply_to_message_id: msg.reply_to,
+    reply_to_message_id: msg.reply_to ?? msg.parent_id,
     source: {
       platform,
       chat_id: chatId,
@@ -548,9 +548,6 @@ function peekPayload(token) {
   }
 }
 
-// connector/run.ts
-import { join } from "node:path";
-
 // src/redact.ts
 function redactSecrets(text, opts) {
   const step = opts?.preserveAcKeys ? text : text.replace(/ac_[A-Za-z0-9_-]{16,}/g, "ac_***REDACTED***");
@@ -626,16 +623,32 @@ function normalizeTimestampForCursor(ts, mode) {
 }
 
 // connector/backfill.ts
+import { join } from "node:path";
+function compareNormalizedTimestamps(aRaw, bRaw) {
+  const aStr = String(aRaw ?? "");
+  const bStr = String(bRaw ?? "");
+  const aNorm = normalizeTimestampForCursor(aStr, "after") || aStr;
+  const bNorm = normalizeTimestampForCursor(bStr, "after") || bStr;
+  return aNorm < bNorm ? -1 : aNorm > bNorm ? 1 : 0;
+}
 function planBackfill(after, msgs, agentId) {
   const list = Array.isArray(msgs) ? msgs : [];
   if (!after) {
-    let newest = "";
+    let newestRaw = "";
+    let newestNorm = "";
     for (const m of list) {
-      const t = String(m?.timestamp || "");
-      if (t > newest)
-        newest = t;
+      if (!m || m.content === "__typing__")
+        continue;
+      const raw = String(m.timestamp || "");
+      if (!raw)
+        continue;
+      const norm = normalizeTimestampForCursor(raw, "after") || raw;
+      if (norm > newestNorm) {
+        newestNorm = norm;
+        newestRaw = raw;
+      }
     }
-    return newest ? { seed: newest, replay: [] } : { replay: [] };
+    return newestRaw ? { seed: newestRaw, replay: [] } : { replay: [] };
   }
   const afterTs = normalizeTimestampForCursor(after, "after") || after;
   const replay = list.filter((m) => {
@@ -646,8 +659,25 @@ function planBackfill(after, msgs, agentId) {
     const msgTs = normalizeTimestampForCursor(m.timestamp, "after");
     return typeof msgTs === "string" && msgTs > afterTs;
   });
-  replay.sort((a, b) => String(a.timestamp ?? "").localeCompare(String(b.timestamp ?? "")));
+  replay.sort((a, b) => compareNormalizedTimestamps(a.timestamp, b.timestamp));
   return { replay };
+}
+function selectChannelContextMessages(msgs, sinceTs, excludeId) {
+  const list = Array.isArray(msgs) ? msgs : [];
+  const filtered = list.filter((m) => m?.content && m.content !== "__typing__" && (!excludeId || m?.id !== excludeId)).sort((a, b) => compareNormalizedTimestamps(a.timestamp, b.timestamp));
+  if (!sinceTs)
+    return filtered.slice(-10);
+  const normSince = normalizeTimestampForCursor(sinceTs, "after") || sinceTs;
+  return filtered.filter((m) => {
+    const raw = String(m.timestamp ?? "");
+    const norm = normalizeTimestampForCursor(raw, "after") || raw;
+    return norm > normSince;
+  }).slice(-10);
+}
+function safeCursorBotFile(cursorDir, botId) {
+  const cleaned = String(botId || "default").replace(/[^A-Za-z0-9._-]/g, "_").replace(/\.{2,}/g, "_");
+  const safeId = cleaned && cleaned !== "." ? cleaned.slice(0, 128) : "default";
+  return join(cursorDir, `last-seen-msg-ts-${safeId}.json`);
 }
 
 // connector/ingest.ts
@@ -745,6 +775,35 @@ class HeartbeatMonitor {
 function computePleaseReconnectDelay(jitterMs, rand = Math.random) {
   const maxJitter = typeof jitterMs === "number" && Number.isFinite(jitterMs) && jitterMs > 0 ? Math.min(Math.floor(jitterMs), 1e4) : 2000;
   return 200 + Math.floor(rand() * maxJitter);
+}
+function resolveDrainReconnectDelay(frame, rand = Math.random) {
+  return computePleaseReconnectDelay(frame?.jitter_ms ?? frame?.within_ms, rand);
+}
+function withTimeoutController(parentSignal, timeoutMs) {
+  const controller = new AbortController;
+  const onParentAbort = () => controller.abort(parentSignal?.reason);
+  if (parentSignal) {
+    if (parentSignal.aborted) {
+      controller.abort(parentSignal.reason);
+      return { signal: controller.signal, cleanup: () => {} };
+    }
+    parentSignal.addEventListener("abort", onParentAbort, { once: true });
+  }
+  const timer = timeoutMs > 0 ? setTimeout(() => {
+    const err = new Error(`HTTP request timed out after ${timeoutMs}ms`);
+    err.name = "TimeoutError";
+    controller.abort(err);
+  }, timeoutMs) : null;
+  timer?.unref?.();
+  return {
+    signal: controller.signal,
+    cleanup: () => {
+      if (timer)
+        clearTimeout(timer);
+      if (parentSignal)
+        parentSignal.removeEventListener("abort", onParentAbort);
+    }
+  };
 }
 
 // connector/run.ts
@@ -874,7 +933,7 @@ function cursorFor(id) {
   let s = cursors.get(id.botId);
   if (s)
     return s;
-  const file = join(CURSOR_DIR, `last-seen-msg-ts-${id.botId}.json`);
+  const file = safeCursorBotFile(CURSOR_DIR, id.botId);
   s = { file, map: loadCursor(file, (m) => log(m.trimEnd())), state: { dirty: false }, timer: null };
   cursors.set(id.botId, s);
   return s;
@@ -1037,7 +1096,6 @@ function connectIdentity(id) {
       ws.close();
       return;
     }
-    backoffByBot.set(id.botId, 1000);
     try {
       ws.send(JSON.stringify({ type: "auth", agent_id: id.agentId, token: id.token, capabilities: ["chat"] }));
     } catch {}
@@ -1057,8 +1115,18 @@ function connectIdentity(id) {
     }
     if (data.type === "auth_ok") {
       hb.receivedPong();
+      backoffByBot.set(id.botId, 1000);
       log(`connected to agentschat as ${id.agentId}`);
       joinMemberships(ws, id);
+      return;
+    }
+    if (data.type === "auth_error") {
+      const reason = redactSecrets(String(data.error ?? data.reason ?? "rejected")).slice(0, 200);
+      log(`agentschat WS auth_error for ${id.botId}: ${reason}; backing off 30000ms`);
+      backoffByBot.set(id.botId, 30000);
+      try {
+        ws.close();
+      } catch {}
       return;
     }
     if (data.type === "channel_created" && data.channel_id) {
@@ -1070,7 +1138,7 @@ function connectIdentity(id) {
       if (heartbeatForced)
         return;
       heartbeatForced = true;
-      const delay = computePleaseReconnectDelay(data.type === "please_reconnect" ? data.drain_window_ms : 1500);
+      const delay = resolveDrainReconnectDelay(data);
       log(`agentschat WS ${data.type} for ${id.botId}; reconnecting after jitter ${delay}ms`);
       backoffByBot.set(id.botId, 1000);
       try {
@@ -1082,7 +1150,7 @@ function connectIdentity(id) {
       scheduleReconnect(id, delay);
       return;
     }
-    if (data.type === "message") {
+    if (data.type === "message" || data.type === "thread_reply") {
       hb.receivedPong();
       if (!data.__source)
         data.__source = "live";
@@ -1159,22 +1227,27 @@ var connector = startConnector({
     },
     async getChannelContext(botId, chatId, sinceTs, excludeId, signal) {
       const id = requireIdentity(identities, botId);
-      const res = await fetch(`${API}/api/channels/${encodeURIComponent(chatId)}/messages?limit=50`, {
-        signal,
-        headers: { Authorization: `Bearer ${id.token}` }
-      });
-      if (!res.ok)
-        return null;
-      const msgs = ((await res.json())?.messages ?? []).filter((m) => m?.content && m.content !== "__typing__" && m?.id !== excludeId).sort((a, b) => String(a.timestamp ?? "").localeCompare(String(b.timestamp ?? "")));
-      const windowed = sinceTs ? msgs.filter((m) => String(m.timestamp ?? "") > sinceTs) : msgs;
-      const tail = windowed.slice(-10);
-      if (!tail.length)
-        return null;
-      return tail.map((m) => ({
-        text: redactSecrets(String(m.content)).slice(0, 500),
-        user_name: m.sender_name ?? m.sender_id,
-        user_id: m.sender_id
-      }));
+      const { signal: boundedSignal, cleanup } = withTimeoutController(signal, HTTP_TIMEOUT_MS);
+      let res;
+      try {
+        res = await fetch(`${API}/api/channels/${encodeURIComponent(chatId)}/messages?limit=50`, {
+          signal: boundedSignal,
+          headers: { Authorization: `Bearer ${id.token}` }
+        });
+        if (!res.ok)
+          return null;
+        const rawMsgs = (await res.json())?.messages ?? [];
+        const tail = selectChannelContextMessages(rawMsgs, sinceTs, excludeId);
+        if (!tail.length)
+          return null;
+        return tail.map((m) => ({
+          text: redactSecrets(String(m.content)).slice(0, 500),
+          user_name: m.sender_name ?? m.sender_id,
+          user_id: m.sender_id
+        }));
+      } finally {
+        cleanup();
+      }
     }
   },
   logger: log

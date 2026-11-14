@@ -64,9 +64,14 @@ describe("toWireEvent — content + identity of the message itself", () => {
     expect(e.message_type).toBe("text");
   });
 
-  test("a reply carries reply_to_message_id", () => {
+  test("a reply carries reply_to_message_id from reply_to or parent_id while keeping thread_id null", () => {
     const e = must({ ...base, reply_to: "msg-0" });
     expect(e.reply_to_message_id).toBe("msg-0");
+    expect(e.source.thread_id).toBeNull();
+
+    const threaded = must({ ...base, parent_id: "parent-42" });
+    expect(threaded.reply_to_message_id).toBe("parent-42");
+    expect(threaded.source.thread_id).toBeNull();
   });
 
   test("typing placeholders never become an event (returns null)", () => {
