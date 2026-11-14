@@ -12,6 +12,7 @@ import {
   mergeUniqueProposalBallots,
   normalizeDiscoveredAgentCards,
   parseChannelSkillFrontmatter,
+  parseSseFrames,
   rankDiscoverableChannels,
   resolveAgentMention,
   resolveInheritedObjectiveChannel,
@@ -6410,6 +6411,56 @@ describe("AgentChatClient realtime collaboration WS events", () => {
       client.disconnect();
     } finally {
       globalThis.WebSocket = OriginalWS;
+    }
+  });
+
+  test("Campaign #74: AgentChatREST.getAgent normalizes offline publicAccountView & avatars, and SSE handles UTF-8 BOM + pre-aborted signals", async () => {
+    const bomParsed = parseSseFrames('\uFEFFdata: {"type":"message","id":"bom-1"}\n\ndata\ndata: {"type":"ping"}\n\n');
+    expect(bomParsed.events).toEqual([{ type: "message", id: "bom-1" }, { type: "ping" }]);
+
+    const originalFetch = globalThis.fetch;
+    let fetchCalls = 0;
+    let nextPayload: unknown = {
+      id: "cold-specialist",
+      name: "Cold Specialist",
+      type: "agent",
+      status: "active",
+      avatarUrl: "unknown",
+      capabilities: ["swift", "sk-secret-leak", "mcp"],
+      reputation: 88,
+    };
+    globalThis.fetch = (async () => {
+      fetchCalls += 1;
+      return Response.json(nextPayload);
+    }) as unknown as typeof fetch;
+
+    try {
+      const rest = new AgentChatREST({ baseUrl: "https://agents-chat.com", bearerToken: "tok_74" });
+      const offlineCard = await rest.getAgent("cold-specialist");
+      expect(offlineCard).toEqual({
+        agent_id: "cold-specialist",
+        display_name: "Cold Specialist",
+        capabilities: ["swift", "mcp"],
+        reputation: 88,
+        status: "offline",
+      });
+      expect("avatar_url" in offlineCard).toBe(false);
+
+      nextPayload = { agent_id: "ac_live_secret", display_name: "Bad" };
+      await expect(rest.getAgent("cold-specialist")).rejects.toThrow("Invalid agent card response");
+
+      // Pre-aborted signal performs 0 fetches on iterateChannelEvents
+      const preAborted = new AbortController();
+      preAborted.abort();
+      const beforeAbortedFetches = fetchCalls;
+      const yielded: unknown[] = [];
+      for await (const evt of rest.iterateChannelEvents("room-dev", { signal: preAborted.signal })) {
+        yielded.push(evt);
+      }
+      expect(yielded).toEqual([]);
+      expect(fetchCalls).toBe(beforeAbortedFetches);
+    } finally {
+      globalThis.fetch = originalFetch;
     }
   });
 });

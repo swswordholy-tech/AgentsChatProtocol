@@ -14,7 +14,7 @@ export function parseSseFrames(buffer: string, maxBufferChars = 262_144): Parsed
   if (typeof buffer !== "string" || !buffer) {
     return { events, rest: "" };
   }
-  let rest = buffer;
+  let rest = buffer.charCodeAt(0) === 0xfeff ? buffer.slice(1) : buffer;
   let sepMatch: RegExpExecArray | null;
   while ((sepMatch = /\r?\n\r?\n/.exec(rest)) !== null) {
     const block = rest.slice(0, sepMatch.index);
@@ -22,7 +22,9 @@ export function parseSseFrames(buffer: string, maxBufferChars = 262_144): Parsed
     const dataLines: string[] = [];
     for (const rawLine of block.split(/\r?\n/)) {
       if (!rawLine || rawLine.startsWith(":")) continue;
-      if (rawLine.startsWith("data:")) {
+      if (rawLine === "data") {
+        dataLines.push("");
+      } else if (rawLine.startsWith("data:")) {
         dataLines.push(rawLine.slice(5).replace(/^ /, ""));
       }
     }
@@ -2210,11 +2212,13 @@ export function normalizeDiscoveredAgentCards(rawCards: unknown): AgentCard[] {
   for (const item of rawCards.slice(0, 500)) {
     if (!item || typeof item !== "object" || Array.isArray(item)) continue;
     const row = item as Record<string, unknown>;
-    const agentId = typeof row.agent_id === "string" ? row.agent_id.trim() : "";
+    const rawAgentId = typeof row.agent_id === "string" ? row.agent_id : typeof row.id === "string" ? row.id : "";
+    const agentId = rawAgentId.trim();
     if (!agentId || isUnsafeAgentId(agentId) || seenIds.has(agentId)) continue;
     seenIds.add(agentId);
 
-    const rawName = typeof row.display_name === "string" ? row.display_name.replace(/[\u0000-\u001F\u007F]+/g, " ").trim() : "";
+    const rawDisplay = typeof row.display_name === "string" ? row.display_name : typeof row.name === "string" ? row.name : "";
+    const rawName = rawDisplay.replace(/[\u0000-\u001F\u007F]+/g, " ").trim();
     const safeName = !rawName
       ? agentId
       : EMAIL_ID_RE.test(rawName) || PHONE_ID_RE.test(rawName)
@@ -3877,10 +3881,24 @@ export class AgentChatREST {
 
   async getAgent(agentId: string, opts?: { bearerToken?: string }): Promise<AgentCard> {
     const safeId = this.assertSafeDiscoveryAgentId(agentId);
-    return this.get(`/api/agents/${encodeURIComponent(safeId)}`, {
+    const raw = await this.get<unknown>(`/api/agents/${encodeURIComponent(safeId)}`, {
       "Cache-Control": "no-store",
       ...(this.authHeaders(opts?.bearerToken) ?? {}),
     });
+    const unwrapped =
+      raw &&
+      typeof raw === "object" &&
+      !Array.isArray(raw) &&
+      "agent" in (raw as Record<string, unknown>) &&
+      (raw as Record<string, unknown>).agent &&
+      typeof (raw as Record<string, unknown>).agent === "object"
+        ? (raw as Record<string, unknown>).agent
+        : raw;
+    const normalized = normalizeDiscoveredAgentCards([unwrapped])[0];
+    if (!normalized) {
+      throw new Error("Invalid agent card response");
+    }
+    return normalized;
   }
 
   async discover(
@@ -4828,6 +4846,7 @@ export class AgentChatREST {
     ) {
       throw new Error("Invalid channel ID");
     }
+    if (opts?.signal?.aborted) return;
     const token = opts?.bearerToken?.trim() || this.bearerToken;
     const headers: Record<string, string> = {
       Accept: "text/event-stream",
@@ -4847,6 +4866,10 @@ export class AgentChatREST {
       throw new Error(`HTTP ${res.status}: ${error.message ?? error.error ?? res.statusText}`);
     }
     if (!res.body) return;
+    if (opts?.signal?.aborted) {
+      await res.body.cancel().catch(() => {});
+      return;
+    }
 
     const reader = res.body.getReader();
     const decoder = new TextDecoder("utf-8");
@@ -4901,6 +4924,9 @@ export class AgentChatREST {
     } finally {
       opts?.signal?.removeEventListener("abort", onAbort);
       await reader.cancel().catch(() => {});
+      try {
+        reader.releaseLock();
+      } catch {}
     }
   }
 
