@@ -14,6 +14,7 @@ import {
   summarizeChannelWakeHealth,
   summarizeCloudAgentRoomPolicy,
   summarizeCloudAgentSpecialties,
+  summarizeOkrWatchReadiness,
   summarizePersonalSkillDetail,
   summarizePersonalSkillsLibrary,
   summarizeProposalsFeed,
@@ -4789,5 +4790,146 @@ describe("AgentChatClient realtime collaboration WS events", () => {
     await expect(
       rest.savePersonalSkill("cjk-skill", { body_markdown: multibyteOversize, if_match_version: 0 }),
     ).rejects.toThrow("exceeds 100000 UTF-8 bytes");
+  });
+
+  test("summarizeOkrWatchReadiness & createOkrWatchLoop enforce server-identical stall/ETA/supply math, pre-slice secret scrubbing, and 14-family credential guards", async () => {
+    const nowMs = Date.parse("2026-11-14T12:00:00.000Z");
+    const longPad = "Waiting on upstream webhook review from vendor ";
+    const readiness = summarizeOkrWatchReadiness(
+      [
+        {
+          id: "t1",
+          assignee: "a",
+          status: "doing",
+          title: "Deploy room-asia-pacific Bearer secret_token_1234567890",
+          last_progress_at: "2026-11-14T11:40:00.000Z", // 20m silent => stalled_doing (>= 5m)
+        },
+        {
+          id: "t_future_eta",
+          assignee: "a",
+          status: "doing",
+          due: "2026-11-14T14:00:00.000Z", // Future ETA => respected, NOT stalled
+          last_progress_at: "2026-11-14T10:00:00.000Z",
+        },
+        {
+          id: "t_over_eta",
+          assignee: "codex-staff-engineer-ca7590",
+          status: "doing",
+          title: "Fix ASIAIOSFODNN7EXAMPLE leak",
+          due: "2026-11-14T11:00:00.000Z",
+          last_progress_at: "2026-11-14T10:30:00.000Z",
+        },
+        {
+          id: "t_blocked",
+          assignee: "codex-staff-engineer-ca7590",
+          status: "blocked",
+          last_progress_at: "2026-11-14T06:00:00.000Z", // 6h >= 4h
+          // Secret starts beyond index 50 so pre-slice scrubbing is mandatory!
+          blocked_reason: `${longPad}mcp_at_1234567890abcdef owner@example.com +1 (415) 555-0199`,
+        },
+        {
+          id: "t_done",
+          assignee: "team-asia",
+          status: "done",
+          updated_at: "2026-11-14T11:55:00.000Z",
+        },
+        {
+          id: "t_ready",
+          assignee: "eyj-notes",
+          status: "todo",
+          depends_on: ["t_done", "ext_done"],
+        },
+        {
+          id: "t_waiting_proto",
+          assignee: "aiza-guide",
+          status: "todo",
+          // toString on plain object must NOT be treated as external status!
+          depends_on: ["toString"],
+        },
+        // Hostile / prototype / credential IDs dropped
+        { id: "__proto__", assignee: "team-asia", status: "doing", last_progress_at: "2026-11-14T00:00:00.000Z" },
+        { id: "t_bad_cred", assignee: "agent_rk_live_1234567890", status: "doing" },
+      ],
+      {
+        nowMs,
+        stallMinutes: 5,
+        members: [
+          "a",
+          "codex-staff-engineer-ca7590",
+          "team-asia",
+          "team-asia", // duplicate member must not inflate idle_agents or supply_floor!
+          "idle-peer-1",
+          "idle-peer-2",
+          "__proto__",
+          "mr_" + "a".repeat(64),
+          "eyj-notes",
+          "aiza-guide",
+        ],
+        externalDepStatuses: { ext_done: "done" },
+      },
+    );
+
+    // Valid tasks: t1, t_future_eta, t_over_eta, t_blocked, t_done, t_ready, t_waiting_proto = 7
+    expect(readiness.total_tasks).toBe(7);
+    expect(readiness.unfinished_tasks).toBe(6);
+    expect(readiness.ready_count).toBe(1);
+    expect(readiness.stalled_doing_task_ids).toEqual(["t1"]);
+    expect(readiness.over_eta_task_ids).toEqual(["t_over_eta"]);
+    expect(readiness.blocked_long_task_ids).toEqual(["t_blocked"]);
+    // Busy (status !== "done"): a, codex-staff-engineer-ca7590, eyj-notes, aiza-guide
+    // Idle (deduplicated & sorted): idle-peer-1, idle-peer-2, team-asia => 3 idle => floor = ceil(6/3) = 2 => ready_count(1) < 2 => starved!
+    expect(readiness.idle_agents).toEqual(["idle-peer-1", "idle-peer-2", "team-asia"]);
+    expect(readiness.supply_floor).toBe(2);
+    expect(readiness.supply_starved).toBe(true);
+
+    const dumped = JSON.stringify(readiness);
+    for (const secret of ["secret_token_", "ASIAIOSFODNN7EXAMPLE", "mcp_at_", "owner@example.com", "555-0199"]) {
+      expect(dumped).not.toContain(secret);
+    }
+
+    const originalFetch = globalThis.fetch;
+    let fetchCalls = 0;
+    globalThis.fetch = (async () => {
+      fetchCalls += 1;
+      return Response.json({ ok: true, loop: { id: "loop_56", channel_id: "room-asia-pacific", status: "active" } });
+    }) as unknown as typeof fetch;
+
+    try {
+      const rest = new AgentChatREST({ baseUrl: "https://agents-chat.com", bearerToken: "tok_56" });
+      for (const badCh of ["__proto__", "constructor", "dm_pair", "dm-pair", "direct:1", "room_mcp_at_1234567890", "arena-1"]) {
+        await expect(
+          rest.createOkrWatchLoop({ channel_id: badCh, objective_id: "obj_56_valid" }),
+        ).rejects.toThrow("Invalid channel ID");
+      }
+      for (const badObj of ["constructor", "prototype", "__proto__", "mcp_at_1234567890", "obj_rk_live_1234567890"]) {
+        await expect(
+          rest.createOkrWatchLoop({ channel_id: "room-asia-pacific", objective_id: badObj }),
+        ).rejects.toThrow("Invalid objective ID");
+      }
+      for (const badAgent of ["__proto__", "constructor", "mr_" + "b".repeat(64), "agent_ghp_1234567890abcdef"]) {
+        await expect(
+          rest.createOkrWatchLoop({
+            channel_id: "room-asia-pacific",
+            objective_id: "obj_56_valid",
+            agent_id: badAgent,
+          }),
+        ).rejects.toThrow("Invalid agent ID");
+      }
+      expect(fetchCalls).toBe(0);
+
+      // Legitimate hyphenated names containing asia / eyj / aiza pass cleanly
+      const created = await rest.createOkrWatchLoop({
+        channel_id: "room-asia-pacific",
+        objective_id: "eyj-notes-sprint",
+        agent_id: "team-asia",
+        watch_idle: true,
+        watch_supply: true,
+        stall_minutes: 10,
+      });
+      expect(created.ok).toBe(true);
+      expect(fetchCalls).toBe(1);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
   });
 });

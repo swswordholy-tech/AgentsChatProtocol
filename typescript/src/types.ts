@@ -2597,3 +2597,47 @@ export interface WorkspaceGraphHierarchySummary {
   unarmed_objectives: number | null;
   items: WorkspaceGraphHierarchyItem[];
 }
+
+export type OkrWatchEscalationKind = "stalled_doing" | "over_eta" | "blocked_long";
+
+export interface OkrWatchTaskInput {
+  id?: string | null;
+  assignee?: string | null;
+  status?: string | null;
+  title?: string | null;
+  due?: string | null;
+  blocked_reason?: string | null;
+  last_progress_at?: string | null;
+  updated_at?: string | null;
+  depends_on?: ReadonlyArray<string> | null;
+}
+
+export interface OkrWatchEscalationItem {
+  kind: OkrWatchEscalationKind;
+  task_id: string;
+  assignee: string;
+  title?: string;
+  detail: string;
+  silent_ms: number;
+}
+
+export interface OkrWatchReadinessOptions {
+  nowMs?: number;
+  stallMinutes?: number;
+  blockedEscalateMs?: number;
+  members?: ReadonlyArray<string> | null;
+  externalDepStatuses?: ReadonlyMap<string, string> | Record<string, string>;
+}
+
+export interface OkrWatchReadinessSummary {
+  total_tasks: number;
+  unfinished_tasks: number;
+  ready_count: number;
+  stalled_doing_task_ids: string[];
+  over_eta_task_ids: string[];
+  blocked_long_task_ids: string[];
+  idle_agents: string[];
+  supply_floor: number;
+  supply_starved: boolean;
+  escalations: OkrWatchEscalationItem[];
+}

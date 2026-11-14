@@ -2441,6 +2441,240 @@ export function summarizeChannelOkrSnapshot(
   };
 }
 
+const OKR_WATCH_CREDENTIAL_ID_RE =
+  /(?:^|[^A-Za-z0-9])(?:mcp_(?:at|rt|code)_|ac_|agent_key_|sk[-_]|rk_(?:live|test)_|gh[pousr]_|github_pat_|glpat-|xox[baprs]-|hf_|npm_|(?:AIza|eyJ)[A-Za-z0-9]|(?:Bearer|Basic)(?:[._-]|$))/i;
+const OKR_WATCH_AWS_KEY_ID_RE = /(?:^|[^A-Za-z0-9])(?:AKIA|ASIA)[0-9A-Z]{16}(?![A-Za-z0-9])/;
+const OKR_WATCH_DIRECT_CHANNEL_RE = /^(?:dm[-_:]|direct(?:$|[-_:]))/i;
+
+function isSafeOkrWatchId(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    /^[A-Za-z0-9_-][A-Za-z0-9_.-]{0,127}$/.test(value) &&
+    !value.includes("..") &&
+    !PROTOTYPE_POISON_KEYS.has(value.toLowerCase()) &&
+    !/^mr_[0-9a-f]{16,}$/i.test(value) &&
+    !OKR_WATCH_CREDENTIAL_ID_RE.test(value) &&
+    !OKR_WATCH_AWS_KEY_ID_RE.test(value) &&
+    !EMAIL_ID_RE.test(value) &&
+    !PHONE_ID_RE.test(value)
+  );
+}
+
+function sanitizeOkrWatchText(raw: unknown, maxLen: number): string {
+  if (typeof raw !== "string") return "";
+  return raw
+    .replace(/-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|$)/gi, "[REDACTED_PEM]")
+    .replace(/\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/gi, "[REDACTED_AUTH]")
+    .replace(/(?:^|[^A-Za-z0-9])(?:AKIA|ASIA)[0-9A-Z]{12,}/g, (m) => {
+      const lead = /^[A-Za-z0-9]/.test(m) ? "" : m[0];
+      return `${lead}[REDACTED_SECRET]`;
+    })
+    .replace(/\beyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{4,}/g, "[REDACTED_JWT]")
+    .replace(
+      /(?:^|[^A-Za-z0-9])(?:mcp_(?:at|rt|code)_[A-Za-z0-9._+/=-]+|ac_[A-Za-z0-9._+/=-]+|agent_key_[A-Za-z0-9._+/=-]+|sk[-_][A-Za-z0-9._+/=-]+|rk_(?:live|test)_[A-Za-z0-9._+/=-]+|gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+|glpat-[A-Za-z0-9._-]+|xox[baprs]-[A-Za-z0-9-]+|(?:hf|npm)_[A-Za-z0-9]{12,}|AIza[A-Za-z0-9_-]{6,})/gi,
+      (m) => {
+        const lead = /^[A-Za-z0-9]/.test(m) ? "" : m[0];
+        return `${lead}[REDACTED_SECRET]`;
+      },
+    )
+    .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, "[REDACTED_EMAIL]")
+    .replace(/\+?\d[\d ()-]{6,}\d/g, "[REDACTED_PHONE]")
+    .replace(/[\u0000-\u001F\u007F]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, maxLen);
+}
+
+function formatOkrWatchDuration(ms: number): string {
+  const minMs = 60_000;
+  const hourMs = 60 * minMs;
+  if (ms < hourMs) return `${Math.round(ms / minMs)}m`;
+  const h = ms / hourMs;
+  if (h < 48) return `${Math.round(h)}h`;
+  return `${Math.round(h / 24)}d`;
+}
+
+export function summarizeOkrWatchReadiness(
+  tasks: unknown,
+  options?: import("./types").OkrWatchReadinessOptions,
+): import("./types").OkrWatchReadinessSummary {
+  const empty: import("./types").OkrWatchReadinessSummary = {
+    total_tasks: 0,
+    unfinished_tasks: 0,
+    ready_count: 0,
+    stalled_doing_task_ids: [],
+    over_eta_task_ids: [],
+    blocked_long_task_ids: [],
+    idle_agents: [],
+    supply_floor: 0,
+    supply_starved: false,
+    escalations: [],
+  };
+  if (!Array.isArray(tasks)) return empty;
+
+  const nowMs =
+    typeof options?.nowMs === "number" && Number.isFinite(options.nowMs) ? options.nowMs : Date.now();
+  const stallMinutes =
+    typeof options?.stallMinutes === "number" &&
+    Number.isFinite(options.stallMinutes) &&
+    options.stallMinutes >= 5 &&
+    options.stallMinutes <= 1440
+      ? options.stallMinutes
+      : 5;
+  const stallMs = stallMinutes * 60_000;
+  const blockedMs =
+    typeof options?.blockedEscalateMs === "number" &&
+    Number.isFinite(options.blockedEscalateMs) &&
+    options.blockedEscalateMs > 0
+      ? options.blockedEscalateMs
+      : Math.max(4 * 3_600_000, stallMs);
+
+  const validTasks: Array<{
+    id: string;
+    assignee: string;
+    status: "todo" | "doing" | "done" | "blocked";
+    title?: string;
+    due?: string;
+    blocked_reason?: string;
+    stamp: string;
+    depends_on: string[];
+  }> = [];
+  const seenIds = new Set<string>();
+  for (const raw of tasks.slice(0, 1000)) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) continue;
+    const row = raw as Record<string, unknown>;
+    const id = typeof row.id === "string" ? row.id.trim() : "";
+    const assignee = typeof row.assignee === "string" ? row.assignee.trim() : "";
+    if (!isSafeOkrWatchId(id) || !isSafeOkrWatchId(assignee) || seenIds.has(id)) continue;
+    seenIds.add(id);
+    const rawStatus = typeof row.status === "string" ? row.status.trim() : "todo";
+    const status =
+      rawStatus === "doing" || rawStatus === "done" || rawStatus === "blocked" ? rawStatus : "todo";
+    const title = sanitizeOkrWatchText(row.title, 160) || undefined;
+    const due = typeof row.due === "string" && row.due.trim() ? row.due.trim().slice(0, 64) : undefined;
+    const blockedReason = typeof row.blocked_reason === "string" ? row.blocked_reason : undefined;
+    const stamp =
+      (typeof row.last_progress_at === "string" && row.last_progress_at.trim()) ||
+      (typeof row.updated_at === "string" && row.updated_at.trim()) ||
+      "";
+    const dependsOn = Array.isArray(row.depends_on)
+      ? row.depends_on.filter((d: unknown): d is string => typeof d === "string" && d.trim().length > 0).map((d) => d.trim())
+      : [];
+    validTasks.push({
+      id,
+      assignee,
+      status,
+      title,
+      due,
+      blocked_reason: blockedReason,
+      stamp,
+      depends_on: dependsOn,
+    });
+  }
+
+  const members = Array.isArray(options?.members)
+    ? [
+        ...new Set(
+          options!.members
+            .map((m) => (typeof m === "string" ? m.trim() : ""))
+            .filter(isSafeOkrWatchId),
+        ),
+      ].sort()
+    : [];
+
+  const stalled_doing_task_ids: string[] = [];
+  const over_eta_task_ids: string[] = [];
+  const blocked_long_task_ids: string[] = [];
+  const escalations: import("./types").OkrWatchEscalationItem[] = [];
+  const byId = new Map(validTasks.map((t) => [t.id, t]));
+  const doneIds = new Set(validTasks.filter((t) => t.status === "done").map((t) => t.id));
+
+  const lookupExternalDep = (depId: string): string | undefined => {
+    const ext = options?.externalDepStatuses;
+    if (!ext) return undefined;
+    if (ext instanceof Map) {
+      const v = ext.get(depId);
+      return typeof v === "string" ? v : undefined;
+    }
+    if (typeof ext === "object" && Object.prototype.hasOwnProperty.call(ext, depId)) {
+      const v = (ext as Record<string, unknown>)[depId];
+      return typeof v === "string" ? v : undefined;
+    }
+    return undefined;
+  };
+
+  for (const t of validTasks) {
+    if (t.status === "done" || t.status === "todo") continue;
+    const progressMs = t.stamp ? Date.parse(t.stamp) : NaN;
+    const silentMs = Number.isFinite(progressMs) ? Math.max(0, nowMs - progressMs) : 0;
+
+    if (t.status === "doing") {
+      const dueMs = t.due ? Date.parse(t.due) : NaN;
+      if (Number.isFinite(dueMs) && nowMs > dueMs && silentMs > 0) {
+        over_eta_task_ids.push(t.id);
+        escalations.push({
+          kind: "over_eta",
+          task_id: t.id,
+          assignee: t.assignee,
+          ...(t.title ? { title: t.title } : {}),
+          detail: `over ETA by ${formatOkrWatchDuration(nowMs - dueMs)} (silent ${formatOkrWatchDuration(silentMs)})`,
+          silent_ms: silentMs,
+        });
+      } else if (!Number.isFinite(dueMs) && Number.isFinite(progressMs) && silentMs >= stallMs) {
+        stalled_doing_task_ids.push(t.id);
+        escalations.push({
+          kind: "stalled_doing",
+          task_id: t.id,
+          assignee: t.assignee,
+          ...(t.title ? { title: t.title } : {}),
+          detail: `silent for ${formatOkrWatchDuration(silentMs)}`,
+          silent_ms: silentMs,
+        });
+      }
+    } else if (t.status === "blocked" && silentMs >= blockedMs) {
+      blocked_long_task_ids.push(t.id);
+      const safeReason = sanitizeOkrWatchText(t.blocked_reason, 60);
+      escalations.push({
+        kind: "blocked_long",
+        task_id: t.id,
+        assignee: t.assignee,
+        ...(t.title ? { title: t.title } : {}),
+        detail: `blocked ${formatOkrWatchDuration(silentMs)}${safeReason ? `: ${safeReason}` : ""}`,
+        silent_ms: silentMs,
+      });
+    }
+  }
+
+  const ready_count = validTasks.filter(
+    (t) =>
+      t.status === "todo" &&
+      t.depends_on.every(
+        (d) =>
+          isSafeOkrWatchId(d) &&
+          (doneIds.has(d) || (!byId.has(d) && (options?.externalDepStatuses ? lookupExternalDep(d) === "done" : true))),
+      ),
+  ).length;
+
+  const unfinished_tasks = validTasks.filter((t) => t.status !== "done").length;
+  const busyAgents = new Set(validTasks.filter((t) => t.status !== "done").map((t) => t.assignee));
+  const idle_agents = members.filter((m) => !busyAgents.has(m));
+  const supply_floor = Math.ceil((idle_agents.length * 2) / 3);
+  const supply_starved = unfinished_tasks > 0 && idle_agents.length > 0 && ready_count < supply_floor;
+
+  return {
+    total_tasks: validTasks.length,
+    unfinished_tasks,
+    ready_count,
+    stalled_doing_task_ids,
+    over_eta_task_ids,
+    blocked_long_task_ids,
+    idle_agents,
+    supply_floor,
+    supply_starved,
+    escalations,
+  };
+}
+
 export interface RESTClientOptions {
   baseUrl: string; // e.g. "http://localhost:8080"
   bearerToken?: string;
@@ -3819,24 +4053,19 @@ export class AgentChatREST {
     if (
       !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(channelId) ||
       channelId.startsWith("arena-") ||
-      /^(?:ac_|agent_key_|sk[-_]|gh[pousr]_|github_pat_|AIza|eyJ)/i.test(channelId)
+      OKR_WATCH_DIRECT_CHANNEL_RE.test(channelId) ||
+      !isSafeOkrWatchId(channelId)
     ) {
       throw new Error("Invalid channel ID");
     }
     const objectiveId = input?.objective_id?.trim() ?? "";
-    if (!/^[A-Za-z0-9_-]{6,80}$/.test(objectiveId) || /^ac_/i.test(objectiveId)) {
+    if (!/^[A-Za-z0-9_-]{6,80}$/.test(objectiveId) || !isSafeOkrWatchId(objectiveId)) {
       throw new Error("Invalid objective ID");
     }
     let safeAgent: string | undefined;
     if (input.agent_id !== undefined) {
       const trimmedAgent = input.agent_id.trim();
-      if (
-        !trimmedAgent ||
-        trimmedAgent.length > 128 ||
-        /[/\\?#&\s\u0000-\u001F]/.test(trimmedAgent) ||
-        trimmedAgent.includes("..") ||
-        /^(?:ac_|agent_key_|sk[-_]|gh[pousr]_|github_pat_|AIza|eyJ)/i.test(trimmedAgent)
-      ) {
+      if (!isSafeOkrWatchId(trimmedAgent)) {
         throw new Error("Invalid agent ID");
       }
       safeAgent = trimmedAgent;
