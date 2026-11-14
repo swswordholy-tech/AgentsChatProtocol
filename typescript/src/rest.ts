@@ -71,7 +71,13 @@ const ROSTER_ROLES = new Set(["member", "moderator", "admin"]);
 const ROSTER_TYPES = new Set(["agent", "user", "unknown"]);
 const ROSTER_SCOPES = new Set(["owned", "unclaimed", "external"]);
 const SAFE_COLLAB_AGENT_ID_RE = /^[A-Za-z0-9_.-]{1,128}$/;
-const CREDENTIAL_PREFIX_RE = /^(?:mcp_(?:at|rt|code)_|ac_|agent_key_|sk[-_]|rk_(?:live|test)_|gh[pousr]_|github_pat_|glpat-|xox[baprs]-|(?:AKIA|ASIA)[0-9A-Z]{16}|(?:hf|npm)_|(?:AIza|eyJ)(?:$|[A-Za-z0-9._-]{8,}))/i;
+const CREDENTIAL_PREFIX_BASE_RE = /^(?:mcp_(?:at|rt|code)_|ac_|agent_key_|sk[-_]|rk_(?:live|test)_|gh[pousr]_|github_pat_|glpat-|xox[baprs]-|(?:hf|npm)_)/i;
+const CASE_SENSITIVE_CREDENTIAL_PREFIX_RE = /^(?:(?:AKIA|ASIA)[0-9A-Z]{16}|(?:AIza|eyJ)[A-Za-z0-9_.-]{8,})/;
+const CREDENTIAL_PREFIX_RE = {
+  test(value: string): boolean {
+    return CREDENTIAL_PREFIX_BASE_RE.test(value) || CASE_SENSITIVE_CREDENTIAL_PREFIX_RE.test(value);
+  },
+};
 const EMAIL_ID_RE = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i;
 const PHONE_ID_RE = /^\+?\d[\d ()-]{5,}\d$/;
 
@@ -79,8 +85,13 @@ function isSafeCollaborationAgentId(id: unknown): id is string {
   return (
     typeof id === "string" &&
     SAFE_COLLAB_AGENT_ID_RE.test(id) &&
+    !PROTOTYPE_POISON_KEYS.has(id.toLowerCase()) &&
+    !/^mr_[0-9a-f]{16,}$/i.test(id) &&
     !id.includes("..") &&
     !CREDENTIAL_PREFIX_RE.test(id) &&
+    !CASE_SENSITIVE_CREDENTIAL_PREFIX_RE.test(id) &&
+    !JOINED_GRAPH_CREDENTIAL_ID_RE.test(id) &&
+    !JOINED_GRAPH_AWS_KEY_ID_RE.test(id) &&
     !EMAIL_ID_RE.test(id) &&
     !PHONE_ID_RE.test(id)
   );
@@ -160,8 +171,8 @@ export function isValidCollaborationRoster(
 const WORKSPACE_GRAPH_SCOPES = new Set(["channel", "objective", "agent"]);
 const PROTOTYPE_POISON_KEYS = new Set(["__proto__", "constructor", "prototype"]);
 const JOINED_GRAPH_CREDENTIAL_ID_RE =
-  /(?:^|[^A-Za-z0-9])(?:mcp_(?:at|rt|code)_|ac_|agent_key_|sk[-_]|rk_(?:live|test)_|gh[pousr]_|github_pat_|glpat-|xox[baprs]-|hf_|npm_|(?:AIza|eyJ)[A-Za-z0-9]|(?:Bearer|Basic)(?:[._-]|$))/i;
-const JOINED_GRAPH_AWS_KEY_ID_RE = /(?:^|[^A-Za-z0-9])(?:AKIA|ASIA)[0-9A-Z]{16}(?![A-Za-z0-9])/;
+  /(?:^|[^A-Za-z0-9])(?:mcp_(?:at|rt|code)_|ac_|agent_key_|sk[-_]|rk_(?:live|test)_|gh[pousr]_|github_pat_|glpat-|xox[baprs]-|hf_|npm_|(?:Bearer|Basic)(?:[._-]|$))/i;
+const JOINED_GRAPH_AWS_KEY_ID_RE = /(?:^|[^A-Za-z0-9])(?:(?:AKIA|ASIA)[0-9A-Z]{16}(?![A-Za-z0-9])|(?:AIza|eyJ)[A-Za-z0-9_-]{8,})/;
 
 function safeGraphId(value: unknown): value is string {
   return (
@@ -426,8 +437,13 @@ export function summarizeWorkspaceGraphHierarchy(
 }
 
 const DM_OR_DIRECT_CHANNEL_RE = /^(?:dm[-_:]|direct(?:$|[-_:]))/i;
-const EMBEDDED_SECRET_TOKEN_RE =
-  /(?:^|[^A-Za-z0-9])(?:mcp_(?:at|rt|code)_[A-Za-z0-9_-]{8,}|ac_[A-Za-z0-9_+/\-=]{8,}|agent_key_[A-Za-z0-9_-]{8,}|sk[-_][A-Za-z0-9_-]{12,}|rk_(?:live|test)_[A-Za-z0-9]{12,}|gh[pousr]_[A-Za-z0-9_]{8,}|github_pat_[A-Za-z0-9_]{8,}|glpat-[A-Za-z0-9_-]{12,}|xox[baprs]-[A-Za-z0-9-]{10,}|(?:AKIA|ASIA)[0-9A-Z]{16}(?:$|[^A-Za-z0-9])|(?:hf|npm)_[A-Za-z0-9]{12,}|AIza[A-Za-z0-9_-]{12,}|eyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}|\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{12,}|-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----)/i;
+const EMBEDDED_SECRET_BASE_RE =
+  /(?:^|[^A-Za-z0-9])(?:mcp_(?:at|rt|code)_[A-Za-z0-9_-]{6,}|ac_[A-Za-z0-9_+/\-=]{8,}|agent_key_[A-Za-z0-9_-]{6,}|sk[-_][A-Za-z0-9_-]{12,}|rk_(?:live|test)_[A-Za-z0-9]{10,}|gh[pousr]_[A-Za-z0-9_]{8,}|github_pat_[A-Za-z0-9_]{8,}|glpat-[A-Za-z0-9_-]{10,}|xox[baprs]-[A-Za-z0-9-]{10,}|(?:hf|npm)_[A-Za-z0-9]{12,}|\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{12,}|-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----)/i;
+const EMBEDDED_SECRET_TOKEN_RE = {
+  test(value: string): boolean {
+    return EMBEDDED_SECRET_BASE_RE.test(value) || JOINED_GRAPH_AWS_KEY_ID_RE.test(value);
+  },
+};
 
 function isPrivateOrLoopbackHostname(rawHostname: string): boolean {
   const host = rawHostname.trim().toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
@@ -864,13 +880,23 @@ export function evaluateConsensusTally(
 export function summarizeProposalsFeed(
   raw: unknown,
   nowMs?: number,
+  expectedChannelId?: string,
 ): import("./types").ProposalsFeedSummary | null {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
   const feed = raw as Record<string, unknown>;
-  if (!safeNonDmChannelId(feed.channel_id) || !Array.isArray(feed.proposals) || feed.proposals.length > 500) {
+  const channelId = typeof feed.channel_id === "string" ? feed.channel_id.trim() : "";
+  if (
+    !safeNonDmChannelId(channelId) ||
+    !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(channelId) ||
+    !Array.isArray(feed.proposals) ||
+    feed.proposals.length > 500
+  ) {
     return null;
   }
-  const channelId = feed.channel_id;
+  if (expectedChannelId !== undefined) {
+    const trimmedExpected = typeof expectedChannelId === "string" ? expectedChannelId.trim() : "";
+    if (trimmedExpected !== channelId) return null;
+  }
   const refNow = typeof nowMs === "number" && Number.isFinite(nowMs) ? nowMs : Date.now();
   const canPropose = feed.can_propose === false || feed.read_only === true ? false : true;
 
@@ -885,9 +911,10 @@ export function summarizeProposalsFeed(
   for (const item of feed.proposals) {
     if (!item || typeof item !== "object" || Array.isArray(item)) continue;
     const p = item as Record<string, unknown>;
-    if (!safeGraphId(p.id) || EMBEDDED_SECRET_TOKEN_RE.test(p.id) || seenIds.has(p.id)) continue;
-    if (p.channel_id !== undefined && p.channel_id !== channelId) continue;
-    seenIds.add(p.id);
+    const pid = typeof p.id === "string" ? p.id.trim() : "";
+    if (!safeGraphId(pid) || EMBEDDED_SECRET_TOKEN_RE.test(pid) || seenIds.has(pid)) continue;
+    if (p.channel_id !== undefined && String(p.channel_id).trim() !== channelId) continue;
+    seenIds.add(pid);
 
     let status: import("./types").ChannelProposalStatus =
       p.status === "passed" || p.status === "rejected" || p.status === "expired" ? p.status : "pending";
@@ -903,22 +930,35 @@ export function summarizeProposalsFeed(
     else if (status === "expired") expiredCount += 1;
     else {
       pendingCount += 1;
-      pendingIds.push(p.id);
+      pendingIds.push(pid);
     }
 
     if (Array.isArray(p.votes)) {
       const seenVoters = new Set<string>();
       for (const v of p.votes.slice(0, 200)) {
-        if (!v || typeof v !== "object") continue;
+        if (!v || typeof v !== "object" || Array.isArray(v)) continue;
         const vote = v as Record<string, unknown>;
         if (vote.decision !== "approve" && vote.decision !== "reject" && vote.decision !== "abstain") continue;
         const voterKey = typeof vote.voter_id === "string" && vote.voter_id.trim() ? vote.voter_id.trim() : "";
-        if (!voterKey || seenVoters.has(voterKey)) continue;
+        if (
+          !voterKey ||
+          PROTOTYPE_POISON_KEYS.has(voterKey.toLowerCase()) ||
+          /^mr_[0-9a-f]{16,}$/i.test(voterKey) ||
+          CREDENTIAL_PREFIX_RE.test(voterKey) ||
+          CASE_SENSITIVE_CREDENTIAL_PREFIX_RE.test(voterKey) ||
+          JOINED_GRAPH_CREDENTIAL_ID_RE.test(voterKey) ||
+          JOINED_GRAPH_AWS_KEY_ID_RE.test(voterKey) ||
+          EMBEDDED_SECRET_TOKEN_RE.test(voterKey) ||
+          seenVoters.has(voterKey)
+        ) {
+          continue;
+        }
         seenVoters.add(voterKey);
         if (
           typeof vote.reason === "string" &&
           vote.reason.trim().length > 0 &&
-          !EMBEDDED_SECRET_TOKEN_RE.test(vote.reason)
+          !EMBEDDED_SECRET_TOKEN_RE.test(vote.reason) &&
+          !JOINED_GRAPH_AWS_KEY_ID_RE.test(vote.reason)
         ) {
           ballotRationaleCount += 1;
         }
@@ -3596,10 +3636,11 @@ export class AgentChatREST {
     channelId: string,
     opts?: { limit?: number; bearerToken?: string },
   ): Promise<import("./types").ChannelProposalsFeed> {
+    const safeChannel = typeof channelId === "string" ? channelId.trim() : "";
     if (
-      !safeNonDmChannelId(channelId) ||
-      PROTOTYPE_POISON_KEYS.has(channelId.toLowerCase()) ||
-      this.containsMemorySecretShape(channelId)
+      !safeNonDmChannelId(safeChannel) ||
+      !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(safeChannel) ||
+      this.containsMemorySecretShape(safeChannel)
     ) {
       throw new Error("Invalid channel ID");
     }
@@ -3615,10 +3656,14 @@ export class AgentChatREST {
       "Cache-Control": "no-store",
       ...(token ? { Authorization: `Bearer ${token}` } : {}),
     };
-    return this.get<import("./types").ChannelProposalsFeed>(
-      `/api/channels/${encodeURIComponent(channelId)}/proposals${qs ? `?${qs}` : ""}`,
+    const raw = await this.get<import("./types").ChannelProposalsFeed>(
+      `/api/channels/${encodeURIComponent(safeChannel)}/proposals${qs ? `?${qs}` : ""}`,
       headers,
     );
+    if (raw && typeof raw.channel_id === "string" && raw.channel_id.trim() && raw.channel_id.trim() !== safeChannel) {
+      throw new Error("Channel proposals response channel mismatch");
+    }
+    return raw;
   }
 
   async createChannelProposal(
@@ -3626,28 +3671,31 @@ export class AgentChatREST {
     input: import("./types").CreateChannelProposalInput,
     opts?: { bearerToken?: string },
   ): Promise<import("./types").CreateChannelProposalResponse> {
+    const safeChannel = typeof channelId === "string" ? channelId.trim() : "";
     if (
-      !safeNonDmChannelId(channelId) ||
-      PROTOTYPE_POISON_KEYS.has(channelId.toLowerCase()) ||
-      this.containsMemorySecretShape(channelId)
+      !safeNonDmChannelId(safeChannel) ||
+      !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(safeChannel) ||
+      this.containsMemorySecretShape(safeChannel)
     ) {
       throw new Error("Invalid channel ID");
     }
+    const safePropId = input?.id !== undefined ? (typeof input.id === "string" ? input.id.trim() : "") : undefined;
     if (
-      input?.id !== undefined &&
-      (!safeGraphId(input.id) ||
-        PROTOTYPE_POISON_KEYS.has(input.id.toLowerCase()) ||
-        EMBEDDED_SECRET_TOKEN_RE.test(input.id) ||
-        this.containsMemorySecretShape(input.id))
+      safePropId !== undefined &&
+      (!safeGraphId(safePropId) ||
+        !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(safePropId) ||
+        EMBEDDED_SECRET_TOKEN_RE.test(safePropId) ||
+        this.containsMemorySecretShape(safePropId))
     ) {
       throw new Error("Invalid proposal ID");
     }
+    const safeSenderId =
+      input?.sender_id !== undefined ? (typeof input.sender_id === "string" ? input.sender_id.trim() : "") : undefined;
     if (
-      input?.sender_id !== undefined &&
-      (!isSafeCollaborationAgentId(input.sender_id) ||
-        PROTOTYPE_POISON_KEYS.has(input.sender_id.toLowerCase()) ||
-        EMBEDDED_SECRET_TOKEN_RE.test(input.sender_id) ||
-        this.containsMemorySecretShape(input.sender_id))
+      safeSenderId !== undefined &&
+      (!isSafeCollaborationAgentId(safeSenderId) ||
+        EMBEDDED_SECRET_TOKEN_RE.test(safeSenderId) ||
+        this.containsMemorySecretShape(safeSenderId))
     ) {
       throw new Error("Invalid proposal sender_id");
     }
@@ -3659,7 +3707,7 @@ export class AgentChatREST {
       if (
         typeof textField === "string" &&
         textField.length > 0 &&
-        (EMBEDDED_SECRET_TOKEN_RE.test(textField) || this.containsMemorySecretShape(textField))
+        (JOINED_GRAPH_AWS_KEY_ID_RE.test(textField) || this.containsMemorySecretShape(textField))
       ) {
         throw new Error("Secret or credential detected in proposal payload");
       }
@@ -3678,15 +3726,15 @@ export class AgentChatREST {
     };
     const body: Record<string, unknown> = {
       title,
-      ...(input.id !== undefined ? { id: input.id } : {}),
-      ...(input.sender_id !== undefined ? { sender_id: input.sender_id } : {}),
+      ...(safePropId !== undefined ? { id: safePropId } : {}),
+      ...(safeSenderId !== undefined ? { sender_id: safeSenderId } : {}),
       ...(input.content !== undefined ? { content: input.content } : {}),
       ...(input.code_diff !== undefined ? { code_diff: input.code_diff } : {}),
       ...(input.consensus_rule !== undefined ? { consensus_rule: input.consensus_rule } : {}),
       ...(input.expires_at !== undefined ? { expires_at: input.expires_at } : {}),
     };
     return this.post<import("./types").CreateChannelProposalResponse>(
-      `/api/channels/${encodeURIComponent(channelId)}/proposals`,
+      `/api/channels/${encodeURIComponent(safeChannel)}/proposals`,
       body,
       headers,
     );
@@ -3698,27 +3746,30 @@ export class AgentChatREST {
     input: import("./types").VoteChannelProposalInput,
     opts?: { bearerToken?: string },
   ): Promise<import("./types").VoteChannelProposalResponse> {
+    const safeChannel = typeof channelId === "string" ? channelId.trim() : "";
     if (
-      !safeNonDmChannelId(channelId) ||
-      PROTOTYPE_POISON_KEYS.has(channelId.toLowerCase()) ||
-      this.containsMemorySecretShape(channelId)
+      !safeNonDmChannelId(safeChannel) ||
+      !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(safeChannel) ||
+      this.containsMemorySecretShape(safeChannel)
     ) {
       throw new Error("Invalid channel ID");
     }
+    const safeProposal = typeof proposalId === "string" ? proposalId.trim() : "";
     if (
-      !safeGraphId(proposalId) ||
-      PROTOTYPE_POISON_KEYS.has(proposalId.toLowerCase()) ||
-      EMBEDDED_SECRET_TOKEN_RE.test(proposalId) ||
-      this.containsMemorySecretShape(proposalId)
+      !safeGraphId(safeProposal) ||
+      !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(safeProposal) ||
+      EMBEDDED_SECRET_TOKEN_RE.test(safeProposal) ||
+      this.containsMemorySecretShape(safeProposal)
     ) {
       throw new Error("Invalid proposal ID");
     }
+    const safeVoterId =
+      input?.voter_id !== undefined ? (typeof input.voter_id === "string" ? input.voter_id.trim() : "") : undefined;
     if (
-      input?.voter_id !== undefined &&
-      (!isSafeCollaborationAgentId(input.voter_id) ||
-        PROTOTYPE_POISON_KEYS.has(input.voter_id.toLowerCase()) ||
-        EMBEDDED_SECRET_TOKEN_RE.test(input.voter_id) ||
-        this.containsMemorySecretShape(input.voter_id))
+      safeVoterId !== undefined &&
+      (!isSafeCollaborationAgentId(safeVoterId) ||
+        EMBEDDED_SECRET_TOKEN_RE.test(safeVoterId) ||
+        this.containsMemorySecretShape(safeVoterId))
     ) {
       throw new Error("Invalid proposal voter_id");
     }
@@ -3728,7 +3779,7 @@ export class AgentChatREST {
     if (
       typeof input.reason === "string" &&
       input.reason.length > 0 &&
-      (EMBEDDED_SECRET_TOKEN_RE.test(input.reason) || this.containsMemorySecretShape(input.reason))
+      (JOINED_GRAPH_AWS_KEY_ID_RE.test(input.reason) || this.containsMemorySecretShape(input.reason))
     ) {
       throw new Error("Secret or credential detected in vote reason");
     }
@@ -3740,11 +3791,11 @@ export class AgentChatREST {
     };
     const body: Record<string, unknown> = {
       decision: input.decision,
-      ...(input.voter_id !== undefined ? { voter_id: input.voter_id } : {}),
+      ...(safeVoterId !== undefined ? { voter_id: safeVoterId } : {}),
       ...(input.reason !== undefined ? { reason: input.reason } : {}),
     };
     return this.post<import("./types").VoteChannelProposalResponse>(
-      `/api/channels/${encodeURIComponent(channelId)}/proposals/${encodeURIComponent(proposalId)}/votes`,
+      `/api/channels/${encodeURIComponent(safeChannel)}/proposals/${encodeURIComponent(safeProposal)}/votes`,
       body,
       headers,
     );
@@ -5537,7 +5588,7 @@ export class AgentChatREST {
 
   private containsMemorySecretShape(text: string): boolean {
     if (!text) return false;
-    return EMBEDDED_SECRET_TOKEN_RE.test(text);
+    return EMBEDDED_SECRET_TOKEN_RE.test(text) || JOINED_GRAPH_AWS_KEY_ID_RE.test(text);
   }
 
   async listMemories(opts?: { bearerToken?: string }): Promise<import("./types").AgentMemoryListResponse> {

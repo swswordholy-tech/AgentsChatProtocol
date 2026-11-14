@@ -5118,4 +5118,122 @@ describe("AgentChatClient realtime collaboration WS events", () => {
       globalThis.fetch = originalFetch;
     }
   });
+
+  test("Campaign #59: summarizeProposalsFeed & proposal REST methods enforce expectedChannelId, prototype/credential/mr_ ID guards, and case-sensitive AKIA/ASIA/AIza checks", async () => {
+    const nowMs = Date.parse("2026-11-14T05:30:00Z");
+    const feedPayload = {
+      channel_id: "room-asia-pacific",
+      proposals: [
+        {
+          id: "  aiza-guide-handbook  ",
+          channel_id: "room-asia-pacific",
+          sender_id: "eyj-notes",
+          title: "ship_v2",
+          content: "region asiapacificregion123 clean",
+          status: "pending",
+          created_at: "2026-11-14T05:00:00Z",
+          expires_at: "2026-11-14T06:00:00Z",
+          votes: [
+            { voter_id: "voter-1", decision: "approve", reason: "looks good for aiza-guide", ts: "2026-11-14T05:05:00Z" },
+            { voter_id: "Constructor", decision: "approve", reason: "poison", ts: "2026-11-14T05:06:00Z" },
+            { voter_id: "mr_" + "a".repeat(64), decision: "reject", reason: "opaque", ts: "2026-11-14T05:07:00Z" },
+            { voter_id: "bot_ASIAIOSFODNN7EXAMPLE", decision: "approve", reason: "aws", ts: "2026-11-14T05:08:00Z" },
+            { voter_id: "voter-2", decision: "reject", reason: "leaked AIzaSyKey12345678", ts: "2026-11-14T05:09:00Z" },
+          ],
+        },
+        {
+          id: "prop_ASIAIOSFODNN7EXAMPLE",
+          channel_id: "room-asia-pacific",
+          sender_id: "agent-1",
+          title: "skip",
+          status: "pending",
+          votes: [],
+        },
+      ],
+    };
+
+    expect(summarizeProposalsFeed(feedPayload, nowMs, "other-room")).toBeNull();
+    const summary = summarizeProposalsFeed(feedPayload, nowMs, "  room-asia-pacific  ");
+    expect(summary).not.toBeNull();
+    expect(summary?.total_proposals).toBe(1);
+    expect(summary?.pending_ids).toEqual(["aiza-guide-handbook"]);
+    expect(summary?.ballot_rationale_count).toBe(1);
+
+    const originalFetch = globalThis.fetch;
+    let calls = 0;
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      calls += 1;
+      const url = String(input);
+      if (url.endsWith("/proposals") && calls === 1) {
+        return Response.json({ channel_id: "spoofed-room", proposals: [] });
+      }
+      if (url.endsWith("/proposals")) {
+        return Response.json({ channel_id: "room-asia-pacific", proposals: [] });
+      }
+      return Response.json({ ok: true, id: "aiza-guide-handbook", status: "pending" });
+    }) as unknown as typeof fetch;
+
+    try {
+      const rest = new AgentChatREST({ baseUrl: "https://agents-chat.com", bearerToken: "tok_59" });
+      await expect(rest.listChannelProposals("room-asia-pacific")).rejects.toThrow(
+        "Channel proposals response channel mismatch",
+      );
+      expect(calls).toBe(1);
+
+      const okList = await rest.listChannelProposals("  room-asia-pacific  ");
+      expect(okList.channel_id).toBe("room-asia-pacific");
+
+      await rest.createChannelProposal("  room-asia-pacific  ", {
+        id: "  aiza-guide-handbook  ",
+        sender_id: "  eyj-notes  ",
+        title: "Ship for asiapacificregion123",
+        content: "aiza-guide handbook ready",
+        consensus_rule: "majority",
+      });
+      await rest.voteChannelProposal("  room-asia-pacific  ", "  aiza-guide-handbook  ", {
+        voter_id: "  eyj-notes  ",
+        decision: "approve",
+        reason: "approved for asiapacificregion123 and aiza-guide",
+      });
+      expect(calls).toBe(4);
+
+      await expect(
+        rest.createChannelProposal("Constructor", { title: "ship" }),
+      ).rejects.toThrow("Invalid channel ID");
+      await expect(
+        rest.createChannelProposal("room-asia-pacific", {
+          id: "mr_" + "f".repeat(64),
+          title: "ship",
+        }),
+      ).rejects.toThrow("Invalid proposal ID");
+      await expect(
+        rest.createChannelProposal("room-asia-pacific", {
+          sender_id: "Constructor",
+          title: "ship",
+        }),
+      ).rejects.toThrow("Invalid proposal sender_id");
+      await expect(
+        rest.createChannelProposal("room-asia-pacific", {
+          title: "ship",
+          content: "key ASIAIOSFODNN7EXAMPLE",
+        }),
+      ).rejects.toThrow("Secret or credential detected");
+      await expect(
+        rest.voteChannelProposal("room-asia-pacific", "aiza-guide-handbook", {
+          voter_id: "mr_" + "b".repeat(64),
+          decision: "approve",
+        }),
+      ).rejects.toThrow("Invalid proposal voter_id");
+      await expect(
+        rest.voteChannelProposal("room-asia-pacific", "aiza-guide-handbook", {
+          voter_id: "eyj-notes",
+          decision: "approve",
+          reason: "token ASIAIOSFODNN7EXAMPLE",
+        }),
+      ).rejects.toThrow("Secret or credential detected");
+      expect(calls).toBe(4);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
 });
