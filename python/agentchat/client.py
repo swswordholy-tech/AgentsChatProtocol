@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 import websockets
-from websockets.asyncio.client import ClientConnection
+from ._security import redact_error
+
+if TYPE_CHECKING:
+    from websockets.asyncio.client import ClientConnection
 
 __all__ = ["AgentChatClient"]
 
@@ -84,7 +88,7 @@ class AgentChatClient:
             connect_timeout: Timeout in seconds for WebSocket open + auth_ok handshake.
             ws_factory: Optional custom async WebSocket connector for testing.
         """
-        if connect_timeout <= 0:
+        if not math.isfinite(connect_timeout) or connect_timeout <= 0:
             raise ValueError("connect_timeout must be > 0")
         self.url = url
         self.agent_id = agent_id
@@ -121,7 +125,10 @@ class AgentChatClient:
             )
         except (TimeoutError, asyncio.TimeoutError) as e:
             self._ws = None
-            raise ConnectionError("WebSocket connection timed out") from e
+            raise ConnectionError("WebSocket connection timed out") from None
+        except Exception as e:
+            self._ws = None
+            raise ConnectionError(redact_error(e, self.token)) from None
 
         try:
             await self._send({
@@ -143,17 +150,20 @@ class AgentChatClient:
                 return
             if resp_type in ("error", "auth_error"):
                 detail = response.get("message") or response.get("reason") or response.get("code") or "unauthorized"
-                raise ConnectionError(f"Auth failed: {detail}")
-            raise ConnectionError(f"Unexpected response: {response}")
+                raise ConnectionError(f"Auth failed: {redact_error(detail, self.token)}")
+            raise ConnectionError(f"Unexpected response: {redact_error(response, self.token)}")
+        except asyncio.CancelledError:
+            await self._close_ws_quietly()
+            raise
         except ConnectionError:
             await self._close_ws_quietly()
             raise
         except (TimeoutError, asyncio.TimeoutError) as e:
             await self._close_ws_quietly()
-            raise ConnectionError("Auth handshake timed out") from e
+            raise ConnectionError("Auth handshake timed out") from None
         except Exception as e:
             await self._close_ws_quietly()
-            raise ConnectionError(f"Handshake failed: {e}") from e
+            raise ConnectionError(f"Handshake failed: {redact_error(e, self.token)}") from None
 
     async def disconnect(self) -> None:
         """Close the WebSocket connection and stop the message loop."""
@@ -163,6 +173,8 @@ class AgentChatClient:
     async def _close_ws_quietly(self) -> None:
         ws = self._ws
         self._ws = None
+        self._running = False
+        self._session_id = None
         if ws is not None:
             try:
                 await ws.close()
@@ -220,6 +232,7 @@ class AgentChatClient:
             try:
                 raw = await self._ws.recv()
             except websockets.ConnectionClosed:
+                await self._close_ws_quietly()
                 break
 
             try:
@@ -234,7 +247,7 @@ class AgentChatClient:
                 self._running = False
                 await self._close_ws_quietly()
                 detail = data.get("message") or data.get("reason") or data.get("code") or "unauthorized"
-                raise ConnectionError(f"Auth error: {detail}")
+                raise ConnectionError(f"Auth error: {redact_error(detail, self.token)}")
 
             if msg_type in ("please_reconnect", "shard_moved"):
                 await self._close_ws_quietly()
@@ -242,6 +255,8 @@ class AgentChatClient:
 
             try:
                 if msg_type == "message":
+                    if data.get("content") == "__typing__":
+                        continue
                     msg = ChatMessage(
                         id=str(data["id"]),
                         channel_id=str(data["channel_id"]),
@@ -700,7 +715,7 @@ class AgentChatClient:
         Args:
             interval: Seconds between pings. Defaults to 30.
         """
-        if interval <= 0:
+        if not math.isfinite(interval) or interval <= 0:
             raise ValueError("interval must be > 0")
         while self._running:
             await asyncio.sleep(interval)

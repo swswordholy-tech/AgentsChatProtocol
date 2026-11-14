@@ -1,5 +1,7 @@
 // AgentsChat TypeScript SDK — WebSocket client
 
+import { redactError } from "./security";
+
 import type {
   AgentPresence,
   ChannelDocUpdatedHandler,
@@ -48,6 +50,7 @@ export class AgentChatClient {
   private ws: WebSocket | null = null;
   private sessionId: string | null = null;
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  private awaitingPongSince: number | null = null;
   private connectTimer: ReturnType<typeof setTimeout> | null = null;
 
   private messageHandlers: MessageHandler[] = [];
@@ -77,6 +80,7 @@ export class AgentChatClient {
   readonly capabilities: string[];
   readonly heartbeatInterval: number;
   readonly connectTimeoutMs: number;
+  readonly heartbeatTimeoutMs: number;
 
   constructor(options: ClientOptions) {
     this.url = options.url;
@@ -85,6 +89,10 @@ export class AgentChatClient {
     this.capabilities = options.capabilities ?? [];
     this.heartbeatInterval = options.heartbeatInterval ?? 30_000;
     this.connectTimeoutMs = options.connectTimeoutMs ?? 15_000;
+    this.heartbeatTimeoutMs = options.heartbeatTimeoutMs ?? this.heartbeatInterval * 2;
+    for (const [name, value] of Object.entries({ heartbeatInterval: this.heartbeatInterval, heartbeatTimeoutMs: this.heartbeatTimeoutMs, connectTimeoutMs: this.connectTimeoutMs })) {
+      if (!Number.isFinite(value) || value <= 0) throw new Error(`${name} must be a positive finite number`);
+    }
     this.wsFactory = options.wsFactory ?? ((url: string) => new WebSocket(url));
   }
 
@@ -111,7 +119,7 @@ export class AgentChatClient {
       try {
         socket = this.wsFactory(this.url);
       } catch (err) {
-        this.rejectConnect(err instanceof Error ? err : new Error(String(err)));
+        this.rejectConnect(new Error(redactError(err instanceof Error ? err.message : err, this.token)));
         return;
       }
       this.ws = socket;
@@ -449,6 +457,7 @@ export class AgentChatClient {
         break;
 
       case "message": {
+        if (data.content === "__typing__") break;
         const msg: ChatMessage = {
           type: "message",
           id: data.id,
@@ -523,9 +532,8 @@ export class AgentChatClient {
       }
 
       case "auth_error": {
-        const detail = String(data.message ?? data.reason ?? data.code ?? "unauthorized");
+        const detail = redactError(data.message ?? data.reason ?? data.code ?? "unauthorized", this.token);
         const codeNum = typeof data.code === "number" ? data.code : 401;
-        this.invokeHandlers(this.errorHandlers, codeNum, detail);
         this.stopHeartbeat();
         const prev = this.ws;
         this.ws = null;
@@ -534,6 +542,7 @@ export class AgentChatClient {
         try {
           prev?.close();
         } catch {}
+        this.invokeHandlers(this.errorHandlers, codeNum, detail);
         break;
       }
 
@@ -545,27 +554,29 @@ export class AgentChatClient {
         this.ws = null;
         this.sessionId = null;
         this.rejectConnect(new Error(`Server requested reconnect (${data.type})`));
+        try {
+          prev?.close();
+        } catch {}
         this.invokeHandlers(this.reconnectNeededHandlers, {
           reason: data.type,
           ...(targetUrl ? { targetUrl } : {}),
         });
-        try {
-          prev?.close();
-        } catch {}
         break;
       }
 
-      case "error":
-        this.invokeHandlers(this.errorHandlers, data.code, data.message);
+      case "error": {
+        const detail = redactError(data.message ?? "Unknown error", this.token);
         if (!this.sessionId) {
           const prev = this.ws;
           this.ws = null;
-          this.rejectConnect(new Error(`Auth failed: ${data.message}`));
+          this.rejectConnect(new Error(`Auth failed: ${detail}`));
           try {
             prev?.close();
           } catch {}
         }
+        this.invokeHandlers(this.errorHandlers, data.code, detail);
         break;
+      }
 
       case "reaction_update":
         this.invokeHandlers(this.reactionHandlers, data as ReactionUpdate);
@@ -645,6 +656,8 @@ export class AgentChatClient {
       }
 
       case "pong":
+        this.awaitingPongSince = null;
+        break;
       case "role_update":
       case "agent_status":
       case "typing":
@@ -687,6 +700,7 @@ export class AgentChatClient {
   }
 
   private stopHeartbeat() {
+    this.awaitingPongSince = null;
     if (this.heartbeatTimer) {
       clearInterval(this.heartbeatTimer);
       this.heartbeatTimer = null;
@@ -706,7 +720,26 @@ export class AgentChatClient {
   private startHeartbeat() {
     this.stopHeartbeat();
     this.heartbeatTimer = setInterval(() => {
-      this.send({ type: "ping", timestamp: new Date().toISOString() });
+      if (this.awaitingPongSince !== null && Date.now() - this.awaitingPongSince >= this.heartbeatTimeoutMs) {
+        const prev = this.ws;
+        this.stopHeartbeat();
+        this.ws = null;
+        this.sessionId = null;
+        try { prev?.close(); } catch {}
+        this.invokeHandlers(this.errorHandlers, 408, "WebSocket heartbeat timed out");
+        return;
+      }
+      if (this.awaitingPongSince === null) this.awaitingPongSince = Date.now();
+      try {
+        this.send({ type: "ping", timestamp: new Date().toISOString() });
+      } catch {
+        const prev = this.ws;
+        this.stopHeartbeat();
+        this.ws = null;
+        this.sessionId = null;
+        try { prev?.close(); } catch {}
+        this.invokeHandlers(this.errorHandlers, 0, "WebSocket heartbeat send failed");
+      }
     }, this.heartbeatInterval);
     (this.heartbeatTimer as unknown as { unref?: () => void })?.unref?.();
   }
