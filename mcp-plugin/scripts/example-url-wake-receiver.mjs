@@ -28,6 +28,8 @@
  * scripts/example-agy-mcp-wrapper.sh as the host's MCP command (fails closed).
  *
  * Signature header: x-agentschat-signature (same as mcp-plugin/src/wake.ts).
+ * Limits: 64 KiB raw body, timestamp within ±5 minutes, 15s HTTP receive timeout.
+ * Host commands have a 180s deadline; stdout/stderr are suppressed to protect credentials.
  * Payload fields: type, channel_id, message_id, sender_id, content (≤500),
  * mentioned_ids, timestamp. Never expect an ac_ token in the body.
  *
@@ -59,7 +61,7 @@ export function signWakeBody(body, secret) {
 
 /** Constant-time verify that `sigHex` signs `body` under `secret`. */
 export function verifyWakeSignature(body, sigHex, secret) {
-  if (!sigHex || typeof sigHex !== "string" || !secret) return false;
+  if (typeof sigHex !== "string" || !/^[a-f0-9]{64}$/i.test(sigHex) || !secret) return false;
   let sigBuf;
   try {
     sigBuf = Buffer.from(sigHex, "hex");
@@ -81,16 +83,90 @@ function envOr(name, fallback) {
   return v && v.trim() ? v.trim() : fallback;
 }
 
-function log(msg) {
-  process.stderr.write(`${new Date().toISOString()} ${msg}\n`);
+export const WAKE_BODY_MAX_BYTES = 64 * 1024;
+export const WAKE_REPLAY_WINDOW_MS = 5 * 60 * 1000;
+
+export function isFreshWakeTimestamp(value, now = Date.now()) {
+  if (typeof value !== "string" || !/^\d{4}-\d\d-\d\dT.*(?:Z|[+-]\d\d:\d\d)$/.test(value)) return false;
+  const time = Date.parse(value);
+  return Number.isFinite(time) && Math.abs(now - time) <= WAKE_REPLAY_WINDOW_MS;
 }
 
-function readBody(req) {
+export function redactWakeLog(value) {
+  let text = String(value);
+  for (const secret of [process.env.AGENTCHAT_WAKE_SECRET, process.env.AGENTCHAT_TOKEN]) {
+    if (secret) text = text.split(secret).join("[redacted]");
+  }
+  return text.replace(/(?:ac_|agent_key_|sk-|sk_|ghp_|github_pat_)[A-Za-z0-9_-]+/gi, "[redacted]")
+    .replace(/(?:Bearer|Basic)\s+[^\s]+/gi, "[redacted]")
+    .replace(/[\r\n\x00-\x1f\x7f]/g, " ");
+}
+
+function log(msg) {
+  process.stderr.write(`${new Date().toISOString()} ${redactWakeLog(msg)}\n`);
+}
+
+export function atomicWriteJson(filename, value) {
+  const tmp = `${filename}.${process.pid}.${crypto.randomBytes(8).toString("hex")}.tmp`;
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(value), { mode: 0o600, flag: "wx" });
+    fs.renameSync(tmp, filename);
+  } finally {
+    try { fs.unlinkSync(tmp); } catch { /* renamed or failed */ }
+  }
+}
+
+export function readBody(req, maxBytes = WAKE_BODY_MAX_BYTES) {
   return new Promise((resolve, reject) => {
     const chunks = [];
-    req.on("data", (c) => chunks.push(c));
-    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
-    req.on("error", reject);
+    let size = 0;
+    let done = false;
+    const fail = (error) => {
+      if (done) return;
+      done = true;
+      chunks.length = 0;
+      reject(error);
+    };
+    req.on("data", (chunk) => {
+      if (done) return;
+      const c = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      size += c.length;
+      if (size > maxBytes) {
+        fail(Object.assign(new Error("body too large"), { statusCode: 413 }));
+        return;
+      }
+      chunks.push(c);
+    });
+    req.on("end", () => {
+      if (done) return;
+      done = true;
+      resolve(Buffer.concat(chunks));
+    });
+    req.on("error", fail);
+    req.on("aborted", () => fail(new Error("request aborted")));
+  });
+}
+
+/** Kill the whole shell group on timeout; never inherit credential-bearing output. */
+export function runWakeCommand(cmd, input, env, timeoutMs = 180_000) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(cmd, { shell: true, detached: process.platform !== "win32",
+      env, stdio: ["pipe", "ignore", "ignore"] });
+    const timer = setTimeout(() => {
+      try {
+        if (process.platform !== "win32" && child.pid) process.kill(-child.pid, "SIGKILL");
+        else child.kill("SIGKILL");
+      } catch { /* already exited */ }
+      reject(new Error("wake command timed out"));
+    }, timeoutMs);
+    child.stdin.on("error", () => { /* early child exit / EPIPE */ });
+    child.once("error", () => { clearTimeout(timer); reject(new Error("wake command spawn failed")); });
+    child.once("close", (code) => {
+      clearTimeout(timer);
+      if (code === 0) resolve();
+      else reject(new Error("wake command failed"));
+    });
+    child.stdin.end(input);
   });
 }
 
@@ -238,7 +314,7 @@ function startServer() {
     if (seen.includes(messageId)) return;
     seen.push(messageId);
     if (seen.length > 200) seen = seen.slice(seen.length - 200);
-    fs.writeFileSync(dedupePath, JSON.stringify(seen));
+    atomicWriteJson(dedupePath, seen);
   }
 
   function queueLen() {
@@ -252,12 +328,12 @@ function startServer() {
   function isBusy() {
     try {
       const pid = Number(fs.readFileSync(lockPath, "utf8").trim());
-      if (!pid) return false;
+      if (!Number.isSafeInteger(pid) || pid <= 0) return false;
       try {
         process.kill(pid, 0);
         return true;
-      } catch {
-        return false;
+      } catch (e) {
+        return e?.code === "EPERM";
       }
     } catch {
       return false;
@@ -266,7 +342,7 @@ function startServer() {
 
   function tryAcquireLock() {
     try {
-      const fd = fs.openSync(lockPath, "wx");
+      const fd = fs.openSync(lockPath, "wx", 0o600);
       fs.writeFileSync(fd, String(process.pid));
       fs.closeSync(fd);
       return true;
@@ -309,25 +385,11 @@ function startServer() {
       log(`EXAMPLE no AGENTCHAT_URL_WAKE_CMD; would inject:\n${prompt.slice(0, 200)}…`);
       return;
     }
-    // Single shell command; JSON job on stdin; prompt also in env for simple wrappers.
-    await new Promise((resolve) => {
-      const child = spawn(cmd, {
-        shell: true,
-        env: {
-          ...buildHostChildEnv(process.env, pin),
-          AGENTCHAT_URL_WAKE_PROMPT: prompt,
-          AGENTCHAT_URL_WAKE_CHANNEL_ID: String(job.channel_id || ""),
-          AGENTCHAT_URL_WAKE_MESSAGE_ID: String(job.message_id || ""),
-        },
-        stdio: ["pipe", "inherit", "inherit"],
-      });
-      child.stdin.write(JSON.stringify({ ...job, prompt }));
-      child.stdin.end();
-      child.on("close", () => resolve());
-      child.on("error", (err) => {
-        log(`spawn error: ${err}`);
-        resolve();
-      });
+    await runWakeCommand(cmd, JSON.stringify({ ...job, prompt }), {
+      ...buildHostChildEnv(process.env, pin),
+      AGENTCHAT_URL_WAKE_PROMPT: prompt,
+      AGENTCHAT_URL_WAKE_CHANNEL_ID: String(job.channel_id || ""),
+      AGENTCHAT_URL_WAKE_MESSAGE_ID: String(job.message_id || ""),
     });
   }
 
@@ -379,8 +441,9 @@ function startServer() {
       let raw;
       try {
         raw = await readBody(req);
-      } catch {
-        sendJson(res, 400, { ok: false, error: "bad body" });
+      } catch (e) {
+        res.setHeader("Connection", "close");
+        sendJson(res, e?.statusCode === 413 ? 413 : 400, { ok: false, error: "bad body" });
         return;
       }
       const sig = req.headers[WAKE_SIG_HEADER];
@@ -400,13 +463,16 @@ function startServer() {
         sendJson(res, 400, { ok: false, error: "channel_id required" });
         return;
       }
+      if (!isFreshWakeTimestamp(payload.timestamp)) {
+        sendJson(res, 400, { ok: false, error: "stale or missing timestamp" });
+        return;
+      }
       const messageId = typeof payload.message_id === "string" ? payload.message_id : undefined;
       if (messageId && wasSeen(messageId)) {
         log(`dedupe skip message_id=${messageId}`);
         sendJson(res, 202, { ok: true, deduped: true });
         return;
       }
-      if (messageId) rememberSeen(messageId);
       const qid = `${Date.now()}-${crypto.randomBytes(4).toString("hex")}`;
       const job = {
         type: payload.type || "message",
@@ -422,7 +488,14 @@ function startServer() {
         _qid: qid,
         _enqueued_at: new Date().toISOString(),
       };
-      fs.writeFileSync(path.join(queueDir, `${qid}.json`), JSON.stringify(job));
+      try {
+        atomicWriteJson(path.join(queueDir, `${qid}.json`), job);
+        if (messageId) rememberSeen(messageId);
+      } catch {
+        log("queue persistence failed");
+        sendJson(res, 503, { ok: false, error: "queue unavailable" });
+        return;
+      }
       log(`enqueued qid=${qid} channel_id=${job.channel_id}`);
       sendJson(res, 202, { ok: true, queued: true, qid });
       setImmediate(() => {
@@ -433,6 +506,9 @@ function startServer() {
     sendJson(res, 404, { ok: false, error: "not found" });
   });
 
+  server.requestTimeout = 15_000;
+  server.headersTimeout = 10_000;
+  server.setTimeout(15_000, (socket) => socket.destroy());
   server.listen(port, "127.0.0.1", () => {
     log(`EXAMPLE listening 127.0.0.1:${port}${wakePath} (not a production daemon)`);
     pump().catch((e) => log(`boot pump error: ${e}`));

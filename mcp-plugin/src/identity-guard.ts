@@ -59,22 +59,40 @@ export function emptyGuardRecord(): IdentityGuardRecord {
   return { bySelector: {}, lastEffective: null };
 }
 
+function isUnsafeSelectorKey(key: string): boolean {
+  const lower = key.toLowerCase();
+  return lower === "__proto__" || lower === "constructor" || lower === "prototype";
+}
+
 /** Parse a persisted record; anything unreadable/malformed is an empty record (never blocks boot). */
 export function parseGuardRecord(text: string | null): IdentityGuardRecord {
   if (!text) return emptyGuardRecord();
   try {
     const raw = JSON.parse(text);
-    if (!raw || typeof raw !== "object") return emptyGuardRecord();
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return emptyGuardRecord();
+    const bySelector: Record<string, string> = {};
+    if (raw.bySelector && typeof raw.bySelector === "object" && !Array.isArray(raw.bySelector)) {
+      for (const [k, v] of Object.entries(raw.bySelector as Record<string, unknown>)) {
+        const key = k.trim();
+        if (!key || isUnsafeSelectorKey(key) || typeof v !== "string" || !v.trim()) continue;
+        bySelector[key] = v.trim();
+      }
+    }
     return {
-      bySelector: raw.bySelector && typeof raw.bySelector === "object" ? { ...raw.bySelector } : {},
-      lastEffective: raw.lastEffective && typeof raw.lastEffective.agentId === "string"
-        ? {
-            agentId: raw.lastEffective.agentId,
-            source: String(raw.lastEffective.source ?? "unknown"),
-            ...(raw.lastEffective.declaredName ? { declaredName: String(raw.lastEffective.declaredName) } : {}),
-            ts: String(raw.lastEffective.ts ?? ""),
-          }
-        : null,
+      bySelector,
+      lastEffective:
+        raw.lastEffective &&
+        typeof raw.lastEffective === "object" &&
+        !Array.isArray(raw.lastEffective) &&
+        typeof raw.lastEffective.agentId === "string" &&
+        raw.lastEffective.agentId.trim().length > 0
+          ? {
+              agentId: raw.lastEffective.agentId,
+              source: String(raw.lastEffective.source ?? "unknown"),
+              ...(raw.lastEffective.declaredName ? { declaredName: String(raw.lastEffective.declaredName) } : {}),
+              ts: String(raw.lastEffective.ts ?? ""),
+            }
+          : null,
     };
   } catch {
     return emptyGuardRecord();
@@ -104,13 +122,19 @@ export function decideIdentityGuard(prev: IdentityGuardRecord, current: GuardIde
     };
   }
 
-  if (current.declaredName && prev.bySelector[current.declaredName] && prev.bySelector[current.declaredName] !== current.agentId) {
+  const prevSelectorAgent =
+    current.declaredName &&
+    !isUnsafeSelectorKey(current.declaredName) &&
+    Object.hasOwn(prev.bySelector, current.declaredName)
+      ? prev.bySelector[current.declaredName]
+      : undefined;
+  if (current.declaredName && typeof prevSelectorAgent === "string" && prevSelectorAgent !== current.agentId) {
     // Same selector, different identity: the profile file behind the selector
     // changed (likely an intentional edit). Loud, but not gated.
     return {
       kind: "warn",
       message:
-        `identity for selector "${current.declaredName}" changed: was "${prev.bySelector[current.declaredName]}", ` +
+        `identity for selector "${current.declaredName}" changed: was "${prevSelectorAgent}", ` +
         `now "${current.agentId}". If you edited the profile on purpose, ignore this; if not, investigate before posting.`,
     };
   }
@@ -134,7 +158,9 @@ export function advanceGuardRecord(
 ): IdentityGuardRecord {
   const next: IdentityGuardRecord = { bySelector: { ...prev.bySelector }, lastEffective: prev.lastEffective };
   if (!current.agentId) return next;
-  if (current.declaredName) next.bySelector[current.declaredName] = current.agentId;
+  if (current.declaredName && !isUnsafeSelectorKey(current.declaredName)) {
+    next.bySelector[current.declaredName] = current.agentId;
+  }
   if (trusted) {
     next.lastEffective = {
       agentId: current.agentId,

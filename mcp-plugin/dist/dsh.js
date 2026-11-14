@@ -671,13 +671,17 @@ var NON_PROFILE_JSON_FILES = new Set([
 // src/session-bind.ts
 var DEFAULT_SESSION_BINDS_FILENAME = "session-binds.json";
 var LEGACY_AGY_BINDS_FILENAME = "agy-binds.json";
+function isUnsafeBindKey(key) {
+  const lower = key.toLowerCase();
+  return lower === "__proto__" || lower === "constructor" || lower === "prototype";
+}
 function parseSessionBinds(raw) {
   if (!raw || typeof raw !== "object" || Array.isArray(raw))
     return {};
   const out = {};
   for (const [k, v] of Object.entries(raw)) {
     const key = k.trim();
-    if (!key)
+    if (!key || isUnsafeBindKey(key))
       continue;
     if (typeof v === "string" && v.trim()) {
       out[key] = v.trim();

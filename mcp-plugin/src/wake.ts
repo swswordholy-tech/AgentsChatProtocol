@@ -212,6 +212,7 @@ export async function fireWake(msg: WakeMessage, cfg: WakeConfig): Promise<void>
   if (!url) return; // not configured — the wake path is opt-in
 
   const payload = buildWakePayload(msg, { targetSessionId: cfg.targetSessionId });
+  if (!payload.timestamp) payload.timestamp = new Date().toISOString();
   const body = JSON.stringify(payload);
   const headers: Record<string, string> = { "Content-Type": "application/json" };
   if (cfg.secret) headers[WAKE_SIG_HEADER] = signWakeBody(body, cfg.secret);

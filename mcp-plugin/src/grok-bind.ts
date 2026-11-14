@@ -44,7 +44,12 @@ export type GrokBindDecision =
   /** Bind hit — caller resolves `<profileName>` the same way `--profile` does. */
   | { kind: "hit"; conversationId: string; profileName: string };
 
-/** uuid → profile name. Non-string (and empty) values are ignored. */
+function isUnsafeObjectKey(key: string): boolean {
+  const lower = key.toLowerCase();
+  return lower === "__proto__" || lower === "constructor" || lower === "prototype";
+}
+
+/** uuid → profile name. Non-string (and empty / prototype) values are ignored. */
 export function parseGrokBinds(raw: unknown): Record<string, string> {
   if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return {};
   const out: Record<string, string> = {};
@@ -53,7 +58,7 @@ export function parseGrokBinds(raw: unknown): Record<string, string> {
     const name = v.trim();
     if (!name) continue;
     const key = k.trim();
-    if (!key) continue;
+    if (!key || isUnsafeObjectKey(key)) continue;
     out[key] = name;
   }
   return out;
@@ -85,8 +90,8 @@ export function decideGrokBind(input: {
 }): GrokBindDecision {
   if (input.explicitIdentity || input.hasToken) return { kind: "skip" };
   const id = input.conversationId?.trim();
-  if (!id) return { kind: "skip" };
-  const profileName = input.binds[id];
+  if (!id || isUnsafeObjectKey(id)) return { kind: "skip" };
+  const profileName = Object.hasOwn(input.binds, id) ? input.binds[id] : undefined;
   if (typeof profileName === "string" && profileName.length > 0) {
     return { kind: "hit", conversationId: id, profileName };
   }
@@ -102,8 +107,8 @@ export function boundProfileForConversation(
   binds: Record<string, string>,
 ): string | null {
   const id = conversationId?.trim();
-  if (!id) return null;
-  const name = binds[id];
+  if (!id || isUnsafeObjectKey(id)) return null;
+  const name = Object.hasOwn(binds, id) ? binds[id] : undefined;
   return typeof name === "string" && name.length > 0 ? name : null;
 }
 
@@ -142,9 +147,10 @@ export function gateSwitchProfile(input: {
   /** Basename of activeProfileFile — used when conversation id is unset. */
   currentProfileName?: string | null;
 }): SwitchProfileGate {
-  const req =
+  const reqRaw =
     typeof input.requestedProfileName === "string" ? input.requestedProfileName.trim() : "";
-  if (!req) return { kind: "allow" };
+  if (!reqRaw) return { kind: "allow" };
+  const reqNorm = profileNameFromPath(reqRaw) ?? reqRaw;
 
   const bindValues = Object.values(input.binds).filter((v) => typeof v === "string" && v.length > 0);
   if (bindValues.length === 0) return { kind: "allow" };
@@ -155,23 +161,25 @@ export function gateSwitchProfile(input: {
 
   const bound = boundProfileForConversation(input.conversationId, input.binds);
   if (bound) {
-    if (req === bound) return { kind: "allow" };
+    const boundNorm = profileNameFromPath(bound) ?? bound;
+    if (reqNorm === boundNorm) return { kind: "allow" };
     return {
       kind: "locked",
       boundProfileName: bound,
-      requestedProfileName: req,
+      requestedProfileName: reqRaw,
       message: lockedMessage(bound),
     };
   }
 
   const current =
     typeof input.currentProfileName === "string" ? input.currentProfileName.trim() : "";
-  if (current && bindValues.includes(current)) {
-    if (req === current) return { kind: "allow" };
+  const currentNorm = current ? (profileNameFromPath(current) ?? current) : "";
+  if (current && bindValues.some((v) => (profileNameFromPath(v) ?? v) === currentNorm)) {
+    if (reqNorm === currentNorm) return { kind: "allow" };
     return {
       kind: "locked",
       boundProfileName: current,
-      requestedProfileName: req,
+      requestedProfileName: reqRaw,
       message: lockedMessage(current),
     };
   }

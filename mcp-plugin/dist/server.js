@@ -170,20 +170,26 @@ function withTimeoutController(parentSignal, timeoutMs) {
 }
 
 // src/timestamps.ts
+var ISO_OFFSET_RE = /^(\d{4}-\d{2}-\d{2})[Tt ](\d{2}:\d{2}:\d{2})(?:\.(\d+))?(Z|z|[+-]\d{2}:\d{2})$/;
 function normalizeTimestampForCursor(ts, mode) {
   if (!ts || typeof ts !== "string")
     return ts;
   const padChar = mode === "before" ? "9" : "0";
-  const withFrac = ts.match(/^(.*\.)(\d+)(Z)$/);
-  if (withFrac) {
-    const frac = withFrac[2];
-    if (frac.length >= 9)
-      return ts;
-    return withFrac[1] + frac + padChar.repeat(9 - frac.length) + withFrac[3];
-  }
-  const noFrac = ts.match(/^(.*\d)(Z)$/);
-  if (noFrac) {
-    return noFrac[1] + "." + padChar.repeat(9) + noFrac[2];
+  const m = ts.match(ISO_OFFSET_RE);
+  if (m) {
+    const datePart = m[1];
+    const timePart = m[2];
+    const rawFrac = m[3] ?? "";
+    const tzPart = m[4];
+    const frac9 = rawFrac.length === 9 ? rawFrac : rawFrac.length > 9 ? rawFrac.slice(0, 9) : rawFrac + padChar.repeat(9 - rawFrac.length);
+    if (tzPart === "Z" || tzPart === "z") {
+      return `${datePart}T${timePart}.${frac9}Z`;
+    }
+    const wholeUtcMs = Date.parse(`${datePart}T${timePart}${tzPart}`);
+    if (Number.isFinite(wholeUtcMs)) {
+      const utcWhole = new Date(wholeUtcMs).toISOString().slice(0, 19);
+      return `${utcWhole}.${frac9}Z`;
+    }
   }
   return ts;
 }
@@ -1730,6 +1736,10 @@ function projectProfileSelector(cwd) {
 import { join as join2 } from "node:path";
 var DEFAULT_GROK_BINDS_FILENAME = "grok-binds.json";
 var GROK_BINDS_META_FILENAME = "grok-binds.meta.json";
+function isUnsafeObjectKey(key) {
+  const lower = key.toLowerCase();
+  return lower === "__proto__" || lower === "constructor" || lower === "prototype";
+}
 function parseGrokBinds(raw) {
   if (raw === null || typeof raw !== "object" || Array.isArray(raw))
     return {};
@@ -1741,7 +1751,7 @@ function parseGrokBinds(raw) {
     if (!name)
       continue;
     const key = k.trim();
-    if (!key)
+    if (!key || isUnsafeObjectKey(key))
       continue;
     out[key] = name;
   }
@@ -1763,9 +1773,9 @@ function decideGrokBind(input) {
   if (input.explicitIdentity || input.hasToken)
     return { kind: "skip" };
   const id = input.conversationId?.trim();
-  if (!id)
+  if (!id || isUnsafeObjectKey(id))
     return { kind: "skip" };
-  const profileName = input.binds[id];
+  const profileName = Object.hasOwn(input.binds, id) ? input.binds[id] : undefined;
   if (typeof profileName === "string" && profileName.length > 0) {
     return { kind: "hit", conversationId: id, profileName };
   }
@@ -1773,9 +1783,9 @@ function decideGrokBind(input) {
 }
 function boundProfileForConversation(conversationId, binds) {
   const id = conversationId?.trim();
-  if (!id)
+  if (!id || isUnsafeObjectKey(id))
     return null;
-  const name = binds[id];
+  const name = Object.hasOwn(binds, id) ? binds[id] : undefined;
   return typeof name === "string" && name.length > 0 ? name : null;
 }
 function profileNameFromPath(profilePath) {
@@ -1786,32 +1796,35 @@ function profileNameFromPath(profilePath) {
   return name || null;
 }
 function gateSwitchProfile(input) {
-  const req = typeof input.requestedProfileName === "string" ? input.requestedProfileName.trim() : "";
-  if (!req)
+  const reqRaw = typeof input.requestedProfileName === "string" ? input.requestedProfileName.trim() : "";
+  if (!reqRaw)
     return { kind: "allow" };
+  const reqNorm = profileNameFromPath(reqRaw) ?? reqRaw;
   const bindValues = Object.values(input.binds).filter((v) => typeof v === "string" && v.length > 0);
   if (bindValues.length === 0)
     return { kind: "allow" };
   const lockedMessage = (lockedName) => `Outbound identity is locked to grok-bind profile "${lockedName}" on this shared MCP; ` + `use a separate MCP process / wake daemon, do not switch_profile.`;
   const bound = boundProfileForConversation(input.conversationId, input.binds);
   if (bound) {
-    if (req === bound)
+    const boundNorm = profileNameFromPath(bound) ?? bound;
+    if (reqNorm === boundNorm)
       return { kind: "allow" };
     return {
       kind: "locked",
       boundProfileName: bound,
-      requestedProfileName: req,
+      requestedProfileName: reqRaw,
       message: lockedMessage(bound)
     };
   }
   const current = typeof input.currentProfileName === "string" ? input.currentProfileName.trim() : "";
-  if (current && bindValues.includes(current)) {
-    if (req === current)
+  const currentNorm = current ? profileNameFromPath(current) ?? current : "";
+  if (current && bindValues.some((v) => (profileNameFromPath(v) ?? v) === currentNorm)) {
+    if (reqNorm === currentNorm)
       return { kind: "allow" };
     return {
       kind: "locked",
       boundProfileName: current,
-      requestedProfileName: req,
+      requestedProfileName: reqRaw,
       message: lockedMessage(current)
     };
   }
@@ -2073,6 +2086,8 @@ async function fireWake(msg, cfg) {
   if (!url)
     return;
   const payload = buildWakePayload(msg, { targetSessionId: cfg.targetSessionId });
+  if (!payload.timestamp)
+    payload.timestamp = new Date().toISOString();
   const body = JSON.stringify(payload);
   const headers = { "Content-Type": "application/json" };
   if (cfg.secret)
@@ -2581,9 +2596,18 @@ function checkAgentLock(opts) {
   const currentPid = opts.currentPid ?? process.pid;
   if (!agentId)
     return { locked: false };
+  const file = lockFilePath(lockDir, agentId);
   const record = readAgentLock(lockDir, agentId);
-  if (!record)
+  if (!record) {
+    if (existsSync4(file)) {
+      try {
+        const st = statSync2(file);
+        if (Date.now() - st.mtimeMs > 1000)
+          unlinkSync2(file);
+      } catch {}
+    }
     return { locked: false };
+  }
   if (!isPidAlive(record.pid)) {
     try {
       unlinkSync2(lockFilePath(lockDir, agentId));
@@ -2626,9 +2650,20 @@ function releaseAgentLock(opts) {
   if (!opts.agentId)
     return false;
   const currentPid = opts.currentPid ?? process.pid;
+  const file = lockFilePath(opts.lockDir, opts.agentId);
   const existing = readAgentLock(opts.lockDir, opts.agentId);
-  if (!existing)
+  if (!existing) {
+    if (existsSync4(file)) {
+      try {
+        const st = statSync2(file);
+        if (Date.now() - st.mtimeMs > 1000) {
+          unlinkSync2(file);
+          return true;
+        }
+      } catch {}
+    }
     return false;
+  }
   const samePid = existing.pid === currentPid;
   const sameSession = Boolean(opts.currentSessionId && existing.sessionId && opts.currentSessionId === existing.sessionId);
   const dead = !isPidAlive(existing.pid);
@@ -2641,13 +2676,17 @@ function releaseAgentLock(opts) {
     return false;
   }
 }
+function isUnsafeBindKey(key) {
+  const lower = key.toLowerCase();
+  return lower === "__proto__" || lower === "constructor" || lower === "prototype";
+}
 function parseSessionBinds(raw) {
   if (!raw || typeof raw !== "object" || Array.isArray(raw))
     return {};
   const out = {};
   for (const [k, v] of Object.entries(raw)) {
     const key = k.trim();
-    if (!key)
+    if (!key || isUnsafeBindKey(key))
       continue;
     if (typeof v === "string" && v.trim()) {
       out[key] = v.trim();
@@ -2732,7 +2771,7 @@ function saveSessionBind(configDir, sessionId, profileName) {
 }
 function removeSessionBind(configDir, sessionId) {
   const sid = sessionId.trim();
-  if (!sid)
+  if (!sid || isUnsafeBindKey(sid))
     return false;
   let removed = false;
   for (const filename of [DEFAULT_SESSION_BINDS_FILENAME, LEGACY_AGY_BINDS_FILENAME]) {
@@ -2741,7 +2780,7 @@ function removeSessionBind(configDir, sessionId) {
       continue;
     try {
       const current = parseSessionBinds(JSON.parse(readFileSync5(path, "utf8")));
-      if (sid in current) {
+      if (Object.hasOwn(current, sid)) {
         delete current[sid];
         safeWriteProfile(path, current);
         removed = true;
@@ -2837,7 +2876,8 @@ function parseAntigravityLsofOutput(stdout, appDataDir = "antigravity") {
   return { ports, openConversations };
 }
 function extractCliFlagValue(cmd, flag) {
-  const re = new RegExp(`${flag}(?:=|\\s+)(?:"([^"]+)"|'([^']+)'|([^\\s"']+))`);
+  const escaped = flag.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const re = new RegExp(`${escaped}(?:=|\\s+)(?:"([^"]+)"|'([^']+)'|([^\\s"']+))`);
   const m = cmd.match(re);
   return (m?.[1] ?? m?.[2] ?? m?.[3] ?? "").trim();
 }
@@ -3312,6 +3352,8 @@ async function detectDshCallerSession(opts) {
         const allValid = roots.filter((r) => typeof r?.id === "string" && r.id.startsWith("session-")).map((r) => r.id);
         if (allValid.length === 1)
           return allValid[0];
+      } else {
+        await res.body?.cancel().catch(() => {});
       }
     } finally {
       clearTimeout(timer);
@@ -3333,13 +3375,17 @@ import { closeSync as closeSync2, existsSync as existsSync5, mkdirSync as mkdirS
 import { join as join5 } from "node:path";
 var DEFAULT_SESSION_BINDS_FILENAME2 = "session-binds.json";
 var LEGACY_AGY_BINDS_FILENAME2 = "agy-binds.json";
+function isUnsafeBindKey2(key) {
+  const lower = key.toLowerCase();
+  return lower === "__proto__" || lower === "constructor" || lower === "prototype";
+}
 function parseSessionBinds2(raw) {
   if (!raw || typeof raw !== "object" || Array.isArray(raw))
     return {};
   const out = {};
   for (const [k, v] of Object.entries(raw)) {
     const key = k.trim();
-    if (!key)
+    if (!key || isUnsafeBindKey2(key))
       continue;
     if (typeof v === "string" && v.trim()) {
       out[key] = v.trim();
@@ -3756,16 +3802,29 @@ var IDENTITY_GUARD_FILENAME = "identity-guard.json";
 function emptyGuardRecord() {
   return { bySelector: {}, lastEffective: null };
 }
+function isUnsafeSelectorKey(key) {
+  const lower = key.toLowerCase();
+  return lower === "__proto__" || lower === "constructor" || lower === "prototype";
+}
 function parseGuardRecord(text) {
   if (!text)
     return emptyGuardRecord();
   try {
     const raw = JSON.parse(text);
-    if (!raw || typeof raw !== "object")
+    if (!raw || typeof raw !== "object" || Array.isArray(raw))
       return emptyGuardRecord();
+    const bySelector = {};
+    if (raw.bySelector && typeof raw.bySelector === "object" && !Array.isArray(raw.bySelector)) {
+      for (const [k, v] of Object.entries(raw.bySelector)) {
+        const key = k.trim();
+        if (!key || isUnsafeSelectorKey(key) || typeof v !== "string" || !v.trim())
+          continue;
+        bySelector[key] = v.trim();
+      }
+    }
     return {
-      bySelector: raw.bySelector && typeof raw.bySelector === "object" ? { ...raw.bySelector } : {},
-      lastEffective: raw.lastEffective && typeof raw.lastEffective.agentId === "string" ? {
+      bySelector,
+      lastEffective: raw.lastEffective && typeof raw.lastEffective === "object" && !Array.isArray(raw.lastEffective) && typeof raw.lastEffective.agentId === "string" && raw.lastEffective.agentId.trim().length > 0 ? {
         agentId: raw.lastEffective.agentId,
         source: String(raw.lastEffective.source ?? "unknown"),
         ...raw.lastEffective.declaredName ? { declaredName: String(raw.lastEffective.declaredName) } : {},
@@ -3790,10 +3849,11 @@ function decideIdentityGuard(prev, current) {
       message: `IDENTITY CHANGED after reconnect/restart: previously trusted as "${last.agentId}" ` + `(via ${last.source}${last.declaredName ? ` "${last.declaredName}"` : ""}), but this boot resolved the DEFAULT profile ` + `"${current.agentId}". Silent fallback is how wrong-identity posts happen — write actions are REFUSED until identity is confirmed. ` + `Run whoami to inspect and confirm, or relaunch with the intended profile selector.`
     };
   }
-  if (current.declaredName && prev.bySelector[current.declaredName] && prev.bySelector[current.declaredName] !== current.agentId) {
+  const prevSelectorAgent = current.declaredName && !isUnsafeSelectorKey(current.declaredName) && Object.hasOwn(prev.bySelector, current.declaredName) ? prev.bySelector[current.declaredName] : undefined;
+  if (current.declaredName && typeof prevSelectorAgent === "string" && prevSelectorAgent !== current.agentId) {
     return {
       kind: "warn",
-      message: `identity for selector "${current.declaredName}" changed: was "${prev.bySelector[current.declaredName]}", ` + `now "${current.agentId}". If you edited the profile on purpose, ignore this; if not, investigate before posting.`
+      message: `identity for selector "${current.declaredName}" changed: was "${prevSelectorAgent}", ` + `now "${current.agentId}". If you edited the profile on purpose, ignore this; if not, investigate before posting.`
     };
   }
   return { kind: "ok" };
@@ -3802,8 +3862,9 @@ function advanceGuardRecord(prev, current, ts, trusted) {
   const next = { bySelector: { ...prev.bySelector }, lastEffective: prev.lastEffective };
   if (!current.agentId)
     return next;
-  if (current.declaredName)
+  if (current.declaredName && !isUnsafeSelectorKey(current.declaredName)) {
     next.bySelector[current.declaredName] = current.agentId;
+  }
   if (trusted) {
     next.lastEffective = {
       agentId: current.agentId,
@@ -3962,20 +4023,26 @@ function persistCursor2(file, cursor, warn) {
 }
 
 // src/timestamps.ts
+var ISO_OFFSET_RE2 = /^(\d{4}-\d{2}-\d{2})[Tt ](\d{2}:\d{2}:\d{2})(?:\.(\d+))?(Z|z|[+-]\d{2}:\d{2})$/;
 function normalizeTimestampForCursor2(ts, mode) {
   if (!ts || typeof ts !== "string")
     return ts;
   const padChar = mode === "before" ? "9" : "0";
-  const withFrac = ts.match(/^(.*\.)(\d+)(Z)$/);
-  if (withFrac) {
-    const frac = withFrac[2];
-    if (frac.length >= 9)
-      return ts;
-    return withFrac[1] + frac + padChar.repeat(9 - frac.length) + withFrac[3];
-  }
-  const noFrac = ts.match(/^(.*\d)(Z)$/);
-  if (noFrac) {
-    return noFrac[1] + "." + padChar.repeat(9) + noFrac[2];
+  const m = ts.match(ISO_OFFSET_RE2);
+  if (m) {
+    const datePart = m[1];
+    const timePart = m[2];
+    const rawFrac = m[3] ?? "";
+    const tzPart = m[4];
+    const frac9 = rawFrac.length === 9 ? rawFrac : rawFrac.length > 9 ? rawFrac.slice(0, 9) : rawFrac + padChar.repeat(9 - rawFrac.length);
+    if (tzPart === "Z" || tzPart === "z") {
+      return `${datePart}T${timePart}.${frac9}Z`;
+    }
+    const wholeUtcMs = Date.parse(`${datePart}T${timePart}${tzPart}`);
+    if (Number.isFinite(wholeUtcMs)) {
+      const utcWhole = new Date(wholeUtcMs).toISOString().slice(0, 19);
+      return `${utcWhole}.${frac9}Z`;
+    }
   }
   return ts;
 }

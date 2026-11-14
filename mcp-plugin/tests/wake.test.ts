@@ -273,4 +273,32 @@ describe("resolveWindowsCliSpawn — safe shell:false Windows .exe/.cmd resoluti
       args: ["-p", promptWithMetachars, "--resume", "sess_1"],
     });
   });
+
+  test("fireWake injects fresh ISO timestamp when msg.timestamp is absent before HMAC signing", async () => {
+    let seenBody = "";
+    let seenSig = "";
+    await fireWake(
+      {
+        type: "message",
+        id: "m-notime",
+        channel_id: "room",
+        sender_id: "u1",
+        content: "hello",
+      },
+      {
+        url: "http://127.0.0.1:9999/wake",
+        secret: "s3cr3t",
+        fetchImpl: (async (_url: RequestInfo | URL, init?: RequestInit) => {
+          seenBody = String(init?.body ?? "");
+          const h = (init?.headers ?? {}) as Record<string, string>;
+          seenSig = h[WAKE_SIG_HEADER] ?? "";
+          return new Response("ok", { status: 202 });
+        }) as unknown as typeof fetch,
+      },
+    );
+    const parsed = JSON.parse(seenBody);
+    expect(typeof parsed.timestamp).toBe("string");
+    expect(Number.isFinite(Date.parse(parsed.timestamp))).toBe(true);
+    expect(verifyWakeSignature(seenBody, seenSig, ["s3cr3t"])).toBe(true);
+  });
 });

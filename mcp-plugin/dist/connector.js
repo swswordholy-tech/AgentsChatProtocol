@@ -606,20 +606,26 @@ function flushCursor(state, persist) {
 }
 
 // src/timestamps.ts
+var ISO_OFFSET_RE = /^(\d{4}-\d{2}-\d{2})[Tt ](\d{2}:\d{2}:\d{2})(?:\.(\d+))?(Z|z|[+-]\d{2}:\d{2})$/;
 function normalizeTimestampForCursor(ts, mode) {
   if (!ts || typeof ts !== "string")
     return ts;
   const padChar = mode === "before" ? "9" : "0";
-  const withFrac = ts.match(/^(.*\.)(\d+)(Z)$/);
-  if (withFrac) {
-    const frac = withFrac[2];
-    if (frac.length >= 9)
-      return ts;
-    return withFrac[1] + frac + padChar.repeat(9 - frac.length) + withFrac[3];
-  }
-  const noFrac = ts.match(/^(.*\d)(Z)$/);
-  if (noFrac) {
-    return noFrac[1] + "." + padChar.repeat(9) + noFrac[2];
+  const m = ts.match(ISO_OFFSET_RE);
+  if (m) {
+    const datePart = m[1];
+    const timePart = m[2];
+    const rawFrac = m[3] ?? "";
+    const tzPart = m[4];
+    const frac9 = rawFrac.length === 9 ? rawFrac : rawFrac.length > 9 ? rawFrac.slice(0, 9) : rawFrac + padChar.repeat(9 - rawFrac.length);
+    if (tzPart === "Z" || tzPart === "z") {
+      return `${datePart}T${timePart}.${frac9}Z`;
+    }
+    const wholeUtcMs = Date.parse(`${datePart}T${timePart}${tzPart}`);
+    if (Number.isFinite(wholeUtcMs)) {
+      const utcWhole = new Date(wholeUtcMs).toISOString().slice(0, 19);
+      return `${utcWhole}.${frac9}Z`;
+    }
   }
   return ts;
 }

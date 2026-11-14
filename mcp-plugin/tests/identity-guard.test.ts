@@ -116,6 +116,20 @@ describe("parseGuardRecord — never blocks boot", () => {
     expect(parsed.lastEffective?.agentId).toBe(CHEVRON);
     expect(parsed.bySelector["Antigravity-2"]).toBe(CHEVRON);
   });
+
+  test("rejects arrays, non-string selector values, and prototype keys without false warnings", () => {
+    expect(parseGuardRecord("[]")).toEqual(emptyGuardRecord());
+    const parsed = parseGuardRecord(
+      '{"bySelector":{"__proto__":"evil","constructor":"evil","bad":123,"Good":"acc_good"},"lastEffective":["bad"]}',
+    );
+    expect(Object.hasOwn(parsed.bySelector, "__proto__")).toBe(false);
+    expect(Object.hasOwn(parsed.bySelector, "constructor")).toBe(false);
+    expect(parsed.bySelector["bad"]).toBeUndefined();
+    expect(parsed.bySelector["Good"]).toBe("acc_good");
+    expect(parsed.lastEffective).toBeNull();
+    // Selector named "toString" must not hit Object.prototype.toString and emit a bogus warning
+    expect(decideIdentityGuard(parsed, { agentId: ACADEMIC, source: "flag-profile", declaredName: "toString" }).kind).toBe("ok");
+  });
 });
 
 import {

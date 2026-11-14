@@ -103,8 +103,17 @@ export function checkAgentLock(opts: {
   const { lockDir, agentId } = opts;
   const currentPid = opts.currentPid ?? process.pid;
   if (!agentId) return { locked: false };
+  const file = lockFilePath(lockDir, agentId);
   const record = readAgentLock(lockDir, agentId);
-  if (!record) return { locked: false };
+  if (!record) {
+    if (existsSync(file)) {
+      try {
+        const st = statSync(file);
+        if (Date.now() - st.mtimeMs > 1_000) unlinkSync(file);
+      } catch {}
+    }
+    return { locked: false };
+  }
   if (!isPidAlive(record.pid)) {
     try { unlinkSync(lockFilePath(lockDir, agentId)); } catch {}
     return { locked: false, stale: true };
@@ -158,8 +167,20 @@ export function releaseAgentLock(opts: {
 }): boolean {
   if (!opts.agentId) return false;
   const currentPid = opts.currentPid ?? process.pid;
+  const file = lockFilePath(opts.lockDir, opts.agentId);
   const existing = readAgentLock(opts.lockDir, opts.agentId);
-  if (!existing) return false;
+  if (!existing) {
+    if (existsSync(file)) {
+      try {
+        const st = statSync(file);
+        if (Date.now() - st.mtimeMs > 1_000) {
+          unlinkSync(file);
+          return true;
+        }
+      } catch {}
+    }
+    return false;
+  }
   const samePid = existing.pid === currentPid;
   const sameSession = Boolean(opts.currentSessionId && existing.sessionId && opts.currentSessionId === existing.sessionId);
   const dead = !isPidAlive(existing.pid);
@@ -172,13 +193,18 @@ export function releaseAgentLock(opts: {
   }
 }
 
+function isUnsafeBindKey(key: string): boolean {
+  const lower = key.toLowerCase();
+  return lower === "__proto__" || lower === "constructor" || lower === "prototype";
+}
+
 /** Parse a `session-binds.json` (or `agy-binds.json`) payload into `sessionId -> profileName`. */
 export function parseSessionBinds(raw: unknown): Record<string, string> {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
   const out: Record<string, string> = {};
   for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
     const key = k.trim();
-    if (!key) continue;
+    if (!key || isUnsafeBindKey(key)) continue;
     if (typeof v === "string" && v.trim()) {
       out[key] = v.trim();
     } else if (v && typeof v === "object" && typeof (v as any).profile === "string" && (v as any).profile.trim()) {
@@ -261,14 +287,14 @@ export function saveSessionBind(configDir: string, sessionId: string, profileNam
 
 export function removeSessionBind(configDir: string, sessionId: string): boolean {
   const sid = sessionId.trim();
-  if (!sid) return false;
+  if (!sid || isUnsafeBindKey(sid)) return false;
   let removed = false;
   for (const filename of [DEFAULT_SESSION_BINDS_FILENAME, LEGACY_AGY_BINDS_FILENAME]) {
     const path = join(configDir, filename);
     if (!existsSync(path)) continue;
     try {
       const current = parseSessionBinds(JSON.parse(readFileSync(path, "utf8")));
-      if (sid in current) {
+      if (Object.hasOwn(current, sid)) {
         delete current[sid];
         safeWriteProfile(path, current);
         removed = true;
@@ -433,7 +459,8 @@ export function parseAntigravityLsofOutput(
 }
 
 function extractCliFlagValue(cmd: string, flag: string): string {
-  const re = new RegExp(`${flag}(?:=|\\s+)(?:"([^"]+)"|'([^']+)'|([^\\s"']+))`);
+  const escaped = flag.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const re = new RegExp(`${escaped}(?:=|\\s+)(?:"([^"]+)"|'([^']+)'|([^\\s"']+))`);
   const m = cmd.match(re);
   return (m?.[1] ?? m?.[2] ?? m?.[3] ?? "").trim();
 }
@@ -1041,6 +1068,8 @@ export async function detectDshCallerSession(opts?: {
           .filter((r) => typeof r?.id === "string" && r.id.startsWith("session-"))
           .map((r) => r.id!);
         if (allValid.length === 1) return allValid[0]!;
+      } else {
+        await res.body?.cancel().catch(() => {});
       }
     } finally {
       clearTimeout(timer);

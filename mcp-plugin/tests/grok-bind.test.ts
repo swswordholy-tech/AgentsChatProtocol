@@ -438,4 +438,35 @@ describe("nonGrokWakeReason / grokBindApplies — non-Grok wakes are exempt", ()
   test("no conversation id + explicit bound profile keeps current-profile lock path", () => {
     expect(grokBindApplies({ env: {}, explicitProfileName: "Jack", conversationId: undefined, binds }).applies).toBe(true);
   });
+
+  test("blocks prototype keys and normalizes .json suffix in gateSwitchProfile", () => {
+    const { binds: parsed } = parseGrokBindsText('{"__proto__":"Evil","constructor":"Evil","prototype":"Evil","uuid-jack":"Jack"}');
+    expect(Object.hasOwn(parsed, "__proto__")).toBe(false);
+    expect(Object.hasOwn(parsed, "constructor")).toBe(false);
+    expect(decideGrokBind({ explicitIdentity: false, hasToken: false, conversationId: "toString", binds: parsed }).kind).toBe("miss");
+    expect(decideGrokBind({ explicitIdentity: false, hasToken: false, conversationId: "constructor", binds: parsed }).kind).toBe("skip");
+    expect(
+      gateSwitchProfile({
+        conversationId: "uuid-jack",
+        binds: parsed,
+        requestedProfileName: "Jack.json",
+      }),
+    ).toEqual({ kind: "allow" });
+    expect(
+      gateSwitchProfile({
+        conversationId: undefined,
+        binds: parsed,
+        currentProfileName: "Jack.json",
+        requestedProfileName: "Jack",
+      }),
+    ).toEqual({ kind: "allow" });
+    expect(
+      gateSwitchProfile({
+        conversationId: undefined,
+        binds: parsed,
+        currentProfileName: "Jack.json",
+        requestedProfileName: "Other",
+      }).kind,
+    ).toBe("locked");
+  });
 });

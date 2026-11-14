@@ -10,7 +10,7 @@ import { join, resolve } from "node:path";
 
 const SCRIPT = resolve(import.meta.dir, "../scripts/grok-bind-register.sh");
 const haveTools =
-  spawnSync("sh", ["-c", "command -v flock && command -v python3"], { stdio: "ignore" }).status === 0;
+  spawnSync("sh", ["-c", "command -v python3"], { stdio: "ignore" }).status === 0;
 const t = haveTools ? test : test.skip;
 
 const A = "11111111-1111-4111-8111-111111111111";

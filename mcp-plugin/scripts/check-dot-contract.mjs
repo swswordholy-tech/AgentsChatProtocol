@@ -12,12 +12,25 @@ if (!root || process.argv.length !== 3) {
 const contract = JSON.parse(readFileSync(new URL('../../docs/dot-remote-mcp.contract.json', import.meta.url), 'utf8'));
 const { MCP_TOOLS } = await import(pathToFileURL(resolve(root, 'src/remote-mcp.ts')).href);
 const { eventDescription, inboxEventDescription } = await import(pathToFileURL(resolve(root, 'src/mcp-events.ts')).href);
-const actual = Object.fromEntries(MCP_TOOLS.map(tool => [tool.name, tool.inputSchema]));
-const metadata = Object.fromEntries(MCP_TOOLS.map(tool => [tool.name, {
-  securitySchemes: tool.securitySchemes, annotations: tool.annotations,
-  ...(tool.outputSchema ? {outputSchema: tool.outputSchema} : {}),
-  ...(tool._meta ? {_meta: tool._meta} : {}),
-}]));
+const pinnedToolNames = new Set(Object.keys(contract.tools));
+const actualAll = Object.fromEntries(MCP_TOOLS.map(tool => [tool.name, tool.inputSchema]));
+const actual = Object.fromEntries(
+  MCP_TOOLS.filter(tool => pinnedToolNames.has(tool.name)).map(tool => [tool.name, tool.inputSchema]),
+);
+const metadata = Object.fromEntries(
+  MCP_TOOLS.filter(tool => pinnedToolNames.has(tool.name)).map(tool => [tool.name, {
+    securitySchemes: tool.securitySchemes, annotations: tool.annotations,
+    ...(tool.outputSchema ? {outputSchema: tool.outputSchema} : {}),
+    ...(tool._meta ? {_meta: tool._meta} : {}),
+  }]),
+);
+for (const tool of MCP_TOOLS) {
+  if (tool?.inputSchema?.additionalProperties !== false || tool?.inputSchema?.properties?.sender_id !== undefined ||
+      !Array.isArray(tool?.securitySchemes) || tool.securitySchemes.length === 0 || !tool?.annotations) {
+    console.error(`dot contract mismatch: server tool safety boundary (${tool?.name ?? 'unknown'})`);
+    process.exit(1);
+  }
+}
 for (const [name, expected, observed] of [
   ['tool input schemas', contract.tools, actual],
   ['tool authorization and result metadata', contract.toolMetadata, metadata],
@@ -39,7 +52,7 @@ const profile = MCP_TOOLS.find(tool => tool.name === 'get_profile');
 const reader = MCP_TOOLS.find(tool => tool.name === 'agentschat_read_messages');
 const reply = MCP_TOOLS.find(tool => tool.name === 'agentschat_reply');
 const typing = MCP_TOOLS.find(tool => tool.name === 'agentschat_set_typing');
-if (profile?._meta?.['openai/profile'] !== true || profile?.annotations?.readOnlyHint !== true ||
+if (!actualAll.get_profile || profile?._meta?.['openai/profile'] !== true || profile?.annotations?.readOnlyHint !== true ||
     reader?.annotations?.readOnlyHint !== true || reply?.annotations?.readOnlyHint !== false || reply?.annotations?.idempotentHint !== true ||
     typing?.annotations?.readOnlyHint !== false || typing?.annotations?.idempotentHint !== false ||
     !isDeepStrictEqual(typing?.securitySchemes, [{type:'oauth2',scopes:['agentschat:reply']}])) {

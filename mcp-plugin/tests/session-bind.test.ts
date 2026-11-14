@@ -1244,4 +1244,42 @@ describe("multi-window lock & connect_profile / disconnect_profile integration t
     expect(externalCodexPresent(winPsRows, 5000)).toBe(true);
     expect(externalCodexPresent(winPsRows.slice(0, 3), 5000)).toBe(false);
   });
+
+  test("removeSessionBind ignores Object.prototype keys and checkAgentLock cleans stale 0-byte locks", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "ac-sb-proto-"));
+    saveSessionBind(dir, "conv-123", "Antigravity");
+    // "toString" and "constructor" must not match Object.prototype or rewrite session-binds.json
+    expect(removeSessionBind(dir, "toString")).toBe(false);
+    expect(removeSessionBind(dir, "constructor")).toBe(false);
+    expect(Object.keys(loadSessionBinds(dir))).toEqual(["conv-123"]);
+
+    // Stale (>1s) 0-byte corrupt lock file is cleaned up automatically by checkAgentLock
+    const lockDir = resolveLockDir(dir);
+    mkdirSync(lockDir, { recursive: true });
+    const lockFile = join(lockDir, "agent-corrupt.lock");
+    writeFileSync(lockFile, "");
+    const past = new Date(Date.now() - 5000);
+    utimesSync(lockFile, past, past);
+    expect(checkAgentLock({ lockDir, agentId: "agent-corrupt", currentPid: process.pid })).toEqual({ locked: false });
+    expect(existsSync(lockFile)).toBe(false);
+
+    // detectDshCallerSession cancels non-OK response bodies cleanly
+    let bodyCancelled = false;
+    const sid = await detectDshCallerSession({
+      dshHome: dir,
+      healthUrl: "http://127.0.0.1:9999/health",
+      fetchImpl: (async () => ({
+        ok: false,
+        status: 503,
+        body: {
+          cancel: async () => {
+            bodyCancelled = true;
+          },
+        } as unknown as ReadableStream<Uint8Array>,
+        json: async () => ({}),
+      }) as Response) as unknown as typeof fetch,
+    });
+    expect(sid).toBeNull();
+    expect(bodyCancelled).toBe(true);
+  });
 });

@@ -38,3 +38,18 @@ test("non-string / non-ISO input is passed through untouched", () => {
   expect(normalizeTimestampForCursor(undefined, "after")).toBe(undefined);
   expect(normalizeTimestampForCursor("not-a-timestamp", "after")).toBe("not-a-timestamp");
 });
+
+test("normalizes numeric timezone offsets, lowercase z, and >9 fractional digits to canonical UTC 9-digit Z", () => {
+  expect(normalizeTimestampForCursor("2026-04-15T18:00:00.123456+08:00", "after")).toBe(
+    "2026-04-15T10:00:00.123456000Z",
+  );
+  expect(normalizeTimestampForCursor("2026-04-15T05:00:00-05:00", "before")).toBe(
+    "2026-04-15T10:00:00.999999999Z",
+  );
+  expect(normalizeTimestampForCursor("2026-04-15T10:00:00.5z", "after")).toBe(
+    "2026-04-15T10:00:00.500000000Z",
+  );
+  expect(normalizeTimestampForCursor("2026-04-15T10:00:00.123456789999Z", "after")).toBe(
+    "2026-04-15T10:00:00.123456789Z",
+  );
+});
