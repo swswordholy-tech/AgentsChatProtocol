@@ -4,9 +4,18 @@ import { homedir } from "node:os";
 import { delimiter, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 function executablePath(bin: string): string | undefined {
-  const candidates = isAbsolute(bin) || bin.includes("/") ? [resolve(bin)] : (process.env.PATH ?? "").split(delimiter).filter(Boolean).map(dir => join(dir, bin));
-  for (const candidate of candidates) {
-    try { accessSync(candidate, constants.X_OK); return realpathSync(candidate); } catch { /* Try the next PATH entry. */ }
+  if (!bin || /[\x00-\x1f\x7f]/.test(bin)) return undefined;
+  const exts = process.platform === "win32" && !/\.[A-Za-z0-9]+$/.test(bin)
+    ? ["", ...(process.env.PATHEXT ?? ".EXE;.CMD;.BAT;.COM").split(";").filter(Boolean)]
+    : [""];
+  const bases = isAbsolute(bin) || bin.includes("/") || bin.includes("\\")
+    ? [resolve(bin)]
+    : (process.env.PATH ?? "").split(delimiter).filter(Boolean).map(dir => join(dir, bin));
+  for (const base of bases) {
+    for (const ext of exts) {
+      const candidate = base + ext;
+      try { accessSync(candidate, constants.X_OK); return realpathSync(candidate); } catch { /* Try the next PATH entry. */ }
+    }
   }
 }
 
@@ -27,6 +36,7 @@ function assertIndependentTree(home: string, allowedAuthOrigin?: string, codexEx
         throw new Error("Independent Codex home must not link configuration or runtime state");
       }
       if (info.isDirectory()) inspect(path);
+      else if (!info.isFile()) throw new Error("Independent Codex home must contain only regular files and directories");
     }
   };
   inspect(home);

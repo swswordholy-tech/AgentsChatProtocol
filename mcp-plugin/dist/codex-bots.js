@@ -907,14 +907,14 @@ function parse(toml, { maxDepth = 1000, integersAsBigInt } = {}) {
 function reasoningEffort(value) {
   if (value === undefined)
     return;
-  if (typeof value !== "string" || !value.trim())
+  if (typeof value !== "string" || !value.trim() || /[\x00-\x1f\x7f]/.test(value))
     throw new Error("effort must be a nonempty model-supported reasoning effort name");
   return value.trim();
 }
 function modelName(value) {
   if (value === undefined)
     return;
-  if (typeof value !== "string" || !value.trim())
+  if (typeof value !== "string" || !value.trim() || /[\x00-\x1f\x7f]/.test(value))
     throw new Error("model must be a nonempty model ID");
   return value.trim();
 }
@@ -988,12 +988,18 @@ function resolveConfig(opts, env = process.env, home = homedir()) {
     ["profile", "default"]
   ];
   const [selector, source] = choices.find(([v]) => v !== undefined && v !== "");
+  if (typeof selector !== "string" || /[\x00-\x1f\x7f]/.test(selector))
+    throw new Error("Invalid profile selector");
   let profileFile;
   if (selector.startsWith("~/"))
     profileFile = join(home, selector.slice(2));
-  else if (isAbsolute(selector) || selector.includes("/"))
+  else if (isAbsolute(selector) || selector.includes("/") || selector.includes("\\"))
     profileFile = resolve(cwd, selector);
   else {
+    const stem = selector.replace(/\.json$/i, "");
+    if (!stem || selector.includes("..") || ["__proto__", "constructor", "prototype"].includes(stem.toLowerCase())) {
+      throw new Error("Invalid central profile selector");
+    }
     const name = selector.endsWith(".json") ? selector : `${selector}.json`;
     profileFile = join(home, ".agentschat/profiles", name);
     if (!existsSync(profileFile))
@@ -1003,7 +1009,10 @@ function resolveConfig(opts, env = process.env, home = homedir()) {
   }
   if (!existsSync(profileFile))
     throw new Error(`Selected profile missing: ${profileFile}; no identity fallback or registration`);
-  if (process.platform !== "win32" && statSync(profileFile).mode & 63)
+  const profileStat = statSync(profileFile);
+  if (!profileStat.isFile())
+    throw new Error(`Selected profile is not a regular file: ${profileFile}`);
+  if (process.platform !== "win32" && profileStat.mode & 63)
     throw new Error(`Profile must be private (chmod 600): ${profileFile}`);
   const profile = readJson(profileFile);
   validateIdentityProfile(profile, profileFile);
@@ -1019,8 +1028,11 @@ function resolveConfig(opts, env = process.env, home = homedir()) {
   const canonicalApi = new URL(apiUrl).href.replace(/\/$/, "");
   const key = createHash("sha256").update(JSON.stringify([cwd, canonicalApi, profile.agent_id])).digest("hex").slice(0, 24);
   const root = opts.stateRoot ?? project.state_root;
-  if (root !== undefined && (typeof root !== "string" || !root.trim()))
+  if (root !== undefined && (typeof root !== "string" || !root.trim() || /[\x00-\x1f\x7f]/.test(root)))
     throw new Error("Invalid state_root");
+  const codexBin = opts.codexBin ?? "codex";
+  if (typeof codexBin !== "string" || !codexBin.trim() || /[\x00-\x1f\x7f]/.test(codexBin))
+    throw new Error("Invalid codex_bin");
   const stateRoot = root === undefined ? join(home, ".agentschat/codex-bridge") : root.startsWith("~/") ? join(home, root.slice(2)) : resolve(cwd, root);
   return {
     cwd,
@@ -1036,7 +1048,7 @@ function resolveConfig(opts, env = process.env, home = homedir()) {
     wsUrl,
     channels: strings(project.channels, "channels"),
     senders: strings(project.senders, "senders"),
-    codexBin: opts.codexBin ?? "codex",
+    codexBin,
     stateDir: join(stateRoot, key)
   };
 }
@@ -1057,7 +1069,8 @@ function loadBots(file = defaultRegistry(), home = homedir2()) {
     if (!object(x) || Object.keys(x).some((k) => !keys.includes(k)))
       throw new Error("Unknown or invalid bot registry field");
   };
-  const text = (x) => typeof x === "string" && x.trim().length > 0;
+  const text = (x) => typeof x === "string" && x.trim().length > 0 && !/[\x00-\x1f\x7f]/.test(x);
+  const reserved = (s) => ["__proto__", "constructor", "prototype"].includes(s.toLowerCase());
   fields(doc, ["version", "default_workdir", "codex_bin", "bots"]);
   if (doc.version !== 1 || !Array.isArray(doc.bots))
     throw new Error("Registry requires version 1 and bots array");
@@ -1070,7 +1083,7 @@ function loadBots(file = defaultRegistry(), home = homedir2()) {
   const bots = [];
   for (const bot of doc.bots) {
     fields(bot, ["name", "profile", "workdir", "enabled", "agent_id", "channels", "senders", "api_url", "ws_url", "permissions", "effort", "model", "state_root", "codex_home_mode"]);
-    if (!text(bot.name) || !/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/.test(bot.name) || names.has(bot.name))
+    if (!text(bot.name) || !/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/.test(bot.name) || reserved(bot.name) || names.has(bot.name))
       throw new Error("Bot names must be unique simple labels");
     names.add(bot.name);
     if (bot.enabled !== undefined && typeof bot.enabled !== "boolean")
@@ -1079,8 +1092,9 @@ function loadBots(file = defaultRegistry(), home = homedir2()) {
       continue;
     if (!text(bot.profile) || bot.workdir !== undefined && !text(bot.workdir))
       throw new Error(`Bot ${bot.name} needs a profile and valid optional workdir`);
-    if (!/^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$/.test(bot.profile))
+    if (!/^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$/.test(bot.profile) || bot.profile.includes("..") || reserved(bot.profile) || reserved(bot.profile.replace(/\.json$/i, ""))) {
       throw new Error(`Bot ${bot.name}: profile must be a central profile name`);
+    }
     if (!doc.default_workdir && !bot.workdir)
       mkdirSync(defaultDir, { recursive: true, mode: 448 });
     const cwd = realpathSync2(bot.workdir ? path(bot.workdir) : defaultDir);

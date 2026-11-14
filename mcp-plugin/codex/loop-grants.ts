@@ -20,10 +20,18 @@ export interface LoopTick {
 
 // An operator writes this local authorization only after an explicit owner request.
 // Neither chat content nor a server-created loop alone grants local execution.
-function grants(config: BridgeConfig): LoopGrant[] {
+function grants(
+  config: BridgeConfig,
+  opts?: { platform?: NodeJS.Platform; getuid?: (() => number) | undefined },
+): LoopGrant[] {
   try {
+    const platform = opts?.platform ?? process.platform;
+    const getuid = opts && "getuid" in opts ? opts.getuid : process.getuid;
     const file = join(config.stateDir, "loop-grants.json"), stat = lstatSync(file);
-    if (!stat.isFile() || (stat.mode & 0o077) !== 0 || stat.uid !== process.getuid?.()) return [];
+    if (!stat.isFile()) return [];
+    if (platform !== "win32") {
+      if (typeof getuid !== "function" || (stat.mode & 0o077) !== 0 || stat.uid !== getuid()) return [];
+    }
     const doc = JSON.parse(readFileSync(file, "utf8"));
     if (doc?.version !== 1 || !Array.isArray(doc.grants)) return [];
     return doc.grants.filter((g: any) => g &&
@@ -33,11 +41,15 @@ function grants(config: BridgeConfig): LoopGrant[] {
   } catch { return []; }
 }
 
-export function authorizedLoopTick(raw: any, config: BridgeConfig): LoopGrant | null {
+export function authorizedLoopTick(
+  raw: any,
+  config: BridgeConfig,
+  opts?: { platform?: NodeJS.Platform; getuid?: (() => number) | undefined },
+): LoopGrant | null {
   const tick = raw?.meta;
   if (raw?.sender_id !== config.agentId || tick?.kind !== "loop_tick" ||
     !Number.isSafeInteger(tick.next_tick_ms) || tick.next_tick_ms <= 0) return null;
-  const matches = grants(config).filter(g => g.loop_id === tick.loop_id && g.channel_id === raw.channel_id);
+  const matches = grants(config, opts).filter(g => g.loop_id === tick.loop_id && g.channel_id === raw.channel_id);
   if (matches.length !== 1) return null;
   const grant = matches[0]!;
   if (tick.prompt !== grant.prompt || tick.interval_ms !== grant.interval_ms ||
@@ -55,10 +67,11 @@ export async function verifyLoopTick(raw: any, config: BridgeConfig, owner: stri
   const rows = Array.isArray(response?.loops) ? response.loops.filter((r: any) => r?.loop_id === grant.loop_id) : [];
   if (rows.length !== 1) return null;
   const loop = rows[0];
-  if (loop.status !== "active" || loop.channel_id !== grant.channel_id || loop.prompt !== grant.prompt ||
+  if (!loop || loop.status !== "active" || loop.channel_id !== grant.channel_id || loop.prompt !== grant.prompt ||
     loop.interval_ms !== grant.interval_ms || loop.expires_at !== null ||
     (loop.mode !== undefined && loop.mode !== "static") ||
     !Number.isSafeInteger(loop.last_tick_at) || loop.last_tick_at <= 0 ||
+    !Number.isSafeInteger(loop.next_tick_ms) ||
     loop.next_tick_ms !== raw.meta.next_tick_ms || loop.last_tick_at + grant.interval_ms !== loop.next_tick_ms) return null;
   // Re-read after network I/O so local revocation during verification takes effect.
   const current = authorizedLoopTick(raw, config);

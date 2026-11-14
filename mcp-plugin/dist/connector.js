@@ -14,6 +14,8 @@ function hmacHex(payload, secret) {
   return createHmac("sha256", secret).update(payload, "utf8").digest("hex");
 }
 function verifySignature(payload, sigHex, secrets) {
+  if (typeof sigHex !== "string" || !/^[0-9a-f]{64}$/i.test(sigHex))
+    return false;
   let sigBuf;
   try {
     sigBuf = Buffer.from(sigHex, "hex");
@@ -44,8 +46,11 @@ function verifyToken(token, secrets) {
   if (parts.length < 3)
     return null;
   const sig = parts[parts.length - 1];
-  const exp = Number.parseInt(parts[parts.length - 2], 10);
-  if (!Number.isFinite(exp))
+  const expText = parts[parts.length - 2];
+  if (!/^\d+$/.test(expText))
+    return null;
+  const exp = Number(expText);
+  if (!Number.isSafeInteger(exp) || String(exp) !== expText)
     return null;
   const payload = parts.slice(0, -2).join(":");
   if (exp !== 0 && Math.floor(Date.now() / 1000) > exp)
@@ -62,6 +67,16 @@ var CONTRACT_VERSION = 1;
 var AGENTSCHAT_MAX_MESSAGE_LENGTH = 4000;
 var SUPPORTED_OPS = ["send", "typing", "get_chat_info"];
 function buildDescriptor(overrides = {}) {
+  const keys = new Set;
+  for (const key of Object.keys(overrides)) {
+    const trimmed = key.trim();
+    if (!trimmed || ["__proto__", "constructor", "prototype"].includes(trimmed.toLowerCase()) || keys.has(trimmed))
+      throw new Error("invalid or duplicate descriptor override key");
+    keys.add(trimmed);
+  }
+  if ([...keys].some((key) => !Object.hasOwn(overrides, key))) {
+    throw new Error("descriptor override keys must not contain surrounding whitespace");
+  }
   return {
     contract_version: CONTRACT_VERSION,
     platform: "agentschat",
@@ -158,18 +173,35 @@ class MessageDedup {
 }
 
 // connector/identities.ts
+function validIdentityId(value) {
+  return typeof value === "string" && value.length > 0 && !/\s|[\x00-\x1f\x7f]/.test(value) && !["__proto__", "constructor", "prototype"].includes(value.toLowerCase());
+}
+function validateIdentities(identities, allowEmptyCredentials = false) {
+  const bots = new Set;
+  const agents = new Set;
+  for (const id of identities) {
+    if (!id || !validIdentityId(id.botId) || !validIdentityId(id.agentId)) {
+      throw new Error("invalid identity botId or agentId");
+    }
+    if ([id.token, id.gatewayId, id.secret].some((value) => typeof value !== "string" || !value.trim() && !(allowEmptyCredentials && value === ""))) {
+      throw new Error("missing identity credentials");
+    }
+    if (bots.has(id.botId.trim()) || agents.has(id.agentId.trim())) {
+      throw new Error("duplicate identity botId or agentId — ambiguous routing");
+    }
+    bots.add(id.botId.trim());
+    agents.add(id.agentId.trim());
+  }
+}
+
 class IdentityTable {
   byBot = new Map;
-  constructor(identities) {
-    for (const id of identities) {
-      if (this.byBot.has(id.botId)) {
-        throw new Error(`duplicate identity botId "${id.botId}" — ambiguous routing`);
-      }
-      this.byBot.set(id.botId, id);
-    }
+  constructor(identities, opts) {
+    validateIdentities(identities, opts?.allowEmptyCredentials === true);
+    this.install(identities);
   }
   forBot(botId) {
-    return this.byBot.get(botId) ?? null;
+    return validIdentityId(botId) ? this.byBot.get(botId) ?? null : null;
   }
   isSingle() {
     return this.byBot.size === 1;
@@ -181,12 +213,16 @@ class IdentityTable {
     return [...this.byBot.values()];
   }
   replace(identities) {
+    validateIdentities(identities);
+    this.install(identities);
+  }
+  install(identities) {
     const next = new Map;
     for (const id of identities) {
       if (next.has(id.botId)) {
         throw new Error(`duplicate identity botId "${id.botId}" — ambiguous routing`);
       }
-      next.set(id.botId, id);
+      next.set(id.botId, Object.freeze({ ...id }));
     }
     this.byBot.clear();
     for (const [k, v] of next)
@@ -194,7 +230,8 @@ class IdentityTable {
   }
 }
 function requireIdentity(identities, botId) {
-  const id = identities.find((id2) => id2.botId === botId);
+  validateIdentities(identities);
+  const id = validIdentityId(botId) ? identities.find((id2) => id2.botId === botId) : undefined;
   if (!id)
     throw new Error(`unknown identity: ${botId}`);
   return id;
@@ -240,7 +277,7 @@ function startConnector(config) {
   const log = config.logger ?? (() => {});
   const descriptor = buildDescriptor(config.descriptor);
   const legacy = !config.identities || config.identities.length === 0;
-  const table = new IdentityTable(legacy ? [{ botId: "default", agentId: "default", token: "", gatewayId: "", secret: "" }] : config.identities);
+  const table = new IdentityTable(legacy ? [{ botId: "default", agentId: "default", token: "", gatewayId: "", secret: "" }] : config.identities, legacy ? { allowEmptyCredentials: true } : undefined);
   function safeLabel(value) {
     for (const id of table.all())
       for (const secret of [id.token, id.secret]) {

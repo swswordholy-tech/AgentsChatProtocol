@@ -10,13 +10,14 @@ export type PermissionMode = "full-access" | "read-only";
 export type ReasoningEffort = string;
 export function reasoningEffort(value: unknown): ReasoningEffort | undefined {
   if (value === undefined) return undefined;
-  if (typeof value !== "string" || !value.trim())
+  if (typeof value !== "string" || !value.trim() || /[\x00-\x1f\x7f]/.test(value))
     throw new Error("effort must be a nonempty model-supported reasoning effort name");
   return value.trim();
 }
 export function modelName(value: unknown): string | undefined {
   if (value === undefined) return undefined;
-  if (typeof value !== "string" || !value.trim()) throw new Error("model must be a nonempty model ID");
+  if (typeof value !== "string" || !value.trim() || /[\x00-\x1f\x7f]/.test(value))
+    throw new Error("model must be a nonempty model ID");
   return value.trim();
 }
 export function permissionMode(value: unknown): PermissionMode {
@@ -81,17 +82,24 @@ export function resolveConfig(opts: { cwd?: string; profile?: string; codexBin?:
     [env.AGENTSCHAT_PROFILE, "env"], [env.AGENTCHAT_PROFILE, "legacy-env"], ["profile", "default"],
   ];
   const [selector, source] = choices.find(([v]) => v !== undefined && v !== "") as [string, string];
+  if (typeof selector !== "string" || /[\x00-\x1f\x7f]/.test(selector)) throw new Error("Invalid profile selector");
   let profileFile: string;
   if (selector.startsWith("~/")) profileFile = join(home, selector.slice(2));
-  else if (isAbsolute(selector) || selector.includes("/")) profileFile = resolve(cwd, selector);
+  else if (isAbsolute(selector) || selector.includes("/") || selector.includes("\\")) profileFile = resolve(cwd, selector);
   else {
+    const stem = selector.replace(/\.json$/i, "");
+    if (!stem || selector.includes("..") || ["__proto__", "constructor", "prototype"].includes(stem.toLowerCase())) {
+      throw new Error("Invalid central profile selector");
+    }
     const name = selector.endsWith(".json") ? selector : `${selector}.json`;
     profileFile = join(home, ".agentschat/profiles", name);
     if (!existsSync(profileFile)) profileFile = join(home, ".agentschat", name);
     if (!existsSync(profileFile)) profileFile = join(home, ".agentchat", name);
   }
   if (!existsSync(profileFile)) throw new Error(`Selected profile missing: ${profileFile}; no identity fallback or registration`);
-  if (process.platform !== "win32" && (statSync(profileFile).mode & 0o077)) throw new Error(`Profile must be private (chmod 600): ${profileFile}`);
+  const profileStat = statSync(profileFile);
+  if (!profileStat.isFile()) throw new Error(`Selected profile is not a regular file: ${profileFile}`);
+  if (process.platform !== "win32" && (profileStat.mode & 0o077)) throw new Error(`Profile must be private (chmod 600): ${profileFile}`);
   const profile = readJson(profileFile);
   validateIdentityProfile(profile, profileFile);
   if (project.agent_id !== undefined && project.agent_id !== profile.agent_id) throw new Error("Project agent_id does not match selected profile");
@@ -105,10 +113,12 @@ export function resolveConfig(opts: { cwd?: string; profile?: string; codexBin?:
   const canonicalApi = new URL(apiUrl).href.replace(/\/$/, "");
   const key = createHash("sha256").update(JSON.stringify([cwd, canonicalApi, profile.agent_id])).digest("hex").slice(0, 24);
   const root = opts.stateRoot ?? project.state_root;
-  if (root !== undefined && (typeof root !== "string" || !root.trim())) throw new Error("Invalid state_root");
+  if (root !== undefined && (typeof root !== "string" || !root.trim() || /[\x00-\x1f\x7f]/.test(root))) throw new Error("Invalid state_root");
+  const codexBin = opts.codexBin ?? "codex";
+  if (typeof codexBin !== "string" || !codexBin.trim() || /[\x00-\x1f\x7f]/.test(codexBin)) throw new Error("Invalid codex_bin");
   const stateRoot = root === undefined ? join(home, ".agentschat/codex-bridge") : root.startsWith("~/") ? join(home, root.slice(2)) : resolve(cwd, root);
   return { cwd, profileFile, source, codexHomeMode: codexHomeMode(opts.codexHomeMode ?? project.codex_home_mode), permissions: permissionMode(project.permissions), effort: reasoningEffort(project.effort), model: modelName(project.model), agentId: profile.agent_id, token: profile.token,
     apiUrl: canonicalApi, wsUrl, channels: strings(project.channels, "channels"),
-    senders: strings(project.senders, "senders"), codexBin: opts.codexBin ?? "codex",
+    senders: strings(project.senders, "senders"), codexBin,
     stateDir: join(stateRoot, key) };
 }

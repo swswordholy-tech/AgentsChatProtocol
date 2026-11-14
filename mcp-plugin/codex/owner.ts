@@ -14,19 +14,31 @@ export async function getBotOwner(
       redirect: "error",
       signal: AbortSignal.timeout(8_000),
     };
-    const [statusResponse, entitlementResponse] = await Promise.all([
+    const [statusSettled, entitlementSettled] = await Promise.allSettled([
       request(`${origin}/api/account/onboarding`, options),
       request(`${origin}/api/me/entitlements`, options),
     ]);
-    if (!statusResponse.ok || !entitlementResponse.ok) return null;
-    const [status, entitlement] = await Promise.all([
+    const statusResponse = statusSettled.status === "fulfilled" ? statusSettled.value : null;
+    const entitlementResponse = entitlementSettled.status === "fulfilled" ? entitlementSettled.value : null;
+    if (!statusResponse?.ok || !entitlementResponse?.ok) {
+      await Promise.allSettled([
+        statusResponse?.body?.cancel(),
+        entitlementResponse?.body?.cancel(),
+      ]);
+      return null;
+    }
+    const [statusResult, entitlementResult] = await Promise.allSettled([
       statusResponse.json(),
       entitlementResponse.json(),
     ]);
-    if (!status || Array.isArray(status) || status.agent_id !== agentId || status.claimed !== true) return null;
-    if (!entitlement || Array.isArray(entitlement)) return null;
+    if (statusResult.status !== "fulfilled" || entitlementResult.status !== "fulfilled") return null;
+    const status = statusResult.value;
+    const entitlement = entitlementResult.value;
+    if (!status || typeof status !== "object" || Array.isArray(status) || status.agent_id !== agentId || status.claimed !== true) return null;
+    if (!entitlement || typeof entitlement !== "object" || Array.isArray(entitlement)) return null;
     const owner = entitlement.owner_account_id;
-    return typeof owner === "string" && owner.trim().length > 0 && owner !== agentId ? owner : null;
+    return typeof owner === "string" && owner.trim().length > 0 && owner === owner.trim() &&
+      !/[\x00-\x1f\x7f]/.test(owner) && owner !== agentId ? owner : null;
   } catch {
     // Missing endpoints, failed authentication and unavailable ownership all fail closed.
     // Never retain a previous owner or expose response bodies / credentials in diagnostics.

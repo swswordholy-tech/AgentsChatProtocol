@@ -12,7 +12,8 @@ export function loadBots(file = defaultRegistry(), home = homedir()): BotConfig[
   const fields = (x: any, keys: string[]) => {
     if (!object(x) || Object.keys(x).some(k => !keys.includes(k))) throw new Error("Unknown or invalid bot registry field");
   };
-  const text = (x: unknown): x is string => typeof x === "string" && x.trim().length > 0;
+  const text = (x: unknown): x is string => typeof x === "string" && x.trim().length > 0 && !/[\x00-\x1f\x7f]/.test(x);
+  const reserved = (s: string) => ["__proto__", "constructor", "prototype"].includes(s.toLowerCase());
   fields(doc, ["version", "default_workdir", "codex_bin", "bots"]);
   if (doc.version !== 1 || !Array.isArray(doc.bots)) throw new Error("Registry requires version 1 and bots array");
   for (const k of ["default_workdir", "codex_bin"]) if (doc[k] !== undefined && !text(doc[k])) throw new Error(`Invalid ${k}`);
@@ -22,13 +23,16 @@ export function loadBots(file = defaultRegistry(), home = homedir()): BotConfig[
   const bots: BotConfig[] = [];
   for (const bot of doc.bots) {
     fields(bot, ["name", "profile", "workdir", "enabled", "agent_id", "channels", "senders", "api_url", "ws_url", "permissions", "effort", "model", "state_root", "codex_home_mode"]);
-    if (!text(bot.name) || !/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/.test(bot.name) || names.has(bot.name)) throw new Error("Bot names must be unique simple labels");
+    if (!text(bot.name) || !/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/.test(bot.name) || reserved(bot.name) || names.has(bot.name)) throw new Error("Bot names must be unique simple labels");
     names.add(bot.name);
     if (bot.enabled !== undefined && typeof bot.enabled !== "boolean") throw new Error("Invalid bot enabled flag");
     if (bot.enabled === false) continue;
     if (!text(bot.profile) || (bot.workdir !== undefined && !text(bot.workdir))) throw new Error(`Bot ${bot.name} needs a profile and valid optional workdir`);
     // Registry profiles are named, centrally stored identities, not project-relative files.
-    if (!/^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$/.test(bot.profile)) throw new Error(`Bot ${bot.name}: profile must be a central profile name`);
+    if (!/^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$/.test(bot.profile) || bot.profile.includes("..") ||
+      reserved(bot.profile) || reserved(bot.profile.replace(/\.json$/i, ""))) {
+      throw new Error(`Bot ${bot.name}: profile must be a central profile name`);
+    }
     if (!doc.default_workdir && !bot.workdir) mkdirSync(defaultDir, { recursive: true, mode: 0o700 });
     const cwd = realpathSync(bot.workdir ? path(bot.workdir) : defaultDir);
     const settings: IdentitySettings = {};
