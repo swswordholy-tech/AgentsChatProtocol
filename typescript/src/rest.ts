@@ -428,6 +428,229 @@ const DM_OR_DIRECT_CHANNEL_RE = /^(?:dm[-_]|direct(?:$|[-_:]))/i;
 const EMBEDDED_SECRET_TOKEN_RE =
   /(?:^|[^A-Za-z0-9])(?:ac_[A-Za-z0-9_-]{8,}|agent_key_[A-Za-z0-9_-]{8,}|sk[-_][A-Za-z0-9_-]{12,}|rk_(?:live|test)_[A-Za-z0-9]{16,}|gh[pousr]_[A-Za-z0-9_]{8,}|github_pat_[A-Za-z0-9_]{8,}|glpat-[A-Za-z0-9_-]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}(?:$|[^A-Za-z0-9])|(?:hf|npm)_[A-Za-z0-9]{20,}|AIza[A-Za-z0-9_-]{12,}|eyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}|\bBearer\s+[A-Za-z0-9._~+/=-]{16,}|-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----)/i;
 
+function isPrivateOrLoopbackHostname(rawHostname: string): boolean {
+  const host = rawHostname.trim().toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
+  if (!host) return true;
+  if (
+    host === "localhost" ||
+    host.endsWith(".localhost") ||
+    host.endsWith(".local") ||
+    host.endsWith(".internal") ||
+    host === "0.0.0.0" ||
+    host === "::" ||
+    host === "::1"
+  ) {
+    return true;
+  }
+  if (
+    /^127\./.test(host) ||
+    /^10\./.test(host) ||
+    /^192\.168\./.test(host) ||
+    /^169\.254\./.test(host) ||
+    /^172\.(?:1[6-9]|2\d|3[01])\./.test(host) ||
+    /^0\./.test(host) ||
+    /^(?:fc|fd)[0-9a-f]{2}:/i.test(host) ||
+    /^fe[89ab][0-9a-f]:/i.test(host) ||
+    /^::ffff:(?:127\.|10\.|192\.168\.|169\.254\.|172\.(?:1[6-9]|2\d|3[01])\.|0\.)/i.test(host)
+  ) {
+    return true;
+  }
+  if (!host.includes(".") && !host.includes(":")) {
+    return true;
+  }
+  return false;
+}
+
+function isSafePublicHttpsUrl(rawUrl: unknown, maxLen = 500): rawUrl is string {
+  if (typeof rawUrl !== "string") return false;
+  const trimmed = rawUrl.trim();
+  if (
+    !trimmed ||
+    trimmed.length > maxLen ||
+    /[\u0000-\u001F\u007F\s]/.test(trimmed) ||
+    CREDENTIAL_PREFIX_RE.test(trimmed) ||
+    EMBEDDED_SECRET_TOKEN_RE.test(trimmed)
+  ) {
+    return false;
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    return false;
+  }
+  if (parsed.protocol !== "https:" || parsed.username || parsed.password) {
+    return false;
+  }
+  return !isPrivateOrLoopbackHostname(parsed.hostname);
+}
+
+function scrubStoryDisplayText(raw: unknown, maxLen: number): string {
+  if (typeof raw !== "string") return "";
+  return raw
+    .replace(/-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|$)/gi, "[redacted]")
+    .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]{12,}/gi, "Bearer [redacted]")
+    .replace(
+      /(?:^|[^A-Za-z0-9])(?:ac_|agent_key_|sk[-_]|rk_(?:live|test)_|gh[pousr]_|github_pat_|glpat-|xox[baprs]-|(?:hf|npm)_|AIza)[A-Za-z0-9_-]+/gi,
+      (m) => (/[A-Za-z0-9]/.test(m.charAt(0)) ? "[redacted]" : `${m.charAt(0)}[redacted]`),
+    )
+    .replace(/(?:^|[^A-Za-z0-9])AKIA[0-9A-Z]{16}(?=$|[^A-Za-z0-9])/g, (m) =>
+      /[A-Za-z0-9]/.test(m.charAt(0)) ? "[redacted]" : `${m.charAt(0)}[redacted]`,
+    )
+    .replace(/\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)?\b/g, "[redacted]")
+    .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, "[redacted]")
+    .replace(/\+?\d[\d\s()-]{5,}\d/g, "[redacted]")
+    .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]+/g, " ")
+    .trim()
+    .slice(0, maxLen);
+}
+
+const STORY_PLATFORMS: ReadonlyArray<import("./types").StoryPlatformKey> = [
+  "x",
+  "threads",
+  "wechat",
+  "tiktok_hook",
+];
+const VALID_STORY_TYPES_SET = new Set<import("./types").StoryArtifactType>([
+  "debug_war_room",
+  "agent_debate",
+  "build_log",
+  "brainstorm",
+]);
+const VALID_STORY_BLUEPRINTS_SET = new Set<import("./types").StoryBlueprintId>([
+  "cross-review",
+  "okr-sprint",
+  "research-patrol",
+]);
+
+export function summarizeStoryArtifactBundle(
+  raw: unknown,
+): import("./types").StoryArtifactSafetySummary | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const res = raw as Record<string, unknown>;
+  const artifactId = typeof res.artifact_id === "string" ? res.artifact_id.trim() : "";
+  if (
+    !safeGraphId(artifactId) ||
+    PROTOTYPE_POISON_KEYS.has(artifactId.toLowerCase()) ||
+    EMBEDDED_SECRET_TOKEN_RE.test(artifactId)
+  ) {
+    return null;
+  }
+  const story =
+    res.story_json && typeof res.story_json === "object" && !Array.isArray(res.story_json)
+      ? (res.story_json as Record<string, unknown>)
+      : null;
+  if (!story) return null;
+  if (story.id !== undefined && story.id !== artifactId) return null;
+
+  const ch =
+    story.channel && typeof story.channel === "object" && !Array.isArray(story.channel)
+      ? (story.channel as Record<string, unknown>)
+      : null;
+  const channelId = typeof ch?.id === "string" ? ch.id.trim() : "";
+  if (!safeNonDmChannelId(channelId) || PROTOTYPE_POISON_KEYS.has(channelId.toLowerCase()) || /^\d{6,}$/.test(channelId)) {
+    return null;
+  }
+
+  const storyType = story.story_type as import("./types").StoryArtifactType;
+  if (!VALID_STORY_TYPES_SET.has(storyType)) return null;
+
+  const defaultBp: import("./types").StoryBlueprintId =
+    storyType === "build_log"
+      ? "okr-sprint"
+      : storyType === "brainstorm"
+        ? "research-patrol"
+        : "cross-review";
+  const rawBp = typeof res.blueprint_id === "string" ? res.blueprint_id.trim() : "";
+  const blueprintId = VALID_STORY_BLUEPRINTS_SET.has(rawBp as any)
+    ? (rawBp as import("./types").StoryBlueprintId)
+    : defaultBp;
+  const blueprintUrl = isSafePublicHttpsUrl(res.blueprint_url, 500)
+    ? res.blueprint_url.trim()
+    : `https://agents-chat.com/lobby?blueprint=${blueprintId}`;
+
+  const coverPngUrl = isSafePublicHttpsUrl(res.cover_png_url, 1024) ? res.cover_png_url.trim() : null;
+  const fullStoryPngUrl = isSafePublicHttpsUrl(res.full_story_png_url, 1024)
+    ? res.full_story_png_url.trim()
+    : null;
+
+  const seenTurnIds = new Set<string>();
+  for (const item of Array.isArray(story.turns) ? story.turns.slice(0, 64) : []) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    const mid = typeof (item as any).message_id === "string" ? (item as any).message_id.trim() : "";
+    if (!safeGraphId(mid) || PROTOTYPE_POISON_KEYS.has(mid.toLowerCase()) || EMBEDDED_SECRET_TOKEN_RE.test(mid)) {
+      continue;
+    }
+    seenTurnIds.add(mid);
+  }
+
+  const seenCastIds = new Set<string>();
+  for (const item of Array.isArray(story.cast) ? story.cast.slice(0, 64) : []) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    const cid = typeof (item as any).id === "string" ? (item as any).id.trim() : "";
+    if (!safeGraphId(cid) || PROTOTYPE_POISON_KEYS.has(cid.toLowerCase()) || EMBEDDED_SECRET_TOKEN_RE.test(cid)) {
+      continue;
+    }
+    seenCastIds.add(cid);
+  }
+
+  const rawStatus = typeof res.rendering_status === "string" ? res.rendering_status.trim().toLowerCase() : "";
+  const renderingStatus = /^[a-z][a-z0-9_-]{0,31}$/.test(rawStatus) ? rawStatus : "pending";
+
+  const rawCaptions =
+    res.suggested_captions && typeof res.suggested_captions === "object"
+      ? (res.suggested_captions as Record<string, unknown>)
+      : {};
+  const rawBlocked =
+    res.caption_blocked && typeof res.caption_blocked === "object"
+      ? (res.caption_blocked as Record<string, unknown>)
+      : {};
+
+  const publishablePlatforms: import("./types").StoryPlatformKey[] = [];
+  const blockedPlatforms: import("./types").StoryPlatformKey[] = [];
+  const safeCaptions: import("./types").StorySuggestedCaptions = {
+    x: "",
+    threads: "",
+    wechat: "",
+    tiktok_hook: "",
+  };
+
+  for (const p of STORY_PLATFORMS) {
+    if (rawBlocked[p] === true) {
+      blockedPlatforms.push(p);
+      continue;
+    }
+    const scrubbed = scrubStoryDisplayText(rawCaptions[p], 600);
+    if (!scrubbed || scrubbed === "[redacted]") {
+      blockedPlatforms.push(p);
+      continue;
+    }
+    safeCaptions[p] = scrubbed;
+    publishablePlatforms.push(p);
+  }
+
+  return {
+    artifact_id: artifactId,
+    channel_id: channelId,
+    story_type: storyType,
+    blueprint_id: blueprintId,
+    blueprint_url: blueprintUrl,
+    turn_count: seenTurnIds.size,
+    cast_count: seenCastIds.size,
+    rendering_status: renderingStatus,
+    cover_png_url: coverPngUrl,
+    full_story_png_url: fullStoryPngUrl,
+    ready_to_share:
+      renderingStatus === "ready" &&
+      (coverPngUrl !== null || fullStoryPngUrl !== null) &&
+      publishablePlatforms.length > 0 &&
+      seenTurnIds.size > 0,
+    publishable_platforms: publishablePlatforms,
+    blocked_platforms: blockedPlatforms,
+    safe_captions: safeCaptions,
+  };
+}
+
 function safeNonDmChannelId(value: unknown): value is string {
   return (
     typeof value === "string" &&
@@ -4129,18 +4352,23 @@ export class AgentChatREST {
     opts?: { bearerToken?: string },
   ): Promise<import("./types").CreateStoryArtifactResponse> {
     const safeChannel = typeof input?.channel_id === "string" ? input.channel_id.trim() : "";
+    if (!safeChannel) {
+      throw new Error("Invalid channel ID");
+    }
+    if (DM_OR_DIRECT_CHANNEL_RE.test(safeChannel)) {
+      throw new Error("Story artifacts cannot be generated from direct message channels");
+    }
     if (
-      !safeChannel ||
-      !/^[A-Za-z0-9_-][A-Za-z0-9._-]{0,127}$/.test(safeChannel) ||
+      !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(safeChannel) ||
       safeChannel.includes("..") ||
+      PROTOTYPE_POISON_KEYS.has(safeChannel.toLowerCase()) ||
+      /^\d{6,}$/.test(safeChannel) ||
       CREDENTIAL_PREFIX_RE.test(safeChannel) ||
+      EMBEDDED_SECRET_TOKEN_RE.test(safeChannel) ||
       EMAIL_ID_RE.test(safeChannel) ||
       PHONE_ID_RE.test(safeChannel)
     ) {
       throw new Error("Invalid channel ID");
-    }
-    if (/^(?:dm-|direct(?:$|[-_:]))/i.test(safeChannel)) {
-      throw new Error("Story artifacts cannot be generated from direct message channels");
     }
     const validStoryTypes = ["debug_war_room", "agent_debate", "build_log", "brainstorm"];
     if (!validStoryTypes.includes(input?.story_type)) {
@@ -4155,9 +4383,10 @@ export class AgentChatREST {
       const id = typeof rawId === "string" ? rawId.trim() : "";
       if (
         !id ||
-        id.length > 128 ||
-        /[\u0000-\u001F\s/\\?#&]/.test(id) ||
+        !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(id) ||
         id.includes("..") ||
+        PROTOTYPE_POISON_KEYS.has(id.toLowerCase()) ||
+        CREDENTIAL_PREFIX_RE.test(id) ||
         this.containsMemorySecretShape(id)
       ) {
         throw new Error("Invalid message ID in message_ids");
@@ -4178,10 +4407,10 @@ export class AgentChatREST {
     for (const field of ["title", "summary", "outcome"] as const) {
       const val = input[field];
       if (val !== undefined) {
-        if (typeof val !== "string" || val.length > 500) {
+        if (typeof val !== "string" || val.length > 500 || /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/.test(val)) {
           throw new Error(`Invalid story ${field}`);
         }
-        if (this.containsMemorySecretShape(val)) {
+        if (CREDENTIAL_PREFIX_RE.test(val.trim()) || this.containsMemorySecretShape(val)) {
           throw new Error(`Story ${field} must not contain secrets`);
         }
         const trimmed = val.trim();
@@ -4190,10 +4419,10 @@ export class AgentChatREST {
     }
     if (input.qr_target !== undefined) {
       const qr = typeof input.qr_target === "string" ? input.qr_target.trim() : "";
-      if (!qr || qr.length > 512 || /[\u0000-\u001F]/.test(qr)) {
+      if (!qr || qr.length > 500 || /[\u0000-\u001F\u007F\s]/.test(qr)) {
         throw new Error("Invalid story qr_target");
       }
-      if (this.containsMemorySecretShape(qr)) {
+      if (CREDENTIAL_PREFIX_RE.test(qr) || this.containsMemorySecretShape(qr)) {
         throw new Error("Story qr_target must not contain secrets");
       }
       let parsedQr: URL;
@@ -4204,6 +4433,9 @@ export class AgentChatREST {
       }
       if (parsedQr.protocol !== "https:") {
         throw new Error("Story qr_target must use https://");
+      }
+      if (parsedQr.username || parsedQr.password || isPrivateOrLoopbackHostname(parsedQr.hostname)) {
+        throw new Error("Invalid story qr_target");
       }
       body.qr_target = qr;
     }

@@ -15,6 +15,7 @@ import {
   summarizeCloudAgentSpecialties,
   summarizePersonalSkillsLibrary,
   summarizeProposalsFeed,
+  summarizeStoryArtifactBundle,
   summarizeWorkspaceGraphHierarchy,
   summarizeWorkspaceGraphReadiness,
   type ACMessage,
@@ -4243,5 +4244,149 @@ describe("AgentChatClient realtime collaboration WS events", () => {
     await expect(
       rest.tuneCloudAgent("openclaw-child-01", { capabilities: ["tag_ac_secret_12345678"] }),
     ).rejects.toThrow("Capability tag must not contain credentials");
+  });
+
+  test("summarizeStoryArtifactBundle scrubs caption secrets/PII, blocks unsafe URLs/DM rooms, and createStoryArtifact blocks SSRF/DM/prototype/secret inputs", async () => {
+    const summary = summarizeStoryArtifactBundle({
+      artifact_id: "story_war51",
+      cover_png_url: "https://storage.googleapis.com/agentschat-stories/story_war51-cover.png",
+      full_story_png_url: "http://169.254.169.254/latest/meta-data",
+      blueprint_id: "cross-review",
+      blueprint_url: "https://agents-chat.com/lobby?blueprint=cross-review",
+      rendering_status: "ready",
+      caption_blocked: {
+        x: false,
+        threads: false,
+        wechat: true,
+        tiktok_hook: false,
+      },
+      suggested_captions: {
+        x: "Shipped fix with @codex-auditor! Contact ops@corp.io or glpat-1234567890abcdef +1 (415) 555-2671",
+        threads: "9 releases in one night via AgentsChat cross-review room.",
+        wechat: "Blocked upstream",
+        tiktok_hook: "sk-proj-1234567890abcdef",
+      },
+      story_json: {
+        id: "story_war51",
+        channel: { id: "room-war-51", name: "AgentChatDev" },
+        source_message_ids: ["msg-1", "msg-2", "msg-3"],
+        story_type: "debug_war_room",
+        title: "Zero-Leak War Room",
+        summary: "Cross-review caught regex ordering edge",
+        cast: [
+          { id: "claude-builder", name: "Claude", role: "builder" },
+          { id: "codex-auditor", name: "Codex", role: "auditor" },
+          { id: "__proto__", name: "Bad", role: "spy" },
+        ],
+        turns: [
+          { message_id: "msg-1", order: 1, speaker_id: "claude-builder", speaker_name: "Claude", content: "Patch ready", created_at: "2026-11-14T02:50:00Z", kind: "message" },
+          { message_id: "msg-2", order: 2, speaker_id: "codex-auditor", speaker_name: "Codex", content: "Verified", created_at: "2026-11-14T02:51:00Z", kind: "message" },
+          { message_id: "msg-3", order: 3, speaker_id: "claude-builder", speaker_name: "Claude", content: "Merged", created_at: "2026-11-14T02:52:00Z", kind: "message" },
+          { message_id: "msg_ac_secret_12345678", order: 4, speaker_id: "claude-builder", speaker_name: "Claude", content: "Drop", created_at: "2026-11-14T02:53:00Z", kind: "message" },
+        ],
+        created_by_agent_id: "claude-builder",
+        created_by_account_id: "user:sw***",
+        created_at: "2026-11-14T02:55:00Z",
+        qr_target: "https://agents-chat.com/lobby?blueprint=cross-review",
+        watermark: "Powered by AgentsChat",
+      },
+    });
+
+    expect(summary).toEqual({
+      artifact_id: "story_war51",
+      channel_id: "room-war-51",
+      story_type: "debug_war_room",
+      blueprint_id: "cross-review",
+      blueprint_url: "https://agents-chat.com/lobby?blueprint=cross-review",
+      turn_count: 3,
+      cast_count: 2,
+      rendering_status: "ready",
+      cover_png_url: "https://storage.googleapis.com/agentschat-stories/story_war51-cover.png",
+      full_story_png_url: null,
+      ready_to_share: true,
+      publishable_platforms: ["x", "threads"],
+      blocked_platforms: ["wechat", "tiktok_hook"],
+      safe_captions: {
+        x: "Shipped fix with @codex-auditor! Contact [redacted] or [redacted] [redacted]",
+        threads: "9 releases in one night via AgentsChat cross-review room.",
+        wechat: "",
+        tiktok_hook: "",
+      },
+    });
+
+    expect(
+      summarizeStoryArtifactBundle({
+        artifact_id: "story_dm",
+        story_json: { id: "story_dm", channel: { id: "dm_secret_peer" }, story_type: "build_log", turns: [], cast: [] },
+      }),
+    ).toBeNull();
+    expect(
+      summarizeStoryArtifactBundle({
+        artifact_id: "__proto__",
+        story_json: { id: "__proto__", channel: { id: "room-a" }, story_type: "build_log", turns: [], cast: [] },
+      }),
+    ).toBeNull();
+
+    const rest = new AgentChatREST({ baseUrl: "https://agents-chat.com", bearerToken: "jwt_owner_51" });
+    await expect(
+      rest.createStoryArtifact({
+        channel_id: "dm_secret",
+        message_ids: ["m1", "m2", "m3"],
+        story_type: "build_log",
+      }),
+    ).rejects.toThrow("direct message channels");
+    await expect(
+      rest.createStoryArtifact({
+        channel_id: "__proto__",
+        message_ids: ["m1", "m2", "m3"],
+        story_type: "build_log",
+      }),
+    ).rejects.toThrow("Invalid channel ID");
+    await expect(
+      rest.createStoryArtifact({
+        channel_id: "room_ac_secret_12345678",
+        message_ids: ["m1", "m2", "m3"],
+        story_type: "build_log",
+      }),
+    ).rejects.toThrow("Invalid channel ID");
+    await expect(
+      rest.createStoryArtifact({
+        channel_id: "room-war-51",
+        message_ids: ["m1", "__proto__", "m3"],
+        story_type: "build_log",
+      }),
+    ).rejects.toThrow("Invalid message ID");
+    await expect(
+      rest.createStoryArtifact({
+        channel_id: "room-war-51",
+        message_ids: ["m1", "m2", "m3"],
+        story_type: "build_log",
+        title: "Bad\x07Title",
+      }),
+    ).rejects.toThrow("Invalid story title");
+    await expect(
+      rest.createStoryArtifact({
+        channel_id: "room-war-51",
+        message_ids: ["m1", "m2", "m3"],
+        story_type: "build_log",
+        qr_target: "https://169.254.169.254/latest/meta-data",
+      }),
+    ).rejects.toThrow("Invalid story qr_target");
+    await expect(
+      rest.createStoryArtifact({
+        channel_id: "room-war-51",
+        message_ids: ["m1", "m2", "m3"],
+        story_type: "build_log",
+        qr_target: "https://user:pass@agents-chat.com/lobby",
+      }),
+    ).rejects.toThrow("Invalid story qr_target");
+    await expect(
+      rest.createStoryArtifact({
+        channel_id: "room-war-51",
+        message_ids: ["m1", "m2", "m3"],
+        story_type: "build_log",
+        qr_target: "https://localhost:8443/internal",
+      }),
+    ).rejects.toThrow("Invalid story qr_target");
   });
 });

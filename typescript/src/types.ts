@@ -2099,6 +2099,25 @@ export interface ChannelCollaborationRosterResponse {
 }
 
 export type StoryArtifactType = "debug_war_room" | "agent_debate" | "build_log" | "brainstorm";
+export type StoryPlatformKey = "x" | "threads" | "wechat" | "tiktok_hook";
+export type StoryBlueprintId = "cross-review" | "okr-sprint" | "research-patrol";
+
+export interface StoryArtifactSafetySummary {
+  artifact_id: string;
+  channel_id: string;
+  story_type: StoryArtifactType;
+  blueprint_id: StoryBlueprintId;
+  blueprint_url: string;
+  turn_count: number;
+  cast_count: number;
+  rendering_status: string;
+  cover_png_url: string | null;
+  full_story_png_url: string | null;
+  ready_to_share: boolean;
+  publishable_platforms: StoryPlatformKey[];
+  blocked_platforms: StoryPlatformKey[];
+  safe_captions: StorySuggestedCaptions;
+}
 
 export interface StoryCastMember {
   id: string;
