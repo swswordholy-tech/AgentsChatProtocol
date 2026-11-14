@@ -12,6 +12,7 @@ import {
   summarizeChannelThreads,
   summarizeChannelWakeHealth,
   summarizeCloudAgentRoomPolicy,
+  summarizeCloudAgentSpecialties,
   summarizePersonalSkillsLibrary,
   summarizeProposalsFeed,
   summarizeWorkspaceGraphHierarchy,
@@ -4144,5 +4145,103 @@ describe("AgentChatClient realtime collaboration WS events", () => {
         target_agents: ["__proto__"],
       }),
     ).rejects.toThrow("Invalid target_agents");
+  });
+
+  test("summarizeCloudAgentSpecialties supports all 11 runtimes and updateAgentCapabilities/tuneCloudAgent block multi-cloud & embedded secrets", async () => {
+    const childSummary = summarizeCloudAgentSpecialties({
+      agent_id: "openclaw-child-01",
+      is_host: false,
+      runtime_type: "openclaw",
+      host_agent_id: "fleet-prod",
+      recovery_config: {
+        capabilities: [
+          " Swift ",
+          "CODE-REVIEW",
+          "swift",
+          "glpat-1234567890abcdef",
+          "tag_sk-1234567890abcdef",
+          "__proto__",
+        ],
+      },
+      capabilities: [
+        "swift",
+        "code-review",
+        "cloud-sub-agent",
+        "runtime:openclaw",
+        "host:fleet-prod",
+        "mcp",
+      ],
+    });
+    expect(childSummary).toEqual({
+      agent_id: "openclaw-child-01",
+      is_host: false,
+      runtime: "openclaw",
+      host_agent_id: "fleet-prod",
+      custom_specialties: ["swift", "code-review"],
+      effective_capabilities: [
+        "swift",
+        "code-review",
+        "cloud-sub-agent",
+        "runtime:openclaw",
+        "host:fleet-prod",
+        "mcp",
+      ],
+      capabilities_synced: true,
+    });
+
+    const hostSummary = summarizeCloudAgentSpecialties({
+      agent_id: "muse-host-01",
+      is_host: true,
+      runtime_type: "muse",
+      capabilities: ["cloud_host", "muse"],
+    });
+    expect(hostSummary).toEqual({
+      agent_id: "muse-host-01",
+      is_host: true,
+      runtime: "muse",
+      host_agent_id: null,
+      custom_specialties: [],
+      effective_capabilities: ["cloud_host", "muse"],
+      capabilities_synced: true,
+    });
+
+    const unsafeHost = summarizeCloudAgentSpecialties({
+      agent_id: "dot-child-01",
+      is_host: false,
+      runtime_type: "dot",
+      host_agent_id: "host..escape",
+      recovery_config: { capabilities: ["testing"] },
+      capabilities: ["testing", "cloud-sub-agent", "mcp"],
+    });
+    expect(unsafeHost?.host_agent_id).toBeNull();
+    expect(unsafeHost?.effective_capabilities).toEqual([
+      "testing",
+      "cloud-sub-agent",
+      "runtime:dot",
+      "mcp",
+    ]);
+    expect(unsafeHost?.capabilities_synced).toBe(false);
+    expect(summarizeCloudAgentSpecialties({ agent_id: "__proto__" })).toBeNull();
+
+    const rest = new AgentChatREST({ baseUrl: "https://agents-chat.com", bearerToken: "jwt_owner_50" });
+    await expect(rest.updateAgentCapabilities("__proto__", ["swift"])).rejects.toThrow("Invalid agent ID");
+    await expect(rest.updateAgentCapabilities("bot..escape", ["swift"])).rejects.toThrow("Invalid agent ID");
+    await expect(rest.updateAgentCapabilities("bot_ac_secret_123456", ["swift"])).rejects.toThrow("Invalid agent ID");
+    await expect(
+      rest.updateAgentCapabilities("bot-01", ["glpat-1234567890abcdef"]),
+    ).rejects.toThrow("Capability tag must not resemble a credential");
+    await expect(
+      rest.updateAgentCapabilities("bot-01", ["tag_sk-1234567890abcdef"]),
+    ).rejects.toThrow("Capability tag must not resemble a credential");
+
+    await expect(
+      rest.tuneCloudAgent("openclaw-child-01", { capabilities: ["__proto__"] }),
+    ).rejects.toThrow("Invalid capability tag");
+    await expect(
+      rest.tuneCloudAgent("openclaw-child-01", { capabilities: ["glpat-1234567890abcdef"] }),
+    ).rejects.toThrow("Capability tag must not contain credentials");
+    await expect(
+      rest.tuneCloudAgent("openclaw-child-01", { capabilities: ["tag_ac_secret_12345678"] }),
+    ).rejects.toThrow("Capability tag must not contain credentials");
   });
 });

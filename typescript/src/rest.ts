@@ -1253,6 +1253,107 @@ export function summarizeCloudAgentRoomPolicy(
   };
 }
 
+const CUSTOM_SPECIALTY_RE = /^[a-z][a-z0-9_-]{0,31}$/;
+const CUSTOM_SPECIALTY_SECRET_IN_ID_RE =
+  /(?:^|[^A-Za-z0-9])(?:ac_|agent_key_|sk[-_]|rk_(?:live|test)_|gh[pousr]_|github_pat_|glpat-|xox[baprs]-|AKIA|(?:hf|npm)_|AIza|eyJ)[A-Za-z0-9_+/=.-]*/i;
+
+function sanitizeCustomSpecialtyTag(raw: unknown): string | null {
+  if (typeof raw !== "string") return null;
+  const tag = raw.trim().toLowerCase();
+  if (
+    !CUSTOM_SPECIALTY_RE.test(tag) ||
+    PROTOTYPE_POISON_KEYS.has(tag) ||
+    CREDENTIAL_PREFIX_RE.test(tag) ||
+    CUSTOM_SPECIALTY_SECRET_IN_ID_RE.test(tag)
+  ) {
+    return null;
+  }
+  return tag;
+}
+
+export function summarizeCloudAgentSpecialties(
+  raw: unknown,
+): import("./types").CloudAgentSpecialtySummary | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const rec = raw as Record<string, unknown>;
+  const agentId = typeof rec.agent_id === "string" ? rec.agent_id.trim() : "";
+  if (!isSafeCloudRoomAgentId(agentId)) return null;
+
+  const isHost = Boolean(rec.is_host);
+  const rawRuntime = typeof rec.runtime_type === "string" ? rec.runtime_type.trim() : "";
+  const runtime = CLOUD_WAKE_RUNTIMES.has(rawRuntime as import("./types").CloudWakeRuntimeType)
+    ? (rawRuntime as import("./types").CloudWakeRuntimeType)
+    : null;
+
+  if (isHost) {
+    const effective = ["cloud_host", ...(runtime ? [runtime] : [])];
+    const observed = Array.isArray(rec.capabilities) ? rec.capabilities : [];
+    const synced =
+      observed.length === effective.length &&
+      effective.every((v, idx) => observed[idx] === v);
+    return {
+      agent_id: agentId,
+      is_host: true,
+      runtime,
+      host_agent_id: null,
+      custom_specialties: [],
+      effective_capabilities: effective,
+      capabilities_synced: synced,
+    };
+  }
+
+  const cfg =
+    rec.recovery_config && typeof rec.recovery_config === "object" && !Array.isArray(rec.recovery_config)
+      ? (rec.recovery_config as Record<string, unknown>)
+      : {};
+  const customSpecialties: string[] = [];
+  const seenCustom = new Set<string>();
+  if (Array.isArray(cfg.capabilities)) {
+    for (const item of cfg.capabilities.slice(0, 8)) {
+      const tag = sanitizeCustomSpecialtyTag(item);
+      if (tag && !seenCustom.has(tag)) {
+        seenCustom.add(tag);
+        customSpecialties.push(tag);
+      }
+    }
+  }
+
+  const rawHost = typeof rec.host_agent_id === "string" ? rec.host_agent_id.trim() : "";
+  const safeHost =
+    rawHost &&
+    /^[A-Za-z0-9_.-]{1,128}$/.test(rawHost) &&
+    !rawHost.includes("..") &&
+    !PROTOTYPE_POISON_KEYS.has(rawHost.toLowerCase()) &&
+    !/^\d[\d.-]{5,}$/.test(rawHost) &&
+    !CREDENTIAL_PREFIX_RE.test(rawHost) &&
+    !CUSTOM_SPECIALTY_SECRET_IN_ID_RE.test(rawHost)
+      ? rawHost
+      : null;
+
+  const effectiveSet = new Set<string>([
+    ...customSpecialties,
+    "cloud-sub-agent",
+    ...(runtime ? [`runtime:${runtime}`] : []),
+    ...(safeHost ? [`host:${safeHost}`] : []),
+    "mcp",
+  ]);
+  const effectiveCapabilities = [...effectiveSet].map((tag) => tag.slice(0, 128));
+  const observedCaps = Array.isArray(rec.capabilities) ? rec.capabilities : [];
+  const synced =
+    observedCaps.length === effectiveCapabilities.length &&
+    effectiveCapabilities.every((val, idx) => observedCaps[idx] === val);
+
+  return {
+    agent_id: agentId,
+    is_host: false,
+    runtime,
+    host_agent_id: safeHost,
+    custom_specialties: customSpecialties,
+    effective_capabilities: effectiveCapabilities,
+    capabilities_synced: synced,
+  };
+}
+
 function isValidMemoryAgentId(value: unknown): value is string {
   return (
     typeof value === "string" &&
@@ -3932,7 +4033,13 @@ export class AgentChatREST {
     opts?: { bearerToken?: string },
   ): Promise<import("./types").UpdateAgentCapabilitiesResponse> {
     const safeAgentId = agentId?.trim() ?? "";
-    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/.test(safeAgentId) || /^(?:ac_|sk[-_])/i.test(safeAgentId)) {
+    if (
+      !/^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/.test(safeAgentId) ||
+      safeAgentId.includes("..") ||
+      PROTOTYPE_POISON_KEYS.has(safeAgentId.toLowerCase()) ||
+      CREDENTIAL_PREFIX_RE.test(safeAgentId) ||
+      CUSTOM_SPECIALTY_SECRET_IN_ID_RE.test(safeAgentId)
+    ) {
       throw new Error("Invalid agent ID");
     }
     if (!Array.isArray(capabilities)) {
@@ -3947,7 +4054,11 @@ export class AgentChatREST {
       if (cleaned.length > 128) {
         throw new Error("Capability tag exceeds 128 chars");
       }
-      if (/^(?:ac_|sk[-_]|ghp_|eyJ[A-Za-z0-9_-]+\.)/i.test(cleaned)) {
+      if (
+        PROTOTYPE_POISON_KEYS.has(cleaned.toLowerCase()) ||
+        CREDENTIAL_PREFIX_RE.test(cleaned) ||
+        CUSTOM_SPECIALTY_SECRET_IN_ID_RE.test(cleaned)
+      ) {
         throw new Error("Capability tag must not resemble a credential");
       }
       const key = cleaned.toLowerCase();
@@ -4620,10 +4731,14 @@ export class AgentChatREST {
       body.capabilities = input.capabilities.map((raw) => {
         if (typeof raw !== "string") throw new Error("Capability tag must be a string");
         const tag = raw.trim();
-        if (!tag || tag.length > 48 || /[\x00-\x1f\x7f]/.test(tag)) {
+        if (!tag || tag.length > 48 || /[\x00-\x1f\x7f]/.test(tag) || PROTOTYPE_POISON_KEYS.has(tag.toLowerCase())) {
           throw new Error("Invalid capability tag");
         }
-        if (this.containsMemorySecretShape(tag) || /^(?:ac_|sk[-_])/i.test(tag)) {
+        if (
+          this.containsMemorySecretShape(tag) ||
+          CREDENTIAL_PREFIX_RE.test(tag) ||
+          CUSTOM_SPECIALTY_SECRET_IN_ID_RE.test(tag)
+        ) {
           throw new Error("Capability tag must not contain credentials");
         }
         return tag;

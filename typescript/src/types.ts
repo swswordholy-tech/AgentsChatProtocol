@@ -1864,6 +1864,16 @@ export interface CloudAgentRoomPolicySummary {
   is_protected_only: boolean;
 }
 
+export interface CloudAgentSpecialtySummary {
+  agent_id: string;
+  is_host: boolean;
+  runtime: CloudWakeRuntimeType | null;
+  host_agent_id: string | null;
+  custom_specialties: string[];
+  effective_capabilities: string[];
+  capabilities_synced: boolean;
+}
+
 export interface WakeCloudAgentInput {
   channel_id?: string;
   prompt?: string;
