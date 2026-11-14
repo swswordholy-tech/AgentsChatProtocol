@@ -2098,22 +2098,101 @@ const CLOUD_WAKE_STATUSES = new Set<import("./types").CloudCliWakeStatus>([
 
 function scrubWakeAgentDisplayName(raw: unknown): string | undefined {
   if (typeof raw !== "string") return undefined;
-  const cleaned = raw
-    .slice(0, 512)
+  const bounded = raw.length > 65_536 ? raw.slice(0, 65_536) : raw;
+  const cleaned = bounded
+    .replace(/-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|$)/gi, "")
+    .replace(/\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/gi, "")
+    .replace(
+      /(^|[^A-Za-z0-9])(?:mcp_(?:at|rt|code)_|ac_|agent_key_|sk[-_]|rk_(?:live|test)_|gh[pousr]_|github_pat_|glpat-|xox[baprs]-|(?:hf|npm)_)[A-Za-z0-9_-]+/gi,
+      "$1",
+    )
+    .replace(/(^|[^A-Za-z0-9])(?:AKIA|ASIA)[0-9A-Z]{16}(?=$|[^A-Za-z0-9])/g, "$1")
+    .replace(/(^|[^A-Za-z0-9])(?:AIza[A-Za-z0-9][A-Za-z0-9_-]{7,}|eyJ[A-Za-z0-9][A-Za-z0-9_.-]{7,})/g, "$1")
+    .replace(/\bmr_[0-9a-f]{16,}\b/gi, "")
     .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, "")
     .replace(/\+?\d[\d\s()-]{4,}\d/g, "")
-    .replace(
-      /(?:^|[^A-Za-z0-9])(?:ac_|agent_key_|sk[-_]|rk_(?:live|test)_|gh[pousr]_|github_pat_|glpat-|xox[baprs]-|(?:hf|npm)_|AIza)[A-Za-z0-9_-]+/gi,
-      " ",
-    )
-    .replace(/\bAKIA[0-9A-Z]{16}\b/g, "")
-    .replace(/\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)?\b/g, "")
-    .replace(/-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|$)/g, "")
     .replace(/[\u0000-\u001f\u007f]/g, " ")
     .replace(/\s+/g, " ")
     .trim()
     .slice(0, 80);
   return cleaned.length > 0 ? cleaned : undefined;
+}
+
+const CLOUD_HEALTH_EXPECTED_ACTIONS: Record<
+  import("./types").CloudAgentHealthState,
+  import("./types").CloudAgentRecoveryAction
+> = {
+  auth_required: "auth",
+  rate_limited: "config",
+  timeout: "config",
+  paused: "config",
+  error: "config",
+  healthy: null,
+};
+
+const CLOUD_HEALTH_AUTH_MODES = new Set(["managed", "byok", "subscription"]);
+
+export function classifyCloudAgentHealthState(
+  raw: unknown,
+  agentId?: unknown,
+): import("./types").CloudAgentHealthStateSummary | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const v = raw as Record<string, unknown>;
+  let state: import("./types").CloudAgentHealthState;
+  let action: import("./types").CloudAgentRecoveryAction;
+
+  if (v.status === undefined || v.status === null) {
+    if (
+      typeof v.state !== "string" ||
+      !Object.prototype.hasOwnProperty.call(CLOUD_HEALTH_EXPECTED_ACTIONS, v.state)
+    ) {
+      return null;
+    }
+    const candidateState = v.state as import("./types").CloudAgentHealthState;
+    const expectedAction = CLOUD_HEALTH_EXPECTED_ACTIONS[candidateState];
+    if ((v.action ?? null) !== expectedAction) return null;
+    state = candidateState;
+    action = expectedAction;
+  } else {
+    if (
+      typeof v.status !== "string" ||
+      !CLOUD_WAKE_AGENT_STATUSES.has(v.status) ||
+      typeof v.auth_mode !== "string" ||
+      !CLOUD_HEALTH_AUTH_MODES.has(v.auth_mode) ||
+      typeof v.subscription_pending !== "boolean" ||
+      (v.last_wake_status !== undefined &&
+        v.last_wake_status !== null &&
+        (typeof v.last_wake_status !== "string" ||
+          !CLOUD_WAKE_STATUSES.has(v.last_wake_status as import("./types").CloudCliWakeStatus)))
+    ) {
+      return null;
+    }
+    const wake = (v.last_wake_status as import("./types").CloudCliWakeStatus | null | undefined) ?? null;
+    if (v.subscription_pending || wake === "auth_required") {
+      state = "auth_required";
+      action = "auth";
+    } else if (v.status === "disabled") {
+      state = "paused";
+      action = "config";
+    } else if (v.status === "expired") {
+      state = "error";
+      action = "config";
+    } else if (wake === "error") {
+      state = v.auth_mode === "subscription" ? "rate_limited" : "error";
+      action = "config";
+    } else if (wake === "timeout") {
+      state = "timeout";
+      action = "config";
+    } else {
+      state = "healthy";
+      action = null;
+    }
+  }
+
+  const safeId = typeof agentId === "string" && isSafeCloudRoomAgentId(agentId) ? agentId : null;
+  const recovery_url =
+    action && safeId ? `/cloud-agents?agent=${encodeURIComponent(safeId)}&action=${action}` : null;
+  return { state, action, recovery_url };
 }
 
 export function summarizeChannelWakeHealth(
@@ -2225,9 +2304,12 @@ export function summarizeChannelWakeHealth(
 function isSafeCloudRoomAgentId(value: unknown): value is string {
   return (
     typeof value === "string" &&
-    /^[A-Za-z0-9_-]{2,64}$/.test(value) &&
-    !PROTOTYPE_POISON_KEYS.has(value) &&
+    /^[A-Za-z0-9][A-Za-z0-9_-]{1,63}$/.test(value) &&
+    !PROTOTYPE_POISON_KEYS.has(value.toLowerCase()) &&
+    !/^mr_[0-9a-f]{16,}$/i.test(value) &&
     !CREDENTIAL_PREFIX_RE.test(value) &&
+    !JOINED_GRAPH_CREDENTIAL_ID_RE.test(value) &&
+    !JOINED_GRAPH_AWS_KEY_ID_RE.test(value) &&
     !EMBEDDED_SECRET_TOKEN_RE.test(value)
   );
 }

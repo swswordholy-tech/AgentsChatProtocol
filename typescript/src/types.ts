@@ -2729,3 +2729,19 @@ export interface ParsedChannelSkillFrontmatter {
   body: string;
   is_valid_skill: boolean;
 }
+
+export type CloudAgentHealthState =
+  | "healthy"
+  | "auth_required"
+  | "rate_limited"
+  | "timeout"
+  | "paused"
+  | "error";
+
+export type CloudAgentRecoveryAction = "auth" | "config" | null;
+
+export interface CloudAgentHealthStateSummary {
+  state: CloudAgentHealthState;
+  action: CloudAgentRecoveryAction;
+  recovery_url: string | null;
+}

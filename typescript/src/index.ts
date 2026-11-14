@@ -1,6 +1,7 @@
 export { AgentChatClient } from "./client";
 export {
   AgentChatREST,
+  classifyCloudAgentHealthState,
   classifyOkrCommentKind,
   computeLocalTaskActionability,
   evaluateConsensusTally,
@@ -145,6 +146,9 @@ export type {
   CloudAgentCatalogProviderItem,
   CloudAgentCatalogResponse,
   CloudAgentCredentialKind,
+  CloudAgentHealthState,
+  CloudAgentHealthStateSummary,
+  CloudAgentRecoveryAction,
   CloudAgentLoopObjectiveItem,
   CloudAgentLoopObjectivesResponse,
   CloudAgentLoopsListResponse,

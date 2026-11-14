@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
   AgentChatClient,
   AgentChatREST,
+  classifyCloudAgentHealthState,
   computeLocalTaskActionability,
   evaluateConsensusTally,
   extractResolvedMentions,
@@ -5977,5 +5978,112 @@ describe("AgentChatClient realtime collaboration WS events", () => {
     } finally {
       globalThis.fetch = origFetch;
     }
+  });
+
+  test("Campaign #68: classifyCloudAgentHealthState & summarizeChannelWakeHealth slug/display-name/mr_* parity", () => {
+    // 1. classifyCloudAgentHealthState covers all 6 states + idempotent normalized form + recovery_url guard
+    expect(
+      classifyCloudAgentHealthState(
+        { status: "active", auth_mode: "subscription", subscription_pending: true, last_wake_status: "ok" },
+        "aiza-worker-1",
+      ),
+    ).toEqual({
+      state: "auth_required",
+      action: "auth",
+      recovery_url: "/cloud-agents?agent=aiza-worker-1&action=auth",
+    });
+
+    expect(
+      classifyCloudAgentHealthState(
+        { status: "active", auth_mode: "subscription", subscription_pending: false, last_wake_status: "error" },
+        "eyj-worker-1",
+      ),
+    ).toEqual({
+      state: "rate_limited",
+      action: "config",
+      recovery_url: "/cloud-agents?agent=eyj-worker-1&action=config",
+    });
+
+    expect(
+      classifyCloudAgentHealthState(
+        { status: "active", auth_mode: "managed", subscription_pending: false, last_wake_status: "error" },
+        "asia-worker-1",
+      ),
+    ).toEqual({
+      state: "error",
+      action: "config",
+      recovery_url: "/cloud-agents?agent=asia-worker-1&action=config",
+    });
+
+    expect(
+      classifyCloudAgentHealthState(
+        { status: "disabled", auth_mode: "managed", subscription_pending: false, last_wake_status: "ok" },
+        "codex-worker-1",
+      ),
+    ).toEqual({
+      state: "paused",
+      action: "config",
+      recovery_url: "/cloud-agents?agent=codex-worker-1&action=config",
+    });
+
+    expect(
+      classifyCloudAgentHealthState(
+        { status: "active", auth_mode: "byok", subscription_pending: false, last_wake_status: "timeout" },
+        "mr_0123456789abcdef",
+      ),
+    ).toEqual({
+      state: "timeout",
+      action: "config",
+      recovery_url: null,
+    });
+
+    const healthy = classifyCloudAgentHealthState(
+      { status: "active", auth_mode: "managed", subscription_pending: false, last_wake_status: "ok" },
+      "aiza-worker-1",
+    );
+    expect(healthy).toEqual({ state: "healthy", action: null, recovery_url: null });
+    expect(classifyCloudAgentHealthState(healthy, "aiza-worker-1")).toEqual(healthy);
+    expect(classifyCloudAgentHealthState({ state: "auth_required", action: "config" })).toBeNull();
+    expect(classifyCloudAgentHealthState({ status: "active", auth_mode: "managed", subscription_pending: "no" })).toBeNull();
+
+    // 2. summarizeChannelWakeHealth preserves hyphenated aiza-/eyj-/asia- & AIza-Worker while blocking Constructor/mr_*/ASIA/mcp_at_
+    const digest = summarizeChannelWakeHealth({
+      channel_id: "aiza-room-1",
+      observation_only: true,
+      agents: [
+        {
+          agent_id: "aiza-worker-1",
+          name: "AIza-Worker · Asia-Pacific mcp_at_secret123456 ASIA1234567890ABCDEF mr_0123456789abcdef",
+          runtime: "codex",
+          cloud_status: "active",
+          last_wake_status: "auth_required",
+          last_wake_at: "2026-11-14T08:00:00.000Z",
+          last_duration_ms: 42,
+        },
+        {
+          agent_id: "eyj-worker-1",
+          name: "EYJ Helper",
+          runtime: "agy",
+          cloud_status: "active",
+          last_wake_status: "ok",
+        },
+        { agent_id: "Constructor", runtime: "codex", cloud_status: "active" },
+        { agent_id: "mr_0123456789abcdef", runtime: "codex", cloud_status: "active" },
+        { agent_id: "bot_ac_secret123456789", runtime: "codex", cloud_status: "active" },
+        { agent_id: "ASIA1234567890ABCDEF", runtime: "codex", cloud_status: "active" },
+      ],
+    });
+    expect(digest).not.toBeNull();
+    expect(digest!.agents.map((a) => a.agent_id)).toEqual(["aiza-worker-1", "eyj-worker-1"]);
+    expect(digest!.agents[0]?.name).toBe("AIza-Worker · Asia-Pacific");
+    expect(digest!.attention_agent_ids).toEqual(["aiza-worker-1"]);
+    expect(digest!.counts).toEqual({
+      total_cloud_agents: 2,
+      ok: 1,
+      auth_required: 1,
+      timeout: 0,
+      error: 0,
+      unobserved: 0,
+    });
   });
 });
