@@ -71,7 +71,7 @@ const ROSTER_ROLES = new Set(["member", "moderator", "admin"]);
 const ROSTER_TYPES = new Set(["agent", "user", "unknown"]);
 const ROSTER_SCOPES = new Set(["owned", "unclaimed", "external"]);
 const SAFE_COLLAB_AGENT_ID_RE = /^[A-Za-z0-9_.-]{1,128}$/;
-const CREDENTIAL_PREFIX_RE = /^(?:ac_|agent_key_|sk[-_]|rk_(?:live|test)_|gh[pousr]_|github_pat_|glpat-|xox[baprs]-|AKIA[0-9A-Z]{16}|(?:hf|npm)_|AIza|eyJ)/i;
+const CREDENTIAL_PREFIX_RE = /^(?:mcp_(?:at|rt|code)_|ac_|agent_key_|sk[-_]|rk_(?:live|test)_|gh[pousr]_|github_pat_|glpat-|xox[baprs]-|(?:AKIA|ASIA)[0-9A-Z]{16}|(?:hf|npm)_|AIza|eyJ)/i;
 const EMAIL_ID_RE = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i;
 const PHONE_ID_RE = /^\+?\d[\d ()-]{5,}\d$/;
 
@@ -424,9 +424,9 @@ export function summarizeWorkspaceGraphHierarchy(
   };
 }
 
-const DM_OR_DIRECT_CHANNEL_RE = /^(?:dm[-_]|direct(?:$|[-_:]))/i;
+const DM_OR_DIRECT_CHANNEL_RE = /^(?:dm[-_:]|direct(?:$|[-_:]))/i;
 const EMBEDDED_SECRET_TOKEN_RE =
-  /(?:^|[^A-Za-z0-9])(?:ac_[A-Za-z0-9_-]{8,}|agent_key_[A-Za-z0-9_-]{8,}|sk[-_][A-Za-z0-9_-]{12,}|rk_(?:live|test)_[A-Za-z0-9]{16,}|gh[pousr]_[A-Za-z0-9_]{8,}|github_pat_[A-Za-z0-9_]{8,}|glpat-[A-Za-z0-9_-]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}(?:$|[^A-Za-z0-9])|(?:hf|npm)_[A-Za-z0-9]{20,}|AIza[A-Za-z0-9_-]{12,}|eyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}|\bBearer\s+[A-Za-z0-9._~+/=-]{16,}|-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----)/i;
+  /(?:^|[^A-Za-z0-9])(?:mcp_(?:at|rt|code)_[A-Za-z0-9_-]{8,}|ac_[A-Za-z0-9_+/\-=]{8,}|agent_key_[A-Za-z0-9_-]{8,}|sk[-_][A-Za-z0-9_-]{12,}|rk_(?:live|test)_[A-Za-z0-9]{12,}|gh[pousr]_[A-Za-z0-9_]{8,}|github_pat_[A-Za-z0-9_]{8,}|glpat-[A-Za-z0-9_-]{12,}|xox[baprs]-[A-Za-z0-9-]{10,}|(?:AKIA|ASIA)[0-9A-Z]{16}(?:$|[^A-Za-z0-9])|(?:hf|npm)_[A-Za-z0-9]{12,}|AIza[A-Za-z0-9_-]{12,}|eyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}|\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{12,}|-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----)/i;
 
 function isPrivateOrLoopbackHostname(rawHostname: string): boolean {
   const host = rawHostname.trim().toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
@@ -489,12 +489,12 @@ function scrubStoryDisplayText(raw: unknown, maxLen: number): string {
   if (typeof raw !== "string") return "";
   return raw
     .replace(/-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|$)/gi, "[redacted]")
-    .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]{12,}/gi, "Bearer [redacted]")
+    .replace(/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{12,}/gi, "$1 [redacted]")
     .replace(
-      /(?:^|[^A-Za-z0-9])(?:ac_|agent_key_|sk[-_]|rk_(?:live|test)_|gh[pousr]_|github_pat_|glpat-|xox[baprs]-|(?:hf|npm)_|AIza)[A-Za-z0-9_-]+/gi,
+      /(?:^|[^A-Za-z0-9])(?:mcp_(?:at|rt|code)_|ac_[A-Za-z0-9_+/\-=]{8,}|agent_key_|sk[-_]|rk_(?:live|test)_|gh[pousr]_|github_pat_|glpat-|xox[baprs]-|(?:hf|npm)_|AIza)[A-Za-z0-9_+/\-=.-]*/gi,
       (m) => (/[A-Za-z0-9]/.test(m.charAt(0)) ? "[redacted]" : `${m.charAt(0)}[redacted]`),
     )
-    .replace(/(?:^|[^A-Za-z0-9])AKIA[0-9A-Z]{16}(?=$|[^A-Za-z0-9])/g, (m) =>
+    .replace(/(?:^|[^A-Za-z0-9])(?:AKIA|ASIA)[0-9A-Z]{16}(?=$|[^A-Za-z0-9])/g, (m) =>
       /[A-Za-z0-9]/.test(m.charAt(0)) ? "[redacted]" : `${m.charAt(0)}[redacted]`,
     )
     .replace(/\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)?\b/g, "[redacted]")
@@ -949,17 +949,163 @@ const VALID_DOC_KINDS_SET = new Set<import("./types").ChannelDocKind>([
   "channel_skill",
 ]);
 
+const CHANNEL_DOC_CREDENTIAL_ID_RE =
+  /(?:^|[^A-Za-z0-9])(?:mcp_(?:at|rt|code)_|ac_|agent_key_|sk[-_]|rk_(?:live|test)_|gh[pousr]_|github_pat_|glpat-|xox[baprs]-|(?:AKIA|ASIA)[0-9A-Z]{16}|(?:hf|npm)_|AIza|eyJ)/i;
+
+function isSafeChannelDocSlug(raw: unknown): raw is string {
+  if (typeof raw !== "string") return false;
+  const id = raw.trim();
+  return (
+    /^[A-Za-z0-9_-]{1,64}$/.test(id) &&
+    !PROTOTYPE_POISON_KEYS.has(id.toLowerCase()) &&
+    !CREDENTIAL_PREFIX_RE.test(id) &&
+    !CHANNEL_DOC_CREDENTIAL_ID_RE.test(id) &&
+    !EMBEDDED_SECRET_TOKEN_RE.test(id)
+  );
+}
+
+export function summarizeChannelDocList(
+  raw: unknown,
+  expectedChannelId?: string,
+): import("./types").ChannelDocListSummary | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const r = raw as Record<string, unknown>;
+  const channelId = typeof r.channel_id === "string" ? r.channel_id.trim() : "";
+  if (
+    !safeNonDmChannelId(channelId) ||
+    PROTOTYPE_POISON_KEYS.has(channelId.toLowerCase()) ||
+    CREDENTIAL_PREFIX_RE.test(channelId) ||
+    EMBEDDED_SECRET_TOKEN_RE.test(channelId) ||
+    /^\d{6,}$/.test(channelId)
+  ) {
+    return null;
+  }
+  if (expectedChannelId !== undefined && expectedChannelId.trim() !== channelId) {
+    return null;
+  }
+  if (!Array.isArray(r.docs)) return null;
+
+  const seenIds = new Set<string>();
+  const docs: import("./types").ChannelDocSummaryItem[] = [];
+  let activeCount = 0;
+  let archivedCount = 0;
+  let l1ActiveCount = 0;
+  let skillCount = 0;
+
+  for (const item of r.docs) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    const d = item as Record<string, unknown>;
+    const id = typeof d.id === "string" ? d.id.trim() : "";
+    if (!isSafeChannelDocSlug(id) || seenIds.has(id)) continue;
+
+    const kind = d.kind as import("./types").ChannelDocKind;
+    if (!VALID_DOC_KINDS_SET.has(kind)) continue;
+    const level = d.level as import("./types").ChannelDocLevel;
+    if (level !== 1 && level !== 2 && level !== 3 && level !== 4) continue;
+    if (typeof d.version !== "number" || !Number.isSafeInteger(d.version) || d.version < 1) continue;
+
+    seenIds.add(id);
+    const rawBodySummary =
+      typeof d.bodySummary === "string"
+        ? d.bodySummary
+        : typeof d.body_summary === "string"
+          ? d.body_summary
+          : "";
+    const archived = d.archived === true;
+    const scrubbedTitle = scrubStoryDisplayText(d.title, 120) || id;
+    const scrubbedSummary = archived ? "" : scrubStoryDisplayText(rawBodySummary, 280);
+    const rawUpdatedAt =
+      typeof d.updatedAt === "string"
+        ? d.updatedAt.trim()
+        : typeof d.updated_at === "string"
+          ? d.updated_at.trim()
+          : "";
+    const updatedAt = /^\d{4}-\d{2}-\d{2}T/.test(rawUpdatedAt) ? rawUpdatedAt.slice(0, 64) : "";
+    const rawUpdatedBy =
+      typeof d.updatedBy === "string"
+        ? d.updatedBy.trim()
+        : typeof d.updated_by === "string"
+          ? d.updated_by.trim()
+          : "";
+    const updatedBy =
+      !rawUpdatedBy ||
+      PROTOTYPE_POISON_KEYS.has(rawUpdatedBy.toLowerCase()) ||
+      CREDENTIAL_PREFIX_RE.test(rawUpdatedBy) ||
+      CHANNEL_DOC_CREDENTIAL_ID_RE.test(rawUpdatedBy) ||
+      EMBEDDED_SECRET_TOKEN_RE.test(rawUpdatedBy) ||
+      EMAIL_ID_RE.test(rawUpdatedBy) ||
+      PHONE_ID_RE.test(rawUpdatedBy)
+        ? "unknown"
+        : rawUpdatedBy.replace(/[\x00-\x1f\x7f]+/g, "").slice(0, 128) || "unknown";
+
+    let skillMeta: import("./types").ChannelDocSummaryItem["skill_meta"] | undefined;
+    if (
+      !archived &&
+      (kind === "skill" || kind === "channel_skill") &&
+      d.skill_meta &&
+      typeof d.skill_meta === "object" &&
+      !Array.isArray(d.skill_meta)
+    ) {
+      const sm = d.skill_meta as Record<string, unknown>;
+      const smName = scrubStoryDisplayText(sm.name, 160);
+      const smDesc = scrubStoryDisplayText(sm.description, 500);
+      if (smName && smDesc) {
+        const smTrigger = scrubStoryDisplayText(sm.trigger, 500);
+        const smHint = scrubStoryDisplayText(sm.argument_hint, 160);
+        skillMeta = {
+          name: smName,
+          description: smDesc,
+          ...(smTrigger ? { trigger: smTrigger } : {}),
+          ...(smHint ? { argument_hint: smHint } : {}),
+        };
+      }
+    }
+
+    if (archived) {
+      archivedCount += 1;
+    } else {
+      activeCount += 1;
+      if (level === 1) l1ActiveCount += 1;
+      if (skillMeta) skillCount += 1;
+    }
+
+    docs.push({
+      id,
+      title: scrubbedTitle,
+      kind,
+      level,
+      bodySummary: scrubbedSummary,
+      version: d.version,
+      updatedAt,
+      updatedBy,
+      ...(archived ? { archived: true } : {}),
+      ...(skillMeta ? { skill_meta: skillMeta } : {}),
+    });
+    if (docs.length >= 100) break;
+  }
+
+  docs.sort((a, b) => a.level - b.level || a.id.localeCompare(b.id));
+
+  return {
+    channel_id: channelId,
+    total_docs: docs.length,
+    active_count: activeCount,
+    archived_count: archivedCount,
+    l1_active_count: l1ActiveCount,
+    l1_remaining_slots: Math.max(0, 3 - l1ActiveCount),
+    channel_remaining_slots: Math.max(0, 20 - activeCount),
+    skill_count: skillCount,
+    docs,
+  };
+}
+
 export function summarizeChannelDocDetail(
   raw: unknown,
 ): import("./types").ChannelDocDetailSummary | null {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
   const d = raw as Record<string, unknown>;
   const id = typeof d.id === "string" ? d.id.trim() : "";
-  if (
-    !/^[A-Za-z0-9_-]{1,64}$/.test(id) ||
-    CREDENTIAL_PREFIX_RE.test(id) ||
-    EMBEDDED_SECRET_TOKEN_RE.test(id)
-  ) {
+  if (!isSafeChannelDocSlug(id)) {
     return null;
   }
   const kind = d.kind as import("./types").ChannelDocKind;
@@ -4151,7 +4297,12 @@ export class AgentChatREST {
 
   private assertChannelDocRoomId(channelId: string): string {
     const safeCh = this.assertOkrEntityId(channelId, "channel ID");
-    if (DM_OR_DIRECT_CHANNEL_RE.test(safeCh) || EMBEDDED_SECRET_TOKEN_RE.test(safeCh)) {
+    if (
+      PROTOTYPE_POISON_KEYS.has(safeCh.toLowerCase()) ||
+      DM_OR_DIRECT_CHANNEL_RE.test(safeCh) ||
+      CREDENTIAL_PREFIX_RE.test(safeCh) ||
+      EMBEDDED_SECRET_TOKEN_RE.test(safeCh)
+    ) {
       throw new Error("Invalid channel ID");
     }
     return safeCh;
@@ -4159,11 +4310,7 @@ export class AgentChatREST {
 
   private assertChannelDocId(docId: string): string {
     const trimmed = docId?.trim() ?? "";
-    if (
-      !/^[A-Za-z0-9_-]{1,64}$/.test(trimmed) ||
-      CREDENTIAL_PREFIX_RE.test(trimmed) ||
-      EMBEDDED_SECRET_TOKEN_RE.test(trimmed)
-    ) {
+    if (!isSafeChannelDocSlug(trimmed)) {
       throw new Error("Invalid channel doc ID");
     }
     return trimmed;

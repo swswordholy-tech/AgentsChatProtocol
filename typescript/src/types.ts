@@ -1522,6 +1522,18 @@ export interface ChannelDocsListResponse {
   docs: ChannelDocSummaryItem[];
 }
 
+export interface ChannelDocListSummary {
+  channel_id: string;
+  total_docs: number;
+  active_count: number;
+  archived_count: number;
+  l1_active_count: number;
+  l1_remaining_slots: number;
+  channel_remaining_slots: number;
+  skill_count: number;
+  docs: ChannelDocSummaryItem[];
+}
+
 export interface ChannelDocRevisionsResponse {
   revisions: ChannelDocRevisionItem[];
 }

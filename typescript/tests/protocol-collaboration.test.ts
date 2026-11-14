@@ -4495,4 +4495,98 @@ describe("AgentChatClient realtime collaboration WS events", () => {
       }),
     ).rejects.toThrow("Invalid proposal voter_id");
   });
+
+  test("summarizeChannelDocList & Channel Docs REST guards enforce L1/total capacity accounting, multi-cloud/joined secret scrubbing, and prototype-key rejection", async () => {
+    const { summarizeChannelDocList, summarizeChannelDocDetail } = await import("../src/index");
+
+    const listSummary = summarizeChannelDocList(
+      {
+        channel_id: "room-53",
+        docs: [
+          {
+            id: "deploy-sop",
+            title: "Deploy SOP mcp_at_1234567890abcdef",
+            kind: "channel_skill",
+            level: 3,
+            bodySummary: "Run checks with env_glpat-1234567890abcdef and owner@example.com",
+            version: 2,
+            updatedAt: "2026-11-14T03:40:00.000Z",
+            updatedBy: "codex-staff-engineer-ca7590",
+            skill_meta: {
+              name: "deploy-sop",
+              description: "Verify release without ASIAIOSFODNN7EXAMPLE",
+              trigger: "/deploy",
+            },
+          },
+          {
+            id: "room-topic",
+            title: "Room Topic",
+            kind: "topic",
+            level: 1,
+            bodySummary: "Index of room goals",
+            version: 1,
+            updatedAt: "2026-11-14T03:35:00.000Z",
+            updatedBy: "bot_ac_ABCDEFGHIJKLMNOP+/==",
+          },
+          {
+            id: "old-draft",
+            title: "Archived Draft",
+            kind: "context",
+            level: 1,
+            bodySummary: "Should clear summary when archived",
+            version: 4,
+            updatedAt: "2026-11-14T03:30:00.000Z",
+            updatedBy: "owner@example.com",
+            archived: true,
+          },
+          // Poison / credential / duplicate entries dropped
+          { id: "__proto__", title: "Poison", kind: "context", level: 2, bodySummary: "x", version: 1, updatedAt: "", updatedBy: "bot" },
+          { id: "doc_glpat-1234567890abcdef", title: "Secret ID", kind: "context", level: 2, bodySummary: "x", version: 1, updatedAt: "", updatedBy: "bot" },
+          { id: "room-topic", title: "Duplicate", kind: "topic", level: 1, bodySummary: "dup", version: 9, updatedAt: "", updatedBy: "bot" },
+        ],
+      },
+      "room-53",
+    );
+
+    expect(listSummary).not.toBeNull();
+    expect(listSummary!.total_docs).toBe(3);
+    expect(listSummary!.active_count).toBe(2);
+    expect(listSummary!.archived_count).toBe(1);
+    expect(listSummary!.l1_active_count).toBe(1);
+    expect(listSummary!.l1_remaining_slots).toBe(2);
+    expect(listSummary!.channel_remaining_slots).toBe(18);
+    expect(listSummary!.skill_count).toBe(1);
+    expect(listSummary!.docs.map((d) => d.id)).toEqual(["old-draft", "room-topic", "deploy-sop"]);
+    expect(listSummary!.docs[0]?.bodySummary).toBe("");
+    expect(listSummary!.docs[0]?.updatedBy).toBe("unknown");
+    expect(listSummary!.docs[1]?.updatedBy).toBe("unknown");
+    const dumped = JSON.stringify(listSummary);
+    for (const secret of ["mcp_at_", "glpat-", "ASIAIOSFODNN7EXAMPLE", "ac_ABCDEFGHIJKLMNOP", "owner@example.com"]) {
+      expect(dumped).not.toContain(secret);
+    }
+
+    expect(summarizeChannelDocList({ channel_id: "room-53", docs: [] }, "other-room")).toBeNull();
+    expect(summarizeChannelDocList({ channel_id: "__proto__", docs: [] })).toBeNull();
+    expect(summarizeChannelDocList({ channel_id: "direct:secret", docs: [] })).toBeNull();
+    expect(summarizeChannelDocDetail({ id: "__proto__", kind: "context", level: 3, version: 1, bodyMarkdown: "x" })).toBeNull();
+    expect(summarizeChannelDocDetail({ id: "doc_mcp_at_1234567890", kind: "context", level: 3, version: 1, bodyMarkdown: "x" })).toBeNull();
+
+    const rest = new AgentChatREST({ baseUrl: "https://agents-chat.com", bearerToken: "jwt_owner_53" });
+    for (const badCh of ["__proto__", "dm:pair", "direct_pair", "mcp_at_1234567890abcdef"]) {
+      await expect(rest.listChannelDocs(badCh)).rejects.toThrow("Invalid channel ID");
+    }
+    for (const badDoc of ["__proto__", "constructor", "prototype", "mcp_at_1234567890", "doc_hf_1234567890abcdef"]) {
+      await expect(rest.getChannelDoc("room-53", badDoc)).rejects.toThrow("Invalid channel doc ID");
+      await expect(rest.archiveChannelDoc("room-53", badDoc, 1)).rejects.toThrow("Invalid channel doc ID");
+    }
+    await expect(
+      rest.saveChannelDoc("room-53", "runbook", {
+        title: "Runbook",
+        kind: "context",
+        level: 3,
+        body_markdown: "Token ac_ABCDEFGHIJKLMNOP+/== and mcp_rt_1234567890abcdef",
+        if_match_version: 0,
+      }),
+    ).rejects.toThrow("Secret or credential detected in channel doc");
+  });
 });
