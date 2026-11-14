@@ -4,6 +4,7 @@ import {
   AgentChatREST,
   computeLocalTaskActionability,
   evaluateConsensusTally,
+  isPrivateOrReservedHost,
   isValidCollaborationRoster,
   resolveInheritedObjectiveChannel,
   summarizeAgentMemoryIndex,
@@ -5371,6 +5372,88 @@ describe("AgentChatClient realtime collaboration WS events", () => {
       expect(res.agents[1].okr_summary).toBeNull();
       expect(res.agents[2].okr_summary?.ready_count).toBe(2);
       expect(res.agents[2].okr_summary?.active_channel_ids).toEqual(["room-asia-pacific"]);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("Campaign #61: isPrivateOrReservedHost unifies SSRF defenses across registerWebhook, probeCloudEndpointModels, and story URLs", async () => {
+    for (const blocked of [
+      "",
+      "localhost",
+      "admin.localhost",
+      "api.localhost.",
+      "127.1",
+      "0x7f000001",
+      "2130706433",
+      "0.0.0.1",
+      "100.64.0.1",
+      "100.100.100.200",
+      "198.18.0.1",
+      "192.0.0.1",
+      "192.0.2.10",
+      "224.0.0.1",
+      "240.0.0.1",
+      "[::1]",
+      "[0:0:0:0:0:0:0:1]",
+      "[::ffff:100.100.100.200]",
+      "[64:ff9b::169.254.169.254]",
+      "[64:ff9b:1::10.0.0.1]",
+      "[2002:7f00:1::1]",
+      "[febf::1]",
+      "[ff02::1]",
+      "[fe80::1%25eth0]",
+      "metadata.google.internal.",
+      "nas.home.arpa",
+      "git.corp",
+      "printer.lan",
+      "sink.invalid",
+      "staging.test",
+      "demo.example",
+      "redis-single-label",
+    ]) {
+      expect(isPrivateOrReservedHost(blocked)).toBe(true);
+    }
+
+    for (const allowed of [
+      "api.openai.com",
+      "example.com",
+      "fcbank.com",
+      "100.63.255.255",
+      "100.128.0.1",
+      "172.32.0.1",
+      "[2606:4700:4700::1111]",
+      "[64:ff9b::8.8.8.8]",
+    ]) {
+      expect(isPrivateOrReservedHost(allowed)).toBe(false);
+    }
+
+    const originalFetch = globalThis.fetch;
+    let networkCalls = 0;
+    globalThis.fetch = (async () => {
+      networkCalls += 1;
+      return Response.json({ ok: true, models: [] });
+    }) as unknown as typeof fetch;
+
+    try {
+      const rest = new AgentChatREST({ baseUrl: "https://agents-chat.com", bearerToken: "tok_61" });
+      for (const badUrl of [
+        "https://100.100.100.200/hook",
+        "https://[64:ff9b::169.254.169.254]/hook",
+        "https://[2002:7f00:1::1]/hook",
+        "https://admin.localhost/hook",
+        "https://sink.invalid/hook",
+      ]) {
+        await expect(rest.registerWebhook("room-dev", badUrl)).rejects.toThrow("Webhook host not allowed");
+        await expect(rest.probeCloudEndpointModels({ base_url: badUrl })).rejects.toThrow(
+          "Private or internal network endpoints are not allowed",
+        );
+      }
+      expect(networkCalls).toBe(0);
+
+      await rest.registerWebhook("room-dev", "https://fcbank.com/webhook");
+      await rest.probeCloudEndpointModels({ base_url: "https://[64:ff9b::8.8.8.8]/v1" });
+      expect(networkCalls).toBe(2);
     } finally {
       globalThis.fetch = originalFetch;
     }

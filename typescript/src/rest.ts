@@ -445,37 +445,163 @@ const EMBEDDED_SECRET_TOKEN_RE = {
   },
 };
 
-function isPrivateOrLoopbackHostname(rawHostname: string): boolean {
-  const host = rawHostname.trim().toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
+const RESERVED_OR_INTRANET_SUFFIXES = [
+  ".internal",
+  ".local",
+  ".home.arpa",
+  ".corp",
+  ".lan",
+  ".home",
+  ".localdomain",
+  ".invalid",
+  ".test",
+  ".example",
+];
+
+function parseSdkIpv4Part(part: string): number | null {
+  if (!part) return null;
+  if (/^0x[0-9a-f]+$/i.test(part)) {
+    const v = Number.parseInt(part.slice(2), 16);
+    return Number.isSafeInteger(v) && v >= 0 && v <= 0xffffffff ? v : null;
+  }
+  if (/^0[0-7]+$/.test(part)) {
+    const v = Number.parseInt(part, 8);
+    return Number.isSafeInteger(v) && v >= 0 && v <= 0xffffffff ? v : null;
+  }
+  if (/^\d+$/.test(part)) {
+    const v = Number.parseInt(part, 10);
+    return Number.isSafeInteger(v) && v >= 0 && v <= 0xffffffff ? v : null;
+  }
+  return null;
+}
+
+function parseSdkIpv4Octets(host: string): [number, number, number, number] | "invalid" | null {
+  const parts = host.split(".");
+  if (parts.length < 1 || parts.length > 4) return null;
+  if (!parts.every((p) => /^(?:0x[0-9a-f]+|\d+)$/i.test(p))) return null;
+  const nums = parts.map(parseSdkIpv4Part);
+  if (nums.some((n) => n === null)) return "invalid";
+  const vals = nums as number[];
+  let ip32 = 0;
+  if (vals.length === 1) {
+    ip32 = vals[0];
+  } else if (vals.length === 2) {
+    if (vals[0] > 255 || vals[1] > 0xffffff) return "invalid";
+    ip32 = ((vals[0] << 24) >>> 0) + vals[1];
+  } else if (vals.length === 3) {
+    if (vals[0] > 255 || vals[1] > 255 || vals[2] > 0xffff) return "invalid";
+    ip32 = ((vals[0] << 24) >>> 0) + (vals[1] << 16) + vals[2];
+  } else {
+    if (vals.some((v) => v > 255)) return "invalid";
+    ip32 = ((vals[0] << 24) >>> 0) + (vals[1] << 16) + (vals[2] << 8) + vals[3];
+  }
+  return [(ip32 >>> 24) & 255, (ip32 >>> 16) & 255, (ip32 >>> 8) & 255, ip32 & 255];
+}
+
+function isPrivateOrReservedIpv4Octets([a, b, c]: [number, number, number, number]): boolean {
+  if (a === 0 || a === 127 || a === 10) return true;
+  if (a === 172 && b >= 16 && b <= 31) return true;
+  if (a === 192 && b === 168) return true;
+  if (a === 169 && b === 254) return true;
+  if (a === 100 && b >= 64 && b <= 127) return true;
+  if (a === 192 && b === 0 && (c === 0 || c === 2)) return true;
+  if (a === 198 && (b === 18 || b === 19)) return true;
+  if (a === 198 && b === 51 && c === 100) return true;
+  if (a === 203 && b === 0 && c === 113) return true;
+  if (a >= 224) return true;
+  return false;
+}
+
+function parseSdkIpv6Words(raw: string): number[] | null {
+  if (!raw.includes(":")) return null;
+  let working = raw;
+  const lastColon = working.lastIndexOf(":");
+  if (lastColon !== -1 && working.slice(lastColon + 1).includes(".")) {
+    const tailOctets = parseSdkIpv4Octets(working.slice(lastColon + 1));
+    if (!tailOctets || tailOctets === "invalid") return null;
+    const hi = ((tailOctets[0] << 8) | tailOctets[1]).toString(16);
+    const lo = ((tailOctets[2] << 8) | tailOctets[3]).toString(16);
+    working = `${working.slice(0, lastColon + 1)}${hi}:${lo}`;
+  }
+  const dblParts = working.split("::");
+  if (dblParts.length > 2) return null;
+  const parseSide = (side: string): number[] | null => {
+    if (!side) return [];
+    const out: number[] = [];
+    for (const seg of side.split(":")) {
+      if (!/^[0-9a-f]{1,4}$/i.test(seg)) return null;
+      out.push(Number.parseInt(seg, 16));
+    }
+    return out;
+  };
+  if (dblParts.length === 2) {
+    const left = parseSide(dblParts[0]);
+    const right = parseSide(dblParts[1]);
+    if (!left || !right || left.length + right.length >= 8) return null;
+    return [...left, ...new Array<number>(8 - left.length - right.length).fill(0), ...right];
+  }
+  const full = parseSide(working);
+  return full && full.length === 8 ? full : null;
+}
+
+function sdkWordsToIpv4(hi: number, lo: number): [number, number, number, number] {
+  return [(hi >>> 8) & 255, hi & 255, (lo >>> 8) & 255, lo & 255];
+}
+
+/**
+ * Pure SSRF host classifier shared across SDK outbound URL validators
+ * (webhooks, BYOK `/models` endpoint probes, story media/blueprint URLs, and QR handoff links).
+ * Returns `true` when `rawHostname` is empty, malformed, single-label, loopback, RFC1918,
+ * CGNAT (`100.64.0.0/10`), link-local, NAT64/6to4/mapped private IPv6, multicast, or a reserved TLD.
+ */
+export function isPrivateOrReservedHost(rawHostname: string): boolean {
+  if (typeof rawHostname !== "string") return true;
+  let host = rawHostname.trim().toLowerCase();
+  if (host.endsWith(".")) host = host.replace(/\.+$/, "");
   if (!host) return true;
-  if (
-    host === "localhost" ||
-    host.endsWith(".localhost") ||
-    host.endsWith(".local") ||
-    host.endsWith(".internal") ||
-    host === "0.0.0.0" ||
-    host === "::" ||
-    host === "::1"
-  ) {
-    return true;
+  if (host.startsWith("[") && host.endsWith("]")) {
+    host = host.slice(1, -1);
+    if (host.endsWith(".")) host = host.replace(/\.+$/, "");
+    if (!host) return true;
   }
-  if (
-    /^127\./.test(host) ||
-    /^10\./.test(host) ||
-    /^192\.168\./.test(host) ||
-    /^169\.254\./.test(host) ||
-    /^172\.(?:1[6-9]|2\d|3[01])\./.test(host) ||
-    /^0\./.test(host) ||
-    /^(?:fc|fd)[0-9a-f]{2}:/i.test(host) ||
-    /^fe[89ab][0-9a-f]:/i.test(host) ||
-    /^::ffff:(?:127\.|10\.|192\.168\.|169\.254\.|172\.(?:1[6-9]|2\d|3[01])\.|0\.)/i.test(host)
-  ) {
-    return true;
+  if (host.includes("%") || /[\s\u0000-\u001f\u007f/\\?#]/.test(host)) return true;
+
+  const v6 = parseSdkIpv6Words(host);
+  if (v6) {
+    const isZeroPrefix5 = v6[0] === 0 && v6[1] === 0 && v6[2] === 0 && v6[3] === 0 && v6[4] === 0;
+    if (isZeroPrefix5 && v6[5] === 0 && v6[6] === 0 && (v6[7] === 0 || v6[7] === 1)) return true;
+    if (isZeroPrefix5 && (v6[5] === 0xffff || v6[5] === 0)) {
+      return isPrivateOrReservedIpv4Octets(sdkWordsToIpv4(v6[6], v6[7]));
+    }
+    if (v6[0] === 0x0064 && v6[1] === 0xff9b && (v6[2] === 0 || v6[2] === 1)) {
+      if (isPrivateOrReservedIpv4Octets(sdkWordsToIpv4(v6[6], v6[7]))) return true;
+    }
+    if (v6[0] === 0x2002) {
+      if (isPrivateOrReservedIpv4Octets(sdkWordsToIpv4(v6[1], v6[2]))) return true;
+    }
+    if ((v6[0] & 0xfe00) === 0xfc00) return true;
+    if ((v6[0] & 0xffc0) === 0xfe80) return true;
+    if ((v6[0] & 0xff00) === 0xff00) return true;
+    if (v6[0] === 0x0100 && v6[1] === 0 && v6[2] === 0 && v6[3] === 0) return true;
+    return false;
   }
-  if (!host.includes(".") && !host.includes(":")) {
-    return true;
+  if (host.includes(":")) return true;
+
+  if (host === "localhost" || host.endsWith(".localhost")) return true;
+  if (!host.includes(".")) return true;
+
+  const v4 = parseSdkIpv4Octets(host);
+  if (v4 === "invalid") return true;
+  if (v4) return isPrivateOrReservedIpv4Octets(v4);
+
+  for (const suffix of RESERVED_OR_INTRANET_SUFFIXES) {
+    if (host.endsWith(suffix) || host === suffix.slice(1)) return true;
   }
   return false;
+}
+
+function isPrivateOrLoopbackHostname(rawHostname: string): boolean {
+  return isPrivateOrReservedHost(rawHostname);
 }
 
 function isSafePublicHttpsUrl(rawUrl: unknown, maxLen = 500): rawUrl is string {
@@ -3208,38 +3334,7 @@ export class AgentChatREST {
     if (parsed.username || parsed.password) {
       throw new Error("Webhook URL must not contain credentials");
     }
-    const host = parsed.hostname.replace(/^\[|\]$/g, "").toLowerCase();
-    let blockedHost =
-      !host ||
-      host === "localhost" ||
-      host.endsWith(".localhost") ||
-      host.endsWith(".local") ||
-      host.endsWith(".internal") ||
-      host.endsWith(".home.arpa") ||
-      host.endsWith(".corp") ||
-      host.endsWith(".lan") ||
-      /^\d+$/.test(host) ||
-      /^0x[0-9a-f]+$/i.test(host) ||
-      host === "::1" ||
-      host === "::" ||
-      this.isPrivateIpv4Host(host) ||
-      /^f[cd][0-9a-f]{0,2}:/.test(host) ||
-      /^fe[89ab][0-9a-f]:/.test(host);
-    if (!blockedHost && host.startsWith("::ffff:")) {
-      const rest = host.slice(7);
-      if (this.isPrivateIpv4Host(rest)) {
-        blockedHost = true;
-      } else {
-        const hexMatch = rest.match(/^([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
-        if (hexMatch) {
-          const hi = parseInt(hexMatch[1]!, 16);
-          const lo = parseInt(hexMatch[2]!, 16);
-          const mappedIpv4 = `${(hi >> 8) & 0xff}.${hi & 0xff}.${(lo >> 8) & 0xff}.${lo & 0xff}`;
-          if (this.isPrivateIpv4Host(mappedIpv4)) blockedHost = true;
-        }
-      }
-    }
-    if (blockedHost) {
+    if (isPrivateOrReservedHost(parsed.hostname)) {
       throw new Error("Webhook host not allowed");
     }
     return { channelId: safeChannel, url: trimmedUrl };
@@ -3343,33 +3438,8 @@ export class AgentChatREST {
     if (parsed.username || parsed.password || parsed.search || parsed.hash) {
       throw new Error("API Base URL must not include credentials, query parameters, or fragments");
     }
-    const host = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, "");
-    if (
-      !host ||
-      host === "localhost" ||
-      host.endsWith(".localhost") ||
-      host.endsWith(".local") ||
-      host.endsWith(".internal") ||
-      host === "::1" ||
-      host === "::" ||
-      /^f[cd][0-9a-f]{0,2}:/i.test(host) ||
-      /^fe[89ab][0-9a-f]:/i.test(host) ||
-      this.isPrivateIpv4Host(host)
-    ) {
+    if (isPrivateOrReservedHost(parsed.hostname)) {
       throw new Error("Private or internal network endpoints are not allowed");
-    }
-    const mappedV4 = host.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/i);
-    if (mappedV4 && this.isPrivateIpv4Host(mappedV4[1])) {
-      throw new Error("Private or internal network endpoints are not allowed");
-    }
-    const mappedHex = host.match(/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i);
-    if (mappedHex) {
-      const hi = parseInt(mappedHex[1], 16);
-      const lo = parseInt(mappedHex[2], 16);
-      const dotted = `${(hi >> 8) & 0xff}.${hi & 0xff}.${(lo >> 8) & 0xff}.${lo & 0xff}`;
-      if (this.isPrivateIpv4Host(dotted)) {
-        throw new Error("Private or internal network endpoints are not allowed");
-      }
     }
     return parsed.toString();
   }

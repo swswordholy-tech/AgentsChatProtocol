@@ -4,6 +4,7 @@ export {
   classifyOkrCommentKind,
   computeLocalTaskActionability,
   evaluateConsensusTally,
+  isPrivateOrReservedHost,
   isValidCollaborationRoster,
   parseSseFrames,
   resolveInheritedObjectiveChannel,
