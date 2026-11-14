@@ -2023,11 +2023,86 @@ function isSafeCloudGroupChannelId(value: unknown): value is string {
   return (
     typeof value === "string" &&
     /^[A-Za-z0-9_][A-Za-z0-9_-]{0,127}$/.test(value) &&
-    !PROTOTYPE_POISON_KEYS.has(value) &&
+    !PROTOTYPE_POISON_KEYS.has(value.toLowerCase()) &&
+    !/^mr_[0-9a-f]{16,}$/i.test(value) &&
     !CLOUD_DIRECT_CHANNEL_RE.test(value) &&
+    !DM_OR_DIRECT_CHANNEL_RE.test(value) &&
     !CREDENTIAL_PREFIX_RE.test(value) &&
+    !JOINED_GRAPH_CREDENTIAL_ID_RE.test(value) &&
+    !JOINED_GRAPH_AWS_KEY_ID_RE.test(value) &&
     !EMBEDDED_SECRET_TOKEN_RE.test(value)
   );
+}
+
+function isSafeCloudOkrChannelId(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    /^[A-Za-z0-9_-]{2,80}$/.test(value) &&
+    isSafeCloudGroupChannelId(value)
+  );
+}
+
+export function summarizeCloudAgentOkr(
+  raw: unknown,
+): import("./types").CloudAgentOkrWorkloadSummary | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const obj = raw as Record<string, unknown>;
+  let summaryObj: Record<string, unknown>;
+  if ("okr_summary" in obj || "is_host" in obj) {
+    if (obj.is_host !== false) return null;
+    if (!obj.okr_summary || typeof obj.okr_summary !== "object" || Array.isArray(obj.okr_summary)) {
+      return null;
+    }
+    summaryObj = obj.okr_summary as Record<string, unknown>;
+  } else {
+    summaryObj = obj;
+  }
+
+  const countFields = [
+    summaryObj.doing_count,
+    summaryObj.ready_count,
+    summaryObj.waiting_count,
+    summaryObj.blocked_count,
+    summaryObj.done_count,
+    summaryObj.owned_active_objectives,
+  ];
+  if (
+    !countFields.every(
+      (v): v is number => typeof v === "number" && Number.isSafeInteger(v) && v >= 0 && v <= 1_000_000,
+    )
+  ) {
+    return null;
+  }
+  const [doingCount, readyCount, waitingCount, blockedCount, doneCount, ownedActiveObjectives] =
+    countFields as [number, number, number, number, number, number];
+
+  const rawChannels = summaryObj.active_channel_ids;
+  if (!Array.isArray(rawChannels) || rawChannels.length > 3) return null;
+  const activeChannelIds: string[] = [];
+  const seen = new Set<string>();
+  for (const ch of rawChannels) {
+    if (!isSafeCloudOkrChannelId(ch) || seen.has(ch)) return null;
+    seen.add(ch);
+    activeChannelIds.push(ch);
+  }
+
+  const actionableCount = doingCount + readyCount;
+  const activeWorkloadCount =
+    doingCount + readyCount + waitingCount + blockedCount + ownedActiveObjectives;
+
+  return {
+    doing_count: doingCount,
+    ready_count: readyCount,
+    waiting_count: waitingCount,
+    blocked_count: blockedCount,
+    done_count: doneCount,
+    owned_active_objectives: ownedActiveObjectives,
+    active_channel_ids: activeChannelIds,
+    actionable_count: actionableCount,
+    active_workload_count: activeWorkloadCount,
+    is_idle: activeWorkloadCount === 0,
+    primary_channel_id: activeChannelIds[0] ?? null,
+  };
 }
 
 export function summarizeCloudAgentRoomPolicy(
@@ -5789,8 +5864,17 @@ export class AgentChatREST {
   ): Promise<import("./types").CloudAgentsListResponse> {
     const params = new URLSearchParams();
     if (query?.host_environment_id !== undefined) {
-      const envId = query.host_environment_id.trim();
-      if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(envId) || /^(?:ac_|sk[-_])/i.test(envId)) {
+      const envId = typeof query.host_environment_id === "string" ? query.host_environment_id.trim() : "";
+      if (
+        !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(envId) ||
+        envId.includes("..") ||
+        PROTOTYPE_POISON_KEYS.has(envId.toLowerCase()) ||
+        /^mr_[0-9a-f]{16,}$/i.test(envId) ||
+        CREDENTIAL_PREFIX_RE.test(envId) ||
+        JOINED_GRAPH_CREDENTIAL_ID_RE.test(envId) ||
+        JOINED_GRAPH_AWS_KEY_ID_RE.test(envId) ||
+        this.containsMemorySecretShape(envId)
+      ) {
         throw new Error("Invalid host_environment_id");
       }
       params.set("host_environment_id", envId);
@@ -5799,7 +5883,7 @@ export class AgentChatREST {
       params.set("parent_agent_id", this.assertCloudAgentId(query.parent_agent_id));
     }
     const qs = params.toString();
-    return this.get<import("./types").CloudAgentsListResponse>(
+    const raw = await this.get<import("./types").CloudAgentsListResponse>(
       `/api/cloud-agents${qs ? `?${qs}` : ""}`,
       {
         Accept: "application/json",
@@ -5807,6 +5891,31 @@ export class AgentChatREST {
         ...(this.authHeaders(query?.bearerToken) ?? {}),
       },
     );
+    if (!raw || !Array.isArray(raw.agents)) return raw;
+    const sanitizedAgents = raw.agents.map((agent) => {
+      if (!agent || typeof agent !== "object" || Array.isArray(agent)) return agent;
+      if (!("okr_summary" in agent) && agent.is_host === undefined) return agent;
+      if (agent.is_host !== false) {
+        return "okr_summary" in agent ? { ...agent, okr_summary: null } : agent;
+      }
+      if (agent.okr_summary === undefined) return agent;
+      const cleanOkr = summarizeCloudAgentOkr({ is_host: false, okr_summary: agent.okr_summary });
+      return {
+        ...agent,
+        okr_summary: cleanOkr
+          ? {
+              doing_count: cleanOkr.doing_count,
+              ready_count: cleanOkr.ready_count,
+              waiting_count: cleanOkr.waiting_count,
+              blocked_count: cleanOkr.blocked_count,
+              done_count: cleanOkr.done_count,
+              owned_active_objectives: cleanOkr.owned_active_objectives,
+              active_channel_ids: cleanOkr.active_channel_ids,
+            }
+          : null,
+      };
+    });
+    return { ...raw, agents: sanitizedAgents };
   }
 
   async tuneCloudAgent(

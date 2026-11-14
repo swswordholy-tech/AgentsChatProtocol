@@ -13,6 +13,7 @@ import {
   summarizeChannelPins,
   summarizeChannelThreads,
   summarizeChannelWakeHealth,
+  summarizeCloudAgentOkr,
   summarizeCloudAgentRoomPolicy,
   summarizeCloudAgentSpecialties,
   summarizeOkrWatchReadiness,
@@ -5232,6 +5233,144 @@ describe("AgentChatClient realtime collaboration WS events", () => {
         }),
       ).rejects.toThrow("Secret or credential detected");
       expect(calls).toBe(4);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("Campaign #60: summarizeCloudAgentOkr & listCloudAgents validate non-host workload counts, block DM/prototype/mr_/14-family channel IDs fail-closed, and harden host_environment_id", async () => {
+    const valid = summarizeCloudAgentOkr({
+      is_host: false,
+      okr_summary: {
+        doing_count: 1,
+        ready_count: 2,
+        waiting_count: 1,
+        blocked_count: 0,
+        done_count: 4,
+        owned_active_objectives: 1,
+        active_channel_ids: ["room-asia-pacific", "aiza-guide", "eyj-notes"],
+      },
+    });
+    expect(valid).toEqual({
+      doing_count: 1,
+      ready_count: 2,
+      waiting_count: 1,
+      blocked_count: 0,
+      done_count: 4,
+      owned_active_objectives: 1,
+      active_channel_ids: ["room-asia-pacific", "aiza-guide", "eyj-notes"],
+      actionable_count: 3,
+      active_workload_count: 5,
+      is_idle: false,
+      primary_channel_id: "room-asia-pacific",
+    });
+
+    const idle = summarizeCloudAgentOkr({
+      doing_count: 0,
+      ready_count: 0,
+      waiting_count: 0,
+      blocked_count: 0,
+      done_count: 7,
+      owned_active_objectives: 0,
+      active_channel_ids: [],
+    });
+    expect(idle?.is_idle).toBe(true);
+    expect(idle?.actionable_count).toBe(0);
+    expect(idle?.primary_channel_id).toBeNull();
+
+    // Host agents, malformed counts, duplicate channels, >3 channels, DM aliases, prototype keys, mr_ refs & 14-family secrets fail closed
+    for (const bad of [
+      null,
+      { is_host: true, okr_summary: { ...valid } },
+      { is_host: null, okr_summary: { ...valid } },
+      { ...valid, doing_count: -1 },
+      { ...valid, ready_count: 1.5 },
+      { ...valid, done_count: 1_000_001 },
+      { ...valid, active_channel_ids: ["r1", "r1"] },
+      { ...valid, active_channel_ids: ["r1", "r2", "r3", "r4"] },
+      { ...valid, active_channel_ids: ["dm_pair"] },
+      { ...valid, active_channel_ids: ["dm-pair"] },
+      { ...valid, active_channel_ids: ["direct"] },
+      { ...valid, active_channel_ids: ["Constructor"] },
+      { ...valid, active_channel_ids: ["__proto__"] },
+      { ...valid, active_channel_ids: ["mr_" + "a".repeat(64)] },
+      { ...valid, active_channel_ids: ["room_ASIAIOSFODNN7EXAMPLE"] },
+      { ...valid, active_channel_ids: ["room_mcp_at_1234567890"] },
+    ]) {
+      expect(summarizeCloudAgentOkr(bad)).toBeNull();
+    }
+
+    const originalFetch = globalThis.fetch;
+    let calls = 0;
+    globalThis.fetch = (async () => {
+      calls += 1;
+      return Response.json({
+        agents: [
+          {
+            agent_id: "host-1",
+            is_host: true,
+            okr_summary: {
+              doing_count: 2,
+              ready_count: 0,
+              waiting_count: 0,
+              blocked_count: 0,
+              done_count: 0,
+              owned_active_objectives: 0,
+              active_channel_ids: ["room-1"],
+            },
+          },
+          {
+            agent_id: "sub-poisoned",
+            is_host: false,
+            okr_summary: {
+              doing_count: 1,
+              ready_count: 0,
+              waiting_count: 0,
+              blocked_count: 0,
+              done_count: 0,
+              owned_active_objectives: 0,
+              active_channel_ids: ["dm_secret_pair"],
+            },
+          },
+          {
+            agent_id: "sub-clean",
+            is_host: false,
+            okr_summary: {
+              doing_count: 0,
+              ready_count: 2,
+              waiting_count: 0,
+              blocked_count: 0,
+              done_count: 1,
+              owned_active_objectives: 0,
+              active_channel_ids: ["room-asia-pacific"],
+            },
+          },
+        ],
+      });
+    }) as unknown as typeof fetch;
+
+    try {
+      const rest = new AgentChatREST({ baseUrl: "https://agents-chat.com", bearerToken: "tok_60" });
+      for (const badEnv of [
+        "Constructor",
+        "__proto__",
+        "env..escape",
+        "mr_" + "c".repeat(64),
+        "env_ASIAIOSFODNN7EXAMPLE",
+        "mcp_at_1234567890",
+      ]) {
+        await expect(rest.listCloudAgents({ host_environment_id: badEnv })).rejects.toThrow(
+          "Invalid host_environment_id",
+        );
+      }
+      expect(calls).toBe(0);
+
+      const res = await rest.listCloudAgents({ host_environment_id: "  aiza-guide-env  " });
+      expect(calls).toBe(1);
+      expect(res.agents[0].okr_summary).toBeNull();
+      expect(res.agents[1].okr_summary).toBeNull();
+      expect(res.agents[2].okr_summary?.ready_count).toBe(2);
+      expect(res.agents[2].okr_summary?.active_channel_ids).toEqual(["room-asia-pacific"]);
     } finally {
       globalThis.fetch = originalFetch;
     }

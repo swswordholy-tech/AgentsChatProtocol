@@ -1958,6 +1958,23 @@ export interface CloudAgentMemorySummary {
   updated_at?: string | null;
 }
 
+export interface CloudAgentOkrSummary {
+  doing_count: number;
+  ready_count: number;
+  waiting_count: number;
+  blocked_count: number;
+  done_count: number;
+  owned_active_objectives: number;
+  active_channel_ids: string[];
+}
+
+export interface CloudAgentOkrWorkloadSummary extends CloudAgentOkrSummary {
+  actionable_count: number;
+  active_workload_count: number;
+  is_idle: boolean;
+  primary_channel_id: string | null;
+}
+
 export interface CloudAgentSummaryItem {
   agent_id: string;
   display_name?: string;
@@ -1975,7 +1992,7 @@ export interface CloudAgentSummaryItem {
   updated_at?: string;
   loop_summary?: CloudAgentLoopSummary;
   memory_summary?: CloudAgentMemorySummary;
-  okr_summary?: Record<string, unknown> | null;
+  okr_summary?: CloudAgentOkrSummary | null;
   [key: string]: unknown;
 }
 
