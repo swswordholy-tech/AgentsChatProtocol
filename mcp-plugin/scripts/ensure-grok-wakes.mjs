@@ -74,7 +74,7 @@ export function resolveRunTimeoutMs(raw) {
  * @param {{ kill?: (pid: number, sig: number) => void, readCmdline?: (pid: number) => string | null }} [deps]
  */
 export function isLockOwnerAlive(pid, deps = {}) {
-  if (!Number.isInteger(pid) || pid <= 0) return false;
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
   const kill = deps.kill ?? ((p, sig) => process.kill(p, sig));
   try {
     kill(pid, 0);
@@ -151,7 +151,8 @@ export function parseBinds(raw) {
     if (typeof v !== "string") continue;
     const name = v.trim();
     const key = k.trim();
-    if (!name || !key) continue;
+    if (!name || !key || ["__proto__", "constructor", "prototype"].includes(key.toLowerCase())) continue;
+    if (!/^[A-Za-z0-9_-]+$/.test(key) || !/^[A-Za-z0-9_-]+$/.test(name)) continue;
     out[key] = name;
   }
   return out;
@@ -200,7 +201,12 @@ export function mayPruneWakes(bindsFileExists) {
 /** @param {string} text */
 export function parseBindsText(text) {
   try {
-    return { binds: parseBinds(JSON.parse(text)), malformed: false };
+    const raw = JSON.parse(text);
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return { binds: {}, malformed: true };
+    const binds = parseBinds(raw);
+    // Invalid rows must never turn an authoritative file into prune-all.
+    if (Object.keys(binds).length !== Object.keys(raw).length) return { binds: {}, malformed: true };
+    return { binds, malformed: false };
   } catch {
     return { binds: {}, malformed: true };
   }

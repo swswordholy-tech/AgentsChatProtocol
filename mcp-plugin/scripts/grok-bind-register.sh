@@ -19,6 +19,7 @@
 #   Missing binds file → nothing to prune. Entries without meta ts are never age-pruned.
 # Never prints tokens.
 set -eu
+umask 077
 
 AGENTSCHAT_DIR="${AGENTSCHAT_DIR:-${HOME:-/home/box}/.agentschat}"
 BINDS="${AGENTCHAT_GROK_BINDS:-$AGENTSCHAT_DIR/grok-binds.json}"
@@ -66,7 +67,7 @@ fi
 MODE="$mode" UUID="$uuid" PROFILE="$profile" BINDS="$BINDS" META="$META" \
 AGENTSCHAT_DIR="$AGENTSCHAT_DIR" AGENT_DATA_DIR="$AGENT_DATA_DIR" \
 PRUNE_AGE_DAYS="$PRUNE_AGE_DAYS" PRUNE_LOG="$PRUNE_LOG" python3 - <<'PY'
-import json, os, socket, sys, tempfile, time
+import json, os, re, socket, sys, tempfile, time
 from datetime import datetime, timezone
 
 mode = os.environ["MODE"]; binds_p = os.environ["BINDS"]; meta_p = os.environ["META"]
@@ -83,11 +84,19 @@ def load(p):
     except Exception:
         return None
 
+def safe_entry(key, value):
+    return isinstance(key, str) and key.lower() not in ("__proto__", "constructor", "prototype") \
+        and re.fullmatch(r"[A-Za-z0-9_-]+", key) is not None \
+        and isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_-]+", value) is not None
+
+def valid_binds(d):
+    return isinstance(d, dict) and all(safe_entry(k, v) for k, v in d.items())
+
 def write(p, d):
     fd, tmp = tempfile.mkstemp(dir=os.path.dirname(p) or ".", prefix="." + os.path.basename(p) + ".")
     try:
         with os.fdopen(fd, "w") as f:
-            json.dump(d, f, indent=2); f.write("\n")
+            json.dump(d, f, indent=2); f.write("\n"); f.flush(); os.fsync(f.fileno())
         os.chmod(tmp, 0o600)
         os.replace(tmp, p)
     except Exception:
@@ -111,7 +120,7 @@ def log_prune(msg):
 if mode == "register":
     uuid = os.environ["UUID"]; profile = os.environ["PROFILE"]
     binds = load(binds_p)
-    if binds is None:
+    if not valid_binds(binds):
         print(f"grok-bind-register: {binds_p} is malformed; refusing to overwrite", file=sys.stderr); sys.exit(6)
     meta = load(meta_p) or {}
     prev = binds.get(uuid)
@@ -132,7 +141,7 @@ if mode == "register":
 if not os.path.exists(binds_p):
     print(f"grok-bind-register: no binds file {binds_p}; nothing to prune"); sys.exit(0)
 binds = load(binds_p)
-if binds is None:
+if not valid_binds(binds):
     print(f"grok-bind-register: {binds_p} is malformed; not pruning", file=sys.stderr); sys.exit(6)
 meta = load(meta_p) or {}
 now = time.time(); removed = []
