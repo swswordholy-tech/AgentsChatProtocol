@@ -630,14 +630,21 @@ function isSafePublicHttpsUrl(rawUrl: unknown, maxLen = 500): rawUrl is string {
 
 function scrubStoryDisplayText(raw: unknown, maxLen: number): string {
   if (typeof raw !== "string") return "";
-  return raw
+  const bounded = raw.length > 65_536 ? raw.slice(0, 65_536) : raw;
+  return bounded
     .replace(/-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|$)/gi, "[redacted]")
     .replace(/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{12,}/gi, "$1 [redacted]")
     .replace(
-      /(?:^|[^A-Za-z0-9])(?:mcp_(?:at|rt|code)_|ac_[A-Za-z0-9_+/\-=]{8,}|agent_key_|sk[-_]|rk_(?:live|test)_|gh[pousr]_|github_pat_|glpat-|xox[baprs]-|(?:hf|npm)_|AIza)[A-Za-z0-9_+/\-=.-]*/gi,
+      /(?:^|[^A-Za-z0-9])(?:mcp_(?:at|rt|code)_|ac_[A-Za-z0-9_+/\-=]{8,}|agent_key_|sk[-_]|rk_(?:live|test)_|gh[pousr]_|github_pat_|glpat-|xox[baprs]-|(?:hf|npm)_)[A-Za-z0-9_+/\-=.-]*/gi,
       (m) => (/[A-Za-z0-9]/.test(m.charAt(0)) ? "[redacted]" : `${m.charAt(0)}[redacted]`),
     )
+    .replace(/(?:^|[^A-Za-z0-9])AIza[A-Za-z0-9][A-Za-z0-9_+/\-=.-]{7,}/g, (m) =>
+      /[A-Za-z0-9]/.test(m.charAt(0)) ? "[redacted]" : `${m.charAt(0)}[redacted]`,
+    )
     .replace(/(?:^|[^A-Za-z0-9])(?:AKIA|ASIA)[0-9A-Z]{16}(?=$|[^A-Za-z0-9])/g, (m) =>
+      /[A-Za-z0-9]/.test(m.charAt(0)) ? "[redacted]" : `${m.charAt(0)}[redacted]`,
+    )
+    .replace(/(?:^|[^A-Za-z0-9])mr_[0-9a-f]{16,}/gi, (m) =>
       /[A-Za-z0-9]/.test(m.charAt(0)) ? "[redacted]" : `${m.charAt(0)}[redacted]`,
     )
     .replace(/\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)?\b/g, "[redacted]")
@@ -839,8 +846,11 @@ function isSafeCloudAuditAgentId(id: unknown): id is string {
     /^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/.test(id) &&
     !id.includes("..") &&
     !PROTOTYPE_POISON_KEYS.has(id.toLowerCase()) &&
+    !/^mr_[0-9a-f]{16,}$/i.test(id) &&
     !/^\d{6,}$/.test(id) &&
     !CREDENTIAL_PREFIX_RE.test(id) &&
+    !JOINED_GRAPH_CREDENTIAL_ID_RE.test(id) &&
+    !JOINED_GRAPH_AWS_KEY_ID_RE.test(id) &&
     !EMBEDDED_SECRET_TOKEN_RE.test(id) &&
     !EMAIL_ID_RE.test(id)
   );
@@ -898,7 +908,10 @@ export function summarizeCloudAgentAuditFeed(
     const method = scrubStoryDisplayText(row.method, 16).replace(/\s+/g, " ").trim() || "POST";
     const actor = scrubStoryDisplayText(row.actor, 96).replace(/\s+/g, " ").trim();
     const target = scrubStoryDisplayText(row.target, 96).replace(/\s+/g, " ").trim();
-    const channel = scrubStoryDisplayText(row.channel, 96).replace(/\s+/g, " ").trim();
+    const rawChannel = typeof row.channel === "string" ? row.channel.trim() : "";
+    const channel = DM_OR_DIRECT_CHANNEL_RE.test(rawChannel)
+      ? ""
+      : scrubStoryDisplayText(rawChannel, 96).replace(/\s+/g, " ").trim();
     const action = typeof row.action === "string" ? scrubStoryDisplayText(row.action, 96).replace(/\s+/g, " ").trim() : undefined;
     const tool = typeof row.tool === "string" ? scrubStoryDisplayText(row.tool, 96).replace(/\s+/g, " ").trim() : undefined;
     const reason = typeof row.reason === "string" ? scrubStoryDisplayText(row.reason, 200).replace(/\s+/g, " ").trim() : undefined;
@@ -3875,18 +3888,11 @@ export class AgentChatREST {
 
   // MARK: - Webhooks
 
-  private isPrivateIpv4Host(ipv4: string): boolean {
+  private hasEmbeddedWebhookSecret(candidate: string): boolean {
     return (
-      ipv4 === "0.0.0.0" ||
-      /^0\./.test(ipv4) ||
-      /^127\./.test(ipv4) ||
-      /^10\./.test(ipv4) ||
-      /^192\.168\./.test(ipv4) ||
-      /^169\.254\./.test(ipv4) ||
-      /^172\.(1[6-9]|2\d|3[01])\./.test(ipv4) ||
-      /^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(ipv4) ||
-      /^198\.1[89]\./.test(ipv4) ||
-      /^(?:22[4-9]|23\d|24\d|25[0-5])\./.test(ipv4)
+      EMBEDDED_SECRET_TOKEN_RE.test(candidate) ||
+      JOINED_GRAPH_AWS_KEY_ID_RE.test(candidate) ||
+      this.containsMemorySecretShape(candidate)
     );
   }
 
@@ -3902,10 +3908,17 @@ export class AgentChatREST {
     if (!trimmedUrl || trimmedUrl.length > 1024 || /[\u0000-\u001F\u007F]/.test(trimmedUrl)) {
       throw new Error("Invalid webhook URL");
     }
+    let decodedUrl = "";
+    if (trimmedUrl.includes("%")) {
+      try {
+        decodedUrl = decodeURIComponent(trimmedUrl);
+      } catch {
+        decodedUrl = "";
+      }
+    }
     if (
-      EMBEDDED_SECRET_TOKEN_RE.test(trimmedUrl) ||
-      JOINED_GRAPH_AWS_KEY_ID_RE.test(trimmedUrl) ||
-      this.containsMemorySecretShape(trimmedUrl)
+      this.hasEmbeddedWebhookSecret(trimmedUrl) ||
+      (decodedUrl.length > 0 && this.hasEmbeddedWebhookSecret(decodedUrl))
     ) {
       throw new Error("Webhook URL must not contain secrets");
     }
@@ -4205,10 +4218,19 @@ export class AgentChatREST {
       "Cache-Control": "no-store",
       ...(token ? { Authorization: `Bearer ${token}` } : {}),
     };
-    return this.get<CloudAgentAuditFeed>(
+    const raw = await this.get<unknown>(
       `/api/cloud-agents/${encodeURIComponent(agentId)}/audit${qs ? `?${qs}` : ""}`,
       headers,
     );
+    const summary = summarizeCloudAgentAuditFeed(raw, agentId);
+    if (!summary) {
+      throw new Error("Invalid cloud agent audit feed");
+    }
+    return {
+      agent_id: summary.agent_id,
+      observation_only: true,
+      entries: summary.entries.map(({ is_replay_revocation: _flag, ...entry }) => entry),
+    };
   }
 
   // MARK: - Room-Scoped Cloud Agent Wake-Health Diagnostics
@@ -7205,4 +7227,78 @@ export class AgentChatREST {
     }
     return res.json();
   }
+}
+
+const CONTACT_INTERNAL_PRINCIPAL_RE = /^(?:apple_[a-z0-9._-]+|user:)/i;
+const CONTACT_EMAIL_ID_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const CONTACT_PHONE_ID_RE = /^\+?\d[\d ()-]{5,}\d$/;
+const CONTACT_CREDENTIAL_ID_RE =
+  /(?:^|[^A-Za-z0-9])(?:mcp_(?:at|rt|code)_|ac_|agent_key_|sk[-_]|rk_(?:live|test)_|gh[pousr]_|github_pat_|glpat-|xox[baprs]-|(?:hf|npm)_)/i;
+const CONTACT_CASE_SENSITIVE_SECRET_RE =
+  /(?:^|[^A-Za-z0-9])(?:(?:AKIA|ASIA)[0-9A-Z]{16}(?![A-Za-z0-9])|(?:AIza|eyJ)[A-Za-z0-9][A-Za-z0-9_.-]{7,})/;
+
+function isPhoneShapedContactHitId(id: string): boolean {
+  return CONTACT_PHONE_ID_RE.test(id) && id.replace(/\D/g, "").length >= 7;
+}
+
+/**
+ * Pure zero-I/O client contact-search privacy filter mirroring `src/contact-search-filter.ts`:
+ * - Agent handles remain discoverable by prefix/substring;
+ * - Human accounts (`type: "user" | "human"`, email IDs, or phone IDs) surface ONLY on exact match;
+ * - Blocks `apple_*`, `user:*`, `mr_*` opaque refs, prototype keys, tombstones, and 14-family credentials;
+ * - Deduplicates hits and excludes caller case-insensitively.
+ */
+export function filterContactSearchHits<T extends import("./types").ContactSearchHit>(
+  results: ReadonlyArray<T>,
+  caller: string,
+  query: string,
+): T[] {
+  if (!Array.isArray(results)) return [];
+  const q = (typeof query === "string" ? query : "").trim().toLowerCase();
+  const callerNorm = (typeof caller === "string" ? caller : "").trim().toLowerCase();
+  const seen = new Set<string>();
+  const out: T[] = [];
+
+  for (const hit of results) {
+    if (!hit || typeof hit !== "object" || typeof hit.id !== "string") continue;
+    const rawId = hit.id.trim();
+    if (
+      !rawId ||
+      rawId.length > 128 ||
+      /[\x00-\x1f\x7f]/.test(rawId) ||
+      PROTOTYPE_POISON_KEYS.has(rawId.toLowerCase()) ||
+      /^mr_[0-9a-f]{16,}$/i.test(rawId) ||
+      CONTACT_INTERNAL_PRINCIPAL_RE.test(rawId) ||
+      CONTACT_CREDENTIAL_ID_RE.test(rawId) ||
+      CONTACT_CASE_SENSITIVE_SECRET_RE.test(rawId)
+    ) {
+      continue;
+    }
+    const status = typeof hit.status === "string" ? hit.status.trim().toLowerCase() : "";
+    if (
+      status === "deleted" ||
+      status === "disabled" ||
+      Boolean(hit.deleted_at) ||
+      hit.deletion_pending === true
+    ) {
+      continue;
+    }
+    const idNorm = rawId.toLowerCase();
+    if (callerNorm && idNorm === callerNorm) continue;
+    if (seen.has(idNorm)) continue;
+
+    const normType = typeof hit.type === "string" ? hit.type.trim().toLowerCase() : "";
+    const isHuman =
+      normType === "user" ||
+      normType === "human" ||
+      CONTACT_EMAIL_ID_RE.test(rawId) ||
+      isPhoneShapedContactHitId(rawId);
+
+    if (isHuman && (!q || idNorm !== q)) continue;
+
+    seen.add(idNorm);
+    out.push(hit);
+  }
+
+  return out;
 }

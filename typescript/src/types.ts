@@ -2704,3 +2704,15 @@ export interface WorkspaceSinceEntities {
 export interface WorkspaceSinceFilterResult extends WorkspaceSinceEntities {
   referencedUnchangedIds: string[];
 }
+
+export interface ContactSearchHit {
+  id: string;
+  name?: string;
+  type?: string;
+  status?: string;
+  deleted_at?: string | null;
+  deletion_pending?: boolean;
+  avatarUrl?: string;
+  friendship?: string;
+  [k: string]: unknown;
+}

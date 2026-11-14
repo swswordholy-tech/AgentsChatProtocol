@@ -5717,4 +5717,117 @@ describe("AgentChatClient realtime collaboration WS events", () => {
       globalThis.fetch = origFetch;
     }
   });
+
+  test("Campaign #66: filterContactSearchHits, sanitized getCloudAgentAuditLogs / summarizeCloudAgentAuditFeed (aiza-guide preserved, DM/mr_/ASIA scrubbed), and %20 webhook secret guard", async () => {
+    const { filterContactSearchHits, summarizeCloudAgentAuditFeed } = await import("../src/index");
+
+    const hits = [
+      { id: "alice@gmail.com", name: "Alice Untyped" },
+      { id: "bob@gmail.com", name: "Bob Upper", type: "USER" },
+      { id: "+8613800138000", name: "Phone User" },
+      { id: "apple_001234.abcdef", name: "Apple User", type: "agent" },
+      { id: "mr_0123456789abcdef0123", name: "Opaque Ref", type: "agent" },
+      { id: "deleted-bot", name: "Deleted", type: "agent", status: "deleted" },
+      { id: "ASIAIOSFODNN7EXAMPLE", name: "AWS STS", type: "agent" },
+      { id: "aiza-worker-1", name: "Aiza Worker", type: "agent" },
+      { id: "aiza-worker-1", name: "Dup Worker", type: "agent" },
+      { id: "Caller@Example.com", name: "Caller Self", type: "user" },
+    ];
+    expect(filterContactSearchHits(hits, "caller@example.com", "gmail").map((h) => h.id)).toEqual([
+      "aiza-worker-1",
+    ]);
+    expect(filterContactSearchHits(hits, "caller@example.com", "ALICE@GMAIL.COM").map((h) => h.id)).toEqual([
+      "alice@gmail.com",
+      "aiza-worker-1",
+    ]);
+
+    const summary = summarizeCloudAgentAuditFeed(
+      {
+        agent_id: "aiza-worker-1",
+        observation_only: true,
+        entries: [
+          {
+            id: "aud_66_1",
+            ts: "2026-11-14T07:30:00.000Z",
+            actor: "aiza-worker-1",
+            target: "mr_0123456789abcdef0123",
+            channel: "dm_dtr851",
+            method: "POST",
+            path: "/mcp?secret=ASIAIOSFODNN7EXAMPLE",
+            status: 403,
+            result: "denied",
+            reason: "Reviewed aiza-guide with ASIAIOSFODNN7EXAMPLE and AIzaSyDummyGoogleApiKey123456",
+          },
+        ],
+      },
+      "aiza-worker-1",
+    );
+    expect(summary).not.toBeNull();
+    expect(summary!.entries[0]?.actor).toBe("aiza-worker-1");
+    expect(summary!.entries[0]?.target).toBe("[redacted]");
+    expect(summary!.entries[0]?.channel).toBe("");
+    expect(summary!.entries[0]?.path).toBe("/mcp");
+    expect(summary!.entries[0]?.reason).toContain("Reviewed aiza-guide");
+    expect(summary!.entries[0]?.reason).not.toContain("ASIAIOSFODNN7EXAMPLE");
+    expect(summary!.entries[0]?.reason).not.toContain("AIzaSyDummy");
+
+    expect(
+      summarizeCloudAgentAuditFeed({
+        agent_id: "mr_0123456789abcdef0123",
+        observation_only: true,
+        entries: [],
+      }),
+    ).toBeNull();
+
+    const origFetch = globalThis.fetch;
+    let mode: "ok" | "non_observation" = "ok";
+    globalThis.fetch = (async () => {
+      if (mode === "non_observation") {
+        return Response.json({ agent_id: "aiza-worker-1", observation_only: false, entries: [] });
+      }
+      return Response.json({
+        agent_id: "aiza-worker-1",
+        observation_only: true,
+        entries: [
+          {
+            id: "aud_66_2",
+            ts: "2026-11-14T07:35:00.000Z",
+            actor: "aiza-worker-1",
+            target: "eyj-worker-1",
+            channel: "dm:secret",
+            method: "POST",
+            path: "/mcp?tok=secret",
+            status: 200,
+            result: "ok",
+            reason: "Safe aiza-guide note, leaked mr_0123456789abcdef0123",
+          },
+        ],
+      });
+    }) as typeof fetch;
+
+    try {
+      const rest = new AgentChatREST({ baseUrl: "https://agents-chat.com", bearerToken: "owner-jwt" });
+      const feed = await rest.getCloudAgentAuditLogs("aiza-worker-1");
+      expect(feed.entries[0]?.channel).toBe("");
+      expect(feed.entries[0]?.path).toBe("/mcp");
+      expect(feed.entries[0]?.reason).toBe("Safe aiza-guide note, leaked [redacted]");
+      expect((feed.entries[0] as Record<string, unknown>).is_replay_revocation).toBeUndefined();
+
+      mode = "non_observation";
+      await expect(rest.getCloudAgentAuditLogs("aiza-worker-1")).rejects.toThrow(
+        "Invalid cloud agent audit feed",
+      );
+      await expect(rest.getCloudAgentAuditLogs("mr_0123456789abcdef0123")).rejects.toThrow(
+        "Invalid cloud agent ID",
+      );
+      await expect(
+        rest.registerWebhook("room-dev", "https://hooks.example.com/cb?auth=Basic%20dXNlcjpwYXNzMTIzNDU="),
+      ).rejects.toThrow("Webhook URL must not contain secrets");
+      await expect(
+        rest.removeWebhook("room-dev", "https://hooks.example.com/cb?auth=Bearer%20secret_bearer_token_12345"),
+      ).rejects.toThrow("Webhook URL must not contain secrets");
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
 });
