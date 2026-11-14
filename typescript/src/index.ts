@@ -12,6 +12,8 @@ export {
   rankDiscoverableChannels,
   resolveAgentMention,
   resolveInheritedObjectiveChannel,
+  resolveStoryBlueprintId,
+  resolveStoryBlueprintUrl,
   scheduleReadyDagTasks,
   summarizeAgentMemoryIndex,
   summarizeChannelBriefReadiness,

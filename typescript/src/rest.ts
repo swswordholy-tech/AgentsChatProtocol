@@ -72,7 +72,7 @@ const ROSTER_TYPES = new Set(["agent", "user", "unknown"]);
 const ROSTER_SCOPES = new Set(["owned", "unclaimed", "external"]);
 const SAFE_COLLAB_AGENT_ID_RE = /^[A-Za-z0-9_.-]{1,128}$/;
 const CREDENTIAL_PREFIX_BASE_RE = /^(?:mcp_(?:at|rt|code)_|ac_|agent_key_|sk[-_]|rk_(?:live|test)_|gh[pousr]_|github_pat_|glpat-|xox[baprs]-|(?:hf|npm)_)/i;
-const CASE_SENSITIVE_CREDENTIAL_PREFIX_RE = /^(?:(?:AKIA|ASIA)[0-9A-Z]{16}|(?:AIza|eyJ)[A-Za-z0-9_.-]{8,})/;
+const CASE_SENSITIVE_CREDENTIAL_PREFIX_RE = /^(?:(?:AKIA|ASIA)[0-9A-Z]{16}|(?:AIza|eyJ)[A-Za-z0-9][A-Za-z0-9_.-]{7,})/;
 const CREDENTIAL_PREFIX_RE = {
   test(value: string): boolean {
     return CREDENTIAL_PREFIX_BASE_RE.test(value) || CASE_SENSITIVE_CREDENTIAL_PREFIX_RE.test(value);
@@ -172,7 +172,7 @@ const WORKSPACE_GRAPH_SCOPES = new Set(["channel", "objective", "agent"]);
 const PROTOTYPE_POISON_KEYS = new Set(["__proto__", "constructor", "prototype"]);
 const JOINED_GRAPH_CREDENTIAL_ID_RE =
   /(?:^|[^A-Za-z0-9])(?:mcp_(?:at|rt|code)_|ac_|agent_key_|sk[-_]|rk_(?:live|test)_|gh[pousr]_|github_pat_|glpat-|xox[baprs]-|hf_|npm_|(?:Bearer|Basic)(?:[._-]|$))/i;
-const JOINED_GRAPH_AWS_KEY_ID_RE = /(?:^|[^A-Za-z0-9])(?:(?:AKIA|ASIA)[0-9A-Z]{16}(?![A-Za-z0-9])|(?:AIza|eyJ)[A-Za-z0-9_-]{8,})/;
+const JOINED_GRAPH_AWS_KEY_ID_RE = /(?:^|[^A-Za-z0-9])(?:(?:AKIA|ASIA)[0-9A-Z]{16}(?![A-Za-z0-9])|(?:AIza|eyJ)[A-Za-z0-9][A-Za-z0-9_-]{7,})/;
 
 function safeGraphId(value: unknown): value is string {
   return (
@@ -666,6 +666,31 @@ const VALID_STORY_BLUEPRINTS_SET = new Set<import("./types").StoryBlueprintId>([
   "research-patrol",
 ]);
 
+/**
+ * Pure zero-I/O room blueprint resolver mirroring `src/story.ts`:
+ * honors channel `{ name, topic }` hints before falling back to `storyType` defaults.
+ */
+export function resolveStoryBlueprintId(
+  storyType: import("./types").StoryArtifactType,
+  channelContext?: { name?: string; topic?: string } | null,
+): import("./types").StoryBlueprintId {
+  const hay = `${channelContext?.name ?? ""} ${channelContext?.topic ?? ""}`.toLowerCase();
+  if (/(?:\bokr\b|okr-sprint|冲刺作战室|okr\s*sprint)/i.test(hay)) return "okr-sprint";
+  if (/(?:cross-review|交叉互审|peer[\s-]*review|code[\s-]*review)/i.test(hay)) return "cross-review";
+  if (/(?:research-patrol|情报雷达|research\s*&?\s*patrol)/i.test(hay)) return "research-patrol";
+  if (storyType === "build_log") return "okr-sprint";
+  if (storyType === "brainstorm") return "research-patrol";
+  return "cross-review";
+}
+
+export function resolveStoryBlueprintUrl(
+  storyType: import("./types").StoryArtifactType,
+  channelContext?: { name?: string; topic?: string } | null,
+): string {
+  const bp = resolveStoryBlueprintId(storyType, channelContext);
+  return `https://agents-chat.com/lobby?blueprint=${bp}`;
+}
+
 export function summarizeStoryArtifactBundle(
   raw: unknown,
 ): import("./types").StoryArtifactSafetySummary | null {
@@ -674,6 +699,7 @@ export function summarizeStoryArtifactBundle(
   const artifactId = typeof res.artifact_id === "string" ? res.artifact_id.trim() : "";
   if (
     !safeGraphId(artifactId) ||
+    /^mr_[0-9a-f]{16,}$/i.test(artifactId) ||
     PROTOTYPE_POISON_KEYS.has(artifactId.toLowerCase()) ||
     EMBEDDED_SECRET_TOKEN_RE.test(artifactId)
   ) {
@@ -691,19 +717,22 @@ export function summarizeStoryArtifactBundle(
       ? (story.channel as Record<string, unknown>)
       : null;
   const channelId = typeof ch?.id === "string" ? ch.id.trim() : "";
-  if (!safeNonDmChannelId(channelId) || PROTOTYPE_POISON_KEYS.has(channelId.toLowerCase()) || /^\d{6,}$/.test(channelId)) {
+  if (
+    !safeNonDmChannelId(channelId) ||
+    /^mr_[0-9a-f]{16,}$/i.test(channelId) ||
+    PROTOTYPE_POISON_KEYS.has(channelId.toLowerCase()) ||
+    /^\d{6,}$/.test(channelId)
+  ) {
     return null;
   }
 
   const storyType = story.story_type as import("./types").StoryArtifactType;
   if (!VALID_STORY_TYPES_SET.has(storyType)) return null;
 
-  const defaultBp: import("./types").StoryBlueprintId =
-    storyType === "build_log"
-      ? "okr-sprint"
-      : storyType === "brainstorm"
-        ? "research-patrol"
-        : "cross-review";
+  const defaultBp = resolveStoryBlueprintId(storyType, {
+    name: typeof ch?.name === "string" ? ch.name : undefined,
+    topic: typeof ch?.topic === "string" ? ch.topic : undefined,
+  });
   const rawBp = typeof res.blueprint_id === "string" ? res.blueprint_id.trim() : "";
   const blueprintId = VALID_STORY_BLUEPRINTS_SET.has(rawBp as any)
     ? (rawBp as import("./types").StoryBlueprintId)
@@ -721,7 +750,12 @@ export function summarizeStoryArtifactBundle(
   for (const item of Array.isArray(story.turns) ? story.turns.slice(0, 64) : []) {
     if (!item || typeof item !== "object" || Array.isArray(item)) continue;
     const mid = typeof (item as any).message_id === "string" ? (item as any).message_id.trim() : "";
-    if (!safeGraphId(mid) || PROTOTYPE_POISON_KEYS.has(mid.toLowerCase()) || EMBEDDED_SECRET_TOKEN_RE.test(mid)) {
+    if (
+      !safeGraphId(mid) ||
+      /^mr_[0-9a-f]{16,}$/i.test(mid) ||
+      PROTOTYPE_POISON_KEYS.has(mid.toLowerCase()) ||
+      EMBEDDED_SECRET_TOKEN_RE.test(mid)
+    ) {
       continue;
     }
     seenTurnIds.add(mid);
@@ -731,7 +765,12 @@ export function summarizeStoryArtifactBundle(
   for (const item of Array.isArray(story.cast) ? story.cast.slice(0, 64) : []) {
     if (!item || typeof item !== "object" || Array.isArray(item)) continue;
     const cid = typeof (item as any).id === "string" ? (item as any).id.trim() : "";
-    if (!safeGraphId(cid) || PROTOTYPE_POISON_KEYS.has(cid.toLowerCase()) || EMBEDDED_SECRET_TOKEN_RE.test(cid)) {
+    if (
+      !safeGraphId(cid) ||
+      /^mr_[0-9a-f]{16,}$/i.test(cid) ||
+      PROTOTYPE_POISON_KEYS.has(cid.toLowerCase()) ||
+      EMBEDDED_SECRET_TOKEN_RE.test(cid)
+    ) {
       continue;
     }
     seenCastIds.add(cid);
@@ -5948,6 +5987,7 @@ export class AgentChatREST {
     if (
       !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(safeChannel) ||
       safeChannel.includes("..") ||
+      /^mr_[0-9a-f]{16,}$/i.test(safeChannel) ||
       PROTOTYPE_POISON_KEYS.has(safeChannel.toLowerCase()) ||
       /^\d{6,}$/.test(safeChannel) ||
       CREDENTIAL_PREFIX_RE.test(safeChannel) ||
@@ -5972,6 +6012,7 @@ export class AgentChatREST {
         !id ||
         !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(id) ||
         id.includes("..") ||
+        /^mr_[0-9a-f]{16,}$/i.test(id) ||
         PROTOTYPE_POISON_KEYS.has(id.toLowerCase()) ||
         CREDENTIAL_PREFIX_RE.test(id) ||
         this.containsMemorySecretShape(id)
@@ -5991,10 +6032,11 @@ export class AgentChatREST {
       message_ids: cleanMessageIds,
       story_type: input.story_type,
     };
+    const fieldCaps = { title: 96, summary: 200, outcome: 160 } as const;
     for (const field of ["title", "summary", "outcome"] as const) {
       const val = input[field];
       if (val !== undefined) {
-        if (typeof val !== "string" || val.length > 500 || /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/.test(val)) {
+        if (typeof val !== "string" || val.length > fieldCaps[field] || /[\x00-\x1f\x7f]/.test(val)) {
           throw new Error(`Invalid story ${field}`);
         }
         if (CREDENTIAL_PREFIX_RE.test(val.trim()) || this.containsMemorySecretShape(val)) {

@@ -11,6 +11,8 @@ import {
   rankDiscoverableChannels,
   resolveAgentMention,
   resolveInheritedObjectiveChannel,
+  resolveStoryBlueprintId,
+  resolveStoryBlueprintUrl,
   scheduleReadyDagTasks,
   summarizeAgentMemoryIndex,
   summarizeChannelBriefReadiness,
@@ -5623,6 +5625,94 @@ describe("AgentChatClient realtime collaboration WS events", () => {
       const rest = new AgentChatREST({ baseUrl: "https://agents-chat.com", bearerToken: "jwt_test" });
       const discovered = await rest.discoverChannels("agent", 10);
       expect(discovered.map((c) => c.id)).toEqual(["room-a", "room-b"]);
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
+  test("Campaign #65: resolveStoryBlueprintId/Url, summarizeStoryArtifactBundle room-context fallback & mr_ guards, and createStoryArtifact length/control/hyphenated-prose precision", async () => {
+    expect(resolveStoryBlueprintId("debug_war_room", { name: "Q4 OKR 冲刺作战室" })).toBe("okr-sprint");
+    expect(resolveStoryBlueprintUrl("build_log", { topic: "Claude × Codex 交叉互审" })).toBe(
+      "https://agents-chat.com/lobby?blueprint=cross-review",
+    );
+
+    const summary = summarizeStoryArtifactBundle({
+      artifact_id: "story_okr_65",
+      rendering_status: "ready",
+      suggested_captions: { x: "Shipped aiza-guide and eyJ-notes-v2!", threads: "Done", wechat: "Done", tiktok_hook: "Done" },
+      story_json: {
+        id: "story_okr_65",
+        channel: { id: "AIza-room-v2", name: "Sprint OKR 冲刺作战室" },
+        story_type: "debug_war_room",
+        turns: [
+          { message_id: "eyJ-notes-v2" },
+          { message_id: "mr_0123456789abcdef0123" },
+        ],
+        cast: [
+          { id: "aiza-builder" },
+          { id: "mr_0123456789abcdef0123" },
+        ],
+      },
+    });
+    expect(summary).not.toBeNull();
+    expect(summary?.blueprint_id).toBe("okr-sprint");
+    expect(summary?.blueprint_url).toBe("https://agents-chat.com/lobby?blueprint=okr-sprint");
+    expect(summary?.turn_count).toBe(1);
+    expect(summary?.cast_count).toBe(1);
+
+    expect(
+      summarizeStoryArtifactBundle({
+        artifact_id: "mr_0123456789abcdef0123",
+        story_json: { id: "mr_0123456789abcdef0123", channel: { id: "room-1" }, story_type: "build_log" },
+      }),
+    ).toBeNull();
+
+    const origFetch = globalThis.fetch;
+    let sentBody: any = null;
+    globalThis.fetch = (async (_url: string, init?: RequestInit) => {
+      sentBody = JSON.parse(String(init?.body ?? "{}"));
+      return new Response(JSON.stringify({ artifact_id: "story_ok" }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }) as any;
+
+    try {
+      const rest = new AgentChatREST({ baseUrl: "https://agents-chat.com", bearerToken: "jwt_65" });
+      await rest.createStoryArtifact({
+        channel_id: "AIza-room-v2",
+        message_ids: ["eyJ-notes-1", "aiza-msg-2", "m3"],
+        story_type: "build_log",
+        title: "AIza-Guide: Multi-Agent Setup",
+      });
+      expect(sentBody.channel_id).toBe("AIza-room-v2");
+      expect(sentBody.title).toBe("AIza-Guide: Multi-Agent Setup");
+
+      await expect(
+        rest.createStoryArtifact({
+          channel_id: "mr_0123456789abcdef0123",
+          message_ids: ["m1", "m2", "m3"],
+          story_type: "build_log",
+        }),
+      ).rejects.toThrow("Invalid channel ID");
+
+      await expect(
+        rest.createStoryArtifact({
+          channel_id: "room-1",
+          message_ids: ["m1", "m2", "m3"],
+          story_type: "build_log",
+          title: "x".repeat(97),
+        }),
+      ).rejects.toThrow("Invalid story title");
+
+      await expect(
+        rest.createStoryArtifact({
+          channel_id: "room-1",
+          message_ids: ["m1", "m2", "m3"],
+          story_type: "build_log",
+          title: "Line1\nLine2",
+        }),
+      ).rejects.toThrow("Invalid story title");
     } finally {
       globalThis.fetch = origFetch;
     }
