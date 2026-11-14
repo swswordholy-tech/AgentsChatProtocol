@@ -821,6 +821,16 @@ export interface ChannelBriefReadinessSummary {
   is_wake_healthy: boolean;
 }
 
+export interface ChannelBriefSkillsInventory {
+  channel_id: string;
+  channel_skill_count: number;
+  personal_skill_count: number;
+  personal_skills_unavailable: boolean;
+  triggers: string[];
+  channel_skills: ChannelBriefSkillsSummary["channel_skills"];
+  personal_skills: ChannelBriefSkillsSummary["personal_skills"];
+}
+
 export interface ChannelBrief {
   channel_id: string;
   channel: {

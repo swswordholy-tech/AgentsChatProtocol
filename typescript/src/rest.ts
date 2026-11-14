@@ -1252,16 +1252,163 @@ export function summarizeChannelThreads(
   };
 }
 
+function isSafeBriefCapabilityTag(cap: string): boolean {
+  return (
+    /^[a-z][a-z0-9:_-]{0,47}$/.test(cap) &&
+    !cap.includes("..") &&
+    !cap.includes("::") &&
+    !PROTOTYPE_POISON_KEYS.has(cap) &&
+    !CREDENTIAL_PREFIX_RE.test(cap) &&
+    !EMBEDDED_SECRET_TOKEN_RE.test(cap)
+  );
+}
+
+function sanitizeBriefSkillMeta(
+  rawMeta: unknown,
+): NonNullable<import("./types").ChannelBriefDocItem["skill_meta"]> {
+  const out: NonNullable<import("./types").ChannelBriefDocItem["skill_meta"]> = {};
+  if (!rawMeta || typeof rawMeta !== "object" || Array.isArray(rawMeta)) return out;
+  const m = rawMeta as Record<string, unknown>;
+  for (const key of ["name", "description", "trigger", "argument_hint"] as const) {
+    if (typeof m[key] === "string") {
+      const cleaned = scrubStoryDisplayText(m[key], 256);
+      if (cleaned && cleaned !== "[redacted]") out[key] = cleaned;
+    }
+  }
+  return out;
+}
+
+export function summarizeChannelBriefSkills(
+  raw: unknown,
+  expectedChannelId?: string,
+): import("./types").ChannelBriefSkillsInventory | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const brief = raw as Record<string, unknown>;
+  const channelId = typeof brief.channel_id === "string" ? brief.channel_id.trim() : "";
+  if (
+    !safeNonDmChannelId(channelId) ||
+    PROTOTYPE_POISON_KEYS.has(channelId.toLowerCase()) ||
+    EMBEDDED_SECRET_TOKEN_RE.test(channelId) ||
+    !brief.channel ||
+    typeof brief.channel !== "object"
+  ) {
+    return null;
+  }
+  if (expectedChannelId !== undefined && expectedChannelId.trim() !== channelId) {
+    return null;
+  }
+  const chObj = brief.channel as Record<string, unknown>;
+  if (
+    chObj.id !== channelId ||
+    (typeof chObj.type === "string" && chObj.type.trim().toLowerCase() === "direct")
+  ) {
+    return null;
+  }
+
+  const skillsObj =
+    brief.skills_summary && typeof brief.skills_summary === "object"
+      ? (brief.skills_summary as Record<string, unknown>)
+      : null;
+
+  const seenChannelIds = new Set<string>();
+  const channelSkills: import("./types").ChannelBriefSkillsSummary["channel_skills"] = [];
+  const triggersSet = new Set<string>();
+
+  for (const item of Array.isArray(skillsObj?.channel_skills) ? skillsObj!.channel_skills : []) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    const row = item as Record<string, unknown>;
+    const docId = typeof row.doc_id === "string" ? row.doc_id.trim() : "";
+    if (
+      !safeGraphId(docId) ||
+      PROTOTYPE_POISON_KEYS.has(docId.toLowerCase()) ||
+      EMBEDDED_SECRET_TOKEN_RE.test(docId) ||
+      row.archived === true ||
+      row.body_markdown === "" ||
+      seenChannelIds.has(docId)
+    ) {
+      continue;
+    }
+    seenChannelIds.add(docId);
+    const meta = sanitizeBriefSkillMeta(row.skill_meta);
+    if (meta.trigger) triggersSet.add(meta.trigger);
+    const version =
+      typeof row.version === "number" && Number.isSafeInteger(row.version) && row.version >= 1
+        ? row.version
+        : undefined;
+    channelSkills.push({
+      doc_id: docId,
+      skill_meta: meta,
+      ...(version !== undefined ? { version } : {}),
+      load_hint: `agentschat_read_channel_doc(channel_id=${JSON.stringify(channelId)}, doc_id=${JSON.stringify(docId)})`,
+    });
+    if (channelSkills.length >= 20) break;
+  }
+
+  const seenPersonalNames = new Set<string>();
+  const personalSkills: import("./types").ChannelBriefSkillsSummary["personal_skills"] = [];
+  for (const item of Array.isArray(skillsObj?.personal_skills) ? skillsObj!.personal_skills : []) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    const row = item as Record<string, unknown>;
+    const name = typeof row.name === "string" ? row.name.trim() : "";
+    if (
+      !safeGraphId(name) ||
+      PROTOTYPE_POISON_KEYS.has(name.toLowerCase()) ||
+      EMBEDDED_SECRET_TOKEN_RE.test(name) ||
+      row.archived === true ||
+      row.body_markdown === "" ||
+      seenPersonalNames.has(name)
+    ) {
+      continue;
+    }
+    seenPersonalNames.add(name);
+    const meta = sanitizeBriefSkillMeta(row.skill_meta);
+    if (meta.trigger) triggersSet.add(meta.trigger);
+    const version =
+      typeof row.version === "number" && Number.isSafeInteger(row.version) && row.version >= 1
+        ? row.version
+        : undefined;
+    personalSkills.push({
+      name,
+      skill_meta: meta,
+      ...(version !== undefined ? { version } : {}),
+      load_hint: `GET /api/skills/${encodeURIComponent(name)}`,
+    });
+    if (personalSkills.length >= 50) break;
+  }
+
+  return {
+    channel_id: channelId,
+    channel_skill_count: channelSkills.length,
+    personal_skill_count: personalSkills.length,
+    personal_skills_unavailable: brief.personal_skills_unavailable === true,
+    triggers: [...triggersSet].sort(),
+    channel_skills: channelSkills,
+    personal_skills: personalSkills,
+  };
+}
+
 export function summarizeChannelBriefReadiness(
   raw: unknown,
 ): import("./types").ChannelBriefReadinessSummary | null {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
   const brief = raw as Record<string, unknown>;
-  if (!safeNonDmChannelId(brief.channel_id) || !brief.channel || typeof brief.channel !== "object") {
+  const channelId = typeof brief.channel_id === "string" ? brief.channel_id.trim() : "";
+  if (
+    !safeNonDmChannelId(channelId) ||
+    PROTOTYPE_POISON_KEYS.has(channelId.toLowerCase()) ||
+    EMBEDDED_SECRET_TOKEN_RE.test(channelId) ||
+    !brief.channel ||
+    typeof brief.channel !== "object"
+  ) {
     return null;
   }
   const chObj = brief.channel as Record<string, unknown>;
-  if (chObj.id !== brief.channel_id || chObj.type === "direct") return null;
+  if (
+    chObj.id !== channelId ||
+    (typeof chObj.type === "string" && chObj.type.trim().toLowerCase() === "direct")
+  ) {
+    return null;
+  }
 
   const seenAgents = new Set<string>();
   let totalAgents = 0;
@@ -1273,7 +1420,14 @@ export function summarizeChannelBriefReadiness(
     if (!item || typeof item !== "object" || Array.isArray(item)) continue;
     const ag = item as Record<string, unknown>;
     const id = typeof ag.id === "string" ? ag.id.trim() : "";
-    if (!safeGraphId(id) || EMBEDDED_SECRET_TOKEN_RE.test(id) || seenAgents.has(id)) continue;
+    if (
+      !safeGraphId(id) ||
+      PROTOTYPE_POISON_KEYS.has(id.toLowerCase()) ||
+      EMBEDDED_SECRET_TOKEN_RE.test(id) ||
+      seenAgents.has(id)
+    ) {
+      continue;
+    }
     seenAgents.add(id);
     totalAgents += 1;
     const isOnline = ag.online === true;
@@ -1281,7 +1435,7 @@ export function summarizeChannelBriefReadiness(
     const seenCaps = new Set<string>();
     for (const rawCap of Array.isArray(ag.capabilities) ? ag.capabilities.slice(0, 16) : []) {
       const cap = typeof rawCap === "string" ? rawCap.trim().toLowerCase() : "";
-      if (!/^[a-z][a-z0-9_-]{0,31}$/.test(cap) || EMBEDDED_SECRET_TOKEN_RE.test(cap) || seenCaps.has(cap)) {
+      if (!isSafeBriefCapabilityTag(cap) || seenCaps.has(cap)) {
         continue;
       }
       seenCaps.add(cap);
@@ -1304,22 +1458,9 @@ export function summarizeChannelBriefReadiness(
     )
     .slice(0, 16);
 
-  const skillsObj =
-    brief.skills_summary && typeof brief.skills_summary === "object"
-      ? (brief.skills_summary as Record<string, unknown>)
-      : null;
-  const channelSkillCount = Array.isArray(skillsObj?.channel_skills)
-    ? skillsObj!.channel_skills.filter((s: any) => {
-        const docId = typeof s?.doc_id === "string" ? s.doc_id.trim() : "";
-        return safeGraphId(docId) && !EMBEDDED_SECRET_TOKEN_RE.test(docId) && s?.archived !== true;
-      }).length
-    : 0;
-  const personalSkillCount = Array.isArray(skillsObj?.personal_skills)
-    ? skillsObj!.personal_skills.filter((s: any) => {
-        const name = typeof s?.name === "string" ? s.name.trim() : "";
-        return safeGraphId(name) && !EMBEDDED_SECRET_TOKEN_RE.test(name) && s?.archived !== true;
-      }).length
-    : 0;
+  const skillsInventory = summarizeChannelBriefSkills(raw, channelId);
+  const channelSkillCount = skillsInventory?.channel_skill_count ?? 0;
+  const personalSkillCount = skillsInventory?.personal_skill_count ?? 0;
 
   const okrObj =
     brief.okr_summary && typeof brief.okr_summary === "object"
@@ -1342,7 +1483,12 @@ export function summarizeChannelBriefReadiness(
           loopObj!.unarmed_objective_ids
             .filter((x): x is string => typeof x === "string")
             .map((x) => x.trim())
-            .filter((x) => safeGraphId(x) && !EMBEDDED_SECRET_TOKEN_RE.test(x)),
+            .filter(
+              (x) =>
+                safeGraphId(x) &&
+                !PROTOTYPE_POISON_KEYS.has(x.toLowerCase()) &&
+                !EMBEDDED_SECRET_TOKEN_RE.test(x),
+            ),
         ),
       ].slice(0, 25)
     : [];
@@ -1357,8 +1503,23 @@ export function summarizeChannelBriefReadiness(
     ? [
         ...new Set(
           wakeObj!.attention_agents
+            .filter((a: any) => {
+              if (!a || typeof a !== "object") return false;
+              if (
+                typeof a.runtime === "string" &&
+                !CLOUD_WAKE_RUNTIMES.has(a.runtime.trim() as import("./types").CloudWakeRuntimeType)
+              ) {
+                return false;
+              }
+              return true;
+            })
             .map((a: any) => (typeof a?.agent_id === "string" ? a.agent_id.trim() : ""))
-            .filter((id: string) => safeGraphId(id) && !EMBEDDED_SECRET_TOKEN_RE.test(id)),
+            .filter(
+              (id: string) =>
+                safeGraphId(id) &&
+                !PROTOTYPE_POISON_KEYS.has(id.toLowerCase()) &&
+                !EMBEDDED_SECRET_TOKEN_RE.test(id),
+            ),
         ),
       ].slice(0, 16)
     : [];
@@ -1372,7 +1533,7 @@ export function summarizeChannelBriefReadiness(
     ((typeof countsObj?.error === "number" ? countsObj.error : 0) || 0);
 
   return {
-    channel_id: brief.channel_id as string,
+    channel_id: channelId,
     online_agent_count: onlineAgents,
     total_agent_count: totalAgents,
     specialties,
@@ -2985,7 +3146,11 @@ export class AgentChatREST {
     opts?: { bearerToken?: string },
   ): Promise<import("./types").ChannelBrief> {
     const safeChannel = typeof channelId === "string" ? channelId.trim() : "";
-    if (!safeNonDmChannelId(safeChannel)) {
+    if (
+      !safeNonDmChannelId(safeChannel) ||
+      PROTOTYPE_POISON_KEYS.has(safeChannel.toLowerCase()) ||
+      EMBEDDED_SECRET_TOKEN_RE.test(safeChannel)
+    ) {
       throw new Error("Invalid channel ID");
     }
     const token = opts?.bearerToken?.trim() || this.bearerToken;

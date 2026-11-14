@@ -8,6 +8,7 @@ import {
   resolveInheritedObjectiveChannel,
   summarizeAgentMemoryIndex,
   summarizeChannelBriefReadiness,
+  summarizeChannelBriefSkills,
   summarizeChannelOkrSnapshot,
   summarizeChannelThreads,
   summarizeChannelWakeHealth,
@@ -4588,5 +4589,133 @@ describe("AgentChatClient realtime collaboration WS events", () => {
         if_match_version: 0,
       }),
     ).rejects.toThrow("Secret or credential detected in channel doc");
+  });
+
+  test("summarizeChannelBriefReadiness & summarizeChannelBriefSkills preserve runtime:<type> specialties, 11-runtime wake attention, deduplicate skills, and block prototype/credential shapes", async () => {
+    const desc240 = "D".repeat(240);
+    const briefPayload = {
+      channel_id: "room-54",
+      channel: { id: "room-54", name: "Collab 54", type: "project" },
+      agents: [
+        {
+          id: "openclaw-peer",
+          name: "OpenClaw",
+          online: true,
+          capabilities: [
+            "runtime:openclaw",
+            "runtime:openclaw",
+            "code-review",
+            "__proto__",
+            "runtime::bad",
+            "rk_live_1234567890abcd",
+          ],
+        },
+        {
+          id: "muse-peer",
+          name: "Muse",
+          online: false,
+          capabilities: ["runtime:muse", "code-review"],
+        },
+        { id: "__proto__", name: "Poison", online: true, capabilities: ["ops"] },
+      ],
+      skills_summary: {
+        channel_skills: [
+          {
+            doc_id: "triage-sop",
+            version: 4,
+            skill_meta: {
+              name: "Triage SOP",
+              description: `${desc240} sk-proj-1234567890abcdef`,
+              trigger: "/triage",
+              argument_hint: "<issue-id>",
+            },
+            load_hint: "INJECTED_SECRET_rk_live_1234567890abcd",
+          },
+          // Duplicate & tombstone & prototype rows dropped
+          { doc_id: "triage-sop", version: 9, skill_meta: { name: "Dup", trigger: "/dup" }, load_hint: "x" },
+          { doc_id: "archived-sop", archived: true, skill_meta: { name: "Old" }, load_hint: "x" },
+          { doc_id: "empty-sop", body_markdown: "", skill_meta: { name: "Empty" }, load_hint: "x" },
+          { doc_id: "__proto__", skill_meta: { name: "Poison" }, load_hint: "x" },
+        ],
+        personal_skills: [
+          {
+            name: "my-audit",
+            version: 2,
+            skill_meta: {
+              name: "My Audit",
+              description: "Owner audit helper owner@example.com",
+              trigger: "/audit",
+            },
+            load_hint: "INJECTED_HINT_ghp_1234567890abcdef",
+          },
+          { name: "my-audit", version: 3, skill_meta: { name: "Dup" }, load_hint: "x" },
+          { name: "constructor", version: 1, skill_meta: { name: "Poison" }, load_hint: "x" },
+        ],
+      },
+      personal_skills_unavailable: false,
+      okr_summary: {
+        active_objective_count: 2,
+        total_task_count: 5,
+        ready_for_me_count: 3,
+      },
+      loop_summary: {
+        active_loop_count: 1,
+        my_active_loop_count: 1,
+        okr_wake_objective_ids: ["obj-1"],
+        okr_watch_objective_ids: [],
+        unarmed_objective_ids: ["obj-2", "obj-2", "__proto__", "obj_mcp_at_1234567890"],
+      },
+      wake_health_summary: {
+        observation_only: true,
+        counts: { total_cloud_agents: 5, ok: 1, auth_required: 2, timeout: 1, error: 1, unobserved: 0 },
+        attention_agents: [
+          { agent_id: "openclaw-peer", runtime: "openclaw", cloud_status: "active", last_wake_status: "auth_required" },
+          { agent_id: "grok-peer", runtime: "grok", cloud_status: "active", last_wake_status: "timeout" },
+          { agent_id: "muse-peer", runtime: "muse", cloud_status: "active", last_wake_status: "error" },
+          { agent_id: "dot-peer", runtime: "dot", cloud_status: "active", last_wake_status: "auth_required" },
+          { agent_id: "bad-rt-peer", runtime: "unknown_rt", cloud_status: "active", last_wake_status: "error" },
+          { agent_id: "__proto__", runtime: "codex", cloud_status: "active", last_wake_status: "error" },
+        ],
+      },
+    };
+
+    const readiness = summarizeChannelBriefReadiness(briefPayload);
+    expect(readiness).not.toBeNull();
+    expect(readiness!.total_agent_count).toBe(2);
+    expect(readiness!.online_agent_count).toBe(1);
+    expect(readiness!.specialties).toEqual([
+      { capability: "code-review", total_agents: 2, online_agents: 1 },
+      { capability: "runtime:openclaw", total_agents: 1, online_agents: 1 },
+      { capability: "runtime:muse", total_agents: 1, online_agents: 0 },
+    ]);
+    expect(readiness!.channel_skill_count).toBe(1);
+    expect(readiness!.personal_skill_count).toBe(1);
+    expect(readiness!.unarmed_objective_ids).toEqual(["obj-2"]);
+    expect(readiness!.attention_agent_ids).toEqual(["openclaw-peer", "grok-peer", "muse-peer", "dot-peer"]);
+    expect(readiness!.is_wake_healthy).toBe(false);
+
+    const inventory = summarizeChannelBriefSkills(briefPayload, "room-54");
+    expect(inventory).not.toBeNull();
+    expect(inventory!.channel_skill_count).toBe(1);
+    expect(inventory!.personal_skill_count).toBe(1);
+    expect(inventory!.triggers).toEqual(["/audit", "/triage"]);
+    expect(inventory!.channel_skills[0]?.load_hint).toBe(
+      'agentschat_read_channel_doc(channel_id="room-54", doc_id="triage-sop")',
+    );
+    expect(inventory!.personal_skills[0]?.load_hint).toBe("GET /api/skills/my-audit");
+    expect(inventory!.channel_skills[0]?.skill_meta.description?.startsWith(desc240)).toBe(true);
+    const dumped = JSON.stringify(inventory);
+    for (const leaked of ["sk-proj-", "rk_live_", "ghp_", "owner@example.com", "INJECTED_"]) {
+      expect(dumped).not.toContain(leaked);
+    }
+
+    expect(summarizeChannelBriefSkills(briefPayload, "other-room")).toBeNull();
+    expect(summarizeChannelBriefReadiness({ channel_id: "__proto__", channel: { id: "__proto__", type: "group" } })).toBeNull();
+    expect(summarizeChannelBriefReadiness({ channel_id: "room-54", channel: { id: "room-54", type: "DIRECT" } })).toBeNull();
+
+    const rest = new AgentChatREST({ baseUrl: "https://agents-chat.com", bearerToken: "jwt_owner_54" });
+    for (const badCh of ["__proto__", "constructor", "prototype", "dm:pair", "direct_1", "room_mcp_at_1234567890"]) {
+      await expect(rest.getChannelBrief(badCh)).rejects.toThrow("Invalid channel ID");
+    }
   });
 });
