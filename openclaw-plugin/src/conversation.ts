@@ -13,6 +13,9 @@ export function parseConversationId(conversationId: string) {
   const raw = conversationId.slice(CHANNEL_PREFIX.length);
   const separatorIndex = raw.indexOf(THREAD_SEPARATOR);
 
+  const channelId = separatorIndex === -1 ? raw : raw.slice(0, separatorIndex);
+  if (!channelId.trim()) return null;
+
   if (separatorIndex === -1) {
     return { channelId: raw, threadId: undefined as string | undefined };
   }

@@ -7,7 +7,7 @@ const gatewayStates = new Map<string, AgentChatGatewayState>();
 const mentionCursors = new Map<string, string>();
 
 function mentionCursorKey(accountId: string, conversationId: string) {
-  return `${accountId}:${conversationId}`;
+  return JSON.stringify([accountId, conversationId]);
 }
 
 export function getGatewayState(accountId: string) {

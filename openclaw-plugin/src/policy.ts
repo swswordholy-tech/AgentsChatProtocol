@@ -25,6 +25,12 @@ function getThreadId(message: ChatMessage): string | number | undefined {
 
 function deriveRestBaseUrl(wsUrl: string) {
   const url = new URL(wsUrl);
+  if (!["ws:", "wss:"].includes(url.protocol) || url.username || url.password) {
+    throw new Error("AgentChat history requires a WebSocket URL without credentials");
+  }
+  if (url.protocol !== "wss:" && !["127.0.0.1", "localhost", "[::1]"].includes(url.hostname)) {
+    throw new Error("AgentChat history requires wss for remote hosts");
+  }
   url.protocol = url.protocol === "wss:" ? "https:" : "http:";
   url.hash = "";
   url.search = "";
@@ -60,6 +66,38 @@ function isMentioned(content: string, account: AgentChatResolvedAccount) {
 }
 
 const HISTORY_FETCH_TIMEOUT_MS = 10_000;
+const MAX_HISTORY_BYTES = 512 * 1024;
+
+function scrubHistoryError(error: unknown) {
+  return (error instanceof Error ? error.message : String(error))
+    .replace(/\bBearer\s+[^\s"'<>]+/gi, "Bearer [redacted]")
+    .replace(/ac_[A-Za-z0-9_-]+/gi, "[redacted]");
+}
+
+async function readHistoryJson(response: Response) {
+  if (!response.body) return {};
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  let bytes = 0;
+  let text = "";
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      bytes += value.byteLength;
+      if (bytes > MAX_HISTORY_BYTES) throw new Error("AgentChat history exceeds byte limit");
+      text += decoder.decode(value, { stream: true });
+    }
+    text += decoder.decode();
+    return JSON.parse(text);
+  } catch (error) {
+    // Do not let a stalled producer delay the single-message fallback.
+    void reader.cancel().catch(() => {});
+    throw error;
+  } finally {
+    reader.releaseLock();
+  }
+}
 
 async function fetchChannelHistory(params: {
   wsUrl: string;
@@ -73,14 +111,16 @@ async function fetchChannelHistory(params: {
   const response = await fetch(
     `${baseUrl}/api/channels/${encodeURIComponent(params.channelId)}/messages?${search.toString()}`,
     {
+      redirect: "error",
       headers: params.token ? { Authorization: `Bearer ${params.token}` } : {},
       signal: AbortSignal.timeout(HISTORY_FETCH_TIMEOUT_MS),
     },
   );
   if (!response.ok) {
+    await response.body?.cancel();
     throw new Error(`HTTP ${response.status}: failed to fetch AgentChat history`);
   }
-  const payload = (await response.json()) as { messages?: ChatMessage[] };
+  const payload = (await readHistoryJson(response)) as { messages?: ChatMessage[] };
   return payload.messages ?? [];
 }
 
@@ -143,7 +183,8 @@ export async function buildInboundPolicy(params: {
   const conversationId = buildConversationId(message.channel_id, threadId);
   const isDirect = isDirectChannel(message.channel_id);
 
-  if (!isDirect && !isMentioned(rawBody, account)) {
+  if ((account.agentId && message.sender_id === account.agentId) ||
+      (!isDirect && !isMentioned(rawBody, account))) {
     return {
       shouldDispatch: false,
       bodyForAgent: rawBody,
@@ -178,11 +219,13 @@ export async function buildInboundPolicy(params: {
       accountId,
       channelId: message.channel_id,
       messageId: message.id,
-      error: error instanceof Error ? error.message : String(error),
+      error: scrubHistoryError(error),
     });
   }
 
-  setMentionCursor(accountId, conversationId, message.timestamp);
+  if (typeof message.timestamp === "string" && message.timestamp.trim()) {
+    setMentionCursor(accountId, conversationId, message.timestamp);
+  }
   return {
     shouldDispatch: true,
     bodyForAgent: prefix ? `${prefix}${message.sender_id}: ${rawBody}` : rawBody,

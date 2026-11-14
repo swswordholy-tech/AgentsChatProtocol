@@ -38,16 +38,19 @@ export const agentChatOutbound: ChannelOutboundAdapter = {
       throw new Error("AgentChat outbound requires accountId");
     }
 
+    const to = ctx.to?.trim();
+    if (!to) throw new Error("AgentChat target is required");
+
     const state = getGatewayState(accountId);
     if (!state) {
       throw new Error(`AgentChat gateway is not running for account ${accountId}`);
     }
 
     if (ctx.threadId !== undefined && ctx.threadId !== null && String(ctx.threadId).trim() !== "") {
-      state.client.sendMessage(ctx.to, ctx.text, ctx.threadId);
+      state.client.sendMessage(to, ctx.text, ctx.threadId);
     } else {
-      state.client.sendMessage(ctx.to, ctx.text);
+      state.client.sendMessage(to, ctx.text);
     }
-    return buildResult(ctx);
+    return buildResult({ ...ctx, to });
   },
 };

@@ -188,7 +188,10 @@ test("shard_moved triggers fast reconnect and invokes onReconnect", async () => 
   try {
     await client.connect();
     sockets[0].send(JSON.stringify({ type: "shard_moved" }));
-    await new Promise((r) => setTimeout(r, 90));
+    const deadline = Date.now() + 2_000;
+    while ((connections < 2 || reconnected < 1) && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
     assert.equal(connections, 2);
     assert.equal(reconnected, 1);
   } finally {
@@ -210,7 +213,7 @@ test("mentionCursors caps at 2000 entries (FIFO) and history fetch passes an Abo
   const origFetch = globalThis.fetch;
   globalThis.fetch = async (_url, init) => {
     receivedSignal = init?.signal ?? null;
-    return { ok: true, status: 200, json: async () => ({ messages: [] }) };
+    return Response.json({ messages: [] });
   };
   try {
     await buildInboundPolicy({

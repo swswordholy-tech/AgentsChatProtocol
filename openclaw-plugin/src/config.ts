@@ -15,18 +15,22 @@ function readChannelConfig(raw: OpenClawConfig | unknown): AgentChatChannelConfi
   return cfg?.channels?.agentchat ?? {};
 }
 
+function isSafeAccountId(id: string) {
+  return Boolean(id.trim()) && !/^(?:__proto__|constructor|prototype)$/i.test(id.trim());
+}
+
 function resolveAccountId(raw: unknown, requested?: string | null): string {
   const channel = readChannelConfig(raw);
   const accounts = channel.accounts ?? {};
   if (requested != null) {
-    if (!requested || !Object.hasOwn(accounts, requested)) throw new Error("Selected AgentChat account is missing; no identity fallback");
+    if (!isSafeAccountId(requested) || !Object.hasOwn(accounts, requested)) throw new Error("Selected AgentChat account is missing; no identity fallback");
     return requested;
   }
   if (channel.defaultAccountId !== undefined) {
-    if (!Object.hasOwn(accounts, channel.defaultAccountId)) throw new Error("Default AgentChat account is missing; repair the binding");
+    if (!isSafeAccountId(channel.defaultAccountId) || !Object.hasOwn(accounts, channel.defaultAccountId)) throw new Error("Default AgentChat account is missing; repair the binding");
     return channel.defaultAccountId;
   }
-  const ids = Object.keys(accounts);
+  const ids = Object.keys(accounts).filter(isSafeAccountId);
   if (ids.length > 1) throw new Error("Multiple AgentChat accounts; select an account or configure defaultAccountId");
   return ids[0] ?? "default";
 }
@@ -75,24 +79,26 @@ export const agentChatConfigSchema = {
 
 export const agentChatConfig: AgentChatConfigAdapter = {
   listAccountIds(cfg: OpenClawConfig) {
-    return Object.keys(readChannelConfig(cfg).accounts ?? {});
+    return Object.keys(readChannelConfig(cfg).accounts ?? {}).filter(isSafeAccountId);
   },
   resolveAccount(cfg: OpenClawConfig, accountId?: string | null) {
     const resolvedAccountId = resolveAccountId(cfg, accountId);
-    const raw = readChannelConfig(cfg).accounts?.[resolvedAccountId] ?? {};
+    const accounts = readChannelConfig(cfg).accounts ?? {};
+    const raw = Object.hasOwn(accounts, resolvedAccountId) ? accounts[resolvedAccountId] : {};
     return {
       accountId: resolvedAccountId,
-      name: raw.name,
-      agentId: raw.agentId,
-      token: raw.token,
-      wsUrl: raw.wsUrl ?? DEFAULT_WS_URL,
-      defaultChannelId: raw.defaultChannelId,
+      name: raw.name?.trim() || undefined,
+      agentId: raw.agentId?.trim() || undefined,
+      token: raw.token?.trim() || undefined,
+      wsUrl: raw.wsUrl?.trim() || DEFAULT_WS_URL,
+      defaultChannelId: raw.defaultChannelId?.trim() || undefined,
       enabled: raw.enabled !== false,
     };
   },
   inspectAccount(cfg: OpenClawConfig, accountId?: string | null) {
     const resolvedAccountId = resolveAccountId(cfg, accountId);
-    return readChannelConfig(cfg).accounts?.[resolvedAccountId] ?? null;
+    const accounts = readChannelConfig(cfg).accounts ?? {};
+    return Object.hasOwn(accounts, resolvedAccountId) ? accounts[resolvedAccountId] : null;
   },
   defaultAccountId(cfg: OpenClawConfig) {
     return resolveAccountId(cfg, null);
@@ -104,14 +110,14 @@ export const agentChatConfig: AgentChatConfigAdapter = {
     return account.enabled ? "" : "AgentChat account disabled";
   },
   isConfigured(account: AgentChatResolvedAccount) {
-    return Boolean(account.agentId && account.token);
+    return Boolean(account.agentId?.trim() && account.token?.trim());
   },
   unconfiguredReason(account: AgentChatResolvedAccount) {
-    if (account.agentId && account.token) return "";
+    if (account.agentId?.trim() && account.token?.trim()) return "";
     return "Missing AgentChat agentId or token";
   },
   describeAccount(account: AgentChatResolvedAccount) {
-    const configured = Boolean(account.agentId && account.token);
+    const configured = Boolean(account.agentId?.trim() && account.token?.trim());
     return {
       accountId: account.accountId,
       name: account.name ?? account.agentId ?? account.accountId,

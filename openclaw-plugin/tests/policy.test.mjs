@@ -46,11 +46,7 @@ async function withFetch(fakeFetch, fn) {
 }
 
 function okHistory(messages) {
-  return async () => ({
-    ok: true,
-    status: 200,
-    json: async () => ({ messages }),
-  });
+  return async () => Response.json({ messages });
 }
 
 test("group message without a mention does not dispatch and never fetches", async () => {
