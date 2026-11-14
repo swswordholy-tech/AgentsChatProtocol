@@ -8,6 +8,7 @@ import {
   filterWorkspaceEntitiesSince,
   isPrivateOrReservedHost,
   isValidCollaborationRoster,
+  parseChannelSkillFrontmatter,
   rankDiscoverableChannels,
   resolveAgentMention,
   resolveInheritedObjectiveChannel,
@@ -17,6 +18,8 @@ import {
   summarizeAgentMemoryIndex,
   summarizeChannelBriefReadiness,
   summarizeChannelBriefSkills,
+  summarizeChannelDocDetail,
+  summarizeChannelDocList,
   summarizeChannelOkrSnapshot,
   summarizeChannelPins,
   summarizeChannelThreads,
@@ -5826,6 +5829,151 @@ describe("AgentChatClient realtime collaboration WS events", () => {
       await expect(
         rest.removeWebhook("room-dev", "https://hooks.example.com/cb?auth=Bearer%20secret_bearer_token_12345"),
       ).rejects.toThrow("Webhook URL must not contain secrets");
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
+  test("Campaign #67: parseChannelSkillFrontmatter (CRLF+LF+EOF) & doc/memory/skill slug + mr_/ASIA parity", async () => {
+    const crlfSkill =
+      "---\r\nname: deploy-release\r\ndescription: Ship Cloud Run cleanly to ops@example.invalid\r\ntrigger: /deploy\r\nargument-hint: \"[service]\"\r\n---\r\n\r\n# Steps\r\nRun smoke checks.";
+    const parsed = parseChannelSkillFrontmatter(crlfSkill);
+    expect(parsed.is_valid_skill).toBe(true);
+    expect(parsed.metadata).toEqual({
+      name: "deploy-release",
+      description: "Ship Cloud Run cleanly to [redacted]",
+      trigger: "/deploy",
+      argument_hint: "[service]",
+    });
+    expect(parsed.body).toBe("# Steps\r\nRun smoke checks.");
+
+    const eofSkill = "---\r\nname: eof-skill\r\ndescription: Header only\r\n---";
+    expect(parseChannelSkillFrontmatter(eofSkill)).toEqual({
+      metadata: { name: "eof-skill", description: "Header only" },
+      body: "",
+      is_valid_skill: true,
+    });
+    expect(parseChannelSkillFrontmatter("# Plain doc").is_valid_skill).toBe(false);
+
+    const docList = summarizeChannelDocList({
+      channel_id: "room-dev",
+      docs: [
+        {
+          id: "aiza-guide",
+          title: "AIza Guide",
+          kind: "channel_skill",
+          level: 2,
+          bodyMarkdown: crlfSkill,
+          bodySummary: "Steps Run smoke checks.",
+          version: 3,
+          updatedAt: "2026-11-14T08:00:00Z",
+          updatedBy: "mr_0123456789abcdef0123",
+        },
+        {
+          id: "mr_0123456789abcdef0123",
+          title: "Blocked opaque slug",
+          kind: "context",
+          level: 3,
+          bodySummary: "Should drop",
+          version: 1,
+          updatedAt: "2026-11-14T08:00:00Z",
+          updatedBy: "codex-1",
+        },
+      ],
+    });
+    expect(docList).not.toBeNull();
+    expect(docList!.docs.map((d) => d.id)).toEqual(["aiza-guide"]);
+    expect(docList!.docs[0]?.updatedBy).toBe("unknown");
+    expect(docList!.docs[0]?.skill_meta?.name).toBe("deploy-release");
+    expect(docList!.skill_count).toBe(1);
+
+    const docDetail = summarizeChannelDocDetail({
+      id: "eyj-notes",
+      title: "JWT Notes",
+      kind: "context",
+      level: 3,
+      version: 2,
+      bodyMarkdown: "# Safe",
+    });
+    expect(docDetail?.id).toBe("eyj-notes");
+
+    const skillDetail = summarizePersonalSkillDetail({
+      name: "aiza-skill",
+      body_markdown: eofSkill,
+      version: 1,
+      updated_at: "2026-11-14T08:00:00Z",
+    });
+    expect(skillDetail?.title).toBe("eof-skill");
+    expect(skillDetail?.description).toBe("Header only");
+    expect(
+      summarizePersonalSkillDetail({
+        name: "mr_0123456789abcdef",
+        body_markdown: eofSkill,
+        version: 1,
+      }),
+    ).toBeNull();
+
+    const memIndex = summarizeAgentMemoryIndex({
+      agent_id: "aiza-worker-1",
+      memories: [
+        {
+          name: "aiza-notes",
+          description: "Safe checkpoint",
+          version: 1,
+          bytes: 15,
+          updated_at: "2026-11-14T08:00:00Z",
+        },
+        {
+          name: "eyj-notes",
+          description: "Leaked mr_0123456789abcdef0123",
+          version: 1,
+          bytes: 20,
+          updated_at: "2026-11-14T08:01:00Z",
+        },
+        {
+          name: "mr_0123456789abcdef",
+          description: "Drop opaque slug",
+          version: 1,
+          bytes: 10,
+          updated_at: "2026-11-14T08:02:00Z",
+        },
+      ],
+    });
+    expect(memIndex).not.toBeNull();
+    expect(memIndex!.items.map((i) => i.name)).toEqual(["eyj-notes", "aiza-notes"]);
+    expect(memIndex!.redacted_count).toBe(1);
+    expect(memIndex!.items[0]?.description).toBe("");
+    expect(summarizeAgentMemoryIndex({ agent_id: "mr_0123456789abcdef", memories: [] })).toBeNull();
+    expect(summarizeAgentMemoryIndex({ agent_id: "Constructor", memories: [] })).toBeNull();
+
+    const origFetch = globalThis.fetch;
+    let calls = 0;
+    globalThis.fetch = (async () => {
+      calls++;
+      return Response.json({ id: "aiza-guide", title: "AIza Guide", kind: "channel_skill", level: 3, version: 1, bodyMarkdown: crlfSkill, bodySummary: "Steps", updatedAt: "2026-11-14T08:00:00Z", updatedBy: "codex-1" });
+    }) as typeof fetch;
+    try {
+      const rest = new AgentChatREST({ baseUrl: "https://agents-chat.com", bearerToken: "tok" });
+      await expect(
+        rest.saveChannelDoc("room-dev", "aiza-guide", {
+          title: "Missing frontmatter",
+          kind: "channel_skill",
+          level: 3,
+          body_markdown: "# No frontmatter",
+          if_match_version: 0,
+        }),
+      ).rejects.toThrow("Invalid skill frontmatter");
+      expect(calls).toBe(0);
+
+      const saved = await rest.saveChannelDoc("room-dev", "aiza-guide", {
+        title: "AIza Guide",
+        kind: "channel_skill",
+        level: 3,
+        body_markdown: crlfSkill,
+        if_match_version: 0,
+      });
+      expect(saved.id).toBe("aiza-guide");
+      expect(calls).toBe(1);
     } finally {
       globalThis.fetch = origFetch;
     }

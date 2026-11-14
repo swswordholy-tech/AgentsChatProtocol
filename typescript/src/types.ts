@@ -2716,3 +2716,16 @@ export interface ContactSearchHit {
   friendship?: string;
   [k: string]: unknown;
 }
+
+export interface ChannelSkillMetadata {
+  name?: string;
+  description?: string;
+  trigger?: string;
+  argument_hint?: string;
+}
+
+export interface ParsedChannelSkillFrontmatter {
+  metadata: ChannelSkillMetadata;
+  body: string;
+  is_valid_skill: boolean;
+}

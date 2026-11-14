@@ -1169,7 +1169,53 @@ const VALID_DOC_KINDS_SET = new Set<import("./types").ChannelDocKind>([
 ]);
 
 const CHANNEL_DOC_CREDENTIAL_ID_RE =
-  /(?:^|[^A-Za-z0-9])(?:mcp_(?:at|rt|code)_|ac_|agent_key_|sk[-_]|rk_(?:live|test)_|gh[pousr]_|github_pat_|glpat-|xox[baprs]-|(?:AKIA|ASIA)[0-9A-Z]{16}|(?:hf|npm)_|AIza|eyJ)/i;
+  /(?:^|[^A-Za-z0-9])(?:mr_[0-9a-f]{16,}$|mcp_(?:at|rt|code)_|ac_|agent_key_|sk[-_]|rk_(?:live|test)_|gh[pousr]_|github_pat_|glpat-|xox[baprs]-|(?:AKIA|ASIA)(?:$|[A-Za-z0-9])|(?:hf|npm)_|(?:AIza|eyJ)(?:$|[A-Za-z0-9]))/i;
+
+const LEADING_SKILL_FRONTMATTER_RE = /^---\r?\n(?:([\s\S]*?)\r?\n)?---[ \t]*(?=\r?\n|$)/;
+
+/**
+ * Pure zero-I/O YAML frontmatter parser for Channel Skills (`skill` / `channel_skill`)
+ * and Personal Skills (`---\nname: ...\ndescription: ...\n---`), supporting both LF (`\n`),
+ * CRLF (`\r\n`), and EOF `---` terminators while scrubbing embedded secrets/PII in metadata.
+ */
+export function parseChannelSkillFrontmatter(
+  markdown: unknown,
+): import("./types").ParsedChannelSkillFrontmatter {
+  if (typeof markdown !== "string") {
+    return { metadata: {}, body: "", is_valid_skill: false };
+  }
+  const match = markdown.match(LEADING_SKILL_FRONTMATTER_RE);
+  if (!match) {
+    return { metadata: {}, body: markdown, is_valid_skill: false };
+  }
+  const raw = match[1] ?? "";
+  const body = markdown.slice(match[0].length).replace(/^\s*\r?\n/, "");
+  const metadata: import("./types").ChannelSkillMetadata = {};
+  for (const line of raw.split(/\r?\n/)) {
+    const m = line.match(/^([A-Za-z0-9_-]+):\s*(.*)$/);
+    if (!m) continue;
+    const key = m[1].toLowerCase().replace(/-/g, "_");
+    let value = m[2].trim();
+    if (
+      (value.startsWith('"') && value.endsWith('"')) ||
+      (value.startsWith("'") && value.endsWith("'"))
+    ) {
+      value = value.slice(1, -1);
+    }
+    if (key === "name" || key === "description" || key === "trigger" || key === "argument_hint") {
+      const cap = key === "description" || key === "trigger" ? 500 : 160;
+      const cleaned = scrubStoryDisplayText(value, cap);
+      if (cleaned) {
+        metadata[key] = cleaned;
+      }
+    }
+  }
+  return {
+    metadata,
+    body,
+    is_valid_skill: Boolean(metadata.name && metadata.description),
+  };
+}
 
 function isSafeChannelDocSlug(raw: unknown): raw is string {
   if (typeof raw !== "string") return false;
@@ -1258,25 +1304,32 @@ export function summarizeChannelDocList(
         : rawUpdatedBy.replace(/[\x00-\x1f\x7f]+/g, "").slice(0, 128) || "unknown";
 
     let skillMeta: import("./types").ChannelDocSummaryItem["skill_meta"] | undefined;
-    if (
-      !archived &&
-      (kind === "skill" || kind === "channel_skill") &&
-      d.skill_meta &&
-      typeof d.skill_meta === "object" &&
-      !Array.isArray(d.skill_meta)
-    ) {
-      const sm = d.skill_meta as Record<string, unknown>;
-      const smName = scrubStoryDisplayText(sm.name, 160);
-      const smDesc = scrubStoryDisplayText(sm.description, 500);
-      if (smName && smDesc) {
-        const smTrigger = scrubStoryDisplayText(sm.trigger, 500);
-        const smHint = scrubStoryDisplayText(sm.argument_hint, 160);
-        skillMeta = {
-          name: smName,
-          description: smDesc,
-          ...(smTrigger ? { trigger: smTrigger } : {}),
-          ...(smHint ? { argument_hint: smHint } : {}),
-        };
+    if (!archived && (kind === "skill" || kind === "channel_skill")) {
+      if (d.skill_meta && typeof d.skill_meta === "object" && !Array.isArray(d.skill_meta)) {
+        const sm = d.skill_meta as Record<string, unknown>;
+        const smName = scrubStoryDisplayText(sm.name, 160);
+        const smDesc = scrubStoryDisplayText(sm.description, 500);
+        if (smName && smDesc) {
+          const smTrigger = scrubStoryDisplayText(sm.trigger, 500);
+          const smHint = scrubStoryDisplayText(sm.argument_hint, 160);
+          skillMeta = {
+            name: smName,
+            description: smDesc,
+            ...(smTrigger ? { trigger: smTrigger } : {}),
+            ...(smHint ? { argument_hint: smHint } : {}),
+          };
+        }
+      } else {
+        const fallbackBody =
+          typeof d.bodyMarkdown === "string"
+            ? d.bodyMarkdown
+            : typeof d.body_markdown === "string"
+              ? d.body_markdown
+              : "";
+        const parsed = parseChannelSkillFrontmatter(fallbackBody);
+        if (parsed.is_valid_skill) {
+          skillMeta = parsed.metadata;
+        }
       }
     }
 
@@ -1832,7 +1885,11 @@ function isValidPersonalSkillSlug(value: unknown): value is string {
     PERSONAL_SKILL_SLUG_RE.test(value) &&
     !value.includes("..") &&
     !PROTOTYPE_POISON_KEYS.has(value.toLowerCase()) &&
+    !/(?:^|[^A-Za-z0-9])mr_[0-9a-f]{16,}$/i.test(value) &&
     !CREDENTIAL_PREFIX_RE.test(value) &&
+    !JOINED_GRAPH_CREDENTIAL_ID_RE.test(value) &&
+    !JOINED_GRAPH_AWS_KEY_ID_RE.test(value) &&
+    !/^(?:AIza|eyJ)[A-Za-z0-9]/i.test(value) &&
     !/^xox[baprs]-/i.test(value) &&
     !EMBEDDED_SECRET_TOKEN_RE.test(value) &&
     !EMAIL_ID_RE.test(value) &&
@@ -1843,27 +1900,19 @@ function isValidPersonalSkillSlug(value: unknown): value is string {
 function cleanSkillFieldText(value: unknown, maxLen: number): string {
   if (typeof value !== "string") return "";
   const cleaned = value.replace(/[\u0000-\u001F\u007F]+/g, " ").trim();
-  if (!cleaned || EMBEDDED_SECRET_TOKEN_RE.test(cleaned) || EMAIL_ID_RE.test(cleaned)) {
+  if (
+    !cleaned ||
+    /(?:^|[^A-Za-z0-9])mr_[0-9a-f]{16,}/i.test(cleaned) ||
+    EMBEDDED_SECRET_TOKEN_RE.test(cleaned) ||
+    EMAIL_ID_RE.test(cleaned)
+  ) {
     return "";
   }
   return cleaned.slice(0, maxLen);
 }
 
 function hasValidSkillFrontmatter(markdown: string): boolean {
-  const match = markdown.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/);
-  if (!match) return false;
-  let hasName = false;
-  let hasDescription = false;
-  for (const line of match[1].split(/\r?\n/)) {
-    const idx = line.indexOf(":");
-    if (idx <= 0) continue;
-    const key = line.slice(0, idx).trim();
-    const val = line.slice(idx + 1).trim().replace(/^["']|["']$/g, "");
-    if (!val) continue;
-    if (key === "name") hasName = true;
-    else if (key === "description") hasDescription = true;
-  }
-  return hasName && hasDescription;
+  return parseChannelSkillFrontmatter(markdown).is_valid_skill;
 }
 
 export function summarizePersonalSkillsLibrary(
@@ -1966,22 +2015,8 @@ export function summarizePersonalSkillDetail(
     row.skill_meta && typeof row.skill_meta === "object" && !Array.isArray(row.skill_meta)
       ? (row.skill_meta as Record<string, unknown>)
       : null;
-  const fm = hasValidSkillFrontmatter(row.body_markdown)
-    ? (() => {
-        const match = row.body_markdown.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/);
-        const out: Record<string, string> = {};
-        if (match) {
-          for (const line of match[1].split(/\r?\n/)) {
-            const idx = line.indexOf(":");
-            if (idx <= 0) continue;
-            const k = line.slice(0, idx).trim();
-            const v = line.slice(idx + 1).trim().replace(/^["']|["']$/g, "");
-            if (k && v) out[k] = v;
-          }
-        }
-        return out;
-      })()
-    : {};
+  const parsedFm = parseChannelSkillFrontmatter(row.body_markdown);
+  const fm = parsedFm.is_valid_skill ? parsedFm.metadata : {};
 
   const version =
     typeof row.version === "number" && Number.isSafeInteger(row.version) && row.version >= 1
@@ -2013,7 +2048,7 @@ export function summarizePersonalSkillDetail(
   const description = cleanSkillFieldText(row.description ?? meta?.description ?? fm.description, 280);
   const trigger = cleanSkillFieldText(meta?.trigger ?? fm.trigger, 120) || null;
   const argumentHint =
-    cleanSkillFieldText(meta?.argument_hint ?? fm["argument-hint"] ?? fm.argument_hint, 120) || null;
+    cleanSkillFieldText(meta?.argument_hint ?? fm.argument_hint, 120) || null;
 
   return {
     name,
@@ -2440,8 +2475,12 @@ function isValidMemoryAgentId(value: unknown): value is string {
     typeof value === "string" &&
     /^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/.test(value) &&
     !value.includes("..") &&
+    !PROTOTYPE_POISON_KEYS.has(value.toLowerCase()) &&
+    !/(?:^|[^A-Za-z0-9])mr_[0-9a-f]{16,}$/i.test(value) &&
     !/^\d{6,}$/.test(value) &&
     !CREDENTIAL_PREFIX_RE.test(value) &&
+    !JOINED_GRAPH_CREDENTIAL_ID_RE.test(value) &&
+    !JOINED_GRAPH_AWS_KEY_ID_RE.test(value) &&
     !EMBEDDED_SECRET_TOKEN_RE.test(value) &&
     !EMAIL_ID_RE.test(value) &&
     !PHONE_ID_RE.test(value)
@@ -2500,6 +2539,7 @@ export function summarizeAgentMemoryIndex(
     const rawDesc = typeof row.description === "string" ? row.description : "";
     const redacted =
       rawDesc === "[redacted]" ||
+      /(?:^|[^A-Za-z0-9])mr_[0-9a-f]{16,}/i.test(rawDesc) ||
       EMBEDDED_SECRET_TOKEN_RE.test(rawDesc) ||
       CREDENTIAL_PREFIX_RE.test(rawDesc.trim());
     const description = redacted
@@ -5716,6 +5756,12 @@ export class AgentChatREST {
     if (![1, 2, 3, 4].includes(input?.level)) throw new Error("Invalid channel doc level");
     if (typeof input?.body_markdown !== "string" || !input.body_markdown.trim()) {
       throw new Error("Invalid channel doc body_markdown");
+    }
+    if (
+      (input.kind === "skill" || input.kind === "channel_skill") &&
+      !parseChannelSkillFrontmatter(input.body_markdown).is_valid_skill
+    ) {
+      throw new Error("Invalid skill frontmatter: name and description are required");
     }
     if (!Number.isSafeInteger(input?.if_match_version) || input.if_match_version < 0) {
       throw new Error("Invalid channel doc if_match_version");
