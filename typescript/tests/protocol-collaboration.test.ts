@@ -6,6 +6,7 @@ import {
   isValidCollaborationRoster,
   resolveInheritedObjectiveChannel,
   summarizeChannelOkrSnapshot,
+  summarizeWorkspaceGraphHierarchy,
   summarizeWorkspaceGraphReadiness,
   type ACMessage,
   type ChannelBrief,
@@ -3196,6 +3197,131 @@ describe("AgentChatClient realtime collaboration WS events", () => {
         await expect(rest.listCloudAgentLoopObjectives("codex-cloud-01", badId)).rejects.toThrow("Invalid channel ID");
       }
       await expect(rest.listCloudAgentLoopObjectives("codex-cloud-01", "dm-private")).rejects.toThrow("Invalid channel ID");
+      expect(fetchCalls).toBe(0);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("summarizeWorkspaceGraphHierarchy resolves 3-layer parent_id/contains lineage, cycle safety, unchanged vs dangling parents, and DM/embedded-secret guards", async () => {
+    const fullGraph: WorkspaceGraph = {
+      scope: { type: "channel", id: "room-dev" },
+      nodes: [
+        { type: "channel", id: "room-dev" },
+        { type: "objective", id: "obj_root", title: "Platform Nervous System", status: "active" },
+        { type: "objective", id: "obj_l2", title: "Inherited Sub-Objective", status: "active", parent_id: "obj_root" },
+        // L3 linked via contains edge without redundant node.parent_id
+        { type: "objective", id: "obj_l3", title: "Leaf Audit Goal", status: "active" },
+        // Hostile IDs ignored
+        { type: "objective", id: "ac_live_secret", title: "Secret ID", status: "active" },
+      ],
+      edges: [
+        { from: ["objective", "obj_l2"], to: ["objective", "obj_l3"], type: "contains" },
+      ],
+      sections: [
+        {
+          id: "okr",
+          title: "OKR",
+          summary: {
+            active_objectives: 3,
+            active_tasks: 2,
+            ready_tasks: 1,
+            active_loops: 2,
+            unarmed_objectives: 1,
+          },
+        },
+      ],
+      as_of: "2026-11-14T08:02:00.000Z",
+    };
+
+    const summary = summarizeWorkspaceGraphHierarchy(fullGraph);
+    expect(summary).toEqual({
+      scope_type: "channel",
+      scope_id: "room-dev",
+      root_objective_ids: ["obj_root"],
+      nested_objective_ids: ["obj_l2", "obj_l3"],
+      max_objective_depth: 3,
+      unchanged_parent_ids: [],
+      dangling_parent_ids: [],
+      active_loops: 2,
+      unarmed_objectives: 1,
+      items: [
+        {
+          id: "obj_root",
+          title: "Platform Nervous System",
+          status: "active",
+          parent_id: null,
+          root_id: null,
+          depth: 1,
+          child_count: 1,
+          unchanged_parent: false,
+        },
+        {
+          id: "obj_l2",
+          title: "Inherited Sub-Objective",
+          status: "active",
+          parent_id: "obj_root",
+          root_id: "obj_root",
+          depth: 2,
+          child_count: 1,
+          unchanged_parent: false,
+        },
+        {
+          id: "obj_l3",
+          title: "Leaf Audit Goal",
+          status: "active",
+          parent_id: "obj_l2",
+          root_id: "obj_root",
+          depth: 3,
+          child_count: 0,
+          unchanged_parent: false,
+        },
+      ],
+    });
+
+    // Incremental ?since= diff distinguishes unchanged_parent_ids vs dangling_parent_ids and handles cycles safely
+    const diffGraph: WorkspaceGraph = {
+      scope: { type: "channel", id: "room-dev" },
+      nodes: [
+        { type: "objective", id: "obj_changed_child", title: "Changed L2", status: "active", parent_id: "obj_unchanged_root" },
+        { type: "objective", id: "obj_orphan_child", title: "Orphan L2", status: "active", parent_id: "obj_foreign_room" },
+        { type: "objective", id: "obj_cyc_a", title: "Cycle A", status: "active", parent_id: "obj_cyc_b" },
+        { type: "objective", id: "obj_cyc_b", title: "Cycle B", status: "active", parent_id: "obj_cyc_a" },
+      ],
+      edges: [],
+      sections: [{ id: "okr", title: "OKR", summary: { active_objectives: 4 } }],
+      since: "2026-11-14T08:00:00.000Z",
+      referenced_unchanged_ids: ["obj_unchanged_root", "ac_live_secret"],
+    };
+    const diffSummary = summarizeWorkspaceGraphHierarchy(diffGraph);
+    expect(diffSummary?.unchanged_parent_ids).toEqual(["obj_unchanged_root"]);
+    expect(diffSummary?.dangling_parent_ids).toEqual(["obj_foreign_room"]);
+    expect(diffSummary?.active_loops).toBeNull();
+    expect(diffSummary?.unarmed_objectives).toBeNull();
+    expect(diffSummary?.max_objective_depth).toBe(2);
+
+    // DM channel scope rejected in pure helper and REST client with zero network egress
+    expect(
+      summarizeWorkspaceGraphHierarchy({
+        ...fullGraph,
+        scope: { type: "channel", id: "dm-private-chat" },
+      }),
+    ).toBeNull();
+
+    const originalFetch = globalThis.fetch;
+    let fetchCalls = 0;
+    globalThis.fetch = (async () => {
+      fetchCalls += 1;
+      return Response.json(fullGraph);
+    }) as unknown as typeof fetch;
+
+    try {
+      const rest = new AgentChatREST({ baseUrl: "https://agents-chat.com", bearerToken: "tok_41" });
+      await expect(rest.getWorkspaceGraph("channel", "dm-private-chat")).rejects.toThrow("Invalid workspace graph ID");
+      await expect(rest.getWorkspaceGraph("channel", "direct:u1:u2")).rejects.toThrow("Invalid workspace graph ID");
+      await expect(rest.getWorkspaceGraph("objective", "room_sk-proj-1234567890abcdef")).rejects.toThrow(
+        "Invalid workspace graph ID",
+      );
       expect(fetchCalls).toBe(0);
     } finally {
       globalThis.fetch = originalFetch;

@@ -7,6 +7,7 @@ export {
   parseSseFrames,
   resolveInheritedObjectiveChannel,
   summarizeChannelOkrSnapshot,
+  summarizeWorkspaceGraphHierarchy,
   summarizeWorkspaceGraphReadiness,
   type RESTClientOptions,
 } from "./rest";
@@ -248,6 +249,8 @@ export type {
   WorkspaceGraphDocsSummary,
   WorkspaceGraphEdge,
   WorkspaceGraphEdgeType,
+  WorkspaceGraphHierarchyItem,
+  WorkspaceGraphHierarchySummary,
   WorkspaceGraphNode,
   WorkspaceGraphNodeType,
   WorkspaceGraphOkrSummary,

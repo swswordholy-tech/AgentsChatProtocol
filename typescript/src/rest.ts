@@ -266,6 +266,162 @@ export function summarizeWorkspaceGraphReadiness(
   return summary;
 }
 
+export function summarizeWorkspaceGraphHierarchy(
+  graph: unknown,
+): import("./types").WorkspaceGraphHierarchySummary | null {
+  if (!graph || typeof graph !== "object") return null;
+  const g = graph as Record<string, unknown>;
+  if (!g.scope || typeof g.scope !== "object") return null;
+  const scope = g.scope as Record<string, unknown>;
+  if (
+    typeof scope.type !== "string" ||
+    !WORKSPACE_GRAPH_SCOPES.has(scope.type) ||
+    !safeGraphId(scope.id) ||
+    (scope.type === "channel" && DM_OR_DIRECT_CHANNEL_RE.test(scope.id))
+  ) {
+    return null;
+  }
+  if (!Array.isArray(g.nodes) || !Array.isArray(g.edges) || !Array.isArray(g.sections)) {
+    return null;
+  }
+
+  let okr: Record<string, unknown> = {};
+  for (const sec of g.sections) {
+    if (sec && typeof sec === "object") {
+      const s = sec as Record<string, unknown>;
+      if (s.id === "okr" && s.summary && typeof s.summary === "object") {
+        okr = s.summary as Record<string, unknown>;
+        break;
+      }
+    }
+  }
+
+  const objectiveNodes = new Map<string, { id: string; title: string; status: string }>();
+  const parentByObjId = new Map<string, string>();
+  for (const rawNode of g.nodes.slice(0, 1000)) {
+    if (!rawNode || typeof rawNode !== "object") continue;
+    const node = rawNode as Record<string, unknown>;
+    if (node.type !== "objective" || !safeGraphId(node.id) || objectiveNodes.has(node.id)) continue;
+    const title =
+      typeof node.title === "string" && node.title.trim()
+        ? node.title.trim().slice(0, 200)
+        : node.id;
+    const status =
+      typeof node.status === "string" && node.status.trim()
+        ? node.status.trim().slice(0, 32)
+        : "active";
+    objectiveNodes.set(node.id, { id: node.id, title, status });
+    if (safeGraphId(node.parent_id) && node.parent_id !== node.id) {
+      parentByObjId.set(node.id, node.parent_id);
+    }
+  }
+
+  for (const rawEdge of g.edges.slice(0, 4000)) {
+    if (!rawEdge || typeof rawEdge !== "object") continue;
+    const edge = rawEdge as Record<string, unknown>;
+    if (edge.type !== "contains" || !Array.isArray(edge.from) || !Array.isArray(edge.to)) continue;
+    if (edge.from[0] !== "objective" || edge.to[0] !== "objective") continue;
+    const parentId = edge.from[1];
+    const childId = edge.to[1];
+    if (
+      !safeGraphId(parentId) ||
+      !safeGraphId(childId) ||
+      parentId === childId ||
+      !objectiveNodes.has(childId)
+    ) {
+      continue;
+    }
+    if (!parentByObjId.has(childId)) {
+      parentByObjId.set(childId, parentId);
+    }
+  }
+
+  const childCountByObjId = new Map<string, number>();
+  for (const [, parentId] of parentByObjId.entries()) {
+    childCountByObjId.set(parentId, (childCountByObjId.get(parentId) ?? 0) + 1);
+  }
+
+  const unchangedSet = new Set<string>(
+    Array.isArray(g.referenced_unchanged_ids)
+      ? g.referenced_unchanged_ids.slice(0, 5000).filter(safeGraphId)
+      : [],
+  );
+
+  const computeLineage = (id: string): { depth: number; rootId: string | null } => {
+    let depth = 1;
+    let cur = id;
+    let rootId = id;
+    const seen = new Set<string>([id]);
+    while (parentByObjId.has(cur) && depth < 3) {
+      const next = parentByObjId.get(cur);
+      if (!next || seen.has(next)) break;
+      seen.add(next);
+      depth += 1;
+      cur = next;
+      rootId = next;
+    }
+    return { depth, rootId: depth > 1 ? rootId : null };
+  };
+
+  const rootObjectiveIds: string[] = [];
+  const nestedObjectiveIds: string[] = [];
+  const unchangedParentIds = new Set<string>();
+  const danglingParentIds = new Set<string>();
+  const items: import("./types").WorkspaceGraphHierarchyItem[] = [];
+  let maxObjectiveDepth = objectiveNodes.size > 0 ? 1 : 0;
+
+  for (const [id, obj] of objectiveNodes.entries()) {
+    const parentId = parentByObjId.get(id) ?? null;
+    const { depth, rootId } = computeLineage(id);
+    if (depth > maxObjectiveDepth) maxObjectiveDepth = depth;
+    if (parentId) {
+      nestedObjectiveIds.push(id);
+      if (!objectiveNodes.has(parentId)) {
+        if (unchangedSet.has(parentId)) unchangedParentIds.add(parentId);
+        else danglingParentIds.add(parentId);
+      }
+    } else {
+      rootObjectiveIds.push(id);
+    }
+    items.push({
+      id,
+      title: obj.title,
+      status: obj.status,
+      parent_id: parentId,
+      root_id: rootId,
+      depth,
+      child_count: childCountByObjId.get(id) ?? 0,
+      unchanged_parent: Boolean(parentId && !objectiveNodes.has(parentId) && unchangedSet.has(parentId)),
+    });
+  }
+
+  items.sort((a, b) => a.depth - b.depth || b.child_count - a.child_count);
+
+  const activeLoops =
+    typeof okr.active_loops === "number" && Number.isSafeInteger(okr.active_loops) && okr.active_loops >= 0
+      ? Math.min(okr.active_loops, 1_000_000)
+      : null;
+  const unarmedObjectives =
+    typeof okr.unarmed_objectives === "number" &&
+    Number.isSafeInteger(okr.unarmed_objectives) &&
+    okr.unarmed_objectives >= 0
+      ? Math.min(okr.unarmed_objectives, 1_000_000)
+      : null;
+
+  return {
+    scope_type: scope.type as import("./types").WorkspaceGraphScopeType,
+    scope_id: scope.id,
+    root_objective_ids: rootObjectiveIds,
+    nested_objective_ids: nestedObjectiveIds,
+    max_objective_depth: maxObjectiveDepth,
+    unchanged_parent_ids: [...unchangedParentIds],
+    dangling_parent_ids: [...danglingParentIds],
+    active_loops: activeLoops,
+    unarmed_objectives: unarmedObjectives,
+    items,
+  };
+}
+
 const DM_OR_DIRECT_CHANNEL_RE = /^(?:dm[-_]|direct(?:$|[-_:]))/i;
 
 function safeNonDmChannelId(value: unknown): value is string {
@@ -1330,7 +1486,12 @@ export class AgentChatREST {
       trimmedId.includes("..") ||
       CREDENTIAL_PREFIX_RE.test(trimmedId) ||
       EMAIL_ID_RE.test(trimmedId) ||
-      PHONE_ID_RE.test(trimmedId)
+      PHONE_ID_RE.test(trimmedId) ||
+      (scope === "channel" && DM_OR_DIRECT_CHANNEL_RE.test(trimmedId)) ||
+      /(?:^|[^A-Za-z0-9])(?:sk[-_][A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9_]{8,}|github_pat_[A-Za-z0-9_]{8,}|AIza[A-Za-z0-9_-]{12,}|eyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,})/i.test(
+        trimmedId,
+      ) ||
+      this.containsMemorySecretShape(trimmedId)
     ) {
       throw new Error("Invalid workspace graph ID");
     }

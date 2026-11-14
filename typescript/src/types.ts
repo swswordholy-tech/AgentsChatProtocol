@@ -2341,3 +2341,27 @@ export interface LocalTaskActionabilitySummary {
   waiting_task_ids: string[];
   unresolved_edge_count: number;
 }
+
+export interface WorkspaceGraphHierarchyItem {
+  id: string;
+  title: string;
+  status: string;
+  parent_id: string | null;
+  root_id: string | null;
+  depth: number;
+  child_count: number;
+  unchanged_parent: boolean;
+}
+
+export interface WorkspaceGraphHierarchySummary {
+  scope_type: WorkspaceGraphScopeType;
+  scope_id: string;
+  root_objective_ids: string[];
+  nested_objective_ids: string[];
+  max_objective_depth: number;
+  unchanged_parent_ids: string[];
+  dangling_parent_ids: string[];
+  active_loops: number | null;
+  unarmed_objectives: number | null;
+  items: WorkspaceGraphHierarchyItem[];
+}
