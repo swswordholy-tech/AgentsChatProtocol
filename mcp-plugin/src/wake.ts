@@ -207,6 +207,7 @@ export async function fireWake(msg: WakeMessage, cfg: WakeConfig): Promise<void>
     const f = cfg.fetchImpl ?? fetch;
     const ctrl = new AbortController();
     const t = setTimeout(() => ctrl.abort(), cfg.timeoutMs ?? 5000);
+    t.unref?.();
     try {
       const res = await f(url, { method: "POST", headers, body, signal: ctrl.signal });
       if (!res.ok) log(`[agentchat] wake POST ${url} → HTTP ${res.status}`);
@@ -393,6 +394,7 @@ export async function fireGrokWake(msg: WakeMessage, cfg: GrokWakeConfig): Promi
     const f = cfg.fetchImpl ?? fetch;
     const ctrl = new AbortController();
     const t = setTimeout(() => ctrl.abort(), cfg.timeoutMs ?? 5000);
+    t.unref?.();
     try {
       const res = await f(url, {
         method: "POST",
@@ -512,6 +514,7 @@ export async function fireAntigravityWake(msg: WakeMessage, cfg: AntigravityWake
     const url = `http://${addr}/exa.language_server_pb.LanguageServerService/SendAgentMessage`;
     const ctrl = new AbortController();
     const t = setTimeout(() => ctrl.abort(), cfg.timeoutMs ?? 5000);
+    t.unref?.();
     try {
       const res = await f(url, {
         method: "POST",
@@ -554,6 +557,8 @@ export interface ZcodeWakeConfig {
   promptOverride?: string;
   /** Timeout per turn in ms (default 180s). */
   timeoutMs?: number;
+  /** Grace period in ms after SIGTERM before escalating to SIGKILL (default 2000ms). */
+  killGraceMs?: number;
   /** Injectable runner for unit tests. */
   runCommandImpl?: (cmd: string, args: string[], opts: { cwd?: string; env: Record<string, string | undefined>; timeoutMs: number }) => Promise<{ code: number; stderr?: string }>;
   logger?: (msg: string) => void;
@@ -636,18 +641,33 @@ export function fireZcodeWake(msg: WakeMessage, cfg: ZcodeWakeConfig): Promise<b
         child.stderr?.on("data", (chunk) => {
           if (stderr.length < 500) stderr += String(chunk);
         });
+        let killGraceTimer: ReturnType<typeof setTimeout> | null = null;
+        const clearTimers = () => {
+          clearTimeout(timer);
+          if (killGraceTimer) {
+            clearTimeout(killGraceTimer);
+            killGraceTimer = null;
+          }
+        };
         const timer = setTimeout(() => {
           try {
             child.kill("SIGTERM");
           } catch {}
+          killGraceTimer = setTimeout(() => {
+            try {
+              child.kill("SIGKILL");
+            } catch {}
+          }, cfg.killGraceMs ?? 2000);
+          killGraceTimer.unref?.();
         }, timeoutMs);
+        timer.unref?.();
         child.on("error", (err) => {
-          clearTimeout(timer);
+          clearTimers();
           log(`[agentchat] zcode wake spawn error (${sessionId}): ${err}`);
           resolve();
         });
         child.on("close", (code) => {
-          clearTimeout(timer);
+          clearTimers();
           succeeded = code === 0;
           if (!succeeded) {
             log(`[agentchat] zcode wake (${sessionId}) exited code=${code}${stderr ? `: ${stderr.trim().slice(0, 200)}` : ""}`);

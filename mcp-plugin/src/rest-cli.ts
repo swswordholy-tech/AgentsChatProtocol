@@ -61,6 +61,57 @@ export function parseMaxIdleMs(raw: string | number | undefined): number | undef
 }
 const MAX_SSE_STREAMS = 3;
 const MAX_SEEN_IDS = 200;
+const DEFAULT_HTTP_TIMEOUT_MS = 15_000;
+
+async function fetchWithDeadline(
+  f: typeof fetch,
+  url: string,
+  init: RequestInit,
+  timeoutMs: number,
+  parentSignal?: AbortSignal,
+): Promise<Response> {
+  if (parentSignal?.aborted) {
+    const err = new Error("Aborted");
+    err.name = "AbortError";
+    throw err;
+  }
+  const ctrl = new AbortController();
+  const onParentAbort = () => ctrl.abort(parentSignal?.reason);
+  if (parentSignal) {
+    parentSignal.addEventListener("abort", onParentAbort, { once: true });
+  }
+  const timer =
+    timeoutMs > 0
+      ? setTimeout(() => {
+          const err = new Error(`HTTP request timed out after ${timeoutMs}ms`);
+          err.name = "TimeoutError";
+          ctrl.abort(err);
+        }, timeoutMs)
+      : null;
+  timer?.unref?.();
+  try {
+    return await f(url, { ...init, signal: ctrl.signal });
+  } finally {
+    if (timer) clearTimeout(timer);
+    if (parentSignal) parentSignal.removeEventListener("abort", onParentAbort);
+  }
+}
+
+function sleepAbortable(ms: number, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) return Promise.resolve();
+  return new Promise((resolve) => {
+    const onAbort = () => {
+      clearTimeout(t);
+      resolve();
+    };
+    const t = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    t.unref?.();
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
 
 export interface JoinChannelResult {
   ok: boolean;
@@ -187,20 +238,26 @@ export async function joinChannelRest(opts: {
   agentId: string;
   token: string;
   channelId: string;
+  timeoutMs?: number;
   fetchImpl?: typeof fetch;
 }): Promise<JoinChannelResult> {
   const f = opts.fetchImpl ?? fetch;
   const baseUrl = opts.restUrl.replace(/\/$/, "");
   const url = `${baseUrl}/api/channels/${encodeURIComponent(opts.channelId)}/join`;
   try {
-    const res = await f(url, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${opts.token}`,
-        "Content-Type": "application/json",
+    const res = await fetchWithDeadline(
+      f,
+      url,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${opts.token}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ sender_id: opts.agentId }),
       },
-      body: JSON.stringify({ sender_id: opts.agentId }),
-    });
+      opts.timeoutMs ?? DEFAULT_HTTP_TIMEOUT_MS,
+    );
     const data = (await res.json().catch(() => ({}))) as Record<string, unknown>;
     if (res.ok) {
       return {
@@ -239,6 +296,7 @@ export async function sendRestMessage(opts: {
   text: string;
   replyTo?: string;
   maxIdleMs?: number;
+  timeoutMs?: number;
   fetchImpl?: typeof fetch;
   warn?: Warn;
 }): Promise<SendMessageResult> {
@@ -247,20 +305,25 @@ export async function sendRestMessage(opts: {
   const cleanText = redactSecrets(opts.text);
   const url = `${baseUrl}/api/channels/${encodeURIComponent(opts.channelId)}/messages`;
   try {
-    const res = await f(url, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${opts.token}`,
-        "Content-Type": "application/json",
+    const res = await fetchWithDeadline(
+      f,
+      url,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${opts.token}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          sender_id: opts.agentId,
+          sender_type: "agent",
+          content_type: "text",
+          content: cleanText,
+          ...(opts.replyTo ? { in_reply_to: opts.replyTo } : {}),
+        }),
       },
-      body: JSON.stringify({
-        sender_id: opts.agentId,
-        sender_type: "agent",
-        content_type: "text",
-        content: cleanText,
-        ...(opts.replyTo ? { in_reply_to: opts.replyTo } : {}),
-      }),
-    });
+      opts.timeoutMs ?? DEFAULT_HTTP_TIMEOUT_MS,
+    );
     const data = (await res.json().catch(() => ({}))) as Record<string, unknown>;
     if (res.ok) {
       advanceChannelReadCursor({
@@ -335,6 +398,7 @@ export async function wakeOnce(opts: {
   token: string;
   channels?: string[];
   timeoutMs?: number;
+  requestTimeoutMs?: number;
   maxIdleMs?: number;
   pollIntervalMs?: number;
   enableSse?: boolean;
@@ -348,6 +412,7 @@ export async function wakeOnce(opts: {
   const baseUrl = opts.restUrl.replace(/\/$/, "");
   const { configDir, agentId, displayName, token } = opts;
   const timeoutMs = opts.timeoutMs ?? 240_000;
+  const requestTimeoutMs = opts.requestTimeoutMs ?? DEFAULT_HTTP_TIMEOUT_MS;
   const pollIntervalMs = opts.pollIntervalMs ?? 15_000;
   const enableSse = opts.enableSse ?? true;
 
@@ -416,6 +481,7 @@ export async function wakeOnce(opts: {
         agentId,
         token,
         channelId: ch.trim(),
+        timeoutMs: requestTimeoutMs,
         fetchImpl: f,
       });
     }
@@ -432,10 +498,13 @@ export async function wakeOnce(opts: {
     const params = `limit=50${lastTs ? "&after=" + encodeURIComponent(lastTs) : ""}`;
     let prefix = "";
     try {
-      const res = await f(`${baseUrl}/api/channels/${encodeURIComponent(channelId)}/messages?${params}`, {
-        headers,
-        signal: abortCtrl.signal,
-      });
+      const res = await fetchWithDeadline(
+        f,
+        `${baseUrl}/api/channels/${encodeURIComponent(channelId)}/messages?${params}`,
+        { headers },
+        requestTimeoutMs,
+        abortCtrl.signal,
+      );
       if (res.ok) {
         const data = (await res.json()) as { messages?: any[] };
         const msgs = (data.messages || []).filter(
@@ -626,32 +695,44 @@ export async function wakeOnce(opts: {
             if (!res.ok || !res.body) break;
             sseConnectedChannels.add(channelId);
             const reader = res.body.getReader();
-            const decoder = new TextDecoder();
-            let buf = "";
-            while (!resolved) {
-              const { value, done } = await reader.read();
-              if (done) break;
-              buf += decoder.decode(value, { stream: true });
-              const lines = buf.split(/\r?\n/);
-              buf = lines.pop() || "";
-              for (const line of lines) {
-                if (!line.startsWith("data:")) continue;
-                const raw = line.slice(5).trim();
-                if (!raw) continue;
-                try {
-                  const parsed = JSON.parse(raw);
-                  const wakeEv = await inspectChannelMessages(channelId, [parsed]);
-                  if (wakeEv) {
-                    finish(wakeEv);
-                    return;
-                  }
-                } catch {}
+            try {
+              const decoder = new TextDecoder();
+              let buf = "";
+              let firstChunk = true;
+              while (!resolved) {
+                const { value, done } = await reader.read();
+                if (done) break;
+                let chunk = decoder.decode(value, { stream: true });
+                if (firstChunk) {
+                  firstChunk = false;
+                  if (chunk.startsWith("\uFEFF")) chunk = chunk.slice(1);
+                }
+                buf += chunk;
+                const lines = buf.split(/\r?\n/);
+                buf = lines.pop() || "";
+                for (const line of lines) {
+                  if (!line.startsWith("data:")) continue;
+                  const raw = line.slice(5).trim();
+                  if (!raw) continue;
+                  try {
+                    const parsed = JSON.parse(raw);
+                    const wakeEv = await inspectChannelMessages(channelId, [parsed]);
+                    if (wakeEv) {
+                      finish(wakeEv);
+                      return;
+                    }
+                  } catch {}
+                }
               }
+            } finally {
+              try {
+                reader.releaseLock();
+              } catch {}
             }
           } catch {
             sseConnectedChannels.delete(channelId);
             if (resolved) return;
-            await new Promise((r) => setTimeout(r, 2000));
+            await sleepAbortable(2000, abortCtrl.signal);
           }
         }
         sseConnectedChannels.delete(channelId);
@@ -664,10 +745,13 @@ export async function wakeOnce(opts: {
       if (resolved || polling) return;
       polling = true;
       try {
-        const mineRes = await f(`${baseUrl}/api/channels/mine`, {
-          headers,
-          signal: abortCtrl.signal,
-        });
+        const mineRes = await fetchWithDeadline(
+          f,
+          `${baseUrl}/api/channels/mine`,
+          { headers },
+          requestTimeoutMs,
+          abortCtrl.signal,
+        );
         const channelList: Array<{ id: string; last_message_at?: string }> = [];
         const seenCh = new Set<string>();
         if (mineRes.ok) {
@@ -712,9 +796,12 @@ export async function wakeOnce(opts: {
           const qs = existingAfter
             ? `?after=${encodeURIComponent(existingAfter)}&limit=50`
             : `?limit=20`;
-          const msgRes = await f(
+          const msgRes = await fetchWithDeadline(
+            f,
             `${baseUrl}/api/channels/${encodeURIComponent(ch.id)}/messages${qs}`,
-            { headers, signal: abortCtrl.signal },
+            { headers },
+            requestTimeoutMs,
+            abortCtrl.signal,
           );
           if (!msgRes.ok) continue;
           initialSyncedChannels.add(ch.id);

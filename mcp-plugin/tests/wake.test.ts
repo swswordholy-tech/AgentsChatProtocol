@@ -16,7 +16,7 @@
  * a real wake from a forged POST. The channel-owning agent's ac_ key stays local.
  */
 import { describe, expect, test } from "bun:test";
-import { buildWakePayload, resolveEnvWakeId, signWakeBody, verifyWakeSignature, WAKE_ID_HEADER, WAKE_SIG_HEADER } from "../src/wake.ts";
+import { buildWakePayload, fireZcodeWake, resolveEnvWakeId, signWakeBody, verifyWakeSignature, WAKE_ID_HEADER, WAKE_SIG_HEADER } from "../src/wake.ts";
 
 const MSG = {
   type: "message",
@@ -141,5 +141,32 @@ describe("resolveEnvWakeId — explicit stdio REST wake attribution", () => {
     expect(resolveEnvWakeId({ AGENTSCHAT_WAKE_ID: "a".repeat(129) })).toBeUndefined();
     expect(resolveEnvWakeId({ AGENTSCHAT_WAKE_ID: "ac_live_secret_token_value" })).toBeUndefined();
     expect(resolveEnvWakeId({ AGENTSCHAT_WAKE_ID: "sk-proj-secret" })).toBeUndefined();
+  });
+
+  test("fireZcodeWake escalates SIGTERM to SIGKILL when a child process ignores SIGTERM so session queue never deadlocks", async () => {
+    const { mkdtempSync, rmSync, writeFileSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const dir = mkdtempSync(join(tmpdir(), "zcode-sigkill-"));
+    const script = join(dir, "stubborn-zcode.cjs");
+    writeFileSync(
+      script,
+      `process.on("SIGTERM", () => {}); setInterval(() => {}, 60000);\n`,
+      "utf8",
+    );
+    try {
+      const t0 = Date.now();
+      const ok = await fireZcodeWake(MSG, {
+        sessionId: "sess_sigkill_test",
+        zcodeBin: script,
+        timeoutMs: 30,
+        killGraceMs: 30,
+        logger: () => {},
+      });
+      expect(ok).toBe(false);
+      expect(Date.now() - t0).toBeLessThan(2000);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

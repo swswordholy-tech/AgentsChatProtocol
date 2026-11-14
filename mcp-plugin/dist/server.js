@@ -2036,6 +2036,7 @@ async function fireWake(msg, cfg) {
     const f = cfg.fetchImpl ?? fetch;
     const ctrl = new AbortController;
     const t = setTimeout(() => ctrl.abort(), cfg.timeoutMs ?? 5000);
+    t.unref?.();
     try {
       const res = await f(url, { method: "POST", headers, body, signal: ctrl.signal });
       if (!res.ok)
@@ -2143,6 +2144,7 @@ async function fireGrokWake(msg, cfg) {
     const f = cfg.fetchImpl ?? fetch;
     const ctrl = new AbortController;
     const t = setTimeout(() => ctrl.abort(), cfg.timeoutMs ?? 5000);
+    t.unref?.();
     try {
       const res = await f(url, {
         method: "POST",
@@ -2220,6 +2222,7 @@ async function fireAntigravityWake(msg, cfg) {
     const url = `http://${addr}/exa.language_server_pb.LanguageServerService/SendAgentMessage`;
     const ctrl = new AbortController;
     const t = setTimeout(() => ctrl.abort(), cfg.timeoutMs ?? 5000);
+    t.unref?.();
     try {
       const res = await f(url, {
         method: "POST",
@@ -2305,18 +2308,33 @@ function fireZcodeWake(msg, cfg) {
           if (stderr.length < 500)
             stderr += String(chunk);
         });
+        let killGraceTimer = null;
+        const clearTimers = () => {
+          clearTimeout(timer);
+          if (killGraceTimer) {
+            clearTimeout(killGraceTimer);
+            killGraceTimer = null;
+          }
+        };
         const timer = setTimeout(() => {
           try {
             child.kill("SIGTERM");
           } catch {}
+          killGraceTimer = setTimeout(() => {
+            try {
+              child.kill("SIGKILL");
+            } catch {}
+          }, cfg.killGraceMs ?? 2000);
+          killGraceTimer.unref?.();
         }, timeoutMs);
+        timer.unref?.();
         child.on("error", (err) => {
-          clearTimeout(timer);
+          clearTimers();
           log(`[agentchat] zcode wake spawn error (${sessionId}): ${err}`);
           resolve2();
         });
         child.on("close", (code) => {
-          clearTimeout(timer);
+          clearTimers();
           succeeded = code === 0;
           if (!succeeded) {
             log(`[agentchat] zcode wake (${sessionId}) exited code=${code}${stderr ? `: ${stderr.trim().slice(0, 200)}` : ""}`);
@@ -3653,6 +3671,49 @@ function parseMaxIdleMs(raw) {
 }
 var MAX_SSE_STREAMS = 3;
 var MAX_SEEN_IDS = 200;
+var DEFAULT_HTTP_TIMEOUT_MS = 15000;
+async function fetchWithDeadline(f, url, init, timeoutMs, parentSignal) {
+  if (parentSignal?.aborted) {
+    const err = new Error("Aborted");
+    err.name = "AbortError";
+    throw err;
+  }
+  const ctrl = new AbortController;
+  const onParentAbort = () => ctrl.abort(parentSignal?.reason);
+  if (parentSignal) {
+    parentSignal.addEventListener("abort", onParentAbort, { once: true });
+  }
+  const timer = timeoutMs > 0 ? setTimeout(() => {
+    const err = new Error(`HTTP request timed out after ${timeoutMs}ms`);
+    err.name = "TimeoutError";
+    ctrl.abort(err);
+  }, timeoutMs) : null;
+  timer?.unref?.();
+  try {
+    return await f(url, { ...init, signal: ctrl.signal });
+  } finally {
+    if (timer)
+      clearTimeout(timer);
+    if (parentSignal)
+      parentSignal.removeEventListener("abort", onParentAbort);
+  }
+}
+function sleepAbortable(ms, signal) {
+  if (signal.aborted)
+    return Promise.resolve();
+  return new Promise((resolve3) => {
+    const onAbort = () => {
+      clearTimeout(t);
+      resolve3();
+    };
+    const t = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve3();
+    }, ms);
+    t.unref?.();
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
 function loadSeenIds(file) {
   if (!existsSync7(file))
     return [];
@@ -3723,14 +3784,14 @@ async function joinChannelRest(opts) {
   const baseUrl = opts.restUrl.replace(/\/$/, "");
   const url = `${baseUrl}/api/channels/${encodeURIComponent(opts.channelId)}/join`;
   try {
-    const res = await f(url, {
+    const res = await fetchWithDeadline(f, url, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${opts.token}`,
         "Content-Type": "application/json"
       },
       body: JSON.stringify({ sender_id: opts.agentId })
-    });
+    }, opts.timeoutMs ?? DEFAULT_HTTP_TIMEOUT_MS);
     const data = await res.json().catch(() => ({}));
     if (res.ok) {
       return {
@@ -3764,7 +3825,7 @@ async function sendRestMessage(opts) {
   const cleanText = redactSecrets2(opts.text);
   const url = `${baseUrl}/api/channels/${encodeURIComponent(opts.channelId)}/messages`;
   try {
-    const res = await f(url, {
+    const res = await fetchWithDeadline(f, url, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${opts.token}`,
@@ -3777,7 +3838,7 @@ async function sendRestMessage(opts) {
         content: cleanText,
         ...opts.replyTo ? { in_reply_to: opts.replyTo } : {}
       })
-    });
+    }, opts.timeoutMs ?? DEFAULT_HTTP_TIMEOUT_MS);
     const data = await res.json().catch(() => ({}));
     if (res.ok) {
       advanceChannelReadCursor({
@@ -3847,6 +3908,7 @@ async function wakeOnce(opts) {
   const baseUrl = opts.restUrl.replace(/\/$/, "");
   const { configDir, agentId, displayName, token } = opts;
   const timeoutMs = opts.timeoutMs ?? 240000;
+  const requestTimeoutMs = opts.requestTimeoutMs ?? DEFAULT_HTTP_TIMEOUT_MS;
   const pollIntervalMs = opts.pollIntervalMs ?? 15000;
   const enableSse = opts.enableSse ?? true;
   mkdirSync3(configDir, { recursive: true });
@@ -3905,6 +3967,7 @@ async function wakeOnce(opts) {
         agentId,
         token,
         channelId: ch.trim(),
+        timeoutMs: requestTimeoutMs,
         fetchImpl: f
       });
     }
@@ -3920,10 +3983,7 @@ async function wakeOnce(opts) {
     const params = `limit=50${lastTs ? "&after=" + encodeURIComponent(lastTs) : ""}`;
     let prefix = "";
     try {
-      const res = await f(`${baseUrl}/api/channels/${encodeURIComponent(channelId)}/messages?${params}`, {
-        headers,
-        signal: abortCtrl.signal
-      });
+      const res = await fetchWithDeadline(f, `${baseUrl}/api/channels/${encodeURIComponent(channelId)}/messages?${params}`, { headers }, requestTimeoutMs, abortCtrl.signal);
       if (res.ok) {
         const data = await res.json();
         const msgs = (data.messages || []).filter((m) => m && m.id !== triggerMsgId && m.content !== "__typing__");
@@ -4094,36 +4154,49 @@ ${context}
               break;
             sseConnectedChannels.add(channelId);
             const reader = res.body.getReader();
-            const decoder = new TextDecoder;
-            let buf = "";
-            while (!resolved) {
-              const { value, done } = await reader.read();
-              if (done)
-                break;
-              buf += decoder.decode(value, { stream: true });
-              const lines = buf.split(/\r?\n/);
-              buf = lines.pop() || "";
-              for (const line of lines) {
-                if (!line.startsWith("data:"))
-                  continue;
-                const raw = line.slice(5).trim();
-                if (!raw)
-                  continue;
-                try {
-                  const parsed = JSON.parse(raw);
-                  const wakeEv = await inspectChannelMessages(channelId, [parsed]);
-                  if (wakeEv) {
-                    finish(wakeEv);
-                    return;
-                  }
-                } catch {}
+            try {
+              const decoder = new TextDecoder;
+              let buf = "";
+              let firstChunk = true;
+              while (!resolved) {
+                const { value, done } = await reader.read();
+                if (done)
+                  break;
+                let chunk = decoder.decode(value, { stream: true });
+                if (firstChunk) {
+                  firstChunk = false;
+                  if (chunk.startsWith("\uFEFF"))
+                    chunk = chunk.slice(1);
+                }
+                buf += chunk;
+                const lines = buf.split(/\r?\n/);
+                buf = lines.pop() || "";
+                for (const line of lines) {
+                  if (!line.startsWith("data:"))
+                    continue;
+                  const raw = line.slice(5).trim();
+                  if (!raw)
+                    continue;
+                  try {
+                    const parsed = JSON.parse(raw);
+                    const wakeEv = await inspectChannelMessages(channelId, [parsed]);
+                    if (wakeEv) {
+                      finish(wakeEv);
+                      return;
+                    }
+                  } catch {}
+                }
               }
+            } finally {
+              try {
+                reader.releaseLock();
+              } catch {}
             }
           } catch {
             sseConnectedChannels.delete(channelId);
             if (resolved)
               return;
-            await new Promise((r) => setTimeout(r, 2000));
+            await sleepAbortable(2000, abortCtrl.signal);
           }
         }
         sseConnectedChannels.delete(channelId);
@@ -4136,10 +4209,7 @@ ${context}
         return;
       polling = true;
       try {
-        const mineRes = await f(`${baseUrl}/api/channels/mine`, {
-          headers,
-          signal: abortCtrl.signal
-        });
+        const mineRes = await fetchWithDeadline(f, `${baseUrl}/api/channels/mine`, { headers }, requestTimeoutMs, abortCtrl.signal);
         const channelList = [];
         const seenCh = new Set;
         if (mineRes.ok) {
@@ -4179,7 +4249,7 @@ ${context}
               continue;
           }
           const qs = existingAfter ? `?after=${encodeURIComponent(existingAfter)}&limit=50` : `?limit=20`;
-          const msgRes = await f(`${baseUrl}/api/channels/${encodeURIComponent(ch.id)}/messages${qs}`, { headers, signal: abortCtrl.signal });
+          const msgRes = await fetchWithDeadline(f, `${baseUrl}/api/channels/${encodeURIComponent(ch.id)}/messages${qs}`, { headers }, requestTimeoutMs, abortCtrl.signal);
           if (!msgRes.ok)
             continue;
           initialSyncedChannels.add(ch.id);

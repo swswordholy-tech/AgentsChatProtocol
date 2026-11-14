@@ -439,4 +439,90 @@ describe("rest-cli (--join, --send, --wake-once) & unified per-channel cursor", 
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  test("per-request HTTP deadlines prevent hung requests from wedging join/send/pollOnce, and SSE strips BOM + releases reader lock", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "rest-cli-deadline-"));
+    try {
+      const hungFetch = ((_url: any, init: any) =>
+        new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => reject(init.signal.reason || new Error("Aborted")), { once: true });
+        })) as any;
+
+      const joinRes = await joinChannelRest({
+        restUrl: "https://agents-chat.com",
+        agentId: "bot-deadline",
+        token: "ac_test_token_123456",
+        channelId: "welcome",
+        timeoutMs: 15,
+        fetchImpl: hungFetch,
+      });
+      expect(joinRes.ok).toBe(false);
+      expect(joinRes.status).toBe(0);
+      expect(joinRes.error).toContain("timed out");
+
+      const sendRes = await sendRestMessage({
+        restUrl: "https://agents-chat.com",
+        configDir: dir,
+        agentId: "bot-deadline",
+        token: "ac_test_token_123456",
+        channelId: "dm-test",
+        text: "ping",
+        timeoutMs: 15,
+        fetchImpl: hungFetch,
+      });
+      expect(sendRes.ok).toBe(false);
+      expect(sendRes.status).toBe(0);
+
+      // 1st /api/channels/mine hangs -> aborted by requestTimeoutMs=15ms so 2nd poll succeeds and SSE delivers BOM-prefixed DM!
+      let mineCalls = 0;
+      let sseStreamRef: ReadableStream<Uint8Array> | null = null;
+      const wakeEv = await wakeOnce({
+        restUrl: "https://agents-chat.com",
+        configDir: dir,
+        agentId: "bot-deadline",
+        token: "ac_test_token_123456",
+        timeoutMs: 500,
+        requestTimeoutMs: 15,
+        pollIntervalMs: 20,
+        enableSse: true,
+        nowIso: () => "2026-11-14T11:00:00.000Z",
+        fetchImpl: (async (url: any, init: any) => {
+          const u = String(url);
+          if (u.endsWith("/api/channels/mine")) {
+            mineCalls++;
+            if (mineCalls === 1) return hungFetch(url, init);
+            return Response.json({ channels: [{ id: "dm-live", last_message_at: "2026-11-14T11:00:01.000Z" }] });
+          }
+          if (u.includes("/api/channels/dm-live/stream")) {
+            const encoder = new TextEncoder();
+            sseStreamRef = new ReadableStream<Uint8Array>({
+              start(controller) {
+                controller.enqueue(
+                  encoder.encode(
+                    `\uFEFFdata: ${JSON.stringify({
+                      id: "sse-dm-1",
+                      channel_id: "dm-live",
+                      sender_id: "owner",
+                      content: "live over sse",
+                      timestamp: "2026-11-14T11:00:01.000Z",
+                    })}\n\n`,
+                  ),
+                );
+              },
+            });
+            return new Response(sseStreamRef, { status: 200 });
+          }
+          return Response.json({ messages: [] });
+        }) as any,
+      });
+      expect(wakeEv.event).toBe("agentschat_wake");
+      expect(wakeEv.message_id).toBe("sse-dm-1");
+      expect(mineCalls).toBeGreaterThanOrEqual(2);
+      // Give the async SSE IIFE microtask a tick to run its finally { reader.releaseLock() }
+      await new Promise((r) => setTimeout(r, 5));
+      expect(sseStreamRef!.locked).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
