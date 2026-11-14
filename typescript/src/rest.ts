@@ -1194,10 +1194,15 @@ export function summarizeChannelThreads(
 ): import("./types").ChannelThreadsSummary | null {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
   const feed = raw as Record<string, unknown>;
-  if (!safeNonDmChannelId(feed.channel_id) || !Array.isArray(feed.threads) || feed.threads.length > 500) {
+  const channelId = typeof feed.channel_id === "string" ? feed.channel_id.trim() : "";
+  if (
+    !safeNonDmChannelId(channelId) ||
+    !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(channelId) ||
+    !Array.isArray(feed.threads) ||
+    feed.threads.length > 500
+  ) {
     return null;
   }
-  const channelId = feed.channel_id;
   const seen = new Set<string>();
   const threads: import("./types").ChannelThreadSummaryItem[] = [];
   let totalReplies = 0;
@@ -1206,7 +1211,14 @@ export function summarizeChannelThreads(
     if (!item || typeof item !== "object" || Array.isArray(item)) continue;
     const rec = item as Record<string, unknown>;
     const parentId = typeof rec.parent_id === "string" ? rec.parent_id.trim() : "";
-    if (!safeGraphId(parentId) || EMBEDDED_SECRET_TOKEN_RE.test(parentId) || seen.has(parentId)) continue;
+    if (
+      !safeGraphId(parentId) ||
+      !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(parentId) ||
+      EMBEDDED_SECRET_TOKEN_RE.test(parentId) ||
+      seen.has(parentId)
+    ) {
+      continue;
+    }
     const replyCount =
       typeof rec.reply_count === "number" && Number.isFinite(rec.reply_count)
         ? Math.trunc(rec.reply_count)
@@ -1250,6 +1262,49 @@ export function summarizeChannelThreads(
     most_active_parent_id: mostActiveParentId,
     latest_reply_at: threads[0]?.last_reply_at ? threads[0].last_reply_at : null,
     threads,
+  };
+}
+
+export function summarizeChannelPins(
+  raw: unknown,
+  expectedChannelId?: string,
+): import("./types").ChannelPinsSummary | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const feed = raw as Record<string, unknown>;
+  const channelId = typeof feed.channel_id === "string" ? feed.channel_id.trim() : "";
+  if (
+    !safeNonDmChannelId(channelId) ||
+    !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(channelId) ||
+    !Array.isArray(feed.pinned_messages) ||
+    feed.pinned_messages.length > 500
+  ) {
+    return null;
+  }
+  if (expectedChannelId !== undefined) {
+    const trimmedExpected = typeof expectedChannelId === "string" ? expectedChannelId.trim() : "";
+    if (trimmedExpected !== channelId) return null;
+  }
+  const seen = new Set<string>();
+  const pinnedMessages: string[] = [];
+  for (const item of feed.pinned_messages) {
+    if (typeof item !== "string") continue;
+    const trimmed = item.trim();
+    if (
+      !safeGraphId(trimmed) ||
+      !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(trimmed) ||
+      EMBEDDED_SECRET_TOKEN_RE.test(trimmed) ||
+      seen.has(trimmed)
+    ) {
+      continue;
+    }
+    seen.add(trimmed);
+    pinnedMessages.push(trimmed);
+  }
+  return {
+    channel_id: channelId,
+    total_pins: pinnedMessages.length,
+    latest_pin_id: pinnedMessages.length > 0 ? pinnedMessages[pinnedMessages.length - 1]! : null,
+    pinned_messages: pinnedMessages,
   };
 }
 
@@ -3001,26 +3056,29 @@ export class AgentChatREST {
       /^192\.168\./.test(ipv4) ||
       /^169\.254\./.test(ipv4) ||
       /^172\.(1[6-9]|2\d|3[01])\./.test(ipv4) ||
-      /^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(ipv4)
+      /^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(ipv4) ||
+      /^198\.1[89]\./.test(ipv4) ||
+      /^(?:22[4-9]|23\d|24\d|25[0-5])\./.test(ipv4)
     );
   }
 
   private assertWebhookTarget(channelId: string, rawUrl: string): { channelId: string; url: string } {
-    const safeChannel = channelId?.trim() ?? "";
+    const safeChannel = typeof channelId === "string" ? channelId.trim() : "";
     if (
-      !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(safeChannel) ||
-      safeChannel.includes("..") ||
-      DM_OR_DIRECT_CHANNEL_RE.test(safeChannel) ||
-      CREDENTIAL_PREFIX_RE.test(safeChannel) ||
-      EMBEDDED_SECRET_TOKEN_RE.test(safeChannel)
+      !safeNonDmChannelId(safeChannel) ||
+      !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(safeChannel)
     ) {
       throw new Error("Invalid channel ID");
     }
-    const trimmedUrl = rawUrl?.trim() ?? "";
-    if (!trimmedUrl || trimmedUrl.length > 1024 || /[\u0000-\u001F]/.test(trimmedUrl)) {
+    const trimmedUrl = typeof rawUrl === "string" ? rawUrl.trim() : "";
+    if (!trimmedUrl || trimmedUrl.length > 1024 || /[\u0000-\u001F\u007F]/.test(trimmedUrl)) {
       throw new Error("Invalid webhook URL");
     }
-    if (EMBEDDED_SECRET_TOKEN_RE.test(trimmedUrl) || this.containsMemorySecretShape(trimmedUrl)) {
+    if (
+      EMBEDDED_SECRET_TOKEN_RE.test(trimmedUrl) ||
+      JOINED_GRAPH_AWS_KEY_ID_RE.test(trimmedUrl) ||
+      this.containsMemorySecretShape(trimmedUrl)
+    ) {
       throw new Error("Webhook URL must not contain secrets");
     }
     let parsed: URL;
@@ -3042,6 +3100,11 @@ export class AgentChatREST {
       host.endsWith(".localhost") ||
       host.endsWith(".local") ||
       host.endsWith(".internal") ||
+      host.endsWith(".home.arpa") ||
+      host.endsWith(".corp") ||
+      host.endsWith(".lan") ||
+      /^\d+$/.test(host) ||
+      /^0x[0-9a-f]+$/i.test(host) ||
       host === "::1" ||
       host === "::" ||
       this.isPrivateIpv4Host(host) ||
@@ -3691,12 +3754,10 @@ export class AgentChatREST {
     channelId: string,
     opts?: { bearerToken?: string },
   ): Promise<import("./types").ChannelPinsResponse> {
+    const safeChannel = typeof channelId === "string" ? channelId.trim() : "";
     if (
-      !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(channelId) ||
-      channelId.includes("..") ||
-      DM_OR_DIRECT_CHANNEL_RE.test(channelId) ||
-      CREDENTIAL_PREFIX_RE.test(channelId) ||
-      EMBEDDED_SECRET_TOKEN_RE.test(channelId)
+      !safeNonDmChannelId(safeChannel) ||
+      !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(safeChannel)
     ) {
       throw new Error("Invalid channel ID");
     }
@@ -3707,19 +3768,22 @@ export class AgentChatREST {
       ...(token ? { Authorization: `Bearer ${token}` } : {}),
     };
     const raw = await this.get<{ channel_id?: unknown; pinned_messages?: unknown }>(
-      `/api/channels/${encodeURIComponent(channelId)}/pins`,
+      `/api/channels/${encodeURIComponent(safeChannel)}/pins`,
       headers,
     );
+    const respChannel = typeof raw?.channel_id === "string" && raw.channel_id.trim() ? raw.channel_id.trim() : safeChannel;
+    if (respChannel !== safeChannel) {
+      throw new Error("Channel pins response channel mismatch");
+    }
     const seen = new Set<string>();
     const pinnedMessages: string[] = [];
     if (Array.isArray(raw?.pinned_messages)) {
-      for (const item of raw.pinned_messages) {
+      for (const item of raw.pinned_messages.slice(0, 500)) {
         if (typeof item !== "string") continue;
         const trimmed = item.trim();
         if (
-          !trimmed ||
-          /[\x00-\x1f\x7f]/.test(trimmed) ||
-          CREDENTIAL_PREFIX_RE.test(trimmed) ||
+          !safeGraphId(trimmed) ||
+          !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(trimmed) ||
           EMBEDDED_SECRET_TOKEN_RE.test(trimmed) ||
           seen.has(trimmed)
         ) {
@@ -3730,7 +3794,7 @@ export class AgentChatREST {
       }
     }
     return {
-      channel_id: typeof raw?.channel_id === "string" && raw.channel_id.trim() ? raw.channel_id.trim() : channelId,
+      channel_id: safeChannel,
       pinned_messages: pinnedMessages,
     };
   }
@@ -4940,13 +5004,10 @@ export class AgentChatREST {
     channelId: string,
     opts?: { bearerToken?: string },
   ): Promise<import("./types").ChannelThreadsResponse> {
-    const safeChannel = channelId?.trim() ?? "";
+    const safeChannel = typeof channelId === "string" ? channelId.trim() : "";
     if (
-      !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(safeChannel) ||
-      safeChannel.includes("..") ||
-      DM_OR_DIRECT_CHANNEL_RE.test(safeChannel) ||
-      CREDENTIAL_PREFIX_RE.test(safeChannel) ||
-      EMBEDDED_SECRET_TOKEN_RE.test(safeChannel)
+      !safeNonDmChannelId(safeChannel) ||
+      !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(safeChannel)
     ) {
       throw new Error("Invalid channel ID");
     }
@@ -4954,33 +5015,45 @@ export class AgentChatREST {
       `/api/channels/${encodeURIComponent(safeChannel)}/threads`,
       this.authHeaders(opts?.bearerToken),
     );
+    const respChannel = typeof raw?.channel_id === "string" && raw.channel_id.trim() ? raw.channel_id.trim() : safeChannel;
+    if (respChannel !== safeChannel) {
+      throw new Error("Channel threads response channel mismatch");
+    }
     const seen = new Set<string>();
     const threads: import("./types").ChannelThreadSummaryItem[] = [];
     if (Array.isArray(raw?.threads)) {
-      for (const item of raw.threads) {
-        if (!item || typeof item !== "object") continue;
+      for (const item of raw.threads.slice(0, 500)) {
+        if (!item || typeof item !== "object" || Array.isArray(item)) continue;
         const rec = item as Record<string, unknown>;
         const parentId = typeof rec.parent_id === "string" ? rec.parent_id.trim() : "";
         if (
-          !parentId ||
-          /[\x00-\x1f\x7f]/.test(parentId) ||
-          CREDENTIAL_PREFIX_RE.test(parentId) ||
+          !safeGraphId(parentId) ||
+          !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(parentId) ||
           EMBEDDED_SECRET_TOKEN_RE.test(parentId) ||
           seen.has(parentId)
         ) {
           continue;
         }
         const replyCount =
-          typeof rec.reply_count === "number" && Number.isFinite(rec.reply_count) && rec.reply_count >= 0
+          typeof rec.reply_count === "number" && Number.isFinite(rec.reply_count)
             ? Math.trunc(rec.reply_count)
             : 0;
-        const lastReplyAt = typeof rec.last_reply_at === "string" ? rec.last_reply_at.trim() : "";
+        if (replyCount <= 0) continue;
+        const parsedTs =
+          typeof rec.last_reply_at === "string" && rec.last_reply_at.trim()
+            ? Date.parse(rec.last_reply_at)
+            : NaN;
+        const lastReplyAt = Number.isFinite(parsedTs) ? new Date(parsedTs).toISOString() : "";
         seen.add(parentId);
-        threads.push({ parent_id: parentId, reply_count: replyCount, last_reply_at: lastReplyAt });
+        threads.push({
+          parent_id: parentId,
+          reply_count: Math.min(replyCount, 100_000),
+          last_reply_at: lastReplyAt,
+        });
       }
     }
     return {
-      channel_id: typeof raw?.channel_id === "string" && raw.channel_id.trim() ? raw.channel_id.trim() : safeChannel,
+      channel_id: safeChannel,
       threads,
     };
   }

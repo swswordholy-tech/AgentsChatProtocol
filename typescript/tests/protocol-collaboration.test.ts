@@ -10,6 +10,7 @@ import {
   summarizeChannelBriefReadiness,
   summarizeChannelBriefSkills,
   summarizeChannelOkrSnapshot,
+  summarizeChannelPins,
   summarizeChannelThreads,
   summarizeChannelWakeHealth,
   summarizeCloudAgentRoomPolicy,
@@ -5012,6 +5013,107 @@ describe("AgentChatClient realtime collaboration WS events", () => {
       const ok = await rest.getWorkspaceGraph("channel", "room-asia-pacific");
       expect(ok.scope.id).toBe("room-asia-pacific");
       expect(fetchCalls).toBe(1);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("Campaign #58: summarizeChannelPins, summarizeChannelThreads, getChannelPins, getChannelThreads & registerWebhook/removeWebhook block prototype keys, mr_ refs, 14-family credentials, DM aliases, and SSRF hosts", async () => {
+    const pinsSummary = summarizeChannelPins({
+      channel_id: "room-asia-pacific",
+      pinned_messages: [
+        "eyj-notes",
+        "aiza-guide",
+        "eyj-notes",
+        "__proto__",
+        "constructor",
+        "prototype",
+        "mr_" + "c".repeat(64),
+        "pin_AKIAIOSFODNN7EXAMPLE",
+        "pin_glpat-1234567890abcdef",
+      ],
+    });
+    expect(pinsSummary).toEqual({
+      channel_id: "room-asia-pacific",
+      total_pins: 2,
+      latest_pin_id: "aiza-guide",
+      pinned_messages: ["eyj-notes", "aiza-guide"],
+    });
+    expect(summarizeChannelPins({ channel_id: "room-asia-pacific", pinned_messages: ["m1"] }, "other-room")).toBeNull();
+    expect(summarizeChannelPins({ channel_id: "constructor", pinned_messages: ["m1"] })).toBeNull();
+    expect(summarizeChannelPins({ channel_id: "dm:secret", pinned_messages: ["m1"] })).toBeNull();
+
+    const threadsSummary = summarizeChannelThreads({
+      channel_id: "eyj-notes",
+      threads: [
+        { parent_id: "aiza-guide", reply_count: 4, last_reply_at: "2026-11-14T05:10:00Z" },
+        { parent_id: "constructor", reply_count: 9, last_reply_at: "2026-11-14T05:11:00Z" },
+        { parent_id: "msg_ASIAIOSFODNN7EXAMPLE", reply_count: 2, last_reply_at: "2026-11-14T05:12:00Z" },
+      ],
+    });
+    expect(threadsSummary?.total_threads).toBe(1);
+    expect(threadsSummary?.most_active_parent_id).toBe("aiza-guide");
+
+    const originalFetch = globalThis.fetch;
+    let calls = 0;
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      calls += 1;
+      const url = String(input);
+      if (url.endsWith("/pins")) {
+        return Response.json({
+          channel_id: "room-asia-pacific",
+          pinned_messages: ["msg-1", "constructor", "mr_" + "d".repeat(64), "pin_rk_live_1234567890abcd", "aiza-guide"],
+        });
+      }
+      if (url.endsWith("/threads")) {
+        return Response.json({
+          channel_id: "room-asia-pacific",
+          threads: [
+            { parent_id: "eyj-notes", reply_count: 3, last_reply_at: "not-a-timestamp sk-proj-1234567890abcdef" },
+            { parent_id: "prototype", reply_count: 5, last_reply_at: "2026-11-14T05:00:00Z" },
+            { parent_id: "zero-replies", reply_count: 0, last_reply_at: "2026-11-14T05:00:00Z" },
+          ],
+        });
+      }
+      return Response.json({ ok: true });
+    }) as unknown as typeof fetch;
+
+    try {
+      const rest = new AgentChatREST({ baseUrl: "https://agents-chat.com", bearerToken: "tok_58" });
+      for (const badChannel of [
+        "__proto__",
+        "constructor",
+        "prototype",
+        "dm:pair",
+        "dm_pair",
+        "mr_" + "e".repeat(64),
+        "room_AKIAIOSFODNN7EXAMPLE",
+        "room_mcp_at_1234567890",
+      ]) {
+        await expect(rest.getChannelPins(badChannel)).rejects.toThrow("Invalid channel ID");
+        await expect(rest.getChannelThreads(badChannel)).rejects.toThrow("Invalid channel ID");
+        await expect(rest.registerWebhook(badChannel, "https://hooks.example.com/ok")).rejects.toThrow("Invalid channel ID");
+      }
+      for (const badUrl of [
+        "http://nas.home.arpa/hook",
+        "http://intranet.corp/hook",
+        "http://router.lan/hook",
+        "http://198.18.0.5/hook",
+        "http://224.0.0.1/hook",
+        "http://255.255.255.255/hook",
+      ]) {
+        await expect(rest.registerWebhook("room-asia-pacific", badUrl)).rejects.toThrow("Webhook host not allowed");
+      }
+      await expect(
+        rest.registerWebhook("room-asia-pacific", "https://hooks.example.com/cb?k=AKIAIOSFODNN7EXAMPLE"),
+      ).rejects.toThrow("secrets");
+      expect(calls).toBe(0);
+
+      const pins = await rest.getChannelPins("  room-asia-pacific  ");
+      expect(pins.pinned_messages).toEqual(["msg-1", "aiza-guide"]);
+      const threads = await rest.getChannelThreads("room-asia-pacific");
+      expect(threads.threads).toEqual([{ parent_id: "eyj-notes", reply_count: 3, last_reply_at: "" }]);
+      expect(calls).toBe(2);
     } finally {
       globalThis.fetch = originalFetch;
     }

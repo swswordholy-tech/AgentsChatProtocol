@@ -1073,6 +1073,13 @@ export interface ChannelPinsResponse {
   pinned_messages: string[];
 }
 
+export interface ChannelPinsSummary {
+  channel_id: string;
+  total_pins: number;
+  latest_pin_id: string | null;
+  pinned_messages: string[];
+}
+
 // MARK: - Personal Skills Library (/api/skills) & Room Loop Governance (/api/loops)
 
 export interface PersonalSkillMeta {
