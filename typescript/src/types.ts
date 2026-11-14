@@ -1419,6 +1419,21 @@ export interface ChannelDocDetailItem extends ChannelDocSummaryItem {
   backlinks?: ChannelDocBacklinkItem[];
 }
 
+export interface ChannelDocDetailSummary {
+  id: string;
+  title: string;
+  kind: ChannelDocKind;
+  level: ChannelDocLevel;
+  version: number;
+  archived: boolean;
+  revision_count: number;
+  backlink_count: number;
+  objective_backlink_ids: string[];
+  kr_backlink_ids: string[];
+  task_backlink_ids: string[];
+  backlinks: ChannelDocBacklinkItem[];
+}
+
 export interface ChannelDocsListResponse {
   channel_id: string;
   docs: ChannelDocSummaryItem[];

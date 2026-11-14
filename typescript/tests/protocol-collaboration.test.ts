@@ -3481,4 +3481,101 @@ describe("AgentChatClient realtime collaboration WS events", () => {
       globalThis.fetch = originalFetch;
     }
   });
+
+  test("summarizeChannelDocDetail projects 3-layer OKR backlinks safely and ChannelDocs/getChannelPins block DM & embedded secrets", async () => {
+    const { summarizeChannelDocDetail } = await import("../src/index");
+
+    const detail = summarizeChannelDocDetail({
+      id: "arch-spec",
+      title: "Architecture Spec",
+      kind: "deep_dive",
+      level: 3,
+      version: 5,
+      bodyMarkdown: "# Architecture\n\n3-layer OKR backlinks.",
+      revisions: [
+        { version: 4, title: "Old" },
+        { version: 4, title: "Dup" },
+        { version: 3, title: "Older" },
+      ],
+      backlinks: [
+        { type: "objective", id: "obj_root_1", title: "Root Objective", relation: "linked_channel_docs" },
+        { type: "objective", id: "obj_root_1", title: "Dup Root", relation: "linked_channel_docs" },
+        { type: "key_result", id: "kr_l2_1", title: "L2 KR ghp_1234567890abcdef", relation: "linked_channel_docs" },
+        { type: "task", id: "task_l3_1", title: "L3 Leaf Task", relation: "linked_channel_docs" },
+        { type: "task", id: "task_ac_secret_987654321", title: "Drop Secret ID", relation: "linked_channel_docs" },
+      ],
+    });
+
+    expect(detail).toEqual({
+      id: "arch-spec",
+      title: "Architecture Spec",
+      kind: "deep_dive",
+      level: 3,
+      version: 5,
+      archived: false,
+      revision_count: 2,
+      backlink_count: 3,
+      objective_backlink_ids: ["obj_root_1"],
+      kr_backlink_ids: ["kr_l2_1"],
+      task_backlink_ids: ["task_l3_1"],
+      backlinks: [
+        { type: "objective", id: "obj_root_1", title: "Root Objective", relation: "linked_channel_docs" },
+        { type: "key_result", id: "kr_l2_1", title: "kr_l2_1", relation: "linked_channel_docs" },
+        { type: "task", id: "task_l3_1", title: "L3 Leaf Task", relation: "linked_channel_docs" },
+      ],
+    });
+
+    // Soft-archived tombstone suppresses active backlinks
+    const archivedDetail = summarizeChannelDocDetail({
+      id: "arch-spec",
+      title: "Architecture Spec",
+      kind: "deep_dive",
+      level: 3,
+      version: 6,
+      bodyMarkdown: "",
+      archived: true,
+      backlinks: [{ type: "objective", id: "obj_root_1", title: "Root Objective" }],
+    });
+    expect(archivedDetail?.archived).toBe(true);
+    expect(archivedDetail?.backlink_count).toBe(0);
+    expect(summarizeChannelDocDetail({ id: "doc_sk-proj-1234567890abcdef", kind: "context", level: 3, version: 1, bodyMarkdown: "x" })).toBeNull();
+
+    const originalFetch = globalThis.fetch;
+    let fetchCalls = 0;
+    globalThis.fetch = (async () => {
+      fetchCalls += 1;
+      return Response.json({
+        channel_id: "room-dev",
+        pinned_messages: ["msg_valid_1", "msg_sk-proj-1234567890abcdef", "ac_secret_987654321", "msg_valid_1"],
+      });
+    }) as unknown as typeof fetch;
+
+    try {
+      const rest = new AgentChatREST({ baseUrl: "https://agents-chat.com", bearerToken: "tok_43" });
+      await expect(rest.listChannelDocs("dm-private")).rejects.toThrow("Invalid channel ID");
+      await expect(rest.getChannelDoc("direct:alice:bob", "arch-spec")).rejects.toThrow("Invalid channel ID");
+      await expect(rest.getChannelDoc("room-dev", "doc_ac_secret_987654321")).rejects.toThrow("Invalid channel doc ID");
+      await expect(
+        rest.saveChannelDoc("room-dev", "arch-spec", {
+          title: "Safe Title",
+          kind: "deep_dive",
+          level: 3,
+          body_markdown: "Leaked token sk-proj-1234567890abcdef inside markdown",
+          if_match_version: 1,
+        }),
+      ).rejects.toThrow("Secret or credential detected");
+      await expect(rest.getChannelPins("dm-private")).rejects.toThrow("Invalid channel ID");
+      await expect(rest.getChannelPins("room_ghp_1234567890abcdef")).rejects.toThrow("Invalid channel ID");
+      expect(fetchCalls).toBe(0);
+
+      const pins = await rest.getChannelPins("room-dev");
+      expect(fetchCalls).toBe(1);
+      expect(pins).toEqual({
+        channel_id: "room-dev",
+        pinned_messages: ["msg_valid_1"],
+      });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
 });

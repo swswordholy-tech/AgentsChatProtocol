@@ -596,6 +596,109 @@ export function summarizeProposalsFeed(
   };
 }
 
+const VALID_DOC_KINDS_SET = new Set<import("./types").ChannelDocKind>([
+  "topic",
+  "rules",
+  "roles",
+  "context",
+  "deep_dive",
+  "skill",
+  "channel_skill",
+]);
+
+export function summarizeChannelDocDetail(
+  raw: unknown,
+): import("./types").ChannelDocDetailSummary | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const d = raw as Record<string, unknown>;
+  const id = typeof d.id === "string" ? d.id.trim() : "";
+  if (
+    !/^[A-Za-z0-9_-]{1,64}$/.test(id) ||
+    CREDENTIAL_PREFIX_RE.test(id) ||
+    EMBEDDED_SECRET_TOKEN_RE.test(id)
+  ) {
+    return null;
+  }
+  const kind = d.kind as import("./types").ChannelDocKind;
+  if (!VALID_DOC_KINDS_SET.has(kind)) return null;
+  const level = d.level as import("./types").ChannelDocLevel;
+  if (level !== 1 && level !== 2 && level !== 3 && level !== 4) return null;
+  if (typeof d.version !== "number" || !Number.isSafeInteger(d.version) || d.version < 1) return null;
+  const body =
+    typeof d.bodyMarkdown === "string"
+      ? d.bodyMarkdown
+      : typeof d.body_markdown === "string"
+        ? d.body_markdown
+        : null;
+  if (body === null) return null;
+
+  const rawTitle =
+    typeof d.title === "string" ? d.title.replace(/[\x00-\x1f\x7f]+/g, " ").trim().slice(0, 120) : "";
+  const title = rawTitle && !EMBEDDED_SECRET_TOKEN_RE.test(rawTitle) ? rawTitle : id;
+  const archived = d.archived === true || body === "";
+
+  let revisionCount = 0;
+  if (Array.isArray(d.revisions)) {
+    const seenVersions = new Set<number>();
+    for (const r of d.revisions.slice(0, 100)) {
+      if (!r || typeof r !== "object") continue;
+      const ver = (r as Record<string, unknown>).version;
+      if (typeof ver === "number" && Number.isSafeInteger(ver) && ver >= 1 && !seenVersions.has(ver)) {
+        seenVersions.add(ver);
+        revisionCount += 1;
+      }
+    }
+  }
+
+  const objectiveBacklinkIds: string[] = [];
+  const krBacklinkIds: string[] = [];
+  const taskBacklinkIds: string[] = [];
+  const backlinks: import("./types").ChannelDocBacklinkItem[] = [];
+  if (!archived && Array.isArray(d.backlinks)) {
+    const seenBacklinks = new Set<string>();
+    for (const item of d.backlinks) {
+      if (!item || typeof item !== "object") continue;
+      const bl = item as Record<string, unknown>;
+      const blType =
+        bl.type === "objective" || bl.type === "key_result" || bl.type === "task" ? bl.type : "";
+      const blId = typeof bl.id === "string" ? bl.id.trim() : "";
+      if (!blType || !safeGraphId(blId) || EMBEDDED_SECRET_TOKEN_RE.test(blId)) continue;
+      const key = `${blType}:${blId}`;
+      if (seenBacklinks.has(key)) continue;
+      seenBacklinks.add(key);
+
+      const rawBlTitle =
+        typeof bl.title === "string" ? bl.title.replace(/[\x00-\x1f\x7f]+/g, " ").trim().slice(0, 120) : "";
+      const blTitle = rawBlTitle && !EMBEDDED_SECRET_TOKEN_RE.test(rawBlTitle) ? rawBlTitle : blId;
+      backlinks.push({
+        type: blType,
+        id: blId,
+        title: blTitle,
+        relation: "linked_channel_docs",
+      });
+      if (blType === "objective") objectiveBacklinkIds.push(blId);
+      else if (blType === "key_result") krBacklinkIds.push(blId);
+      else taskBacklinkIds.push(blId);
+      if (backlinks.length >= 100) break;
+    }
+  }
+
+  return {
+    id,
+    title,
+    kind,
+    level,
+    version: d.version,
+    archived,
+    revision_count: revisionCount,
+    backlink_count: backlinks.length,
+    objective_backlink_ids: objectiveBacklinkIds,
+    kr_backlink_ids: krBacklinkIds,
+    task_backlink_ids: taskBacklinkIds,
+    backlinks,
+  };
+}
+
 export function resolveInheritedObjectiveChannel(
   objectiveId: string,
   objectives: ReadonlyArray<import("./types").InheritableObjectiveChannelNode>,
@@ -1812,7 +1915,13 @@ export class AgentChatREST {
     channelId: string,
     opts?: { bearerToken?: string },
   ): Promise<import("./types").ChannelPinsResponse> {
-    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(channelId) || /^(?:ac_|sk-)/i.test(channelId)) {
+    if (
+      !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(channelId) ||
+      channelId.includes("..") ||
+      DM_OR_DIRECT_CHANNEL_RE.test(channelId) ||
+      CREDENTIAL_PREFIX_RE.test(channelId) ||
+      EMBEDDED_SECRET_TOKEN_RE.test(channelId)
+    ) {
       throw new Error("Invalid channel ID");
     }
     const token = opts?.bearerToken?.trim() || this.bearerToken;
@@ -1831,7 +1940,15 @@ export class AgentChatREST {
       for (const item of raw.pinned_messages) {
         if (typeof item !== "string") continue;
         const trimmed = item.trim();
-        if (!trimmed || /[\x00-\x1f\x7f]/.test(trimmed) || seen.has(trimmed)) continue;
+        if (
+          !trimmed ||
+          /[\x00-\x1f\x7f]/.test(trimmed) ||
+          CREDENTIAL_PREFIX_RE.test(trimmed) ||
+          EMBEDDED_SECRET_TOKEN_RE.test(trimmed) ||
+          seen.has(trimmed)
+        ) {
+          continue;
+        }
         seen.add(trimmed);
         pinnedMessages.push(trimmed);
       }
@@ -2865,9 +2982,21 @@ export class AgentChatREST {
 
   // MARK: - Channel Docs CAS & Revision History (/api/channels/:id/docs) & Key Rotation
 
+  private assertChannelDocRoomId(channelId: string): string {
+    const safeCh = this.assertOkrEntityId(channelId, "channel ID");
+    if (DM_OR_DIRECT_CHANNEL_RE.test(safeCh) || EMBEDDED_SECRET_TOKEN_RE.test(safeCh)) {
+      throw new Error("Invalid channel ID");
+    }
+    return safeCh;
+  }
+
   private assertChannelDocId(docId: string): string {
     const trimmed = docId?.trim() ?? "";
-    if (!/^[A-Za-z0-9_-]{1,64}$/.test(trimmed) || /^(?:ac_|sk[-_])/i.test(trimmed)) {
+    if (
+      !/^[A-Za-z0-9_-]{1,64}$/.test(trimmed) ||
+      CREDENTIAL_PREFIX_RE.test(trimmed) ||
+      EMBEDDED_SECRET_TOKEN_RE.test(trimmed)
+    ) {
       throw new Error("Invalid channel doc ID");
     }
     return trimmed;
@@ -2877,7 +3006,7 @@ export class AgentChatREST {
     channelId: string,
     opts?: { level?: 1 | 2 | 3 | 4; active_only?: boolean; bearerToken?: string },
   ): Promise<import("./types").ChannelDocsListResponse> {
-    const safeCh = this.assertOkrEntityId(channelId, "channel ID");
+    const safeCh = this.assertChannelDocRoomId(channelId);
     const params = new URLSearchParams();
     if (opts?.level !== undefined) {
       if (![1, 2, 3, 4].includes(opts.level)) throw new Error("Invalid channel doc level");
@@ -2896,7 +3025,7 @@ export class AgentChatREST {
     docId: string,
     opts?: { bearerToken?: string },
   ): Promise<import("./types").ChannelDocDetailItem> {
-    const safeCh = this.assertOkrEntityId(channelId, "channel ID");
+    const safeCh = this.assertChannelDocRoomId(channelId);
     const safeDoc = this.assertChannelDocId(docId);
     return this.get<import("./types").ChannelDocDetailItem>(
       `/api/channels/${encodeURIComponent(safeCh)}/docs/${encodeURIComponent(safeDoc)}`,
@@ -2909,7 +3038,7 @@ export class AgentChatREST {
     docId: string,
     opts?: { bearerToken?: string },
   ): Promise<import("./types").ChannelDocRevisionsResponse> {
-    const safeCh = this.assertOkrEntityId(channelId, "channel ID");
+    const safeCh = this.assertChannelDocRoomId(channelId);
     const safeDoc = this.assertChannelDocId(docId);
     return this.get<import("./types").ChannelDocRevisionsResponse>(
       `/api/channels/${encodeURIComponent(safeCh)}/docs/${encodeURIComponent(safeDoc)}/revisions`,
@@ -2923,7 +3052,7 @@ export class AgentChatREST {
     input: import("./types").SaveChannelDocInput,
     opts?: { bearerToken?: string },
   ): Promise<import("./types").ChannelDocDetailItem> {
-    const safeCh = this.assertOkrEntityId(channelId, "channel ID");
+    const safeCh = this.assertChannelDocRoomId(channelId);
     const safeDoc = this.assertChannelDocId(docId);
     const title = input?.title?.trim() ?? "";
     if (!title || title.length > 120) throw new Error("Invalid channel doc title");
@@ -2936,6 +3065,11 @@ export class AgentChatREST {
     }
     if (!Number.isSafeInteger(input?.if_match_version) || input.if_match_version < 0) {
       throw new Error("Invalid channel doc if_match_version");
+    }
+    for (const field of [title, input.body_markdown]) {
+      if (EMBEDDED_SECRET_TOKEN_RE.test(field) || this.containsMemorySecretShape(field)) {
+        throw new Error("Secret or credential detected in channel doc");
+      }
     }
     const headers: Record<string, string> = {
       ...this.authHeaders(opts?.bearerToken),
@@ -2968,7 +3102,7 @@ export class AgentChatREST {
     expectedVersion?: number,
     opts?: { bearerToken?: string },
   ): Promise<import("./types").ArchiveChannelDocResponse> {
-    const safeCh = this.assertOkrEntityId(channelId, "channel ID");
+    const safeCh = this.assertChannelDocRoomId(channelId);
     const safeDoc = this.assertChannelDocId(docId);
     if (expectedVersion !== undefined && (!Number.isSafeInteger(expectedVersion) || expectedVersion < 1)) {
       throw new Error("Invalid channel doc expectedVersion");
