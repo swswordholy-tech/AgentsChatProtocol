@@ -1,3 +1,4 @@
+import { redactError } from "./security";
 // AgentsChat REST API client — HTTP queries for history, channels, agents
 
 import type {
@@ -4875,13 +4876,9 @@ export class AgentChatREST {
         ...(opts?.signal ? { signal: opts.signal } : {}),
       },
     );
-    if (!res.ok) {
-      const error = await res.json().catch(() => ({ message: res.statusText }));
-      throw new Error(`HTTP ${res.status}: ${error.message ?? error.error ?? res.statusText}`);
-    }
     if (!res.body) return;
     if (opts?.signal?.aborted) {
-      await res.body.cancel().catch(() => {});
+      void res.body.cancel().catch(() => {});
       return;
     }
 
@@ -4937,7 +4934,7 @@ export class AgentChatREST {
       }
     } finally {
       opts?.signal?.removeEventListener("abort", onAbort);
-      await reader.cancel().catch(() => {});
+      void reader.cancel().catch(() => {});
       try {
         reader.releaseLock();
       } catch {}
@@ -5984,7 +5981,7 @@ export class AgentChatREST {
       async (res) => {
         if (!res.ok) {
           const error = await res.json().catch(() => ({ message: res.statusText }));
-          throw new Error(`HTTP ${res.status}: ${error.message ?? error.error ?? res.statusText}`);
+          throw new Error(`HTTP ${res.status}: ${redactError(error?.message ?? error?.error ?? res.statusText, opts?.bearerToken ?? this.bearerToken)}`);
         }
         const rawEtag = res.headers.get("ETag")?.replace(/^W\//i, "").replace(/^"|"$/g, "").trim();
         const parsedVer = rawEtag && /^\d+$/.test(rawEtag) ? Number(rawEtag) : undefined;
@@ -7356,12 +7353,20 @@ export class AgentChatREST {
     }, this.timeoutMs);
     (timer as unknown as { unref?: () => void })?.unref?.();
     try {
-      return await this.fetchImpl(url, { ...(init ?? {}), signal: controller.signal });
+      const res = await this.fetchImpl(url, { ...(init ?? {}), signal: controller.signal });
+      // Failed handshakes are finite HTTP responses: bound their error body too.
+      if (!res.ok) {
+        const error = await res.json().catch(() => ({ message: res.statusText }));
+        if (timedOut) throw new Error(`Request timed out after ${this.timeoutMs}ms`);
+        throw new Error(`HTTP ${res.status}: ${error?.message ?? error?.error ?? res.statusText}`);
+      }
+      return res;
     } catch (err) {
       if (timedOut) {
         throw new Error(`Request timed out after ${this.timeoutMs}ms`);
       }
-      throw err;
+      throw new Error(redactError(err instanceof Error ? err.message : err,
+        new Headers(init?.headers).get("Authorization")?.replace(/^Bearer\s+/i, "")));
     } finally {
       clearTimeout(timer);
       upstream?.removeEventListener("abort", onUpstreamAbort);
@@ -7396,7 +7401,8 @@ export class AgentChatREST {
       if (timedOut) {
         throw new Error(`Request timed out after ${this.timeoutMs}ms`);
       }
-      throw err;
+      throw new Error(redactError(err instanceof Error ? err.message : err,
+        new Headers(init?.headers).get("Authorization")?.replace(/^Bearer\s+/i, "")));
     } finally {
       clearTimeout(timer);
       upstream?.removeEventListener("abort", onUpstreamAbort);
@@ -7407,7 +7413,7 @@ export class AgentChatREST {
     return this.withRequestTimeout(url, init, async (res) => {
       if (!res.ok) {
         const error = await res.json().catch(() => ({ message: res.statusText }));
-        throw new Error(`HTTP ${res.status}: ${error.message ?? error.error ?? res.statusText}`);
+        throw new Error(`HTTP ${res.status}: ${redactError(error?.message ?? error?.error ?? res.statusText, new Headers(init?.headers).get("Authorization")?.replace(/^Bearer\s+/i, ""))}`);
       }
       return res.json();
     });

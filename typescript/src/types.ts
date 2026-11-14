@@ -53,6 +53,8 @@ export interface ClientOptions {
   token?: string;
   capabilities?: string[];
   heartbeatInterval?: number;
+  /** Maximum wait for pong; checked each heartbeat tick. Defaults to twice heartbeatInterval. */
+  heartbeatTimeoutMs?: number;
   connectTimeoutMs?: number;
   wsFactory?: (url: string) => WebSocket;
 }

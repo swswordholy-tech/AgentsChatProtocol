@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 import json
+import math
+from ._security import redact_error
 import socket
 import urllib.error
 import urllib.parse
@@ -54,7 +56,7 @@ class AgentChatREST:
             token: Optional Bearer token (agent ac_ key or JWT).
             timeout: Per-request socket timeout in seconds (default 15.0).
         """
-        if timeout <= 0:
+        if not math.isfinite(timeout) or timeout <= 0:
             raise ValueError("timeout must be > 0")
         self.base_url = base_url.rstrip("/")
         self.token = token
@@ -246,7 +248,12 @@ class AgentChatREST:
                     return {}
                 return json.loads(raw_bytes.decode("utf-8"))
         except urllib.error.HTTPError as e:
-            err_body = e.read(65536).decode("utf-8", errors="replace")
+            try:
+                err_body = e.read(65536).decode("utf-8", errors="replace")
+            except (TimeoutError, socket.timeout):
+                raise AgentChatRESTError(0, "Request timed out") from None
+            finally:
+                e.close()
             try:
                 err_data = json.loads(err_body)
                 msg = (
@@ -256,13 +263,13 @@ class AgentChatREST:
                 )
             except (json.JSONDecodeError, ValueError):
                 msg = e.reason
-            raise AgentChatRESTError(e.code, str(msg)) from e
+            raise AgentChatRESTError(e.code, redact_error(msg, self.token)) from None
         except (TimeoutError, socket.timeout) as e:
-            raise AgentChatRESTError(0, "Request timed out") from e
+            raise AgentChatRESTError(0, "Request timed out") from None
         except urllib.error.URLError as e:
             if isinstance(getattr(e, "reason", None), (TimeoutError, socket.timeout)):
-                raise AgentChatRESTError(0, "Request timed out") from e
-            raise AgentChatRESTError(0, f"Connection failed: {e.reason}") from e
+                raise AgentChatRESTError(0, "Request timed out") from None
+            raise AgentChatRESTError(0, f"Connection failed: {redact_error(e.reason, self.token)}") from None
 
     def _get(self, path: str) -> Any:
         return self._request("GET", path)
