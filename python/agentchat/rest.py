@@ -5,12 +5,19 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Optional
 
-import urllib.request
+import json
+import socket
 import urllib.error
 import urllib.parse
-import json
+import urllib.request
 
 __all__ = ["AgentChatREST", "AgentChatRESTError", "RESTClientOptions"]
+
+MAX_RESPONSE_BYTES = 4 * 1024 * 1024
+
+
+def _quote_segment(value: str) -> str:
+    return urllib.parse.quote(str(value), safe="")
 
 
 class AgentChatRESTError(Exception):
@@ -25,25 +32,33 @@ class AgentChatRESTError(Exception):
 @dataclass
 class RESTClientOptions:
     base_url: str  # e.g. "http://localhost:8080"
+    token: Optional[str] = None
+    timeout: float = 15.0
 
 
 class AgentChatREST:
     """Sync HTTP client for the AgentsChat REST API.
 
     Usage:
-        rest = AgentChatREST("http://localhost:8080")
+        rest = AgentChatREST("http://localhost:8080", token="ac_...")
         agents = rest.get_online_agents()
         messages = rest.get_messages("channel-id", limit=20)
     """
 
-    def __init__(self, base_url: str) -> None:
+    def __init__(self, base_url: str, token: Optional[str] = None, timeout: float = 15.0) -> None:
         """Initialize the REST client.
 
         Args:
             base_url: Server base URL (e.g. "http://localhost:8080").
                       Trailing slashes are stripped automatically.
+            token: Optional Bearer token (agent ac_ key or JWT).
+            timeout: Per-request socket timeout in seconds (default 15.0).
         """
+        if timeout <= 0:
+            raise ValueError("timeout must be > 0")
         self.base_url = base_url.rstrip("/")
+        self.token = token
+        self.timeout = float(timeout)
 
     # MARK: - Health
 
@@ -70,72 +85,40 @@ class AgentChatREST:
         return data["agents"]
 
     def get_agent(self, agent_id: str) -> dict[str, Any]:
-        """Get details for a specific agent.
-
-        Args:
-            agent_id: The agent's unique identifier.
-
-        Returns:
-            Agent detail dict.
-        """
-        return self._get(f"/api/agents/{agent_id}")
+        """Get details for a specific agent."""
+        return self._get(f"/api/agents/{_quote_segment(agent_id)}")
 
     def discover(self, capabilities: list[str] | None = None, limit: int = 20) -> list[dict[str, Any]]:
-        """Discover agents by capabilities.
-
-        Args:
-            capabilities: Filter by these capability strings.
-            limit: Maximum number of agents to return.
-
-        Returns:
-            List of matching agent dicts.
-        """
-        params: list[str] = []
+        """Discover agents by capabilities."""
+        query: dict[str, Any] = {"limit": limit}
         if capabilities:
-            params.append(f"capabilities={','.join(capabilities)}")
-        params.append(f"limit={limit}")
-        data = self._get(f"/api/discover?{'&'.join(params)}")
+            query["capabilities"] = ",".join(capabilities)
+        data = self._get(f"/api/discover?{urllib.parse.urlencode(query)}")
         return data["agents"]
 
     # MARK: - Channels
 
     def get_channels(self, agent_id: str) -> list[dict[str, Any]]:
-        """Get channels that an agent belongs to.
-
-        Args:
-            agent_id: The agent's unique identifier.
-
-        Returns:
-            List of channel dicts.
-        """
-        data = self._get(f"/api/channels?agent_id={agent_id}")
+        """Get channels that an agent belongs to."""
+        query = urllib.parse.urlencode({"agent_id": agent_id})
+        data = self._get(f"/api/channels?{query}")
         return data["channels"]
 
     # MARK: - Messages
 
     def get_messages(self, channel_id: str, limit: int = 50, before: str | None = None, after: str | None = None) -> list[dict[str, Any]]:
-        """Get messages from a channel with pagination.
-
-        Args:
-            channel_id: Channel to fetch messages from.
-            limit: Maximum number of messages to return.
-            before: Return messages before this message ID.
-            after: Return messages after this message ID.
-
-        Returns:
-            List of message dicts.
-        """
-        params: list[str] = [f"limit={limit}"]
+        """Get messages from a channel with pagination."""
+        query: dict[str, Any] = {"limit": limit}
         if before:
-            params.append(f"before={before}")
+            query["before"] = before
         if after:
-            params.append(f"after={after}")
-        data = self._get(f"/api/channels/{channel_id}/messages?{'&'.join(params)}")
+            query["after"] = after
+        data = self._get(f"/api/channels/{_quote_segment(channel_id)}/messages?{urllib.parse.urlencode(query)}")
         return data["messages"]
 
     def send_message(self, channel_id: str, sender_id: str, content: str, sender_type: str = "agent", content_type: str = "text") -> dict[str, Any]:
         """Send a message via REST API (no WebSocket needed)."""
-        return self._post(f"/api/channels/{channel_id}/messages", {
+        return self._post(f"/api/channels/{_quote_segment(channel_id)}/messages", {
             "sender_id": sender_id,
             "content": content,
             "sender_type": sender_type,
@@ -146,10 +129,10 @@ class AgentChatREST:
 
     def search(self, query: str, channel_id: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
         """Search messages by keyword."""
-        params: list[str] = [f"q={query}", f"limit={limit}"]
+        params: dict[str, Any] = {"q": query, "limit": limit}
         if channel_id:
-            params.append(f"channel_id={channel_id}")
-        data = self._get(f"/api/search?{'&'.join(params)}")
+            params["channel_id"] = channel_id
+        data = self._get(f"/api/search?{urllib.parse.urlencode(params)}")
         return data["messages"]
 
     # MARK: - Stats
@@ -215,7 +198,7 @@ class AgentChatREST:
 
     def get_account(self, account_id: str) -> dict[str, Any]:
         """Get public account info."""
-        return self._get(f"/api/account/{urllib.parse.quote(account_id)}")
+        return self._get(f"/api/account/{_quote_segment(account_id)}")
 
     def claim_agent(self, owner_id: str, agent_key: str) -> dict[str, Any]:
         """Claim an agent by its key."""
@@ -231,66 +214,61 @@ class AgentChatREST:
 
     def discover_channels(self, query: str | None = None, limit: int = 20) -> list[dict[str, Any]]:
         """Browse public channels."""
-        q = f"?q={urllib.parse.quote(query)}&limit={limit}" if query else f"?limit={limit}"
-        data = self._get(f"/api/channels/discover{q}")
+        params: dict[str, Any] = {"limit": limit}
+        if query:
+            params["q"] = query
+        data = self._get(f"/api/channels/discover?{urllib.parse.urlencode(params)}")
         return data.get("channels", [])
 
     def my_channels(self, agent_id: str) -> list[dict[str, Any]]:
         """Get channels the agent has joined."""
-        data = self._get(f"/api/channels/mine?agent_id={urllib.parse.quote(agent_id)}")
+        data = self._get(f"/api/channels/mine?{urllib.parse.urlencode({'agent_id': agent_id})}")
         return data.get("channels", [])
 
     # MARK: - Internal
 
-    def _get(self, path: str) -> Any:
+    def _request(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
         url = f"{self.base_url}{path}"
-        req = urllib.request.Request(url)
+        headers: dict[str, str] = {"Accept": "application/json"}
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
+        payload: bytes | None = None
+        if body is not None:
+            headers["Content-Type"] = "application/json"
+            payload = json.dumps(body).encode("utf-8")
+        req = urllib.request.Request(url, data=payload, headers=headers, method=method)
         try:
-            with urllib.request.urlopen(req) as response:
-                return json.loads(response.read().decode())
+            with urllib.request.urlopen(req, timeout=self.timeout) as response:
+                raw_bytes = response.read(MAX_RESPONSE_BYTES + 1)
+                if len(raw_bytes) > MAX_RESPONSE_BYTES:
+                    raise AgentChatRESTError(0, "Response exceeded maximum allowed size")
+                if not raw_bytes:
+                    return {}
+                return json.loads(raw_bytes.decode("utf-8"))
         except urllib.error.HTTPError as e:
-            body = e.read().decode()
+            err_body = e.read(65536).decode("utf-8", errors="replace")
             try:
-                data = json.loads(body)
-                msg = data.get("message") or data.get("error") or e.reason
+                err_data = json.loads(err_body)
+                msg = (
+                    (err_data.get("message") or err_data.get("error") or e.reason)
+                    if isinstance(err_data, dict)
+                    else e.reason
+                )
             except (json.JSONDecodeError, ValueError):
                 msg = e.reason
-            raise AgentChatRESTError(e.code, msg) from e
+            raise AgentChatRESTError(e.code, str(msg)) from e
+        except (TimeoutError, socket.timeout) as e:
+            raise AgentChatRESTError(0, "Request timed out") from e
         except urllib.error.URLError as e:
+            if isinstance(getattr(e, "reason", None), (TimeoutError, socket.timeout)):
+                raise AgentChatRESTError(0, "Request timed out") from e
             raise AgentChatRESTError(0, f"Connection failed: {e.reason}") from e
+
+    def _get(self, path: str) -> Any:
+        return self._request("GET", path)
 
     def _post(self, path: str, body: dict[str, Any]) -> Any:
-        url = f"{self.base_url}{path}"
-        data = json.dumps(body).encode()
-        req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"}, method="POST")
-        try:
-            with urllib.request.urlopen(req) as response:
-                return json.loads(response.read().decode())
-        except urllib.error.HTTPError as e:
-            err_body = e.read().decode()
-            try:
-                err_data = json.loads(err_body)
-                msg = err_data.get("message") or err_data.get("error") or e.reason
-            except (json.JSONDecodeError, ValueError):
-                msg = e.reason
-            raise AgentChatRESTError(e.code, msg) from e
-        except urllib.error.URLError as e:
-            raise AgentChatRESTError(0, f"Connection failed: {e.reason}") from e
+        return self._request("POST", path, body)
 
     def _delete(self, path: str, body: dict[str, Any]) -> Any:
-        url = f"{self.base_url}{path}"
-        data = json.dumps(body).encode()
-        req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"}, method="DELETE")
-        try:
-            with urllib.request.urlopen(req) as response:
-                return json.loads(response.read().decode())
-        except urllib.error.HTTPError as e:
-            err_body = e.read().decode()
-            try:
-                err_data = json.loads(err_body)
-                msg = err_data.get("message") or err_data.get("error") or e.reason
-            except (json.JSONDecodeError, ValueError):
-                msg = e.reason
-            raise AgentChatRESTError(e.code, msg) from e
-        except urllib.error.URLError as e:
-            raise AgentChatRESTError(0, f"Connection failed: {e.reason}") from e
+        return self._request("DELETE", path, body)

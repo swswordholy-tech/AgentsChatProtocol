@@ -5,16 +5,19 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
-from datetime import datetime, timezone
-from typing import Callable, Optional
+from datetime import datetime, timedelta, timezone
+from typing import Any, Callable, Optional
 
 import websockets
 from websockets.asyncio.client import ClientConnection
 
 __all__ = ["AgentChatClient"]
 
+MAX_WS_MESSAGE_BYTES = 2 * 1024 * 1024
+
 from .types import (
     AgentCard,
+    AgentStatus,
     AgentStatusUpdate,
     ChannelRole,
     ChatMessage,
@@ -36,6 +39,20 @@ from .types import (
 )
 
 
+def _safe_sender_type(raw: Any) -> SenderType:
+    try:
+        return SenderType(raw)
+    except ValueError:
+        return SenderType.AGENT
+
+
+def _safe_content_type(raw: Any) -> ContentType:
+    try:
+        return ContentType(raw)
+    except ValueError:
+        return ContentType.TEXT
+
+
 class AgentChatClient:
     """Async WebSocket client for the AgentsChat network.
 
@@ -54,6 +71,8 @@ class AgentChatClient:
         agent_id: str,
         token: str = "dev-token",
         capabilities: list[str] | None = None,
+        connect_timeout: float = 15.0,
+        ws_factory: Optional[Callable[..., Any]] = None,
     ):
         """Initialize the AgentsChat WebSocket client.
 
@@ -62,11 +81,17 @@ class AgentChatClient:
             agent_id: Unique identifier for this agent.
             token: Authentication token. Defaults to "dev-token".
             capabilities: List of capability strings this agent supports.
+            connect_timeout: Timeout in seconds for WebSocket open + auth_ok handshake.
+            ws_factory: Optional custom async WebSocket connector for testing.
         """
+        if connect_timeout <= 0:
+            raise ValueError("connect_timeout must be > 0")
         self.url = url
         self.agent_id = agent_id
         self.token = token
         self.capabilities = capabilities or []
+        self.connect_timeout = float(connect_timeout)
+        self._ws_factory = ws_factory or websockets.connect
         self._ws: Optional[ClientConnection] = None
         self._session_id: Optional[str] = None
         self._message_handlers: list[Callable] = []
@@ -84,33 +109,65 @@ class AgentChatClient:
     async def connect(self) -> None:
         """Connect to the WebSocket server and authenticate.
 
-        Sends an auth message and waits for auth_ok response.
-        Raises ConnectionError if authentication fails.
+        Sends an auth message and waits for auth_ok response within connect_timeout.
+        Raises ConnectionError if connection, timeout, or authentication fails,
+        always closing any partially opened socket.
         """
-        self._ws = await websockets.connect(self.url)
-        await self._send({
-            "type": "auth",
-            "agent_id": self.agent_id,
-            "token": self.token,
-            "capabilities": self.capabilities,
-        })
+        try:
+            self._ws = await self._ws_factory(
+                self.url,
+                open_timeout=self.connect_timeout,
+                max_size=MAX_WS_MESSAGE_BYTES,
+            )
+        except (TimeoutError, asyncio.TimeoutError) as e:
+            self._ws = None
+            raise ConnectionError("WebSocket connection timed out") from e
 
-        # Wait for auth_ok
-        response = json.loads(await self._ws.recv())
-        if response.get("type") == "auth_ok":
-            self._session_id = response["session_id"]
-            self._running = True
-        elif response.get("type") == "error":
-            raise ConnectionError(f"Auth failed: {response.get('message')}")
-        else:
+        try:
+            await self._send({
+                "type": "auth",
+                "agent_id": self.agent_id,
+                "token": self.token,
+                "capabilities": self.capabilities,
+            })
+
+            raw = await asyncio.wait_for(self._ws.recv(), timeout=self.connect_timeout)
+            response = json.loads(raw)
+            if not isinstance(response, dict):
+                raise ConnectionError("Unexpected non-object handshake response")
+
+            resp_type = response.get("type")
+            if resp_type == "auth_ok":
+                self._session_id = str(response.get("session_id") or "")
+                self._running = True
+                return
+            if resp_type in ("error", "auth_error"):
+                detail = response.get("message") or response.get("reason") or response.get("code") or "unauthorized"
+                raise ConnectionError(f"Auth failed: {detail}")
             raise ConnectionError(f"Unexpected response: {response}")
+        except ConnectionError:
+            await self._close_ws_quietly()
+            raise
+        except (TimeoutError, asyncio.TimeoutError) as e:
+            await self._close_ws_quietly()
+            raise ConnectionError("Auth handshake timed out") from e
+        except Exception as e:
+            await self._close_ws_quietly()
+            raise ConnectionError(f"Handshake failed: {e}") from e
 
     async def disconnect(self) -> None:
         """Close the WebSocket connection and stop the message loop."""
         self._running = False
-        if self._ws:
-            await self._ws.close()
-            self._ws = None
+        await self._close_ws_quietly()
+
+    async def _close_ws_quietly(self) -> None:
+        ws = self._ws
+        self._ws = None
+        if ws is not None:
+            try:
+                await ws.close()
+            except Exception:
+                pass
 
     async def __aenter__(self) -> "AgentChatClient":
         await self.connect()
@@ -162,43 +219,61 @@ class AgentChatClient:
         while self._running and self._ws:
             try:
                 raw = await self._ws.recv()
-                data = json.loads(raw)
-                msg_type = data.get("type")
+            except websockets.ConnectionClosed:
+                break
 
+            try:
+                data = json.loads(raw)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                continue
+            if not isinstance(data, dict):
+                continue
+
+            msg_type = data.get("type")
+            if msg_type == "auth_error":
+                self._running = False
+                await self._close_ws_quietly()
+                detail = data.get("message") or data.get("reason") or data.get("code") or "unauthorized"
+                raise ConnectionError(f"Auth error: {detail}")
+
+            if msg_type in ("please_reconnect", "shard_moved"):
+                await self._close_ws_quietly()
+                break
+
+            try:
                 if msg_type == "message":
                     msg = ChatMessage(
-                        id=data["id"],
-                        channel_id=data["channel_id"],
-                        sender_id=data["sender_id"],
-                        sender_type=SenderType(data["sender_type"]),
-                        content=data["content"],
-                        content_type=ContentType(data["content_type"]),
-                        timestamp=data["timestamp"],
+                        id=str(data["id"]),
+                        channel_id=str(data["channel_id"]),
+                        sender_id=str(data["sender_id"]),
+                        sender_type=_safe_sender_type(data.get("sender_type")),
+                        content=str(data.get("content", "")),
+                        content_type=_safe_content_type(data.get("content_type")),
+                        timestamp=str(data.get("timestamp", "")),
                     )
                     yield msg
 
                 elif msg_type == "vote_result":
                     result = VoteResult(
                         proposal_id=data["proposal_id"],
-                        passed=data["passed"],
-                        approve_count=data["approve_count"],
-                        reject_count=data["reject_count"],
-                        abstain_count=data["abstain_count"],
-                        total_voters=data["total_voters"],
+                        passed=bool(data["passed"]),
+                        approve_count=int(data["approve_count"]),
+                        reject_count=int(data["reject_count"]),
+                        abstain_count=int(data["abstain_count"]),
+                        total_voters=int(data["total_voters"]),
                     )
-                    for handler in self._vote_handlers:
-                        handler(result)
+                    self._dispatch_handlers(self._vote_handlers, result)
 
                 elif msg_type in ("agent_online", "agent_offline"):
+                    agent_id_val = str(data["agent_id"])
                     card = AgentCard(
-                        agent_id=data["agent_id"],
-                        display_name=data["display_name"],
-                        capabilities=data["capabilities"],
-                        reputation=0,
-                        status="online" if msg_type == "agent_online" else "offline",
+                        agent_id=agent_id_val,
+                        display_name=str(data.get("display_name") or agent_id_val),
+                        capabilities=list(data.get("capabilities") or []),
+                        reputation=float(data.get("reputation", 0)),
+                        status=AgentStatus.ONLINE if msg_type == "agent_online" else AgentStatus.OFFLINE,
                     )
-                    for handler in self._presence_handlers:
-                        handler(card)
+                    self._dispatch_handlers(self._presence_handlers, card)
 
                 elif msg_type == "reaction_update":
                     update = ReactionUpdate(
@@ -206,62 +281,68 @@ class AgentChatClient:
                         channel_id=data["channel_id"],
                         reactions=data["reactions"],
                     )
-                    for handler in self._reaction_handlers:
-                        handler(update)
+                    self._dispatch_handlers(self._reaction_handlers, update)
 
                 elif msg_type == "thread_reply":
+                    parent_id = data.get("parent_id") or data.get("thread_id")
+                    if not parent_id:
+                        continue
                     reply = ThreadReply(
-                        id=data["id"], parent_id=data["parent_id"],
-                        channel_id=data["channel_id"], sender_id=data["sender_id"],
-                        sender_type=SenderType(data["sender_type"]),
-                        content=data["content"], timestamp=data["timestamp"],
+                        id=str(data["id"]),
+                        parent_id=str(parent_id),
+                        channel_id=str(data["channel_id"]),
+                        sender_id=str(data["sender_id"]),
+                        sender_type=_safe_sender_type(data.get("sender_type")),
+                        content=str(data.get("content", "")),
+                        timestamp=str(data.get("timestamp", "")),
                     )
-                    for handler in self._thread_handlers:
-                        handler(reply)
+                    self._dispatch_handlers(self._thread_handlers, reply)
 
                 elif msg_type == "thread_update":
+                    parent_id = data.get("parent_id") or data.get("thread_id")
+                    if not parent_id:
+                        continue
                     update = ThreadUpdate(
-                        parent_id=data["parent_id"], channel_id=data["channel_id"],
-                        reply_count=data["reply_count"], last_reply_at=data["last_reply_at"],
+                        parent_id=str(parent_id),
+                        channel_id=str(data["channel_id"]),
+                        reply_count=int(data["reply_count"]),
+                        last_reply_at=str(data.get("last_reply_at", "")),
                     )
-                    for handler in self._thread_handlers:
-                        handler(update)
+                    self._dispatch_handlers(self._thread_handlers, update)
 
                 elif msg_type == "message_edited":
                     edited = MessageEdited(
-                        message_id=data["message_id"], channel_id=data["channel_id"],
-                        new_content=data["new_content"], edited_at=data["edited_at"],
+                        message_id=data["message_id"],
+                        channel_id=data["channel_id"],
+                        new_content=data["new_content"],
+                        edited_at=data["edited_at"],
                     )
-                    for handler in self._edit_handlers:
-                        handler(edited)
+                    self._dispatch_handlers(self._edit_handlers, edited)
 
                 elif msg_type == "message_deleted":
                     deleted = MessageDeleted(
-                        message_id=data["message_id"], channel_id=data["channel_id"],
+                        message_id=data["message_id"],
+                        channel_id=data["channel_id"],
                     )
-                    for handler in self._delete_handlers:
-                        handler(deleted)
+                    self._dispatch_handlers(self._delete_handlers, deleted)
 
-                elif msg_type == "channel_archived":
-                    pass  # channel became read-only
-
-                elif msg_type == "topic_update":
-                    pass  # channel topic changed
-
-                elif msg_type == "message_ack":
-                    pass  # delivery confirmation
-
-                elif msg_type in ("pin_update", "read_receipt_update", "role_update", "agent_status", "typing"):
-                    pass  # handled by specific handlers if registered
-
-                elif msg_type == "pong":
-                    pass  # heartbeat response
+                elif msg_type in (
+                    "channel_archived",
+                    "topic_update",
+                    "message_ack",
+                    "pin_update",
+                    "read_receipt_update",
+                    "role_update",
+                    "agent_status",
+                    "typing",
+                    "pong",
+                ):
+                    pass
 
                 elif msg_type == "error":
-                    print(f"[AgentsChat Error] {data.get('code')}: {data.get('message')}")
-
-            except websockets.ConnectionClosed:
-                break
+                    pass
+            except (KeyError, TypeError, ValueError):
+                continue
 
     # MARK: - Channels
 
@@ -344,8 +425,11 @@ class AgentChatClient:
             The generated proposal ID (UUID string).
         """
         self._validate_not_empty(channel_id=channel_id, title=title, content=content)
+        if expires_in_hours <= 0:
+            raise ValueError("expires_in_hours must be > 0")
         proposal_id = str(uuid.uuid4())
-        expires_at = datetime.now(timezone.utc).isoformat()  # simplified
+        now = datetime.now(timezone.utc)
+        expires_at = (now + timedelta(hours=expires_in_hours)).isoformat()
         await self._send({
             "type": "proposal",
             "id": proposal_id,
@@ -356,7 +440,7 @@ class AgentChatClient:
             "code_diff": code_diff,
             "consensus_rule": consensus_rule.value,
             "expires_at": expires_at,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": now.isoformat(),
         })
         return proposal_id
 
@@ -616,15 +700,28 @@ class AgentChatClient:
         Args:
             interval: Seconds between pings. Defaults to 30.
         """
+        if interval <= 0:
+            raise ValueError("interval must be > 0")
         while self._running:
             await asyncio.sleep(interval)
             if self._ws and self._running:
-                await self._send({
-                    "type": "ping",
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                })
+                try:
+                    await self._send({
+                        "type": "ping",
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    })
+                except (websockets.ConnectionClosed, ConnectionError):
+                    break
 
     # MARK: - Event Handlers
+
+    @staticmethod
+    def _dispatch_handlers(handlers: list[Callable], event: Any) -> None:
+        for handler in list(handlers):
+            try:
+                handler(event)
+            except Exception:
+                pass
 
     def on_vote_result(self, handler: Callable[[VoteResult], None]) -> None:
         """Register a handler for vote results."""
