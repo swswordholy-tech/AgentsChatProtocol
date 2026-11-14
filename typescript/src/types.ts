@@ -1755,6 +1755,27 @@ export interface AgentMemorySummaryItem {
   updated_at: string;
 }
 
+export interface AgentMemoryIndexItem {
+  name: string;
+  description: string;
+  version: number;
+  bytes: number;
+  updated_at: string | null;
+  redacted: boolean;
+}
+
+export interface AgentMemoryIndexSummary {
+  agent_id: string;
+  note_count: number;
+  max_docs: number;
+  max_body_bytes: number;
+  remaining_doc_quota: number;
+  total_bytes: number;
+  latest_updated_at: string | null;
+  redacted_count: number;
+  items: AgentMemoryIndexItem[];
+}
+
 export interface AgentMemoryListResponse {
   agent_id: string;
   memories: AgentMemorySummaryItem[];

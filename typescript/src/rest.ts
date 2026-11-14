@@ -71,7 +71,7 @@ const ROSTER_ROLES = new Set(["member", "moderator", "admin"]);
 const ROSTER_TYPES = new Set(["agent", "user", "unknown"]);
 const ROSTER_SCOPES = new Set(["owned", "unclaimed", "external"]);
 const SAFE_COLLAB_AGENT_ID_RE = /^[A-Za-z0-9_.-]{1,128}$/;
-const CREDENTIAL_PREFIX_RE = /^(?:ac_|agent_key_|sk[-_]|gh[pousr]_|github_pat_|AIza|eyJ)/i;
+const CREDENTIAL_PREFIX_RE = /^(?:ac_|agent_key_|sk[-_]|rk_(?:live|test)_|gh[pousr]_|github_pat_|glpat-|xox[baprs]-|AKIA[0-9A-Z]{16}|(?:hf|npm)_|AIza|eyJ)/i;
 const EMAIL_ID_RE = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i;
 const PHONE_ID_RE = /^\+?\d[\d ()-]{5,}\d$/;
 
@@ -424,7 +424,7 @@ export function summarizeWorkspaceGraphHierarchy(
 
 const DM_OR_DIRECT_CHANNEL_RE = /^(?:dm[-_]|direct(?:$|[-_:]))/i;
 const EMBEDDED_SECRET_TOKEN_RE =
-  /(?:^|[^A-Za-z0-9])(?:ac_[A-Za-z0-9_-]{8,}|agent_key_[A-Za-z0-9_-]{8,}|sk[-_][A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9_]{8,}|github_pat_[A-Za-z0-9_]{8,}|AIza[A-Za-z0-9_-]{12,}|eyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}|\bBearer\s+[A-Za-z0-9._~+/=-]{16,}|-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----)/i;
+  /(?:^|[^A-Za-z0-9])(?:ac_[A-Za-z0-9_-]{8,}|agent_key_[A-Za-z0-9_-]{8,}|sk[-_][A-Za-z0-9_-]{12,}|rk_(?:live|test)_[A-Za-z0-9]{16,}|gh[pousr]_[A-Za-z0-9_]{8,}|github_pat_[A-Za-z0-9_]{8,}|glpat-[A-Za-z0-9_-]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}(?:$|[^A-Za-z0-9])|(?:hf|npm)_[A-Za-z0-9]{20,}|AIza[A-Za-z0-9_-]{12,}|eyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}|\bBearer\s+[A-Za-z0-9._~+/=-]{16,}|-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----)/i;
 
 function safeNonDmChannelId(value: unknown): value is string {
   return (
@@ -1020,6 +1020,127 @@ export function summarizePersonalSkillsLibrary(
     remaining_active_quota: Math.max(0, PERSONAL_SKILL_ACTIVE_QUOTA - activeCount),
     triggered_count: triggeredCount,
     triggers: [...triggersSet].sort(),
+    items,
+  };
+}
+
+const AGENT_MEMORY_DEFAULT_CAP = 20;
+const AGENT_MEMORY_DEFAULT_BODY_CAP = 256_000;
+
+function isValidMemoryAgentId(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    /^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/.test(value) &&
+    !value.includes("..") &&
+    !/^\d{6,}$/.test(value) &&
+    !CREDENTIAL_PREFIX_RE.test(value) &&
+    !EMBEDDED_SECRET_TOKEN_RE.test(value) &&
+    !EMAIL_ID_RE.test(value) &&
+    !PHONE_ID_RE.test(value)
+  );
+}
+
+export function summarizeAgentMemoryIndex(
+  raw: unknown,
+): import("./types").AgentMemoryIndexSummary | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const payload = raw as Record<string, unknown>;
+  const agentId = typeof payload.agent_id === "string" ? payload.agent_id.trim() : "";
+  if (!isValidMemoryAgentId(agentId)) return null;
+  if (!Array.isArray(payload.memories) || payload.memories.length > 200) return null;
+
+  const maxDocs =
+    typeof payload.max_docs === "number" &&
+    Number.isSafeInteger(payload.max_docs) &&
+    payload.max_docs >= 1 &&
+    payload.max_docs <= 200
+      ? payload.max_docs
+      : AGENT_MEMORY_DEFAULT_CAP;
+  const maxBodyBytes =
+    typeof payload.max_body_bytes === "number" &&
+    Number.isSafeInteger(payload.max_body_bytes) &&
+    payload.max_body_bytes >= 1 &&
+    payload.max_body_bytes <= 10_000_000
+      ? payload.max_body_bytes
+      : AGENT_MEMORY_DEFAULT_BODY_CAP;
+
+  const seenNames = new Set<string>();
+  const items: import("./types").AgentMemoryIndexItem[] = [];
+  let totalBytes = 0;
+  let redactedCount = 0;
+  let latestUpdatedAt: string | null = null;
+  let latestMs = -Infinity;
+
+  for (const entry of payload.memories) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+    const row = entry as Record<string, unknown>;
+    const name = typeof row.name === "string" ? row.name.trim() : "";
+    if (!isValidPersonalSkillSlug(name) || seenNames.has(name)) continue;
+    seenNames.add(name);
+
+    const version =
+      typeof row.version === "number" && Number.isSafeInteger(row.version) && row.version >= 1
+        ? row.version
+        : 1;
+    const bytes =
+      typeof row.bytes === "number" &&
+      Number.isSafeInteger(row.bytes) &&
+      row.bytes >= 0 &&
+      row.bytes <= maxBodyBytes
+        ? row.bytes
+        : 0;
+    const rawDesc = typeof row.description === "string" ? row.description : "";
+    const redacted =
+      rawDesc === "[redacted]" ||
+      EMBEDDED_SECRET_TOKEN_RE.test(rawDesc) ||
+      CREDENTIAL_PREFIX_RE.test(rawDesc.trim());
+    const description = redacted
+      ? ""
+      : rawDesc.replace(/[\u0000-\u001F\u007F]+/g, " ").trim().slice(0, 280);
+    if (redacted) redactedCount += 1;
+
+    const updatedAt =
+      typeof row.updated_at === "string" &&
+      row.updated_at.length <= 80 &&
+      /^\d{4}-\d{2}-\d{2}T/.test(row.updated_at) &&
+      Number.isFinite(Date.parse(row.updated_at))
+        ? row.updated_at
+        : null;
+    if (updatedAt) {
+      const parsed = Date.parse(updatedAt);
+      if (parsed > latestMs) {
+        latestMs = parsed;
+        latestUpdatedAt = updatedAt;
+      }
+    }
+
+    totalBytes += bytes;
+    items.push({
+      name,
+      description,
+      version,
+      bytes,
+      updated_at: updatedAt,
+      redacted,
+    });
+  }
+
+  items.sort((a, b) => {
+    const aMs = a.updated_at ? Date.parse(a.updated_at) : -Infinity;
+    const bMs = b.updated_at ? Date.parse(b.updated_at) : -Infinity;
+    if (aMs !== bMs) return bMs - aMs;
+    return a.name.localeCompare(b.name);
+  });
+
+  return {
+    agent_id: agentId,
+    note_count: items.length,
+    max_docs: maxDocs,
+    max_body_bytes: maxBodyBytes,
+    remaining_doc_quota: Math.max(0, maxDocs - items.length),
+    total_bytes: totalBytes,
+    latest_updated_at: latestUpdatedAt,
+    redacted_count: redactedCount,
     items,
   };
 }
@@ -3996,7 +4117,7 @@ export class AgentChatREST {
 
   private assertMemorySlug(rawName: string): string {
     const safe = rawName?.trim() ?? "";
-    if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/.test(safe) || safe.includes("..")) {
+    if (!isValidPersonalSkillSlug(safe)) {
       throw new Error("Invalid memory name");
     }
     return safe;
@@ -4004,15 +4125,7 @@ export class AgentChatREST {
 
   private containsMemorySecretShape(text: string): boolean {
     if (!text) return false;
-    return (
-      /\bac_[A-Za-z0-9_-]{12,}\b/.test(text) ||
-      /\bsk-(?:ant|proj|live|test)-[A-Za-z0-9_-]{10,}\b/.test(text) ||
-      /\bgh[pousr]_[A-Za-z0-9]{20,}\b/.test(text) ||
-      /\bgithub_pat_[A-Za-z0-9_]{20,}\b/.test(text) ||
-      /\bAIza[0-9A-Za-z_-]{30,}\b/.test(text) ||
-      /\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/.test(text) ||
-      /-----BEGIN (?:RSA |EC |OPENSSH |)PRIVATE KEY-----/.test(text)
-    );
+    return EMBEDDED_SECRET_TOKEN_RE.test(text);
   }
 
   async listMemories(opts?: { bearerToken?: string }): Promise<import("./types").AgentMemoryListResponse> {
@@ -4204,11 +4317,7 @@ export class AgentChatREST {
 
   private assertCloudAgentId(rawId: string): string {
     const safe = rawId?.trim() ?? "";
-    if (
-      !/^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/.test(safe) ||
-      safe.includes("..") ||
-      /^(?:ac_|sk[-_])/i.test(safe)
-    ) {
+    if (!isValidMemoryAgentId(safe)) {
       throw new Error("Invalid cloud agent ID");
     }
     return safe;

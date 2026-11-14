@@ -6,6 +6,7 @@ import {
   evaluateConsensusTally,
   isValidCollaborationRoster,
   resolveInheritedObjectiveChannel,
+  summarizeAgentMemoryIndex,
   summarizeChannelBriefReadiness,
   summarizeChannelOkrSnapshot,
   summarizeChannelThreads,
@@ -3847,5 +3848,96 @@ describe("AgentChatClient realtime collaboration WS events", () => {
     } finally {
       globalThis.fetch = originalFetch;
     }
+  });
+
+  test("summarizeAgentMemoryIndex normalizes memory index quota/redaction and REST memory/cloud-memory guards block multi-cloud secrets & unsafe IDs", async () => {
+    const summary = summarizeAgentMemoryIndex({
+      agent_id: "codex-cloud-01",
+      max_docs: 20,
+      max_body_bytes: 256000,
+      memories: [
+        {
+          name: "lessons-2026.md",
+          description: "Zero-NUL deploy checklist",
+          version: 3,
+          bytes: 512,
+          updated_at: "2026-11-14T01:40:00Z",
+        },
+        {
+          name: "MEMORY",
+          description: "[redacted]",
+          version: 2,
+          bytes: 10,
+          updated_at: "2026-11-14T01:50:00Z",
+        },
+        {
+          name: "legacy_secret_desc",
+          description: "Token env_ac_secret_1234567890",
+          version: 1,
+          bytes: 42,
+          updated_at: "2026-11-14T01:10:00Z",
+        },
+        {
+          name: "bad..slug",
+          description: "skip",
+          version: 1,
+          bytes: 5,
+          updated_at: "2026-11-14T01:55:00Z",
+        },
+      ],
+    });
+
+    expect(summary).toEqual({
+      agent_id: "codex-cloud-01",
+      note_count: 3,
+      max_docs: 20,
+      max_body_bytes: 256000,
+      remaining_doc_quota: 17,
+      total_bytes: 564,
+      latest_updated_at: "2026-11-14T01:50:00Z",
+      redacted_count: 2,
+      items: [
+        {
+          name: "MEMORY",
+          description: "",
+          version: 2,
+          bytes: 10,
+          updated_at: "2026-11-14T01:50:00Z",
+          redacted: true,
+        },
+        {
+          name: "lessons-2026.md",
+          description: "Zero-NUL deploy checklist",
+          version: 3,
+          bytes: 512,
+          updated_at: "2026-11-14T01:40:00Z",
+          redacted: false,
+        },
+        {
+          name: "legacy_secret_desc",
+          description: "",
+          version: 1,
+          bytes: 42,
+          updated_at: "2026-11-14T01:10:00Z",
+          redacted: true,
+        },
+      ],
+    });
+    expect(summarizeAgentMemoryIndex({ agent_id: "child..bad", memories: [] })).toBeNull();
+    expect(summarizeAgentMemoryIndex({ agent_id: "12345678", memories: [] })).toBeNull();
+
+    const rest = new AgentChatREST({ baseUrl: "https://agents-chat.com", bearerToken: "jwt_owner_47" });
+    await expect(rest.getMemory("note_ac_secret_1234567890")).rejects.toThrow("Invalid memory name");
+    await expect(rest.getCloudAgentMemory("child..escape", "runbook")).rejects.toThrow("Invalid cloud agent ID");
+    await expect(rest.getCloudAgentMemory("agent_key_1234567890", "runbook")).rejects.toThrow("Invalid cloud agent ID");
+    await expect(
+      rest.saveMemory("lessons-2026.md", { body_markdown: "AWS key AKIAIOSFODNN7EXAMPLE leaked" }),
+    ).rejects.toThrow("must not contain API keys");
+    await expect(
+      rest.saveCloudAgentMemory("codex-cloud-01", "lessons-2026.md", {
+        body_markdown: "clean body",
+        description: "glpat-1234567890abcdefghij",
+      }),
+    ).rejects.toThrow("must not contain API keys");
   });
 });
