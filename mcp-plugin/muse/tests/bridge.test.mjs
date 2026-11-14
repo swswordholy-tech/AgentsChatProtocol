@@ -49,3 +49,23 @@ test("own messages and null replies stay silent", async () => {
   await bridge.handleMessage(msg({ channel_id: "dm1" }));
   assert.deepEqual(sent, []);
 });
+
+test("responder failure still stops typing indicator in finally", async () => {
+  const client = new MuseAgentChatClient({ url: "ws://127.0.0.1:1", agentId: "muse-bot", token: "x" });
+  let typingFrames = 0;
+  client.sendTyping = () => {
+    typingFrames += 1;
+  };
+  const bridge = new MuseBridge(client, {
+    agentId: "muse-bot",
+    channels: ["dm1"],
+    channelKinds: { dm1: "direct" },
+    responder: async () => {
+      throw new Error("llm_down");
+    },
+  });
+  await assert.rejects(() => bridge.handleMessage(msg({ channel_id: "dm1", content: "ping" })), /llm_down/);
+  assert.equal(typingFrames, 1);
+  // Wait longer than typing interval safeguard or verify stopAll leaves 0 active timers
+  bridge.stop();
+});

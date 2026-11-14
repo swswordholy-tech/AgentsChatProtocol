@@ -105,7 +105,7 @@ class MuseBridge {
   constructor(client, opts) {
     this.client = client;
     this.opts = opts;
-    this.client.onMessage((m) => void this.handleMessage(m));
+    this.client.onMessage((m) => this.handleMessage(m));
   }
   async start() {
     await this.client.connect();
@@ -117,12 +117,18 @@ class MuseBridge {
       this.client.joinChannel(channelId);
   }
   stop() {
+    this.typing.stopAll();
     this.client.disconnect();
   }
   get isConnected() {
     return this.client.isConnected;
   }
   async handleMessage(message) {
+    if (!this.history.has(message.channel_id) && this.history.size >= 200) {
+      const oldest = this.history.keys().next().value;
+      if (oldest !== undefined)
+        this.history.delete(oldest);
+    }
     const list = this.history.get(message.channel_id) ?? [];
     list.push(message);
     this.history.set(message.channel_id, list.slice(-50));
@@ -131,17 +137,26 @@ class MuseBridge {
       return;
     }
     this.typing.start(message.channel_id);
-    const ctx = {
-      message,
-      channelKind: kind,
-      history: [...this.history.get(message.channel_id) ?? []],
-      context: buildContext(this.history.get(message.channel_id) ?? [], this.opts.agentId)
-    };
-    const reply = await this.opts.responder(ctx);
-    if (reply)
-      this.client.sendMessage(message.channel_id, reply);
-    this.typing.stop(message.channel_id);
+    try {
+      const ctx = {
+        message,
+        channelKind: kind,
+        history: [...this.history.get(message.channel_id) ?? []],
+        context: buildContext(this.history.get(message.channel_id) ?? [], this.opts.agentId)
+      };
+      const reply = await this.opts.responder(ctx);
+      if (reply)
+        this.client.sendMessage(message.channel_id, reply);
+    } finally {
+      this.typing.stop(message.channel_id);
+    }
   }
+}
+
+// src/reconnect.ts
+function computePleaseReconnectDelay(jitterMs, rand = Math.random) {
+  const maxJitter = typeof jitterMs === "number" && Number.isFinite(jitterMs) && jitterMs > 0 ? Math.min(Math.floor(jitterMs), 1e4) : 2000;
+  return 200 + Math.floor(rand() * maxJitter);
 }
 
 // muse/src/client.ts
@@ -150,6 +165,8 @@ class MuseAgentChatClient {
   sessionId = null;
   heartbeatTimer = null;
   reconnectTimer = null;
+  connectTimer = null;
+  nextReconnectDelayOverrideMs = null;
   messageHandlers = [];
   errorHandlers = [];
   connectResolve = null;
@@ -164,6 +181,7 @@ class MuseAgentChatClient {
   token;
   capabilities;
   heartbeatIntervalMs;
+  connectTimeoutMs;
   reconnect;
   initialReconnectDelayMs;
   maxReconnectDelayMs;
@@ -175,20 +193,51 @@ class MuseAgentChatClient {
     this.token = options.token;
     this.capabilities = options.capabilities ?? ["chat"];
     this.heartbeatIntervalMs = options.heartbeatIntervalMs ?? 30000;
+    this.connectTimeoutMs = options.connectTimeoutMs ?? 15000;
     this.reconnect = options.reconnect ?? true;
     this.initialReconnectDelayMs = options.initialReconnectDelayMs ?? 1000;
     this.maxReconnectDelayMs = options.maxReconnectDelayMs ?? 60000;
     this.onDebug = options.onDebug;
     this.onReconnect = options.onReconnect;
   }
+  clearConnectTimer() {
+    if (this.connectTimer) {
+      clearTimeout(this.connectTimer);
+      this.connectTimer = null;
+    }
+  }
+  emitError(err) {
+    for (const h of this.errorHandlers) {
+      try {
+        h(err);
+      } catch {}
+    }
+  }
   connect() {
     return new Promise((resolve, reject) => {
+      this.clearConnectTimer();
       this.connectSettled = false;
       this.explicitlyDisconnected = false;
       this.reconnectAttempt = 0;
       this.isReconnecting = false;
       this.connectResolve = resolve;
       this.connectReject = reject;
+      if (this.connectTimeoutMs > 0) {
+        this.connectTimer = setTimeout(() => {
+          this.connectTimer = null;
+          if (!this.connectSettled) {
+            const err = new Error(`AgentsChat connect timed out after ${this.connectTimeoutMs}ms`);
+            this.connectSettled = true;
+            this.explicitlyDisconnected = true;
+            try {
+              this.ws?.close();
+            } catch {}
+            this.connectReject?.(err);
+            this.emitError(err);
+          }
+        }, this.connectTimeoutMs);
+        this.connectTimer.unref?.();
+      }
       this.openSocket();
     });
   }
@@ -208,13 +257,20 @@ class MuseAgentChatClient {
   }
   disconnect() {
     this.explicitlyDisconnected = true;
+    this.clearConnectTimer();
     if (this.reconnectTimer)
       clearTimeout(this.reconnectTimer);
     if (this.heartbeatTimer)
       clearInterval(this.heartbeatTimer);
     this.reconnectTimer = null;
     this.heartbeatTimer = null;
-    this.ws?.close();
+    if (!this.connectSettled) {
+      this.connectSettled = true;
+      this.connectReject?.(new Error("Disconnected before authentication completed"));
+    }
+    try {
+      this.ws?.close();
+    } catch {}
     this.ws = null;
     this.sessionId = null;
     this.lifecycleResolve?.();
@@ -269,23 +325,34 @@ class MuseAgentChatClient {
       if (this.heartbeatTimer)
         clearInterval(this.heartbeatTimer);
       this.heartbeatTimer = setInterval(() => {
-        this.send({ type: "ping", timestamp: new Date().toISOString() });
+        if (this.ws?.readyState === WebSocket.OPEN) {
+          this.send({ type: "ping", timestamp: new Date().toISOString() });
+        }
       }, this.heartbeatIntervalMs);
+      this.heartbeatTimer.unref?.();
     };
     ws.onmessage = (event) => this.handleMessage(String(event.data));
     ws.onerror = () => {
       const err = new Error("WebSocket error");
       if (!this.connectSettled) {
+        this.clearConnectTimer();
         this.connectSettled = true;
         this.connectReject?.(err);
       }
-      this.errorHandlers.forEach((h) => h(err));
+      this.emitError(err);
     };
     ws.onclose = () => {
+      if (this.ws && this.ws !== ws)
+        return;
       if (this.heartbeatTimer)
         clearInterval(this.heartbeatTimer);
       this.heartbeatTimer = null;
       this.sessionId = null;
+      if (!this.connectSettled && !this.reconnect) {
+        this.clearConnectTimer();
+        this.connectSettled = true;
+        this.connectReject?.(new Error("WebSocket closed before authentication"));
+      }
       if (this.explicitlyDisconnected) {
         this.lifecycleResolve?.();
         return;
@@ -294,11 +361,18 @@ class MuseAgentChatClient {
         this.lifecycleResolve?.();
         return;
       }
-      const delay = Math.min(this.initialReconnectDelayMs * 2 ** this.reconnectAttempt, this.maxReconnectDelayMs);
-      this.reconnectAttempt += 1;
+      let delay;
+      if (this.nextReconnectDelayOverrideMs !== null) {
+        delay = this.nextReconnectDelayOverrideMs;
+        this.nextReconnectDelayOverrideMs = null;
+      } else {
+        delay = Math.min(this.initialReconnectDelayMs * 2 ** this.reconnectAttempt, this.maxReconnectDelayMs);
+        this.reconnectAttempt += 1;
+      }
       this.isReconnecting = true;
       this.debug("reconnect:scheduled", { delayMs: delay, attempt: this.reconnectAttempt });
       this.reconnectTimer = setTimeout(() => this.openSocket(), delay);
+      this.reconnectTimer.unref?.();
     };
   }
   send(payload) {
@@ -315,6 +389,7 @@ class MuseAgentChatClient {
       return;
     }
     if (msg.type === "auth_ok") {
+      this.clearConnectTimer();
       this.sessionId = typeof msg.session_id === "string" ? msg.session_id : null;
       this.reconnectAttempt = 0;
       const wasReconnect = this.isReconnecting;
@@ -327,22 +402,40 @@ class MuseAgentChatClient {
       }
       return;
     }
-    if (msg.type === "error") {
-      const err = new Error(typeof msg.message === "string" ? msg.message : "AgentsChat error");
+    if (msg.type === "auth_error" || msg.type === "error") {
+      const text = typeof msg.error === "string" ? msg.error : typeof msg.message === "string" ? msg.message : msg.type === "auth_error" ? "AgentsChat authentication error" : "AgentsChat error";
+      const err = new Error(text);
+      if (msg.type === "auth_error") {
+        this.explicitlyDisconnected = true;
+        try {
+          this.ws?.close();
+        } catch {}
+      }
       if (!this.connectSettled) {
+        this.clearConnectTimer();
         this.connectSettled = true;
         this.connectReject?.(err);
       }
-      this.errorHandlers.forEach((h) => h(err));
+      this.emitError(err);
+      return;
+    }
+    if (msg.type === "please_reconnect" || msg.type === "shard_moved") {
+      const withinMs = typeof msg.within_ms === "number" ? msg.within_ms : undefined;
+      this.nextReconnectDelayOverrideMs = computePleaseReconnectDelay(withinMs);
+      this.reconnectAttempt = 0;
+      try {
+        this.ws?.close();
+      } catch {}
       return;
     }
     if (msg.type === "pong")
       return;
     if (msg.type === "channel_created" && typeof msg.channel_id === "string" && msg.channel_id) {
-      this.joinChannel(msg.channel_id);
+      if (this.ws?.readyState === WebSocket.OPEN)
+        this.joinChannel(msg.channel_id);
       return;
     }
-    if (msg.type === "message") {
+    if (msg.type === "message" || msg.type === "thread_reply") {
       const chat = {
         id: String(msg.id ?? ""),
         channel_id: String(msg.channel_id ?? ""),
@@ -352,10 +445,17 @@ class MuseAgentChatClient {
         content_type: msg.content_type ?? "text",
         timestamp: String(msg.timestamp ?? new Date().toISOString()),
         channel_type: msg.channel_type,
-        thread_id: typeof msg.thread_id === "string" ? msg.thread_id : undefined
+        thread_id: typeof msg.thread_id === "string" ? msg.thread_id : typeof msg.parent_id === "string" ? msg.parent_id : undefined
       };
-      for (const h of this.messageHandlers)
-        h(chat);
+      for (const h of this.messageHandlers) {
+        try {
+          Promise.resolve(h(chat)).catch((err) => {
+            this.emitError(err instanceof Error ? err : new Error(String(err)));
+          });
+        } catch (err) {
+          this.emitError(err instanceof Error ? err : new Error(String(err)));
+        }
+      }
     }
   }
 }
@@ -448,6 +548,7 @@ async function fireWake(msg, cfg) {
     const f = cfg.fetchImpl ?? fetch;
     const ctrl = new AbortController;
     const t = setTimeout(() => ctrl.abort(), cfg.timeoutMs ?? 5000);
+    t.unref?.();
     try {
       const res = await f(url, { method: "POST", headers, body, signal: ctrl.signal });
       if (!res.ok)

@@ -23,6 +23,7 @@ export interface MuseAgentChatOptions {
   token: string;
   capabilities?: string[];
   heartbeatIntervalMs?: number;
+  connectTimeoutMs?: number;
   reconnect?: boolean;
   initialReconnectDelayMs?: number;
   maxReconnectDelayMs?: number;

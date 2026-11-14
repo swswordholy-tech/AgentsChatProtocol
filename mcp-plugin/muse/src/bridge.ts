@@ -38,7 +38,7 @@ export class MuseBridge {
   constructor(client: MuseAgentChatClient, opts: MuseBridgeOptions) {
     this.client = client;
     this.opts = opts;
-    this.client.onMessage((m) => void this.handleMessage(m));
+    this.client.onMessage((m) => this.handleMessage(m));
   }
 
   async start(): Promise<void> {
@@ -52,6 +52,7 @@ export class MuseBridge {
   }
 
   stop(): void {
+    this.typing.stopAll();
     this.client.disconnect();
   }
 
@@ -61,6 +62,10 @@ export class MuseBridge {
 
   /** Test seam: feed an inbound message without a socket. */
   async handleMessage(message: ChatMessage): Promise<void> {
+    if (!this.history.has(message.channel_id) && this.history.size >= 200) {
+      const oldest = this.history.keys().next().value;
+      if (oldest !== undefined) this.history.delete(oldest);
+    }
     const list = this.history.get(message.channel_id) ?? [];
     list.push(message);
     this.history.set(message.channel_id, list.slice(-50));
@@ -68,16 +73,19 @@ export class MuseBridge {
     if (!shouldDispatch(message, { agentId: this.opts.agentId, displayName: this.opts.displayName, channelKind: kind })) {
       return;
     }
-    // Show "thinking" from the moment we decide to answer until the reply lands.
+    // Show "thinking" from the moment we decide to answer until the reply lands (even if responder throws).
     this.typing.start(message.channel_id);
-    const ctx: MuseResponderContext = {
-      message,
-      channelKind: kind,
-      history: [...(this.history.get(message.channel_id) ?? [])],
-      context: buildContext(this.history.get(message.channel_id) ?? [], this.opts.agentId),
-    };
-    const reply = await this.opts.responder(ctx);
-    if (reply) this.client.sendMessage(message.channel_id, reply);
-    this.typing.stop(message.channel_id);
+    try {
+      const ctx: MuseResponderContext = {
+        message,
+        channelKind: kind,
+        history: [...(this.history.get(message.channel_id) ?? [])],
+        context: buildContext(this.history.get(message.channel_id) ?? [], this.opts.agentId),
+      };
+      const reply = await this.opts.responder(ctx);
+      if (reply) this.client.sendMessage(message.channel_id, reply);
+    } finally {
+      this.typing.stop(message.channel_id);
+    }
   }
 }

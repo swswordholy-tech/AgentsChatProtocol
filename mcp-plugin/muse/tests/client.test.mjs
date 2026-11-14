@@ -176,3 +176,103 @@ test("client reconnects after a transient drop and re-authenticates", async () =
     await server.close();
   }
 });
+
+test("auth_error rejects connect() immediately and stops reconnect loops", async () => {
+  const server = new MockServer();
+  const port = await server.listen();
+  server.onMessage = (msg, socket) => {
+    if (msg.type === "auth") {
+      server.send(socket, { type: "auth_error", error: "invalid_token" });
+    }
+  };
+  const client = new MuseAgentChatClient({
+    url: `ws://127.0.0.1:${port}`,
+    agentId: "muse-bot",
+    token: "bad-token",
+    initialReconnectDelayMs: 25,
+    maxReconnectDelayMs: 50,
+  });
+  try {
+    await assert.rejects(() => client.connect(), /invalid_token/);
+    await new Promise((r) => setTimeout(r, 90));
+    assert.equal(server.connections, 1);
+  } finally {
+    client.disconnect();
+    await server.close();
+  }
+});
+
+test("connectTimeoutMs rejects stalled auth handshakes cleanly", async () => {
+  const server = new MockServer();
+  const port = await server.listen();
+  server.onMessage = () => {
+    // Intentionally never reply to auth
+  };
+  const client = new MuseAgentChatClient({
+    url: `ws://127.0.0.1:${port}`,
+    agentId: "muse-bot",
+    token: "t",
+    connectTimeoutMs: 80,
+    initialReconnectDelayMs: 25,
+  });
+  try {
+    await assert.rejects(() => client.connect(), /timed out/);
+    await new Promise((r) => setTimeout(r, 80));
+    assert.equal(server.connections, 1);
+  } finally {
+    client.disconnect();
+    await server.close();
+  }
+});
+
+test("thread_reply delivery, shard_moved reconnect, and async onMessage error routing", async () => {
+  const server = new MockServer();
+  const port = await server.listen();
+  server.onMessage = (msg, socket) => {
+    if (msg.type === "auth") {
+      server.send(socket, { type: "auth_ok", agent_id: msg.agent_id, session_id: `s-${server.connections}` });
+    }
+  };
+  const inbound = [];
+  const errors = [];
+  let reconnected = 0;
+  const client = new MuseAgentChatClient({
+    url: `ws://127.0.0.1:${port}`,
+    agentId: "muse-bot",
+    token: "t",
+    heartbeatIntervalMs: 60_000,
+    initialReconnectDelayMs: 5_000,
+    maxReconnectDelayMs: 10_000,
+    onReconnect: () => {
+      reconnected += 1;
+    },
+  });
+  client.onError((err) => errors.push(err.message));
+  client.onMessage(async (m) => {
+    inbound.push(m);
+    if (m.content === "boom") throw new Error("handler_boom");
+  });
+  try {
+    await client.connect();
+    server.send(server.sockets[0], {
+      type: "thread_reply",
+      id: "tr1",
+      channel_id: "general",
+      parent_id: "root-99",
+      sender_id: "alice",
+      sender_type: "agent",
+      content: "boom",
+      content_type: "text",
+      timestamp: new Date().toISOString(),
+    });
+    await waitFor(() => inbound.length === 1 && errors.includes("handler_boom"), "thread_reply + async error");
+    assert.equal(inbound[0].thread_id, "root-99");
+
+    // shard_moved with within_ms:0 should bypass the 5_000ms exponential backoff
+    server.send(server.sockets[0], { type: "shard_moved", within_ms: 0 });
+    await waitFor(() => reconnected >= 1 && client.session === "s-2", "fast shard_moved reconnect", 1500);
+  } finally {
+    client.disconnect();
+    await server.close();
+  }
+});

@@ -135,6 +135,7 @@ export async function fireWake(msg: WakeMessage, cfg: WakeConfig): Promise<void>
     const f = cfg.fetchImpl ?? fetch;
     const ctrl = new AbortController();
     const t = setTimeout(() => ctrl.abort(), cfg.timeoutMs ?? 5000);
+    t.unref?.();
     try {
       const res = await f(url, { method: "POST", headers, body, signal: ctrl.signal });
       if (!res.ok) log(`[muse-agentchat] wake POST ${url} → HTTP ${res.status}`);
