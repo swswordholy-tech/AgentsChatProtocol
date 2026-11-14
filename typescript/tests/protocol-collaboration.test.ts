@@ -5,8 +5,10 @@ import {
   computeLocalTaskActionability,
   evaluateConsensusTally,
   extractResolvedMentions,
+  filterWorkspaceEntitiesSince,
   isPrivateOrReservedHost,
   isValidCollaborationRoster,
+  rankDiscoverableChannels,
   resolveAgentMention,
   resolveInheritedObjectiveChannel,
   scheduleReadyDagTasks,
@@ -5559,5 +5561,70 @@ describe("AgentChatClient realtime collaboration WS events", () => {
       { senderId: "bob", displayNameOf: dn },
     );
     expect(mentioned).toEqual(["tweed-reactive-lidar", "bobby", "swswordholy@gmail.com"]);
+  });
+
+  test("Campaign #64: filterWorkspaceEntitiesSince tracks 3-layer sub-Objective parents & NaN timestamps, and rankDiscoverableChannels/discoverChannels sanitize & rank rooms", async () => {
+    const since = Date.parse("2026-11-14T07:00:00Z");
+    const diff = filterWorkspaceEntitiesSince(
+      {
+        objectives: [
+          { id: "obj-root", updated_at: "2026-11-14T01:00:00Z" },
+          { id: "obj-archived", archived: true, updated_at: "2026-11-14T01:00:00Z" },
+          { id: "obj-child", parent_id: "obj-root", updated_at: "2026-11-14T07:05:00Z" },
+          { id: "obj-child", parent_id: "obj-root", updated_at: "2026-11-14T07:05:00Z" },
+          { id: "obj-archived-child", parent_id: "obj-archived", updated_at: "2026-11-14T07:06:00Z" },
+        ],
+        keyResults: [{ id: "kr-1", objective_id: "obj-child", updated_at: "2026-11-14T07:07:00Z" }],
+        tasks: [
+          {
+            id: "t-1",
+            objective_id: "obj-child",
+            depends_on: ["t-unchanged", "t-1", "dm-secret", "mr_0123456789abcdef0123", "mcp_at_secret123456"],
+            updatedAt: Number.NaN,
+          },
+        ],
+        channelDocs: [{ id: "doc-1", channel_id: "room-1", updatedAt: "1794640080000" }],
+      },
+      since,
+      "room-1",
+    );
+    expect(diff.objectives.map((o) => o.id)).toEqual(["obj-child", "obj-archived-child"]);
+    expect(diff.tasks.map((t) => t.id)).toEqual(["t-1"]);
+    expect(diff.channelDocs.map((d) => d.id)).toEqual(["doc-1"]);
+    expect(diff.referencedUnchangedIds.sort()).toEqual(["obj-root", "t-unchanged"]);
+
+    const ranked = rankDiscoverableChannels(
+      [
+        { id: "small", member_count: 2, online_agent_count: 0, created_at: "2026-11-14T00:00:00Z" },
+        { id: "live-hub", member_count: 5, online_agent_count: 3, created_at: "2026-11-01T00:00:00Z" },
+        { id: "live-hub", member_count: 5, online_agent_count: 3 },
+        { id: "dm:secret", member_count: 99, online_agent_count: 99 },
+        { id: "arena-match", member_count: 99, online_agent_count: 99 },
+        { id: "mr_0123456789abcdef0123", member_count: 99, online_agent_count: 99 },
+      ],
+      10,
+    );
+    expect(ranked.map((r) => r.id)).toEqual(["live-hub", "small"]);
+
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = (async () =>
+      new Response(
+        JSON.stringify({
+          channels: [
+            { id: "room-b", member_count: 3, online_agent_count: 1, created_at: "2026-11-10T00:00:00Z" },
+            { id: "dm-leak", member_count: 50, online_agent_count: 50 },
+            { id: "room-a", member_count: 8, online_agent_count: 4, created_at: "2026-11-01T00:00:00Z" },
+            { id: "room-a", member_count: 8, online_agent_count: 4 },
+          ],
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      )) as any;
+    try {
+      const rest = new AgentChatREST({ baseUrl: "https://agents-chat.com", bearerToken: "jwt_test" });
+      const discovered = await rest.discoverChannels("agent", 10);
+      expect(discovered.map((c) => c.id)).toEqual(["room-a", "room-b"]);
+    } finally {
+      globalThis.fetch = origFetch;
+    }
   });
 });

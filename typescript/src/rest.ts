@@ -3331,6 +3331,195 @@ export function extractResolvedMentions(
   return out;
 }
 
+const SDK_PROTOTYPE_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+const SDK_UNSAFE_REF_RE =
+  /(?:^dm[-:]|^mr_[0-9a-f]{16,}$|(?:^|[^A-Za-z0-9])(?:mcp_(?:at|rt|code)_|ac_[A-Za-z0-9_+/\-=]{6,}|agent_key_|sk[-_][A-Za-z0-9_-]{8,}|rk_(?:live|test)_|gh[pousr]_|github_pat_|glpat-|xox[baprs]-|(?:hf|npm)_[A-Za-z0-9]{8,}|(?:AIza|eyJ)[A-Za-z0-9][A-Za-z0-9._-]{5,}))/i;
+const SDK_AWS_KEY_ID_RE = /(?:^|[^A-Za-z0-9])(?:AKIA|ASIA)[0-9A-Z]{16}(?=$|[^A-Za-z0-9])/i;
+
+function isSafeSdkWorkspaceRefId(id: unknown): id is string {
+  if (typeof id !== "string") return false;
+  const trimmed = id.trim();
+  if (!trimmed || trimmed !== id || trimmed.length > 128) return false;
+  if (/[\u0000-\u001f\u007f\s]/.test(trimmed)) return false;
+  if (SDK_PROTOTYPE_KEYS.has(trimmed.toLowerCase())) return false;
+  if (SDK_UNSAFE_REF_RE.test(trimmed) || SDK_AWS_KEY_ID_RE.test(trimmed)) return false;
+  return true;
+}
+
+function dedupeSdkRowsById<T extends Record<string, any>>(rows: ReadonlyArray<T> | null | undefined): T[] {
+  if (!Array.isArray(rows)) return [];
+  const seen = new Set<string>();
+  const out: T[] = [];
+  for (const row of rows) {
+    if (!row || typeof row !== "object") continue;
+    const id = typeof row.id === "string" ? row.id : "";
+    if (id) {
+      if (seen.has(id)) continue;
+      seen.add(id);
+    }
+    out.push(row);
+  }
+  return out;
+}
+
+function sdkEntityUpdatedMs(e: any): number {
+  const v = e?.updated_at ?? e?.updatedAt;
+  if (typeof v === "number") return Number.isFinite(v) && v >= 0 ? v : Infinity;
+  if (typeof v === "string") {
+    const trimmed = v.trim();
+    if (!trimmed) return Infinity;
+    const t = Date.parse(trimmed);
+    if (!Number.isNaN(t)) return t;
+    if (/^\d{9,16}$/.test(trimmed)) {
+      const asNum = Number(trimmed);
+      if (Number.isFinite(asNum)) return asNum;
+    }
+    return Infinity;
+  }
+  return Infinity;
+}
+
+/**
+ * Pure zero-I/O `?since=` incremental filter mirroring `src/workspace-since.ts`,
+ * including 3-layer sub-Objective `parent_id` unchanged-ancestor tracking, `NaN`
+ * fail-open timestamp handling, entity deduplication, and unsafe reference rejection.
+ */
+export function filterWorkspaceEntitiesSince(
+  entities: import("./types").WorkspaceSinceEntities,
+  sinceMs: number,
+  scopeChannelId?: string,
+  allowedParentIds?: ReadonlySet<string>,
+): import("./types").WorkspaceSinceFilterResult {
+  const safeSince = typeof sinceMs === "number" && Number.isFinite(sinceMs) ? sinceMs : 0;
+  const changed = (e: any) => sdkEntityUpdatedMs(e) >= safeSince;
+  const projectLinks = (row: any) => {
+    if (!scopeChannelId) return row;
+    const out = { ...row };
+    for (const field of ["linked_docs", "linked_channel_docs"]) {
+      if (Array.isArray(row?.[field])) {
+        out[field] = row[field].filter((ref: any) => ref && (!ref.channel_id || ref.channel_id === scopeChannelId));
+      }
+    }
+    return out;
+  };
+  const rawObjectives = Array.isArray(entities?.objectives) ? entities.objectives : [];
+  const rawKrs = Array.isArray(entities?.keyResults) ? entities.keyResults : [];
+  const rawTasks = Array.isArray(entities?.tasks) ? entities.tasks : [];
+  const rawDocs = Array.isArray(entities?.channelDocs) ? entities.channelDocs : [];
+
+  const archivedObjectiveIds = new Set(
+    rawObjectives.filter((o) => o?.archived === true && typeof o?.id === "string").map((o) => o.id as string),
+  );
+  const objectives = dedupeSdkRowsById(rawObjectives.filter(changed)).map(projectLinks);
+  const keyResults = dedupeSdkRowsById(rawKrs.filter(changed)).map(projectLinks);
+  const tasks = dedupeSdkRowsById(rawTasks.filter(changed)).map(projectLinks);
+  const tombstones = new Set(
+    rawDocs
+      .filter((d) => d?.archived === true || d?.bodyMarkdown === "" || d?.body_markdown === "")
+      .map((d) => d?.id),
+  );
+  const channelDocs = dedupeSdkRowsById(
+    rawDocs
+      .filter((d) => !tombstones.has(d?.id) && (!scopeChannelId || (d.channel_id ?? d.channelId) === scopeChannelId))
+      .filter(changed),
+  );
+
+  const changedIds = new Set<string>();
+  for (const arr of [objectives, keyResults, tasks, channelDocs]) {
+    for (const e of arr) if (typeof e?.id === "string" && e.id) changedIds.add(e.id);
+  }
+
+  const refs = new Set<string>();
+  for (const row of [...objectives, ...keyResults, ...tasks]) {
+    for (const field of ["linked_docs", "linked_channel_docs"]) {
+      if (Array.isArray(row?.[field])) {
+        for (const link of row[field]) {
+          if (
+            isSafeSdkWorkspaceRefId(link?.doc_id) &&
+            (!scopeChannelId || !link.channel_id || link.channel_id === scopeChannelId)
+          ) {
+            refs.add(link.doc_id);
+          }
+        }
+      }
+    }
+  }
+  for (const o of objectives) {
+    if (
+      !o?.archived &&
+      isSafeSdkWorkspaceRefId(o?.parent_id) &&
+      o.parent_id !== o.id &&
+      !archivedObjectiveIds.has(o.parent_id) &&
+      (!allowedParentIds || allowedParentIds.has(o.parent_id))
+    ) {
+      refs.add(o.parent_id);
+    }
+  }
+  for (const k of keyResults) if (isSafeSdkWorkspaceRefId(k?.objective_id)) refs.add(k.objective_id);
+  for (const t of tasks) {
+    if (isSafeSdkWorkspaceRefId(t?.objective_id)) refs.add(t.objective_id);
+    if (isSafeSdkWorkspaceRefId(t?.key_result_id)) refs.add(t.key_result_id);
+    if (Array.isArray(t?.depends_on)) {
+      for (const d of t.depends_on) if (isSafeSdkWorkspaceRefId(d) && d !== t.id) refs.add(d);
+    }
+    if (Array.isArray(t?.contributes_to)) {
+      for (const c of t.contributes_to) if (isSafeSdkWorkspaceRefId(c) && c !== t.id) refs.add(c);
+    }
+  }
+  const referencedUnchangedIds = [...refs].filter((id) => !changedIds.has(id) && !tombstones.has(id));
+  return { objectives, keyResults, tasks, channelDocs, referencedUnchangedIds };
+}
+
+function safeSdkNonNegCount(v: unknown): number {
+  return typeof v === "number" && Number.isFinite(v) && v > 0 ? Math.floor(v) : 0;
+}
+
+function isSafeSdkDiscoverableChannelId(id: unknown): id is string {
+  return isSafeSdkWorkspaceRefId(id) && !/^arena-/i.test(id);
+}
+
+/**
+ * Pure zero-I/O observable-liveness channel ranking mirroring `src/discovery-ranking.ts`:
+ * `online_agent_count DESC` -> `member_count DESC` -> `created_at ASC` -> `id ASC`,
+ * deduplicating channel IDs and dropping unsafe/DM/arena/prototype rows before truncation.
+ */
+export function rankDiscoverableChannels<T extends import("./types").DiscoverableChannelSummary>(
+  channels: ReadonlyArray<T> | null | undefined,
+  limit = 20,
+): T[] {
+  if (!Array.isArray(channels)) return [];
+  const ts = (v: unknown): number => {
+    if (typeof v === "number") return Number.isFinite(v) ? v : Number.MAX_SAFE_INTEGER;
+    if (typeof v === "string") {
+      const n = Date.parse(v);
+      if (!Number.isNaN(n)) return n;
+      const asNum = Number(v);
+      if (Number.isFinite(asNum)) return asNum;
+    }
+    return Number.MAX_SAFE_INTEGER;
+  };
+  const seen = new Set<string>();
+  const clean: T[] = [];
+  for (const ch of channels) {
+    if (!ch || typeof ch !== "object" || !isSafeSdkDiscoverableChannelId(ch.id)) continue;
+    if ((ch as any).type === "direct" || (ch as any).archived === true) continue;
+    if ((ch as any).visibility !== undefined && (ch as any).visibility !== "public") continue;
+    if (seen.has(ch.id)) continue;
+    seen.add(ch.id);
+    clean.push(ch);
+  }
+  clean.sort((a, b) => {
+    const byOnline = safeSdkNonNegCount(b.online_agent_count) - safeSdkNonNegCount(a.online_agent_count);
+    if (byOnline !== 0) return byOnline;
+    const byMembers = safeSdkNonNegCount(b.member_count) - safeSdkNonNegCount(a.member_count);
+    if (byMembers !== 0) return byMembers;
+    const byAge = ts(a.created_at) - ts(b.created_at);
+    if (byAge !== 0) return byAge;
+    return String(a.id).localeCompare(String(b.id));
+  });
+  return limit >= 0 ? clean.slice(0, limit) : clean;
+}
+
 export interface RESTClientOptions {
   baseUrl: string; // e.g. "http://localhost:8080"
   bearerToken?: string;
@@ -3830,7 +4019,7 @@ export class AgentChatREST {
         ...(this.authHeaders(opts?.bearerToken) ?? {}),
       },
     );
-    return data.channels;
+    return rankDiscoverableChannels(data?.channels, limit);
   }
 
   async getCloudAgentCatalog(opts?: { bearerToken?: string }): Promise<import("./types").CloudAgentCatalogResponse> {

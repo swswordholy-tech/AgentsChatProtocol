@@ -2693,3 +2693,14 @@ export interface ExtractResolvedMentionsOptions {
   senderId?: string | null;
   displayNameOf?: (memberId: string) => string | undefined;
 }
+
+export interface WorkspaceSinceEntities {
+  objectives: Array<Record<string, any>>;
+  keyResults: Array<Record<string, any>>;
+  tasks: Array<Record<string, any>>;
+  channelDocs: Array<Record<string, any>>;
+}
+
+export interface WorkspaceSinceFilterResult extends WorkspaceSinceEntities {
+  referencedUnchangedIds: string[];
+}
