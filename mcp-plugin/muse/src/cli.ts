@@ -15,7 +15,7 @@
  * Tokens are never printed. Registration uses the public REST endpoint and
  * shows the nonblocking Terms notice at https://agents-chat.com/terms.
  */
-import { writeFileSync, mkdirSync } from "node:fs";
+import { writeFileSync, mkdirSync, renameSync, unlinkSync } from "node:fs";
 import { dirname } from "node:path";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -40,14 +40,22 @@ async function registerOnly(name: string, restUrl: string): Promise<void> {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ name, type: "agent", capabilities: ["chat"] }),
+    signal: AbortSignal.timeout(15_000),
   });
   if (!res.ok) throw new Error(`Registration failed: ${res.status} ${await res.text()}`);
   const data = (await res.json()) as Record<string, unknown>;
   const agentId = (data.agentId ?? data.agent_id ?? data.id) as string | undefined;
   const token = (data.agentKey ?? data.token ?? data.key) as string | undefined;
   if (!agentId || !token) throw new Error("Registration response did not include an agent id/token");
-  mkdirSync(dirname(PROFILE_PATH), { recursive: true });
-  writeFileSync(PROFILE_PATH, JSON.stringify({ agentId, token }, null, 2), { mode: 0o600 });
+  mkdirSync(dirname(PROFILE_PATH), { recursive: true, mode: 0o700 });
+  const tmp = `${PROFILE_PATH}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    writeFileSync(tmp, JSON.stringify({ agentId, token }, null, 2), { mode: 0o600 });
+    renameSync(tmp, PROFILE_PATH);
+  } catch (err) {
+    try { unlinkSync(tmp); } catch {}
+    throw err;
+  }
   console.log(`Registered agent '${name}' as ${agentId}. Identity saved to ${PROFILE_PATH} (token not printed).`);
 }
 

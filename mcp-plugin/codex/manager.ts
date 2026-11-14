@@ -11,29 +11,45 @@ const root = join(homedir(), ".agentschat/codex-bots"), registry = resolve(value
 const statusFile = join(root, "status.json"), lock = join(root, "manager.lock");
 interface Worker { child?: ChildProcess; config: BotConfig; fingerprint: string; failures: number; next: number; status: string }
 const workers = new Map<string, Worker>();
-let stopping = false, missing = 0, timer: ReturnType<typeof setTimeout> | undefined;
+let stopping = false, missing = 0, saveSeq = 0, timer: ReturnType<typeof setTimeout> | undefined;
 function removeDeadLock(file: string) {
   if (!existsSync(file)) return;
-  const pid = Number(readFileSync(file, "utf8"));
-  if (!Number.isInteger(pid) || pid <= 0) return;
-  try { process.kill(pid, 0); } catch (e: any) { if (e.code === "ESRCH") unlinkSync(file); }
+  const raw = readFileSync(file, "utf8").trim();
+  const pid = Number(raw);
+  if (!raw || !Number.isInteger(pid) || pid <= 0) {
+    try { unlinkSync(file); } catch {}
+    return;
+  }
+  try { process.kill(pid, 0); } catch (e: any) { if (e.code === "ESRCH") try { unlinkSync(file); } catch {} }
 }
 function save() {
-  writeFileSync(statusFile + ".tmp", JSON.stringify({ pid: process.pid, updated_at: new Date().toISOString(), bots: [...workers.values()].map(w => ({ name: w.config.name, agent_id: w.config.agentId, workdir: w.config.cwd, effort: w.config.effort, model: w.config.model, pid: w.child?.pid, status: w.status })) }, null, 2), { mode: 0o600 });
-  renameSync(statusFile + ".tmp", statusFile);
+  const tmp = `${statusFile}.${process.pid}.${++saveSeq}.tmp`;
+  try {
+    writeFileSync(tmp, JSON.stringify({ pid: process.pid, updated_at: new Date().toISOString(), bots: [...workers.values()].map(w => ({ name: w.config.name, agent_id: w.config.agentId, workdir: w.config.cwd, effort: w.config.effort, model: w.config.model, pid: w.child?.pid, status: w.status })) }, null, 2), { mode: 0o600 });
+    renameSync(tmp, statusFile);
+  } catch {
+    try { unlinkSync(tmp); } catch {}
+  }
 }
 async function stop(w: Worker) {
   const child = w.child;
   if (child && child.exitCode === null && child.signalCode === null) await new Promise<void>(done => {
     const timeout = setTimeout(() => killGroup(child), 20_000);
+    timeout.unref?.();
     child.once("exit", () => { clearTimeout(timeout); killGroup(child); done(); }); child.kill("SIGTERM");
   });
   w.child = undefined; w.status = "stopped";
 }
-function killGroup(child: ChildProcess) { if (child.pid) try { process.kill(-child.pid, "SIGKILL"); } catch {} }
+function killGroup(child: ChildProcess) {
+  if (!child.pid) return;
+  if (process.platform !== "win32") {
+    try { process.kill(-child.pid, "SIGKILL"); return; } catch {}
+  }
+  try { child.kill("SIGKILL"); } catch {}
+}
 function start(w: Worker) {
   removeDeadLock(join(w.config.stateDir, "bridge.lock")); w.status = "starting";
-  const child = spawn(process.execPath, [resolve(process.argv[1]!), "--codex-bridge", "--managed-worker"], { cwd: w.config.cwd, detached: true, stdio: ["ignore", "pipe", "pipe", "ipc"] });
+  const child = spawn(process.execPath, [resolve(process.argv[1]!), "--codex-bridge", "--managed-worker"], { cwd: w.config.cwd, detached: process.platform !== "win32", windowsHide: true, stdio: ["ignore", "pipe", "pipe", "ipc"] });
   w.child = child;
   child.once("spawn", () => child.send(w.config, () => {}));
   let buffer = "";

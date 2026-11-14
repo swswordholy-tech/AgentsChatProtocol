@@ -52,6 +52,9 @@ class MockServer {
           if (masked) for (let i = 0; i < payload.length; i++) payload[i] ^= mask[i % 4];
           buf = buf.subarray(off + maskLen + len);
           if (opcode === 8) {
+            try {
+              socket.write(Buffer.from([0x88, 0x00]));
+            } catch {}
             socket.end();
             return;
           }
@@ -268,9 +271,57 @@ test("thread_reply delivery, shard_moved reconnect, and async onMessage error ro
     await waitFor(() => inbound.length === 1 && errors.includes("handler_boom"), "thread_reply + async error");
     assert.equal(inbound[0].thread_id, "root-99");
 
-    // shard_moved with within_ms:0 should bypass the 5_000ms exponential backoff
-    server.send(server.sockets[0], { type: "shard_moved", within_ms: 0 });
+    // shard_moved with within_ms:50 should bypass the 5_000ms exponential backoff ([200ms, 250ms))
+    server.send(server.sockets[0], { type: "shard_moved", within_ms: 50 });
     await waitFor(() => reconnected >= 1 && client.session === "s-2", "fast shard_moved reconnect", 1500);
+  } finally {
+    client.disconnect();
+    await server.close();
+  }
+});
+
+test("reconnect auth timeout recovers from stalled half-open socket and re-joins channel_created rooms without duplicates", async () => {
+  const server = new MockServer();
+  const port = await server.listen();
+  server.onMessage = (msg, socket) => {
+    if (msg.type === "auth") {
+      // Connection #2 stalls without sending auth_ok; connections #1 and #3 succeed!
+      if (server.connections === 2) return;
+      server.send(socket, { type: "auth_ok", agent_id: msg.agent_id, session_id: `s-${server.connections}` });
+    }
+  };
+  const client = new MuseAgentChatClient({
+    url: `ws://127.0.0.1:${port}`,
+    agentId: "muse-bot",
+    token: "t",
+    connectTimeoutMs: 80,
+    heartbeatIntervalMs: 60_000,
+    initialReconnectDelayMs: 30,
+    maxReconnectDelayMs: 60,
+    onReconnect: () => {
+      client.joinChannel("static-room");
+    },
+  });
+  try {
+    await client.connect();
+    client.joinChannel("static-room");
+    // Runtime channel_created joins dm-runtime-1
+    server.send(server.sockets[0], { type: "channel_created", channel_id: "dm-runtime-1" });
+    await waitFor(
+      () => server.received.filter((m) => m.type === "join_channel" && m.channel_id === "dm-runtime-1").length === 1,
+      "initial channel_created join",
+    );
+
+    // Drop connection #1 -> connection #2 hangs on auth -> times out after 80ms -> connection #3 recovers!
+    server.received.length = 0;
+    server.sockets[0].destroy();
+    await waitFor(() => client.session === "s-3", "recovery onto connection #3 after stalled #2", 3000);
+    await waitFor(
+      () => server.received.filter((m) => m.type === "join_channel").length >= 2,
+      "rejoin both static and runtime channels",
+    );
+    const rejoined = server.received.filter((m) => m.type === "join_channel").map((m) => m.channel_id);
+    assert.deepEqual(rejoined, ["static-room", "dm-runtime-1"]);
   } finally {
     client.disconnect();
     await server.close();

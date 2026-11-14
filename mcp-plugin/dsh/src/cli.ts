@@ -10,7 +10,7 @@
  *   npx -y agentschat-mcp@latest --dsh --listen [--channel <id> ...] [--dsh-profile <headless>] [--auto-reply <text>]
  *   npx -y agentschat-mcp@latest --dsh --send <channel-id> --text <text>
  */
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
@@ -101,8 +101,15 @@ async function registerOnly(name: string, restUrl: string, profilePath = DSH_PRO
   const agentId = (data.agentId ?? data.agent_id ?? data.id) as string | undefined;
   const token = (data.agentKey ?? data.token ?? data.key) as string | undefined;
   if (!agentId || !token) throw new Error("Registration response did not include an agent id/token");
-  mkdirSync(dirname(profilePath), { recursive: true });
-  writeFileSync(profilePath, JSON.stringify({ agentId, token }, null, 2), { mode: 0o600 });
+  mkdirSync(dirname(profilePath), { recursive: true, mode: 0o700 });
+  const tmp = `${profilePath}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    writeFileSync(tmp, JSON.stringify({ agentId, token }, null, 2), { mode: 0o600 });
+    renameSync(tmp, profilePath);
+  } catch (err) {
+    try { unlinkSync(tmp); } catch {}
+    throw err;
+  }
   console.log(`Registered DSH agent '${name}' as ${agentId}. Identity saved to ${profilePath} (token not printed).`);
 }
 

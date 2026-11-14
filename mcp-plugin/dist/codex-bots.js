@@ -1156,29 +1156,45 @@ var lock = join3(root, "manager.lock");
 var workers = new Map;
 var stopping = false;
 var missing = 0;
+var saveSeq = 0;
 var timer;
 function removeDeadLock(file) {
   if (!existsSync2(file))
     return;
-  const pid = Number(readFileSync3(file, "utf8"));
-  if (!Number.isInteger(pid) || pid <= 0)
+  const raw = readFileSync3(file, "utf8").trim();
+  const pid = Number(raw);
+  if (!raw || !Number.isInteger(pid) || pid <= 0) {
+    try {
+      unlinkSync(file);
+    } catch {}
     return;
+  }
   try {
     process.kill(pid, 0);
   } catch (e) {
     if (e.code === "ESRCH")
-      unlinkSync(file);
+      try {
+        unlinkSync(file);
+      } catch {}
   }
 }
 function save() {
-  writeFileSync(statusFile + ".tmp", JSON.stringify({ pid: process.pid, updated_at: new Date().toISOString(), bots: [...workers.values()].map((w) => ({ name: w.config.name, agent_id: w.config.agentId, workdir: w.config.cwd, effort: w.config.effort, model: w.config.model, pid: w.child?.pid, status: w.status })) }, null, 2), { mode: 384 });
-  renameSync(statusFile + ".tmp", statusFile);
+  const tmp = `${statusFile}.${process.pid}.${++saveSeq}.tmp`;
+  try {
+    writeFileSync(tmp, JSON.stringify({ pid: process.pid, updated_at: new Date().toISOString(), bots: [...workers.values()].map((w) => ({ name: w.config.name, agent_id: w.config.agentId, workdir: w.config.cwd, effort: w.config.effort, model: w.config.model, pid: w.child?.pid, status: w.status })) }, null, 2), { mode: 384 });
+    renameSync(tmp, statusFile);
+  } catch {
+    try {
+      unlinkSync(tmp);
+    } catch {}
+  }
 }
 async function stop(w) {
   const child = w.child;
   if (child && child.exitCode === null && child.signalCode === null)
     await new Promise((done) => {
       const timeout = setTimeout(() => killGroup(child), 20000);
+      timeout.unref?.();
       child.once("exit", () => {
         clearTimeout(timeout);
         killGroup(child);
@@ -1190,15 +1206,22 @@ async function stop(w) {
   w.status = "stopped";
 }
 function killGroup(child) {
-  if (child.pid)
+  if (!child.pid)
+    return;
+  if (process.platform !== "win32") {
     try {
       process.kill(-child.pid, "SIGKILL");
+      return;
     } catch {}
+  }
+  try {
+    child.kill("SIGKILL");
+  } catch {}
 }
 function start(w) {
   removeDeadLock(join3(w.config.stateDir, "bridge.lock"));
   w.status = "starting";
-  const child = spawn(process.execPath, [resolve3(process.argv[1]), "--codex-bridge", "--managed-worker"], { cwd: w.config.cwd, detached: true, stdio: ["ignore", "pipe", "pipe", "ipc"] });
+  const child = spawn(process.execPath, [resolve3(process.argv[1]), "--codex-bridge", "--managed-worker"], { cwd: w.config.cwd, detached: process.platform !== "win32", windowsHide: true, stdio: ["ignore", "pipe", "pipe", "ipc"] });
   w.child = child;
   child.once("spawn", () => child.send(w.config, () => {}));
   let buffer = "";

@@ -1,4 +1,4 @@
-import { computePleaseReconnectDelay } from "../../src/reconnect.ts";
+import { resolveDrainReconnectDelay } from "../../src/reconnect.ts";
 import type { ChatMessage, MessageHandler, MuseAgentChatOptions, WireMessage } from "./types.ts";
 
 /**
@@ -19,6 +19,8 @@ export class MuseAgentChatClient {
   private nextReconnectDelayOverrideMs: number | null = null;
   private readonly messageHandlers: MessageHandler[] = [];
   private readonly errorHandlers: Array<(err: Error) => void> = [];
+  private readonly joinedChannels = new Set<string>();
+  private readonly sessionJoined = new Set<string>();
   private connectResolve: (() => void) | null = null;
   private connectReject: ((err: Error) => void) | null = null;
   private lifecycleResolve: (() => void) | null = null;
@@ -73,26 +75,27 @@ export class MuseAgentChatClient {
   connect(): Promise<void> {
     return new Promise((resolve, reject) => {
       this.clearConnectTimer();
+      if (this.reconnectTimer) {
+        clearTimeout(this.reconnectTimer);
+        this.reconnectTimer = null;
+      }
+      if (this.heartbeatTimer) {
+        clearInterval(this.heartbeatTimer);
+        this.heartbeatTimer = null;
+      }
+      const prevWs = this.ws;
+      this.ws = null;
+      this.sessionId = null;
+      this.sessionJoined.clear();
+      if (prevWs) {
+        try { prevWs.close(); } catch {}
+      }
       this.connectSettled = false;
       this.explicitlyDisconnected = false;
       this.reconnectAttempt = 0;
       this.isReconnecting = false;
       this.connectResolve = resolve;
       this.connectReject = reject;
-      if (this.connectTimeoutMs > 0) {
-        this.connectTimer = setTimeout(() => {
-          this.connectTimer = null;
-          if (!this.connectSettled) {
-            const err = new Error(`AgentsChat connect timed out after ${this.connectTimeoutMs}ms`);
-            this.connectSettled = true;
-            this.explicitlyDisconnected = true;
-            try { this.ws?.close(); } catch {}
-            this.connectReject?.(err);
-            this.emitError(err);
-          }
-        }, this.connectTimeoutMs);
-        this.connectTimer.unref?.();
-      }
       this.openSocket();
     });
   }
@@ -148,10 +151,16 @@ export class MuseAgentChatClient {
   }
 
   joinChannel(channelId: string): void {
+    if (channelId) {
+      this.joinedChannels.add(channelId);
+      this.sessionJoined.add(channelId);
+    }
     this.send({ type: "join_channel", channel_id: channelId, agent_id: this.agentId });
   }
 
   leaveChannel(channelId: string): void {
+    this.joinedChannels.delete(channelId);
+    this.sessionJoined.delete(channelId);
     this.send({ type: "leave_channel", channel_id: channelId, agent_id: this.agentId });
   }
 
@@ -180,8 +189,29 @@ export class MuseAgentChatClient {
 
   private openSocket(): void {
     this.debug("connect:start", { url: this.url, agentId: this.agentId });
+    this.clearConnectTimer();
+    this.sessionJoined.clear();
     const ws = new WebSocket(this.url);
     this.ws = ws;
+    if (this.connectTimeoutMs > 0) {
+      this.connectTimer = setTimeout(() => {
+        this.connectTimer = null;
+        if (this.ws !== ws) return;
+        const err = new Error(`AgentsChat connect timed out after ${this.connectTimeoutMs}ms`);
+        if (!this.connectSettled) {
+          this.connectSettled = true;
+          this.explicitlyDisconnected = true;
+          try { ws.close(); } catch {}
+          this.connectReject?.(err);
+          this.emitError(err);
+        } else if (this.sessionId === null) {
+          // Reconnect handshake stalled before auth_ok: close hung socket so onclose schedules next retry!
+          this.emitError(err);
+          try { ws.close(); } catch {}
+        }
+      }, this.connectTimeoutMs);
+      this.connectTimer.unref?.();
+    }
     ws.onopen = () => {
       this.send({
         type: "auth",
@@ -209,9 +239,11 @@ export class MuseAgentChatClient {
     };
     ws.onclose = () => {
       if (this.ws && this.ws !== ws) return;
+      this.clearConnectTimer();
       if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
       this.heartbeatTimer = null;
       this.sessionId = null;
+      this.sessionJoined.clear();
       if (!this.connectSettled && !this.reconnect) {
         this.clearConnectTimer();
         this.connectSettled = true;
@@ -268,6 +300,11 @@ export class MuseAgentChatClient {
         this.connectResolve?.();
       } else if (wasReconnect) {
         this.onReconnect?.();
+        for (const ch of this.joinedChannels) {
+          if (!this.sessionJoined.has(ch) && this.ws?.readyState === WebSocket.OPEN) {
+            this.joinChannel(ch);
+          }
+        }
       }
       return;
     }
@@ -296,8 +333,9 @@ export class MuseAgentChatClient {
       return;
     }
     if (msg.type === "please_reconnect" || msg.type === "shard_moved") {
-      const withinMs = typeof msg.within_ms === "number" ? msg.within_ms : undefined;
-      this.nextReconnectDelayOverrideMs = computePleaseReconnectDelay(withinMs);
+      this.nextReconnectDelayOverrideMs = resolveDrainReconnectDelay(
+        msg as { jitter_ms?: unknown; within_ms?: unknown },
+      );
       this.reconnectAttempt = 0;
       try {
         this.ws?.close();

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -59,12 +59,22 @@ test("fireWake posts signed payload once, and is best-effort on failure", async 
   );
 });
 
-test("wake queue deduplicates by message_id", () => {
-  const file = join(mkdtempSync(join(tmpdir(), "muse-wake-")), "queue.jsonl");
+test("wake queue deduplicates by message_id, creates missing parent dirs, enforces 0600, and trims to maxLines", () => {
+  const root = mkdtempSync(join(tmpdir(), "muse-wake-"));
+  const nestedDir = join(root, "nested", "private");
+  const file = join(nestedDir, "queue.jsonl");
   const p = { type: "message", channel_id: "welcome", message_id: "m9", sender_id: "alice", content: "hi" };
-  assert.equal(appendWakeQueue(file, p), true);
-  assert.equal(appendWakeQueue(file, p), false);
-  assert.equal(readFileSync(file, "utf8").trim().split("\n").length, 1);
+  assert.equal(appendWakeQueue(file, p, 3), true);
+  assert.equal(appendWakeQueue(file, p, 3), false);
+  if (process.platform !== "win32") {
+    assert.equal(statSync(file).mode & 0o777, 0o600);
+  }
+  appendWakeQueue(file, { ...p, message_id: "m10" }, 3);
+  appendWakeQueue(file, { ...p, message_id: "m11" }, 3);
+  appendWakeQueue(file, { ...p, message_id: "m12" }, 3);
+  const lines = readFileSync(file, "utf8").trim().split("\n").map((l) => JSON.parse(l).message_id);
+  assert.deepEqual(lines, ["m10", "m11", "m12"]);
+  assert.deepEqual(readdirSync(nestedDir), ["queue.jsonl"]);
 });
 
 test("muse wake prompt names channel, sender and message id", () => {

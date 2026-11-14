@@ -1,5 +1,6 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
-import { appendFileSync, existsSync, readFileSync } from "node:fs";
+import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
 
 /**
  * Muse wake — the Grok Bot pattern, adapted for Muse.
@@ -154,24 +155,52 @@ export async function fireWake(msg: WakeMessage, cfg: WakeConfig): Promise<void>
   }
 }
 
+export const MAX_WAKE_QUEUE_LINES = 500;
+let wakeTmpSeq = 0;
+
 /**
- * Append a wake payload to the queue file, deduplicated by message_id.
+ * Append a wake payload to the queue file, deduplicated by message_id,
+ * auto-creating missing parent directories (0700), enforcing private 0600
+ * file permissions, and bounding retained lines to MAX_WAKE_QUEUE_LINES.
  * Returns true if appended, false if it was already queued.
  */
-export function appendWakeQueue(queueFile: string, payload: WakePayload): boolean {
+export function appendWakeQueue(queueFile: string, payload: WakePayload, maxLines = MAX_WAKE_QUEUE_LINES): boolean {
+  mkdirSync(dirname(queueFile), { recursive: true, mode: 0o700 });
   const line = JSON.stringify(payload);
-  if (payload.message_id && existsSync(queueFile)) {
+  let existingLines: string[] = [];
+  if (existsSync(queueFile)) {
     const existing = readFileSync(queueFile, "utf8");
-    if (existing.split("\n").some((l) => {
-      try {
-        return (JSON.parse(l) as WakePayload).message_id === payload.message_id;
-      } catch {
-        return false;
-      }
-    })) {
+    existingLines = existing.split("\n").filter((l) => l.length > 0);
+    if (
+      payload.message_id &&
+      existingLines.some((l) => {
+        try {
+          return (JSON.parse(l) as WakePayload).message_id === payload.message_id;
+        } catch {
+          return false;
+        }
+      })
+    ) {
       return false;
     }
   }
-  appendFileSync(queueFile, line + "\n");
+  const cap = Math.max(1, maxLines);
+  if (existingLines.length >= cap) {
+    const kept = [...existingLines.slice(-(cap - 1)), line];
+    const tmp = `${queueFile}.${process.pid}.${Date.now()}.${++wakeTmpSeq}.tmp`;
+    try {
+      writeFileSync(tmp, `${kept.join("\n")}\n`, { mode: 0o600 });
+      renameSync(tmp, queueFile);
+    } catch (err) {
+      try { unlinkSync(tmp); } catch {}
+      throw err;
+    }
+    return true;
+  }
+  const existedBefore = existsSync(queueFile);
+  appendFileSync(queueFile, `${line}\n`, { mode: 0o600 });
+  if (!existedBefore && process.platform !== "win32") {
+    try { chmodSync(queueFile, 0o600); } catch {}
+  }
   return true;
 }

@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 
 // muse/src/cli.ts
-import { writeFileSync, mkdirSync } from "node:fs";
-import { dirname } from "node:path";
+import { writeFileSync as writeFileSync2, mkdirSync as mkdirSync2, renameSync as renameSync2, unlinkSync as unlinkSync2 } from "node:fs";
+import { dirname as dirname2 } from "node:path";
 import { homedir as homedir2 } from "node:os";
 import { join as join2 } from "node:path";
 
@@ -158,6 +158,9 @@ function computePleaseReconnectDelay(jitterMs, rand = Math.random) {
   const maxJitter = typeof jitterMs === "number" && Number.isFinite(jitterMs) && jitterMs > 0 ? Math.min(Math.floor(jitterMs), 1e4) : 2000;
   return 200 + Math.floor(rand() * maxJitter);
 }
+function resolveDrainReconnectDelay(frame, rand = Math.random) {
+  return computePleaseReconnectDelay(frame?.jitter_ms ?? frame?.within_ms, rand);
+}
 
 // muse/src/client.ts
 class MuseAgentChatClient {
@@ -169,6 +172,8 @@ class MuseAgentChatClient {
   nextReconnectDelayOverrideMs = null;
   messageHandlers = [];
   errorHandlers = [];
+  joinedChannels = new Set;
+  sessionJoined = new Set;
   connectResolve = null;
   connectReject = null;
   lifecycleResolve = null;
@@ -216,28 +221,29 @@ class MuseAgentChatClient {
   connect() {
     return new Promise((resolve, reject) => {
       this.clearConnectTimer();
+      if (this.reconnectTimer) {
+        clearTimeout(this.reconnectTimer);
+        this.reconnectTimer = null;
+      }
+      if (this.heartbeatTimer) {
+        clearInterval(this.heartbeatTimer);
+        this.heartbeatTimer = null;
+      }
+      const prevWs = this.ws;
+      this.ws = null;
+      this.sessionId = null;
+      this.sessionJoined.clear();
+      if (prevWs) {
+        try {
+          prevWs.close();
+        } catch {}
+      }
       this.connectSettled = false;
       this.explicitlyDisconnected = false;
       this.reconnectAttempt = 0;
       this.isReconnecting = false;
       this.connectResolve = resolve;
       this.connectReject = reject;
-      if (this.connectTimeoutMs > 0) {
-        this.connectTimer = setTimeout(() => {
-          this.connectTimer = null;
-          if (!this.connectSettled) {
-            const err = new Error(`AgentsChat connect timed out after ${this.connectTimeoutMs}ms`);
-            this.connectSettled = true;
-            this.explicitlyDisconnected = true;
-            try {
-              this.ws?.close();
-            } catch {}
-            this.connectReject?.(err);
-            this.emitError(err);
-          }
-        }, this.connectTimeoutMs);
-        this.connectTimer.unref?.();
-      }
       this.openSocket();
     });
   }
@@ -288,9 +294,15 @@ class MuseAgentChatClient {
     this.errorHandlers.push(handler);
   }
   joinChannel(channelId) {
+    if (channelId) {
+      this.joinedChannels.add(channelId);
+      this.sessionJoined.add(channelId);
+    }
     this.send({ type: "join_channel", channel_id: channelId, agent_id: this.agentId });
   }
   leaveChannel(channelId) {
+    this.joinedChannels.delete(channelId);
+    this.sessionJoined.delete(channelId);
     this.send({ type: "leave_channel", channel_id: channelId, agent_id: this.agentId });
   }
   sendMessage(channelId, content, contentType = "text") {
@@ -313,8 +325,33 @@ class MuseAgentChatClient {
   }
   openSocket() {
     this.debug("connect:start", { url: this.url, agentId: this.agentId });
+    this.clearConnectTimer();
+    this.sessionJoined.clear();
     const ws = new WebSocket(this.url);
     this.ws = ws;
+    if (this.connectTimeoutMs > 0) {
+      this.connectTimer = setTimeout(() => {
+        this.connectTimer = null;
+        if (this.ws !== ws)
+          return;
+        const err = new Error(`AgentsChat connect timed out after ${this.connectTimeoutMs}ms`);
+        if (!this.connectSettled) {
+          this.connectSettled = true;
+          this.explicitlyDisconnected = true;
+          try {
+            ws.close();
+          } catch {}
+          this.connectReject?.(err);
+          this.emitError(err);
+        } else if (this.sessionId === null) {
+          this.emitError(err);
+          try {
+            ws.close();
+          } catch {}
+        }
+      }, this.connectTimeoutMs);
+      this.connectTimer.unref?.();
+    }
     ws.onopen = () => {
       this.send({
         type: "auth",
@@ -344,10 +381,12 @@ class MuseAgentChatClient {
     ws.onclose = () => {
       if (this.ws && this.ws !== ws)
         return;
+      this.clearConnectTimer();
       if (this.heartbeatTimer)
         clearInterval(this.heartbeatTimer);
       this.heartbeatTimer = null;
       this.sessionId = null;
+      this.sessionJoined.clear();
       if (!this.connectSettled && !this.reconnect) {
         this.clearConnectTimer();
         this.connectSettled = true;
@@ -399,6 +438,11 @@ class MuseAgentChatClient {
         this.connectResolve?.();
       } else if (wasReconnect) {
         this.onReconnect?.();
+        for (const ch of this.joinedChannels) {
+          if (!this.sessionJoined.has(ch) && this.ws?.readyState === WebSocket.OPEN) {
+            this.joinChannel(ch);
+          }
+        }
       }
       return;
     }
@@ -420,8 +464,7 @@ class MuseAgentChatClient {
       return;
     }
     if (msg.type === "please_reconnect" || msg.type === "shard_moved") {
-      const withinMs = typeof msg.within_ms === "number" ? msg.within_ms : undefined;
-      this.nextReconnectDelayOverrideMs = computePleaseReconnectDelay(withinMs);
+      this.nextReconnectDelayOverrideMs = resolveDrainReconnectDelay(msg);
       this.reconnectAttempt = 0;
       try {
         this.ws?.close();
@@ -512,7 +555,8 @@ function loadConfig(env = process.env, profilePath) {
 
 // muse/src/wake.ts
 import { createHmac, timingSafeEqual } from "node:crypto";
-import { appendFileSync, existsSync as existsSync2, readFileSync as readFileSync2 } from "node:fs";
+import { appendFileSync, chmodSync, existsSync as existsSync2, mkdirSync, readFileSync as readFileSync2, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
 var WAKE_SIG_HEADER = "x-agentschat-signature";
 var WAKE_CONTENT_MAX = 500;
 function redactSecrets(text) {
@@ -567,12 +611,17 @@ async function fireWake(msg, cfg) {
     }
   }
 }
-function appendWakeQueue(queueFile, payload) {
+var MAX_WAKE_QUEUE_LINES = 500;
+var wakeTmpSeq = 0;
+function appendWakeQueue(queueFile, payload, maxLines = MAX_WAKE_QUEUE_LINES) {
+  mkdirSync(dirname(queueFile), { recursive: true, mode: 448 });
   const line = JSON.stringify(payload);
-  if (payload.message_id && existsSync2(queueFile)) {
+  let existingLines = [];
+  if (existsSync2(queueFile)) {
     const existing = readFileSync2(queueFile, "utf8");
-    if (existing.split(`
-`).some((l) => {
+    existingLines = existing.split(`
+`).filter((l) => l.length > 0);
+    if (payload.message_id && existingLines.some((l) => {
       try {
         return JSON.parse(l).message_id === payload.message_id;
       } catch {
@@ -582,8 +631,31 @@ function appendWakeQueue(queueFile, payload) {
       return false;
     }
   }
-  appendFileSync(queueFile, line + `
-`);
+  const cap = Math.max(1, maxLines);
+  if (existingLines.length >= cap) {
+    const kept = [...existingLines.slice(-(cap - 1)), line];
+    const tmp = `${queueFile}.${process.pid}.${Date.now()}.${++wakeTmpSeq}.tmp`;
+    try {
+      writeFileSync(tmp, `${kept.join(`
+`)}
+`, { mode: 384 });
+      renameSync(tmp, queueFile);
+    } catch (err) {
+      try {
+        unlinkSync(tmp);
+      } catch {}
+      throw err;
+    }
+    return true;
+  }
+  const existedBefore = existsSync2(queueFile);
+  appendFileSync(queueFile, `${line}
+`, { mode: 384 });
+  if (!existedBefore && process.platform !== "win32") {
+    try {
+      chmodSync(queueFile, 384);
+    } catch {}
+  }
   return true;
 }
 
@@ -600,7 +672,8 @@ async function registerOnly(name, restUrl) {
   const res = await fetch(`${restUrl.replace(/\/$/, "")}/api/account/register`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ name, type: "agent", capabilities: ["chat"] })
+    body: JSON.stringify({ name, type: "agent", capabilities: ["chat"] }),
+    signal: AbortSignal.timeout(15000)
   });
   if (!res.ok)
     throw new Error(`Registration failed: ${res.status} ${await res.text()}`);
@@ -609,8 +682,17 @@ async function registerOnly(name, restUrl) {
   const token = data.agentKey ?? data.token ?? data.key;
   if (!agentId || !token)
     throw new Error("Registration response did not include an agent id/token");
-  mkdirSync(dirname(PROFILE_PATH), { recursive: true });
-  writeFileSync(PROFILE_PATH, JSON.stringify({ agentId, token }, null, 2), { mode: 384 });
+  mkdirSync2(dirname2(PROFILE_PATH), { recursive: true, mode: 448 });
+  const tmp = `${PROFILE_PATH}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    writeFileSync2(tmp, JSON.stringify({ agentId, token }, null, 2), { mode: 384 });
+    renameSync2(tmp, PROFILE_PATH);
+  } catch (err) {
+    try {
+      unlinkSync2(tmp);
+    } catch {}
+    throw err;
+  }
   console.log(`Registered agent '${name}' as ${agentId}. Identity saved to ${PROFILE_PATH} (token not printed).`);
 }
 async function main() {
