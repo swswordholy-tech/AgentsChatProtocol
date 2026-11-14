@@ -2157,9 +2157,9 @@ describe("AgentChatClient realtime collaboration WS events", () => {
       const transferred = await rest.transferObjective("obj_30", { new_owner: "codex-staff-engineer-ca7590" });
       expect(transferred.objective.owner).toBe("codex-staff-engineer-ca7590");
 
-      // Strict client-side guards
-      await expect(rest.logTaskProgress("task_30", { note: "Leak ac_live_secret_token_123456" })).rejects.toThrow("secrets");
-      await expect(rest.addTaskComment("task_30", "Leak sk-proj-1234567890abcdef")).rejects.toThrow("secrets");
+      // Strict client-side guards on structured IDs & targets (prose notes/comments allowed)
+      await expect(rest.logTaskProgress("task_30", { note: "x".repeat(501) })).rejects.toThrow("max 500 chars");
+      await expect(rest.addTaskComment("task_30", "   ")).rejects.toThrow("Invalid task comment text");
       await expect(rest.setOkrLinks("task", "task_30", { narrative: "Wrong target" })).rejects.toThrow("only supported on objective");
       await expect(rest.setOkrLinks("objective", "obj_30", { discussion_channel_id: "dm-secret" })).rejects.toThrow("direct message");
       await expect(rest.transferObjective("obj_30", { new_owner: "ac_live_secret_token_123456" })).rejects.toThrow("Invalid new_owner");
@@ -2852,9 +2852,9 @@ describe("AgentChatClient realtime collaboration WS events", () => {
       const beforeInvalid = seen.length;
       await expect(
         rest.updateOkrTask("task_36", {
-          append_evidence: [{ kind: "commit", ref: "ac_live_secret_1234567890" }],
+          append_evidence: [{ kind: "commit", ref: "   " }],
         }),
-      ).rejects.toThrow("credentials");
+      ).rejects.toThrow("Invalid task evidence ref");
       await expect(
         rest.updateOkrTask("task_36", {
           append_evidence: [],
@@ -4721,8 +4721,10 @@ describe("AgentChatClient realtime collaboration WS events", () => {
     );
     expect(inventory!.personal_skills[0]?.load_hint).toBe("GET /api/skills/my-audit");
     expect(inventory!.channel_skills[0]?.skill_meta.description?.startsWith(desc240)).toBe(true);
+    expect(inventory!.channel_skills[0]?.skill_meta.description?.length).toBe(256);
+    expect(inventory!.personal_skills[0]?.skill_meta.description).toBe("Owner audit helper owner@example.com");
     const dumped = JSON.stringify(inventory);
-    for (const leaked of ["sk-proj-", "rk_live_", "ghp_", "owner@example.com", "INJECTED_"]) {
+    for (const leaked of ["rk_live_", "ghp_", "INJECTED_"]) {
       expect(dumped).not.toContain(leaked);
     }
 
@@ -4902,11 +4904,12 @@ describe("AgentChatClient realtime collaboration WS events", () => {
     expect(readiness.idle_agents).toEqual(["idle-peer-1", "idle-peer-2", "team-asia"]);
     expect(readiness.supply_floor).toBe(2);
     expect(readiness.supply_starved).toBe(true);
-
+    // Structured credential/prototype/mr_ IDs dropped while task prose is truncated cleanly to length caps
     const dumped = JSON.stringify(readiness);
-    for (const secret of ["secret_token_", "ASIAIOSFODNN7EXAMPLE", "mcp_at_", "owner@example.com", "555-0199"]) {
-      expect(dumped).not.toContain(secret);
-    }
+    expect(dumped).not.toContain("t_bad_cred");
+    expect(dumped).not.toContain("rk_live_");
+    const blockedEsc = readiness.escalations.find((e) => e.kind === "blocked_long");
+    expect(blockedEsc?.detail).toContain(longPad.trim());
 
     const originalFetch = globalThis.fetch;
     let fetchCalls = 0;
@@ -5539,8 +5542,7 @@ describe("AgentChatClient realtime collaboration WS events", () => {
     );
     expect(watch.over_eta_task_ids).toEqual(["t-overdue-zero-progress"]);
     expect(watch.escalations[0]?.detail).toContain("no progress recorded");
-    expect(watch.escalations[0]?.title).toContain("aiza-guide");
-    expect(watch.escalations[0]?.title).not.toContain("AIzaRealLeakedGoogleKey12345");
+    expect(watch.escalations[0]?.title).toBe("Consult aiza-guide & AIzaRealLeakedGoogleKey12345");
     expect(watch.ready_count).toBe(0);
     expect(watch.idle_agents).toEqual(["idle-dev"]);
     expect(watch.supply_starved).toBe(true);
@@ -6183,5 +6185,72 @@ describe("AgentChatClient realtime collaboration WS events", () => {
     });
     expect(skillDetail?.has_redacted_secret).toBe(false);
     expect(skillDetail?.body_markdown).toBe(skillMd);
+  });
+
+  test("Campaign #71: O(1) prose preservation across WorkspaceGraph, ChannelBrief skills, OKR Watch, and OKR task/narrative writes while enforcing structured ID guards", async () => {
+    const hierarchy = summarizeWorkspaceGraphHierarchy({
+      scope: { type: "channel", id: "room-71" },
+      nodes: [
+        {
+          type: "objective",
+          id: "obj_71",
+          title: "Fix broadcastSSE race & Bearer/Webhook parity (ops@example.com)",
+          status: "active",
+        },
+        {
+          type: "objective",
+          id: "obj_rk_live_bad",
+          title: "Must be dropped by structured ID guard",
+          status: "active",
+        },
+      ],
+      edges: [],
+      sections: [],
+    });
+    expect(hierarchy?.root_objective_ids).toEqual(["obj_71"]);
+    expect(JSON.stringify(hierarchy)).toContain("Fix broadcastSSE race & Bearer/Webhook parity (ops@example.com)");
+
+    const watch = summarizeOkrWatchReadiness(
+      [
+        {
+          id: "task_71",
+          assignee: "codex-worker-71",
+          status: "doing",
+          title: "Debug sk-proj-fixture1234567890 & SSE subscriber Set snapshot",
+          last_progress_at: "2026-11-14T08:00:00.000Z",
+        },
+        {
+          id: "task_bad_assignee",
+          assignee: "alice@example.com",
+          status: "doing",
+          last_progress_at: "2026-11-14T08:00:00.000Z",
+        },
+      ],
+      { nowMs: Date.parse("2026-11-14T09:00:00.000Z"), stallMinutes: 5 },
+    );
+    expect(watch.total_tasks).toBe(1);
+    expect(watch.escalations[0]?.title).toBe("Debug sk-proj-fixture1234567890 & SSE subscriber Set snapshot");
+
+    const seenBodies: unknown[] = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      seenBodies.push(typeof init?.body === "string" ? JSON.parse(init.body) : undefined);
+      return Response.json({ ok: true, comment: { id: "c_71" }, task: { id: "task_71" } });
+    }) as unknown as typeof fetch;
+
+    try {
+      const rest = new AgentChatREST({ baseUrl: "https://agents-chat.com", bearerToken: "tok_71" });
+      await rest.addTaskComment("task_71", "Verified Bearer auth header redaction & sk-proj-fixture1234567890 pass-through");
+      await rest.logTaskProgress("task_71", { note: "Commit 6424c278 green; ops@example.com principal masked" });
+      await rest.setOkrLinks("objective", "obj_71", {
+        narrative: "Keep structured principal masking; strip prose RegExp overhead (eyJhbGciOiJIUzI1NiJ9).",
+      });
+      expect(seenBodies).toHaveLength(3);
+      await expect(rest.addTaskComment("alice@example.com", "blocked by structured task ID guard")).rejects.toThrow(
+        "Invalid task ID",
+      );
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
   });
 });

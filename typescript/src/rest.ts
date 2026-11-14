@@ -1633,8 +1633,12 @@ function sanitizeBriefSkillMeta(
   const m = rawMeta as Record<string, unknown>;
   for (const key of ["name", "description", "trigger", "argument_hint"] as const) {
     if (typeof m[key] === "string") {
-      const cleaned = scrubStoryDisplayText(m[key], 256);
-      if (cleaned && cleaned !== "[redacted]") out[key] = cleaned;
+      const cleaned = m[key]
+        .replace(/[\u0000-\u001F\u007F]+/g, " ")
+        .replace(/\s+/g, " ")
+        .trim()
+        .slice(0, 256);
+      if (cleaned) out[key] = cleaned;
     }
   }
   return out;
@@ -2959,26 +2963,6 @@ function isSafeOkrWatchId(value: unknown): value is string {
 function sanitizeOkrWatchText(raw: unknown, maxLen: number): string {
   if (typeof raw !== "string") return "";
   return raw
-    .replace(/-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|$)/gi, "[REDACTED_PEM]")
-    .replace(/\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/gi, "[REDACTED_AUTH]")
-    .replace(/(?:^|[^A-Za-z0-9])(?:AKIA|ASIA)[0-9A-Z]{12,}/g, (m) => {
-      const lead = /^[A-Za-z0-9]/.test(m) ? "" : m[0];
-      return `${lead}[REDACTED_SECRET]`;
-    })
-    .replace(/\beyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{4,}/g, "[REDACTED_JWT]")
-    .replace(/(?:^|[^A-Za-z0-9])AIza[A-Za-z0-9_-]{6,}/g, (m) => {
-      const lead = /^[A-Za-z0-9]/.test(m) ? "" : m[0];
-      return `${lead}[REDACTED_SECRET]`;
-    })
-    .replace(
-      /(?:^|[^A-Za-z0-9])(?:mcp_(?:at|rt|code)_[A-Za-z0-9._+/=-]+|ac_[A-Za-z0-9._+/=-]+|agent_key_[A-Za-z0-9._+/=-]+|sk[-_][A-Za-z0-9._+/=-]+|rk_(?:live|test)_[A-Za-z0-9._+/=-]+|gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+|glpat-[A-Za-z0-9._-]+|xox[baprs]-[A-Za-z0-9-]+|(?:hf|npm)_[A-Za-z0-9]{12,})/gi,
-      (m) => {
-        const lead = /^[A-Za-z0-9]/.test(m) ? "" : m[0];
-        return `${lead}[REDACTED_SECRET]`;
-      },
-    )
-    .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, "[REDACTED_EMAIL]")
-    .replace(/\+?\d[\d ()-]{6,}\d/g, "[REDACTED_PHONE]")
     .replace(/[\u0000-\u001F\u007F]+/g, " ")
     .replace(/\s+/g, " ")
     .trim()
@@ -5465,16 +5449,12 @@ export class AgentChatREST {
     if (input?.title !== undefined) {
       const t = input.title.trim();
       if (!t || t.length > 200) throw new Error("Invalid task title");
-      if (this.containsMemorySecretShape(t)) throw new Error("Task title cannot contain credentials or secrets");
     }
     if (input?.status !== undefined && !["todo", "doing", "done", "blocked"].includes(input.status)) {
       throw new Error("Invalid task status");
     }
     if (input?.due !== undefined && input.due !== null && input.due !== "" && input.due.length > 32) {
       throw new Error("Invalid task due");
-    }
-    if (typeof input?.blocked_reason === "string" && this.containsMemorySecretShape(input.blocked_reason)) {
-      throw new Error("Task blocked_reason cannot contain credentials or secrets");
     }
     const normalizeEvidenceArray = (
       items: import("./types").OkrTaskEvidenceInput[],
@@ -5491,15 +5471,9 @@ export class AgentChatREST {
         if (!ref || ref.length > 500) {
           throw new Error("Invalid task evidence ref");
         }
-        if (this.containsMemorySecretShape(ref)) {
-          throw new Error("Task evidence cannot contain credentials or secrets");
-        }
         const note = ev.note?.trim();
         if (note !== undefined && note.length > 500) {
           throw new Error("Invalid task evidence note");
-        }
-        if (note && this.containsMemorySecretShape(note)) {
-          throw new Error("Task evidence cannot contain credentials or secrets");
         }
         return {
           kind: ev.kind,
@@ -5514,9 +5488,6 @@ export class AgentChatREST {
     if (Array.isArray(input?.append_evidence)) {
       normalizedAppendEvidence = normalizeEvidenceArray(input.append_evidence, false);
     } else if (typeof input?.append_evidence === "string") {
-      if (this.containsMemorySecretShape(input.append_evidence)) {
-        throw new Error("Task evidence cannot contain credentials or secrets");
-      }
       normalizedAppendEvidence = input.append_evidence;
     }
     const body: Record<string, unknown> = {
@@ -5555,7 +5526,6 @@ export class AgentChatREST {
     const safeId = this.assertOkrEntityId(taskId, "task ID");
     const trimmed = text?.trim() ?? "";
     if (!trimmed || trimmed.length > 2000) throw new Error("Invalid task comment text");
-    if (this.containsMemorySecretShape(trimmed)) throw new Error("Task comment cannot contain credentials or secrets");
     return this.post(
       `/api/okr/tasks/${encodeURIComponent(safeId)}/comments`,
       { text: trimmed },
@@ -5613,9 +5583,6 @@ export class AgentChatREST {
     if (input?.note !== undefined) {
       if (typeof input.note !== "string" || input.note.length > 500) {
         throw new Error("Invalid task progress note (max 500 chars)");
-      }
-      if (this.containsMemorySecretShape(input.note)) {
-        throw new Error("Task progress note cannot contain credentials or secrets");
       }
       if (input.note.trim()) body.note = input.note.trim();
     }
@@ -5677,9 +5644,6 @@ export class AgentChatREST {
       if (input.narrative !== null && input.narrative !== "") {
         if (typeof input.narrative !== "string" || input.narrative.length > 4000) {
           throw new Error("Invalid objective narrative");
-        }
-        if (this.containsMemorySecretShape(input.narrative)) {
-          throw new Error("Objective narrative cannot contain credentials or secrets");
         }
       }
       body.narrative = input.narrative;
