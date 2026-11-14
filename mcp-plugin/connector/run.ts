@@ -43,6 +43,7 @@ import { MessageDedup } from "../src/dedup.ts";
 import { planBackfill } from "./backfill.ts";
 import { ingestAgentsChatFrame } from "./ingest.ts";
 import { HeartbeatMonitor, WS_CLOSED } from "../src/heartbeat.ts";
+import { computePleaseReconnectDelay } from "../src/reconnect.ts";
 
 const log = (m: string) => process.stderr.write(`[agentschat-connector] ${m}\n`);
 
@@ -152,6 +153,7 @@ function scheduleReconnect(id: Identity, delay: number) {
     reconnectTimerByBot.delete(id.botId);
     if (currentIdentity(id)) connectIdentity(id);
   }, delay);
+  (timer as any).unref?.();
   reconnectTimerByBot.set(id.botId, timer);
 }
 const backoffByBot = new Map<string, number>();
@@ -163,6 +165,7 @@ const dedup = new MessageDedup();
 const HB_PING_MS = Math.max(5_000, Number(process.env.AGENTSCHAT_CONNECTOR_PING_MS || 15_000));
 const HB_PONG_MS = Math.max(HB_PING_MS + 5_000, Number(process.env.AGENTSCHAT_CONNECTOR_PONG_TIMEOUT_MS || 45_000));
 const HB_CONNECT_MS = Math.max(5_000, Number(process.env.AGENTSCHAT_CONNECTOR_CONNECT_TIMEOUT_MS || 30_000));
+const HTTP_TIMEOUT_MS = Math.max(2_000, Number(process.env.AGENTSCHAT_CONNECTOR_HTTP_TIMEOUT_MS || 10_000));
 
 function stopHeartbeat(botId: string) {
   const hb = heartbeatsByBot.get(botId);
@@ -232,7 +235,10 @@ function joinChannel(ws: WS, id: Identity, channelId: string, name?: string) {
 // Hermes never sees inbound messages despite REST membership.
 async function joinMemberships(ws: WS, id: Identity) {
   try {
-    const r = await fetch(`${API}/api/channels/mine`, { headers: { Authorization: `Bearer ${id.token}` } });
+    const r = await fetch(`${API}/api/channels/mine`, {
+      headers: { Authorization: `Bearer ${id.token}` },
+      signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
+    });
     if (!r.ok) {
       log(`list mine failed: ${r.status}`);
       return;
@@ -272,6 +278,7 @@ async function backfillIdentity(id: Identity, channelIds: string[]) {
       const params = after ? `?after=${encodeURIComponent(after)}&limit=50` : `?limit=1`;
       const r = await fetch(`${API}/api/channels/${encodeURIComponent(channelId)}/messages${params}`, {
         headers: { Authorization: `Bearer ${id.token}` },
+        signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
       });
       if (!r.ok) continue;
       const msgs = (((await r.json()) as any)?.messages ?? []) as any[];
@@ -372,6 +379,23 @@ function connectIdentity(id: Identity) {
       joinChannel(ws, id, data.channel_id, data.name);
       return;
     }
+    if (data.type === "please_reconnect" || data.type === "shard_moved") {
+      if (heartbeatForced) return;
+      heartbeatForced = true;
+      const delay = computePleaseReconnectDelay(
+        data.type === "please_reconnect" ? data.drain_window_ms : 1500,
+      );
+      log(`agentschat WS ${data.type} for ${id.botId}; reconnecting after jitter ${delay}ms`);
+      backoffByBot.set(id.botId, 1000);
+      try {
+        ws.removeAllListeners("close");
+        ws.close();
+      } catch {}
+      socketsByBot.delete(id.botId);
+      stopHeartbeat(id.botId);
+      scheduleReconnect(id, delay);
+      return;
+    }
     if (data.type === "message") {
       hb.receivedPong(); // any live traffic counts as liveness
       if (!data.__source) data.__source = "live";
@@ -408,6 +432,7 @@ const connector = startConnector({
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${id.token}` },
         body: JSON.stringify({ sender_id: id.agentId, content_type: "text", content, ...(replyTo ? { parent_id: replyTo } : {}) }),
+        signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
       }).catch(() => { throw new PlatformNetworkError(); });
       if (!res.ok) throw new PlatformHttpError(res.status);
       const data = (await res.json()) as any;
@@ -425,6 +450,7 @@ const connector = startConnector({
       const id = requireIdentity(identities, botId);
       const res = await fetch(`${API}/api/channels/${encodeURIComponent(chatId)}`, {
         headers: { Authorization: `Bearer ${id.token}` },
+        signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
       });
       if (!res.ok) return { name: chatId, type: chatId.startsWith("dm-") ? "dm" : "group" };
       const data = (await res.json()) as any;
@@ -528,18 +554,22 @@ function reloadIdentitiesFromConfig() {
   log(`hot-reload complete: ${identities.length} identit${identities.length === 1 ? "y" : "ies"} (${added.length} added, ${removed.length} removed)`);
 }
 
-process.on("SIGHUP", () => {
-  try {
-    reloadIdentitiesFromConfig();
-  } catch (e: any) {
-    log(`hot-reload FAILED (keeping previous identities): ${e?.message ?? e}`);
-  }
-});
+if (process.platform !== "win32") {
+  process.on("SIGHUP", () => {
+    try {
+      reloadIdentitiesFromConfig();
+    } catch (e: any) {
+      log(`hot-reload FAILED (keeping previous identities): ${e?.message ?? e}`);
+    }
+  });
+}
 
 for (const sig of ["SIGINT", "SIGTERM"] as const) {
   process.on(sig, () => {
     (process as any).__shutdown = true;
     for (const botId of reconnectTimerByBot.keys()) cancelReconnect(botId);
+    for (const [, t] of backfillTimerByBot) clearTimeout(t);
+    backfillTimerByBot.clear();
     for (const botId of [...heartbeatsByBot.keys()]) stopHeartbeat(botId);
     for (const ws of socketsByBot.values()) {
       try { ws.close(); } catch {}

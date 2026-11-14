@@ -263,7 +263,7 @@ function startConnector(config) {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ ok: true, service: "agentschat-connector", contract_version: 1, identities: table.size }));
   });
-  const wss = new WebSocketServer({ noServer: true });
+  const wss = new WebSocketServer({ noServer: true, maxPayload: 2 * 1024 * 1024 });
   http.on("upgrade", (req, socket, head) => {
     const { pathname } = new URL(req.url ?? "/", "http://localhost");
     if (pathname !== "/relay") {
@@ -380,9 +380,12 @@ function startConnector(config) {
     }
   }
   function send(ws, obj) {
-    if (ws.readyState === WebSocket.OPEN)
-      ws.send(JSON.stringify(obj) + `
+    if (ws.readyState === WebSocket.OPEN) {
+      try {
+        ws.send(JSON.stringify(obj) + `
 `);
+      } catch {}
+    }
   }
   const ready = new Promise((resolve, reject) => {
     http.once("listening", resolve);
@@ -457,6 +460,7 @@ function startConnector(config) {
                       controller.abort();
                       resolve(null);
                     }, 1000);
+                    timer.unref?.();
                   })
                 ]);
                 if (ctx && ctx.length) {
@@ -472,8 +476,15 @@ function startConnector(config) {
                   clearTimeout(timer);
               }
             }
-            if (msg.timestamp && Number.isFinite(Date.parse(msg.timestamp)) && (!since || Date.parse(msg.timestamp) > Date.parse(since)))
+            if (msg.timestamp && Number.isFinite(Date.parse(msg.timestamp)) && (!since || Date.parse(msg.timestamp) > Date.parse(since))) {
+              lastAddressed.delete(key);
               lastAddressed.set(key, msg.timestamp);
+              if (lastAddressed.size > 2000) {
+                const oldestKey = lastAddressed.keys().next().value;
+                if (oldestKey !== undefined)
+                  lastAddressed.delete(oldestKey);
+              }
+            }
           }
           if (tick) {
             baseEvent.context = [...baseEvent.context ?? [], {
@@ -713,6 +724,12 @@ class HeartbeatMonitor {
   }
 }
 
+// src/reconnect.ts
+function computePleaseReconnectDelay(jitterMs, rand = Math.random) {
+  const maxJitter = typeof jitterMs === "number" && Number.isFinite(jitterMs) && jitterMs > 0 ? Math.min(Math.floor(jitterMs), 1e4) : 2000;
+  return 200 + Math.floor(rand() * maxJitter);
+}
+
 // connector/run.ts
 var log = (m) => process.stderr.write(`[agentschat-connector] ${m}
 `);
@@ -815,6 +832,7 @@ function scheduleReconnect(id, delay) {
     if (currentIdentity(id))
       connectIdentity(id);
   }, delay);
+  timer.unref?.();
   reconnectTimerByBot.set(id.botId, timer);
 }
 var backoffByBot = new Map;
@@ -824,6 +842,7 @@ var dedup = new MessageDedup;
 var HB_PING_MS = Math.max(5000, Number(process.env.AGENTSCHAT_CONNECTOR_PING_MS || 15000));
 var HB_PONG_MS = Math.max(HB_PING_MS + 5000, Number(process.env.AGENTSCHAT_CONNECTOR_PONG_TIMEOUT_MS || 45000));
 var HB_CONNECT_MS = Math.max(5000, Number(process.env.AGENTSCHAT_CONNECTOR_CONNECT_TIMEOUT_MS || 30000));
+var HTTP_TIMEOUT_MS = Math.max(2000, Number(process.env.AGENTSCHAT_CONNECTOR_HTTP_TIMEOUT_MS || 1e4));
 function stopHeartbeat(botId) {
   const hb = heartbeatsByBot.get(botId);
   if (!hb)
@@ -882,7 +901,10 @@ function joinChannel(ws, id, channelId, name) {
 }
 async function joinMemberships(ws, id) {
   try {
-    const r = await fetch(`${API}/api/channels/mine`, { headers: { Authorization: `Bearer ${id.token}` } });
+    const r = await fetch(`${API}/api/channels/mine`, {
+      headers: { Authorization: `Bearer ${id.token}` },
+      signal: AbortSignal.timeout(HTTP_TIMEOUT_MS)
+    });
     if (!r.ok) {
       log(`list mine failed: ${r.status}`);
       return;
@@ -923,7 +945,8 @@ async function backfillIdentity(id, channelIds) {
       const after = s.map.get(channelId);
       const params = after ? `?after=${encodeURIComponent(after)}&limit=50` : `?limit=1`;
       const r = await fetch(`${API}/api/channels/${encodeURIComponent(channelId)}/messages${params}`, {
-        headers: { Authorization: `Bearer ${id.token}` }
+        headers: { Authorization: `Bearer ${id.token}` },
+        signal: AbortSignal.timeout(HTTP_TIMEOUT_MS)
       });
       if (!r.ok)
         continue;
@@ -1026,6 +1049,22 @@ function connectIdentity(id) {
       joinChannel(ws, id, data.channel_id, data.name);
       return;
     }
+    if (data.type === "please_reconnect" || data.type === "shard_moved") {
+      if (heartbeatForced)
+        return;
+      heartbeatForced = true;
+      const delay = computePleaseReconnectDelay(data.type === "please_reconnect" ? data.drain_window_ms : 1500);
+      log(`agentschat WS ${data.type} for ${id.botId}; reconnecting after jitter ${delay}ms`);
+      backoffByBot.set(id.botId, 1000);
+      try {
+        ws.removeAllListeners("close");
+        ws.close();
+      } catch {}
+      socketsByBot.delete(id.botId);
+      stopHeartbeat(id.botId);
+      scheduleReconnect(id, delay);
+      return;
+    }
     if (data.type === "message") {
       hb.receivedPong();
       if (!data.__source)
@@ -1061,7 +1100,8 @@ var connector = startConnector({
       const res = await fetch(`${API}/api/channels/${encodeURIComponent(chatId)}/messages`, {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${id.token}` },
-        body: JSON.stringify({ sender_id: id.agentId, content_type: "text", content, ...replyTo ? { parent_id: replyTo } : {} })
+        body: JSON.stringify({ sender_id: id.agentId, content_type: "text", content, ...replyTo ? { parent_id: replyTo } : {} }),
+        signal: AbortSignal.timeout(HTTP_TIMEOUT_MS)
       }).catch(() => {
         throw new PlatformNetworkError;
       });
@@ -1083,7 +1123,8 @@ var connector = startConnector({
     async getChatInfo(botId, chatId) {
       const id = requireIdentity(identities, botId);
       const res = await fetch(`${API}/api/channels/${encodeURIComponent(chatId)}`, {
-        headers: { Authorization: `Bearer ${id.token}` }
+        headers: { Authorization: `Bearer ${id.token}` },
+        signal: AbortSignal.timeout(HTTP_TIMEOUT_MS)
       });
       if (!res.ok)
         return { name: chatId, type: chatId.startsWith("dm-") ? "dm" : "group" };
@@ -1172,18 +1213,23 @@ function reloadIdentitiesFromConfig() {
   }
   log(`hot-reload complete: ${identities.length} identit${identities.length === 1 ? "y" : "ies"} (${added.length} added, ${removed.length} removed)`);
 }
-process.on("SIGHUP", () => {
-  try {
-    reloadIdentitiesFromConfig();
-  } catch (e) {
-    log(`hot-reload FAILED (keeping previous identities): ${e?.message ?? e}`);
-  }
-});
+if (process.platform !== "win32") {
+  process.on("SIGHUP", () => {
+    try {
+      reloadIdentitiesFromConfig();
+    } catch (e) {
+      log(`hot-reload FAILED (keeping previous identities): ${e?.message ?? e}`);
+    }
+  });
+}
 for (const sig of ["SIGINT", "SIGTERM"]) {
   process.on(sig, () => {
     process.__shutdown = true;
     for (const botId of reconnectTimerByBot.keys())
       cancelReconnect(botId);
+    for (const [, t] of backfillTimerByBot)
+      clearTimeout(t);
+    backfillTimerByBot.clear();
     for (const botId of [...heartbeatsByBot.keys()])
       stopHeartbeat(botId);
     for (const ws of socketsByBot.values()) {

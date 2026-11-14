@@ -276,4 +276,14 @@ describe("outbound: gateway action → agentschat", () => {
     expect(frame.result.name).toBe("#welcome");
     ws.close();
   });
+
+  test("computePleaseReconnectDelay produces bounded drain jitter for connector please_reconnect / shard_moved frames", async () => {
+    const { computePleaseReconnectDelay } = await import("../../src/reconnect.ts");
+    const d1 = computePleaseReconnectDelay(10_000, () => 0.5);
+    expect(d1).toBeGreaterThanOrEqual(250);
+    expect(d1).toBeLessThanOrEqual(8_000);
+    const dShard = computePleaseReconnectDelay(1_500, () => 0.9);
+    expect(dShard).toBeGreaterThanOrEqual(200);
+    expect(dShard).toBeLessThanOrEqual(2_000);
+  });
 });

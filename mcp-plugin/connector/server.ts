@@ -132,7 +132,7 @@ export function startConnector(config: ConnectorConfig): ConnectorHandle {
     res.end(JSON.stringify({ ok: true, service: "agentschat-connector", contract_version: 1, identities: table.size }));
   });
 
-  const wss = new WebSocketServer({ noServer: true });
+  const wss = new WebSocketServer({ noServer: true, maxPayload: 2 * 1024 * 1024 });
 
   http.on("upgrade", (req: IncomingMessage, socket, head) => {
     const { pathname } = new URL(req.url ?? "/", "http://localhost");
@@ -267,7 +267,9 @@ export function startConnector(config: ConnectorConfig): ConnectorHandle {
   function send(ws: WebSocket, obj: any) {
     // Newline-delimited (gateway ws_transport.py splits on "\n"): a frame without the
     // terminator never reaches the gateway's frame handler.
-    if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj) + "\n");
+    if (ws.readyState === WebSocket.OPEN) {
+      try { ws.send(JSON.stringify(obj) + "\n"); } catch {}
+    }
   }
 
   const ready = new Promise<void>((resolve, reject) => {
@@ -355,7 +357,10 @@ export function startConnector(config: ConnectorConfig): ConnectorHandle {
               try {
                 const ctx = await Promise.race([
                   hooks.getChannelContext(target.botId, msg.channel_id!, since, msg.id, controller.signal),
-                  new Promise<null>(resolve => { timer = setTimeout(() => { controller.abort(); resolve(null); }, 1000); }),
+                  new Promise<null>(resolve => {
+                    timer = setTimeout(() => { controller.abort(); resolve(null); }, 1000);
+                    timer.unref?.();
+                  }),
                 ]);
                 if (ctx && ctx.length) {
                   baseEvent.context = ctx.slice(-10).map((c) => ({
@@ -370,7 +375,14 @@ export function startConnector(config: ConnectorConfig): ConnectorHandle {
               }
             }
             if (msg.timestamp && Number.isFinite(Date.parse(msg.timestamp)) &&
-                (!since || Date.parse(msg.timestamp) > Date.parse(since))) lastAddressed.set(key, msg.timestamp);
+                (!since || Date.parse(msg.timestamp) > Date.parse(since))) {
+              lastAddressed.delete(key);
+              lastAddressed.set(key, msg.timestamp);
+              if (lastAddressed.size > 2000) {
+                const oldestKey = lastAddressed.keys().next().value;
+                if (oldestKey !== undefined) lastAddressed.delete(oldestKey);
+              }
+            }
           }
           if (tick) {
             baseEvent.context = [...(baseEvent.context ?? []), {
