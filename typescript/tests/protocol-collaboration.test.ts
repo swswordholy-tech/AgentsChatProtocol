@@ -7,6 +7,7 @@ import {
   isPrivateOrReservedHost,
   isValidCollaborationRoster,
   resolveInheritedObjectiveChannel,
+  scheduleReadyDagTasks,
   summarizeAgentMemoryIndex,
   summarizeChannelBriefReadiness,
   summarizeChannelBriefSkills,
@@ -24,6 +25,7 @@ import {
   summarizeStoryArtifactBundle,
   summarizeWorkspaceGraphHierarchy,
   summarizeWorkspaceGraphReadiness,
+  topologicalSortDagTasks,
   type ACMessage,
   type ChannelBrief,
   type ChannelDocUpdatedMessage,
@@ -5457,5 +5459,76 @@ describe("AgentChatClient realtime collaboration WS events", () => {
     } finally {
       globalThis.fetch = originalFetch;
     }
+  });
+
+  test("Campaign #62: topologicalSortDagTasks, scheduleReadyDagTasks, and summarizeOkrWatchReadiness align with server okr-watch & specialist-first DAG scheduler", () => {
+    expect(
+      topologicalSortDagTasks([
+        { id: "root", depends_on: [] },
+        { id: "mid", depends_on: ["root", "root"] },
+        { id: "leaf", depends_on: ["mid", "root"] },
+      ]),
+    ).toEqual(["root", "mid", "leaf"]);
+    expect(
+      topologicalSortDagTasks([
+        { id: "a", depends_on: ["b"] },
+        { id: "b", depends_on: ["a"] },
+      ]),
+    ).toBeNull();
+    expect(topologicalSortDagTasks([{ id: "self", depends_on: ["self"] }])).toBeNull();
+    expect(topologicalSortDagTasks([{ id: "dangling", depends_on: ["missing"] }])).toBeNull();
+
+    const assignments = scheduleReadyDagTasks(
+      [
+        { id: "generic-doc", status: "pending", required_capabilities: [] },
+        { id: "ios-ui", status: "todo", required_capabilities: ["Swift", "SwiftUI"] },
+        { id: "blocked-by-dep", status: "todo", depends_on: ["ios-ui"], required_capabilities: ["swift"] },
+      ],
+      [
+        { id: "broad-ios", capabilities: ["swift", "swiftui", "python", "go"], current_task_id: null },
+        { id: "focused-ios", capabilities: ["swift", "swiftui"], current_task_id: null },
+        { id: "busy-ios", capabilities: ["swift"], current_task_id: "other" },
+      ],
+    );
+    expect(assignments).toEqual([
+      { task_id: "ios-ui", agent_id: "focused-ios", matched_capabilities: 2, required_capabilities: 2 },
+      { task_id: "generic-doc", agent_id: "broad-ios", matched_capabilities: 0, required_capabilities: 0 },
+    ]);
+
+    const nowMs = Date.parse("2026-11-14T06:00:00Z");
+    const watch = summarizeOkrWatchReadiness(
+      [
+        {
+          id: "t-overdue-zero-progress",
+          assignee: "worker-1",
+          status: "doing",
+          title: "Consult aiza-guide & AIzaRealLeakedGoogleKey12345",
+          due: "2026-11-14T04:00:00Z",
+        },
+        {
+          id: "t-self-dep",
+          assignee: "worker-2",
+          status: "todo",
+          depends_on: ["t-self-dep"],
+        },
+        {
+          id: "t-blank-dep",
+          assignee: "worker-2",
+          status: "todo",
+          depends_on: [""],
+        },
+      ],
+      {
+        nowMs,
+        members: ["worker-1", "worker-2", "idle-dev", "mr_0123456789abcdef0123"],
+      },
+    );
+    expect(watch.over_eta_task_ids).toEqual(["t-overdue-zero-progress"]);
+    expect(watch.escalations[0]?.detail).toContain("no progress recorded");
+    expect(watch.escalations[0]?.title).toContain("aiza-guide");
+    expect(watch.escalations[0]?.title).not.toContain("AIzaRealLeakedGoogleKey12345");
+    expect(watch.ready_count).toBe(0);
+    expect(watch.idle_agents).toEqual(["idle-dev"]);
+    expect(watch.supply_starved).toBe(true);
   });
 });

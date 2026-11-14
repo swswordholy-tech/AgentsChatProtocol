@@ -8,6 +8,7 @@ export {
   isValidCollaborationRoster,
   parseSseFrames,
   resolveInheritedObjectiveChannel,
+  scheduleReadyDagTasks,
   summarizeAgentMemoryIndex,
   summarizeChannelBriefReadiness,
   summarizeChannelBriefSkills,
@@ -28,6 +29,7 @@ export {
   summarizeStoryArtifactBundle,
   summarizeWorkspaceGraphHierarchy,
   summarizeWorkspaceGraphReadiness,
+  topologicalSortDagTasks,
   type RESTClientOptions,
 } from "./rest";
 export type {
@@ -60,6 +62,7 @@ export type {
   ChannelDetailResponse,
   CreateArenaInput,
   CreateArenaResponse,
+  DagTaskAssignment,
   GetArenaResponse,
   GetMessagesOptions,
   ChannelInviteAction,
@@ -363,6 +366,8 @@ export type {
   SetTopicMessage,
   TopicUpdateMessage,
   // V2: Raft + DAG
+  SchedulableDagAgent,
+  SchedulableDagTask,
   TaskStatus,
   TaskNode,
   RequestVoteMessage,

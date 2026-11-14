@@ -2767,8 +2767,12 @@ function sanitizeOkrWatchText(raw: unknown, maxLen: number): string {
       return `${lead}[REDACTED_SECRET]`;
     })
     .replace(/\beyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{4,}/g, "[REDACTED_JWT]")
+    .replace(/(?:^|[^A-Za-z0-9])AIza[A-Za-z0-9_-]{6,}/g, (m) => {
+      const lead = /^[A-Za-z0-9]/.test(m) ? "" : m[0];
+      return `${lead}[REDACTED_SECRET]`;
+    })
     .replace(
-      /(?:^|[^A-Za-z0-9])(?:mcp_(?:at|rt|code)_[A-Za-z0-9._+/=-]+|ac_[A-Za-z0-9._+/=-]+|agent_key_[A-Za-z0-9._+/=-]+|sk[-_][A-Za-z0-9._+/=-]+|rk_(?:live|test)_[A-Za-z0-9._+/=-]+|gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+|glpat-[A-Za-z0-9._-]+|xox[baprs]-[A-Za-z0-9-]+|(?:hf|npm)_[A-Za-z0-9]{12,}|AIza[A-Za-z0-9_-]{6,})/gi,
+      /(?:^|[^A-Za-z0-9])(?:mcp_(?:at|rt|code)_[A-Za-z0-9._+/=-]+|ac_[A-Za-z0-9._+/=-]+|agent_key_[A-Za-z0-9._+/=-]+|sk[-_][A-Za-z0-9._+/=-]+|rk_(?:live|test)_[A-Za-z0-9._+/=-]+|gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+|glpat-[A-Za-z0-9._-]+|xox[baprs]-[A-Za-z0-9-]+|(?:hf|npm)_[A-Za-z0-9]{12,})/gi,
       (m) => {
         const lead = /^[A-Za-z0-9]/.test(m) ? "" : m[0];
         return `${lead}[REDACTED_SECRET]`;
@@ -2835,6 +2839,7 @@ export function summarizeOkrWatchReadiness(
     blocked_reason?: string;
     stamp: string;
     depends_on: string[];
+    has_invalid_dep: boolean;
   }> = [];
   const seenIds = new Set<string>();
   for (const raw of tasks.slice(0, 1000)) {
@@ -2854,9 +2859,26 @@ export function summarizeOkrWatchReadiness(
       (typeof row.last_progress_at === "string" && row.last_progress_at.trim()) ||
       (typeof row.updated_at === "string" && row.updated_at.trim()) ||
       "";
-    const dependsOn = Array.isArray(row.depends_on)
-      ? row.depends_on.filter((d: unknown): d is string => typeof d === "string" && d.trim().length > 0).map((d) => d.trim())
-      : [];
+    let hasInvalidDep = false;
+    const dependsOn: string[] = [];
+    if (row.depends_on !== undefined && row.depends_on !== null) {
+      if (!Array.isArray(row.depends_on)) {
+        hasInvalidDep = true;
+      } else {
+        for (const dep of row.depends_on) {
+          if (typeof dep !== "string") {
+            hasInvalidDep = true;
+            continue;
+          }
+          const trimmedDep = dep.trim();
+          if (!isSafeOkrWatchId(trimmedDep) || trimmedDep === id) {
+            hasInvalidDep = true;
+            continue;
+          }
+          dependsOn.push(trimmedDep);
+        }
+      }
+    }
     validTasks.push({
       id,
       assignee,
@@ -2866,6 +2888,7 @@ export function summarizeOkrWatchReadiness(
       blocked_reason: blockedReason,
       stamp,
       depends_on: dependsOn,
+      has_invalid_dep: hasInvalidDep,
     });
   }
 
@@ -2907,14 +2930,16 @@ export function summarizeOkrWatchReadiness(
 
     if (t.status === "doing") {
       const dueMs = t.due ? Date.parse(t.due) : NaN;
-      if (Number.isFinite(dueMs) && nowMs > dueMs && silentMs > 0) {
+      if (Number.isFinite(dueMs) && nowMs > dueMs && (!Number.isFinite(progressMs) || silentMs > 0)) {
         over_eta_task_ids.push(t.id);
         escalations.push({
           kind: "over_eta",
           task_id: t.id,
           assignee: t.assignee,
           ...(t.title ? { title: t.title } : {}),
-          detail: `over ETA by ${formatOkrWatchDuration(nowMs - dueMs)} (silent ${formatOkrWatchDuration(silentMs)})`,
+          detail: Number.isFinite(progressMs)
+            ? `over ETA by ${formatOkrWatchDuration(nowMs - dueMs)} (silent ${formatOkrWatchDuration(silentMs)})`
+            : `over ETA by ${formatOkrWatchDuration(nowMs - dueMs)} (no progress recorded)`,
           silent_ms: silentMs,
         });
       } else if (!Number.isFinite(dueMs) && Number.isFinite(progressMs) && silentMs >= stallMs) {
@@ -2945,9 +2970,11 @@ export function summarizeOkrWatchReadiness(
   const ready_count = validTasks.filter(
     (t) =>
       t.status === "todo" &&
+      !t.has_invalid_dep &&
       t.depends_on.every(
         (d) =>
           isSafeOkrWatchId(d) &&
+          d !== t.id &&
           (doneIds.has(d) || (!byId.has(d) && (options?.externalDepStatuses ? lookupExternalDep(d) === "done" : true))),
       ),
   ).length;
@@ -2970,6 +2997,210 @@ export function summarizeOkrWatchReadiness(
     supply_starved,
     escalations,
   };
+}
+
+function normalizeSdkDagCapabilities(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return [];
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const item of raw.slice(0, 64)) {
+    if (typeof item !== "string") continue;
+    const norm = item.trim().toLowerCase();
+    if (!norm || norm.length > 64 || PROTOTYPE_POISON_KEYS.has(norm) || OKR_WATCH_CREDENTIAL_ID_RE.test(norm) || OKR_WATCH_AWS_KEY_ID_RE.test(norm) || seen.has(norm)) {
+      continue;
+    }
+    seen.add(norm);
+    out.push(norm);
+  }
+  return out;
+}
+
+/**
+ * Pure O(V+E) Kahn topological sort for client-side DAG validation.
+ * Returns ordered safe task IDs when acyclic and all dependencies exist in `tasks`, or `null` on cycle/invalid/dangling dependency.
+ */
+export function topologicalSortDagTasks(tasks: unknown): string[] | null {
+  if (!Array.isArray(tasks)) return null;
+  const nodeDeps = new Map<string, string[]>();
+  for (const raw of tasks.slice(0, 2000)) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+    const row = raw as Record<string, unknown>;
+    const id = typeof row.id === "string" ? row.id.trim() : "";
+    if (!isSafeOkrWatchId(id) || nodeDeps.has(id)) return null;
+    const rawDeps = row.depends_on ?? row.dependsOn;
+    const deps: string[] = [];
+    const seenDeps = new Set<string>();
+    if (rawDeps !== undefined && rawDeps !== null) {
+      if (!Array.isArray(rawDeps)) return null;
+      for (const d of rawDeps) {
+        if (typeof d !== "string") return null;
+        const depId = d.trim();
+        if (!isSafeOkrWatchId(depId) || depId === id) return null;
+        if (!seenDeps.has(depId)) {
+          seenDeps.add(depId);
+          deps.push(depId);
+        }
+      }
+    }
+    nodeDeps.set(id, deps);
+  }
+
+  const inDegree = new Map<string, number>();
+  const adjacency = new Map<string, string[]>();
+  for (const [id, deps] of nodeDeps) {
+    for (const dep of deps) {
+      if (!nodeDeps.has(dep)) return null;
+      const list = adjacency.get(dep) ?? [];
+      list.push(id);
+      adjacency.set(dep, list);
+    }
+    inDegree.set(id, deps.length);
+  }
+
+  const queue: string[] = [];
+  for (const [id, deg] of inDegree) {
+    if (deg === 0) queue.push(id);
+  }
+  const sorted: string[] = [];
+  let head = 0;
+  while (head < queue.length) {
+    const cur = queue[head++]!;
+    sorted.push(cur);
+    for (const nextId of adjacency.get(cur) ?? []) {
+      const nextDeg = (inDegree.get(nextId) ?? 0) - 1;
+      inDegree.set(nextId, nextDeg);
+      if (nextDeg === 0) queue.push(nextId);
+    }
+  }
+  return sorted.length === nodeDeps.size ? sorted : null;
+}
+
+/**
+ * Pure specialist-first capability scheduler matching `Server/src/dag-scheduler.ts`.
+ * Schedules ready (`pending` / `todo`) tasks whose `depends_on` are all `completed` / `done`,
+ * prioritizing capability-constrained tasks before generic tasks and narrow specialists on ties.
+ */
+export function scheduleReadyDagTasks(
+  tasks: unknown,
+  agents: unknown,
+): import("./types").DagTaskAssignment[] {
+  if (!Array.isArray(tasks) || !Array.isArray(agents)) return [];
+
+  const parsedTasks: Array<{
+    id: string;
+    idx: number;
+    status: string;
+    deps: string[];
+    hasInvalidDep: boolean;
+    reqCaps: string[];
+  }> = [];
+  const seenTasks = new Set<string>();
+  tasks.slice(0, 1000).forEach((raw, idx) => {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return;
+    const row = raw as Record<string, unknown>;
+    const id = typeof row.id === "string" ? row.id.trim() : "";
+    if (!isSafeOkrWatchId(id) || seenTasks.has(id)) return;
+    seenTasks.add(id);
+    const status = typeof row.status === "string" && row.status.trim() ? row.status.trim().toLowerCase() : "pending";
+    const rawDeps = row.depends_on ?? row.dependsOn;
+    const deps: string[] = [];
+    let hasInvalidDep = false;
+    if (rawDeps !== undefined && rawDeps !== null) {
+      if (!Array.isArray(rawDeps)) {
+        hasInvalidDep = true;
+      } else {
+        for (const d of rawDeps) {
+          if (typeof d !== "string") {
+            hasInvalidDep = true;
+            continue;
+          }
+          const depId = d.trim();
+          if (!isSafeOkrWatchId(depId) || depId === id) {
+            hasInvalidDep = true;
+            continue;
+          }
+          deps.push(depId);
+        }
+      }
+    }
+    const reqCaps = normalizeSdkDagCapabilities(row.required_capabilities ?? row.requiredCapabilities);
+    parsedTasks.push({ id, idx, status, deps, hasInvalidDep, reqCaps });
+  });
+
+  const completedIds = new Set(
+    parsedTasks.filter((t) => t.status === "completed" || t.status === "done").map((t) => t.id),
+  );
+  const readyTasks = parsedTasks
+    .filter(
+      (t) =>
+        (t.status === "pending" || t.status === "todo") &&
+        !t.hasInvalidDep &&
+        t.deps.every((depId) => completedIds.has(depId)),
+    )
+    .sort(
+      (a, b) =>
+        Number(b.reqCaps.length > 0) - Number(a.reqCaps.length > 0) ||
+        b.reqCaps.length - a.reqCaps.length ||
+        a.idx - b.idx,
+    );
+
+  const availableAgents: Array<{ id: string; capSet: Set<string> }> = [];
+  const seenAgents = new Set<string>();
+  for (const raw of agents.slice(0, 500)) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) continue;
+    const row = raw as Record<string, unknown>;
+    const id = typeof row.id === "string" ? row.id.trim() : "";
+    if (!isSafeOkrWatchId(id) || seenAgents.has(id)) continue;
+    seenAgents.add(id);
+    const curTask = row.current_task_id ?? row.currentTaskId;
+    if (curTask !== undefined && curTask !== null && curTask !== "") continue;
+    availableAgents.push({
+      id,
+      capSet: new Set(normalizeSdkDagCapabilities(row.capabilities)),
+    });
+  }
+
+  const busyIds = new Set<string>();
+  const assignments: import("./types").DagTaskAssignment[] = [];
+  for (const task of readyTasks) {
+    const candidates = availableAgents.filter((a) => !busyIds.has(a.id));
+    if (candidates.length === 0) break;
+    if (task.reqCaps.length === 0) {
+      const chosen = candidates[0]!;
+      busyIds.add(chosen.id);
+      assignments.push({
+        task_id: task.id,
+        agent_id: chosen.id,
+        matched_capabilities: 0,
+        required_capabilities: 0,
+      });
+      continue;
+    }
+    let best: { id: string; capSet: Set<string> } | null = null;
+    let bestScore = -1;
+    let bestMatched = 0;
+    let bestBreadth = Number.POSITIVE_INFINITY;
+    for (const candidate of candidates) {
+      const matched = task.reqCaps.filter((c) => candidate.capSet.has(c)).length;
+      const score = matched / task.reqCaps.length;
+      if (score > bestScore || (score === bestScore && score > 0 && candidate.capSet.size < bestBreadth)) {
+        bestScore = score;
+        bestMatched = matched;
+        bestBreadth = candidate.capSet.size;
+        best = candidate;
+      }
+    }
+    if (best) {
+      busyIds.add(best.id);
+      assignments.push({
+        task_id: task.id,
+        agent_id: best.id,
+        matched_capabilities: bestMatched,
+        required_capabilities: task.reqCaps.length,
+      });
+    }
+  }
+  return assignments;
 }
 
 export interface RESTClientOptions {

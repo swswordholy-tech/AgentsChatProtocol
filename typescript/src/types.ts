@@ -2665,3 +2665,26 @@ export interface OkrWatchReadinessSummary {
   supply_starved: boolean;
   escalations: OkrWatchEscalationItem[];
 }
+
+export interface SchedulableDagTask {
+  id: string;
+  status?: string | null;
+  depends_on?: ReadonlyArray<string> | null;
+  dependsOn?: ReadonlyArray<string> | null;
+  required_capabilities?: ReadonlyArray<string> | null;
+  requiredCapabilities?: ReadonlyArray<string> | null;
+}
+
+export interface SchedulableDagAgent {
+  id: string;
+  capabilities?: ReadonlyArray<string> | null;
+  current_task_id?: string | null;
+  currentTaskId?: string | null;
+}
+
+export interface DagTaskAssignment {
+  task_id: string;
+  agent_id: string;
+  matched_capabilities: number;
+  required_capabilities: number;
+}
