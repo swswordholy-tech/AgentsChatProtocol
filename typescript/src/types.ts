@@ -28,6 +28,7 @@ export interface AgentCard {
   capabilities: string[];
   reputation: number;
   status: AgentStatus;
+  avatar_url?: string;
 }
 
 export interface VoteResult {

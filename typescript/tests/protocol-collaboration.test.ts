@@ -10,6 +10,7 @@ import {
   isPrivateOrReservedHost,
   isValidCollaborationRoster,
   mergeUniqueProposalBallots,
+  normalizeDiscoveredAgentCards,
   parseChannelSkillFrontmatter,
   rankDiscoverableChannels,
   resolveAgentMention,
@@ -6249,6 +6250,78 @@ describe("AgentChatClient realtime collaboration WS events", () => {
       await expect(rest.addTaskComment("alice@example.com", "blocked by structured task ID guard")).rejects.toThrow(
         "Invalid task ID",
       );
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("Campaign #72: normalizeDiscoveredAgentCards & discover/getOnlineAgents strip 'unknown'/SSRF avatar_url, credential/PII capabilities, and unsafe agent IDs", async () => {
+    const rawCards = [
+      {
+        agent_id: "directory-empty",
+        display_name: "Fresh directory-empty",
+        description: "Public description",
+        capabilities: ["Swift", "swift", "human@example.com", "+15551234567", "ac_HIDDENKEY123456", "sk-proj-HIDDENSECRET"],
+        reputation: 50,
+        status: "online",
+        avatar_url: "unknown",
+      },
+      {
+        agent_id: "directory-uploads",
+        display_name: "owner@example.com",
+        capabilities: ["Rust"],
+        reputation: 88,
+        status: "busy",
+        avatar_url: "/uploads/avatar-72.png",
+      },
+      {
+        agent_id: "directory-ssrf-avatar",
+        display_name: "SSRF Avatar",
+        capabilities: ["Go"],
+        reputation: 60,
+        status: "offline",
+        avatar_url: "http://127.0.0.1/avatar.png",
+      },
+      { agent_id: "human@example.com", display_name: "Human", capabilities: [], reputation: 50, status: "online" },
+      { agent_id: "ac_PRIVATEKEY123456", display_name: "Leak", capabilities: [], reputation: 50, status: "online" },
+      { agent_id: "__proto__", display_name: "Poison", capabilities: [], reputation: 50, status: "online" },
+    ];
+
+    const normalized = normalizeDiscoveredAgentCards(rawCards);
+    expect(normalized).toEqual([
+      {
+        agent_id: "directory-empty",
+        display_name: "Fresh directory-empty",
+        description: "Public description",
+        capabilities: ["Swift"],
+        reputation: 50,
+        status: "online",
+      },
+      {
+        agent_id: "directory-uploads",
+        display_name: "directory-uploads",
+        capabilities: ["Rust"],
+        reputation: 88,
+        status: "busy",
+        avatar_url: "/uploads/avatar-72.png",
+      },
+      {
+        agent_id: "directory-ssrf-avatar",
+        display_name: "SSRF Avatar",
+        capabilities: ["Go"],
+        reputation: 60,
+        status: "offline",
+      },
+    ]);
+
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async () => Response.json({ agents: rawCards })) as unknown as typeof fetch;
+    try {
+      const rest = new AgentChatREST({ baseUrl: "https://agents-chat.com", bearerToken: "tok_72" });
+      const discovered = await rest.discover(["Swift"]);
+      expect(discovered).toHaveLength(3);
+      expect(discovered[0]?.avatar_url).toBeUndefined();
+      expect(discovered[0]?.capabilities).toEqual(["Swift"]);
     } finally {
       globalThis.fetch = originalFetch;
     }

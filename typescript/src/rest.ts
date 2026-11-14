@@ -2161,6 +2161,101 @@ const CLOUD_HEALTH_EXPECTED_ACTIONS: Record<
 
 const CLOUD_HEALTH_AUTH_MODES = new Set(["managed", "byok", "subscription"]);
 
+export function normalizeDiscoveredAgentCards(rawCards: unknown): AgentCard[] {
+  if (!Array.isArray(rawCards)) return [];
+  const out: AgentCard[] = [];
+  const seenIds = new Set<string>();
+  const isUnsafeAgentId = (id: string) =>
+    !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/.test(id) ||
+    id.includes("..") ||
+    PROTOTYPE_POISON_KEYS.has(id.toLowerCase()) ||
+    /^mr_[0-9a-f]{16,}$/i.test(id) ||
+    /^apple_/i.test(id) ||
+    EMAIL_ID_RE.test(id) ||
+    PHONE_ID_RE.test(id) ||
+    CREDENTIAL_PREFIX_RE.test(id) ||
+    JOINED_GRAPH_CREDENTIAL_ID_RE.test(id) ||
+    JOINED_GRAPH_AWS_KEY_ID_RE.test(id) ||
+    EMBEDDED_SECRET_TOKEN_RE.test(id);
+  const isUnsafeCapability = (tag: string) =>
+    !tag ||
+    tag.length > 64 ||
+    /[\u0000-\u001F\u007F]/.test(tag) ||
+    PROTOTYPE_POISON_KEYS.has(tag.toLowerCase()) ||
+    EMAIL_ID_RE.test(tag) ||
+    PHONE_ID_RE.test(tag) ||
+    CREDENTIAL_PREFIX_RE.test(tag) ||
+    JOINED_GRAPH_CREDENTIAL_ID_RE.test(tag) ||
+    JOINED_GRAPH_AWS_KEY_ID_RE.test(tag) ||
+    EMBEDDED_SECRET_TOKEN_RE.test(tag);
+  const normalizeSafeAvatar = (raw: unknown): string | undefined => {
+    if (typeof raw !== "string") return undefined;
+    const trimmed = raw.trim();
+    if (!trimmed || trimmed.toLowerCase() === "unknown" || trimmed.length > 1024 || /[\u0000-\u001F\u007F]/.test(trimmed)) {
+      return undefined;
+    }
+    if (trimmed.startsWith("/uploads/") && !trimmed.includes("..")) return trimmed;
+    try {
+      const parsed = new URL(trimmed);
+      if ((parsed.protocol !== "https:" && parsed.protocol !== "http:") || parsed.username || parsed.password) {
+        return undefined;
+      }
+      if (isPrivateOrReservedHost(parsed.hostname)) return undefined;
+      return trimmed;
+    } catch {
+      return undefined;
+    }
+  };
+
+  for (const item of rawCards.slice(0, 500)) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    const row = item as Record<string, unknown>;
+    const agentId = typeof row.agent_id === "string" ? row.agent_id.trim() : "";
+    if (!agentId || isUnsafeAgentId(agentId) || seenIds.has(agentId)) continue;
+    seenIds.add(agentId);
+
+    const rawName = typeof row.display_name === "string" ? row.display_name.replace(/[\u0000-\u001F\u007F]+/g, " ").trim() : "";
+    const safeName = !rawName
+      ? agentId
+      : EMAIL_ID_RE.test(rawName) || PHONE_ID_RE.test(rawName)
+        ? agentId
+        : rawName.slice(0, 120);
+    const rawDesc = typeof row.description === "string" ? row.description.replace(/[\u0000-\u001F\u007F]+/g, " ").trim() : "";
+    const safeDesc = rawDesc ? rawDesc.slice(0, 500) : undefined;
+
+    const seenCapsLower = new Set<string>();
+    const capabilities: string[] = [];
+    if (Array.isArray(row.capabilities)) {
+      for (const rawCap of row.capabilities) {
+        if (typeof rawCap !== "string") continue;
+        const cap = rawCap.trim();
+        const lower = cap.toLowerCase();
+        if (isUnsafeCapability(cap) || seenCapsLower.has(lower)) continue;
+        seenCapsLower.add(lower);
+        capabilities.push(cap);
+        if (capabilities.length >= 32) break;
+      }
+    }
+
+    const reputation =
+      typeof row.reputation === "number" && Number.isFinite(row.reputation) ? row.reputation : 50;
+    const status: import("./types").AgentStatus =
+      row.status === "online" || row.status === "busy" ? row.status : "offline";
+    const avatarUrl = normalizeSafeAvatar(row.avatar_url ?? row.avatarUrl);
+
+    out.push({
+      agent_id: agentId,
+      display_name: safeName,
+      ...(safeDesc !== undefined ? { description: safeDesc } : {}),
+      capabilities,
+      reputation,
+      status,
+      ...(avatarUrl !== undefined ? { avatar_url: avatarUrl } : {}),
+    });
+  }
+  return out;
+}
+
 export function classifyCloudAgentHealthState(
   raw: unknown,
   agentId?: unknown,
@@ -3777,7 +3872,7 @@ export class AgentChatREST {
       "Cache-Control": "no-store",
       ...(this.authHeaders(opts?.bearerToken) ?? {}),
     });
-    return data.agents;
+    return normalizeDiscoveredAgentCards(data?.agents);
   }
 
   async getAgent(agentId: string, opts?: { bearerToken?: string }): Promise<AgentCard> {
@@ -3821,7 +3916,7 @@ export class AgentChatREST {
       "Cache-Control": "no-store",
       ...(this.authHeaders(opts?.bearerToken) ?? {}),
     });
-    return data.agents;
+    return normalizeDiscoveredAgentCards(data?.agents);
   }
 
   // MARK: - Channels

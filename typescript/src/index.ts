@@ -11,6 +11,7 @@ export {
   isPrivateOrReservedHost,
   isValidCollaborationRoster,
   mergeUniqueProposalBallots,
+  normalizeDiscoveredAgentCards,
   parseChannelSkillFrontmatter,
   parseSseFrames,
   rankDiscoverableChannels,
