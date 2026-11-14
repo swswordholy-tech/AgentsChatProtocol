@@ -8,7 +8,8 @@ import { redactSecrets } from "../src/redact.ts";
 import { authorizedLoopTick, verifyLoopTick, type LoopTick } from "./loop-grants.ts";
 import { acquireAgentLock, isPidAlive, releaseAgentLock, resolveLockDir } from "../src/session-bind.ts";
 
-export interface ChatMessage { id: string; channel_id: string; sender_id: string; content: string; mentions?: string[]; mentioned_ids?: string[]; meta?: LoopTick }
+export const MAX_BRIDGE_TERMINAL_ENTRIES = 500;
+export interface ChatMessage { id: string; channel_id: string; sender_id: string; content: string; mentions?: string[]; mentioned_ids?: string[]; parent_id?: string; reply_to?: string; meta?: LoopTick }
 interface Entry { message: ChatMessage; status: "pending" | "running" | "ready" | "sending" | "sent" | "failed" | "uncertain" | "blocked" | "skipped"; answer?: string; error?: string }
 interface ChannelThread { thread: string; namespace?: string; bootstrap?: string; importedThreads?: string[] }
 interface State { version: 1; threads: Record<string, string>; channels?: Record<string, ChannelThread>; entries: Entry[] }
@@ -46,17 +47,13 @@ export class Bridge {
     if (existsSync(this.lock)) {
       try {
         const holderPid = Number(readFileSync(this.lock, "utf8").trim());
-        if (holderPid > 0 && !isPidAlive(holderPid)) unlinkSync(this.lock);
+        if (!Number.isInteger(holderPid) || holderPid <= 0 || !isPidAlive(holderPid)) unlinkSync(this.lock);
       } catch {}
     }
     try { const fd = openSync(this.lock, "wx", 0o600); writeFileSync(fd, String(process.pid)); closeSync(fd); }
     catch { throw new Error(`Bridge already locked: ${this.lock}. If its process has exited, remove that lock manually.`); }
     const homeDir = process.env.HOME || process.env.USERPROFILE || ".";
-    acquireAgentLock({
-      lockDir: resolveLockDir(homeDir, process.env),
-      agentId: config.agentId,
-      runtime: "codex-bridge",
-    });
+    const lockDir = resolveLockDir(homeDir, process.env);
     try {
       this.state = existsSync(this.file) ? JSON.parse(readFileSync(this.file, "utf8")) : { version: 1, threads: {}, entries: [] };
       if (this.state.version !== 1 || !this.state.threads || !Array.isArray(this.state.entries)) throw new Error("Invalid bridge state");
@@ -65,11 +62,41 @@ export class Bridge {
         if (e.status === "running") e.status = "failed";
       }
       this.save();
-    } catch { unlinkSync(this.lock); throw new Error("Cannot load bridge state; refusing to discard history"); }
+    } catch {
+      try { unlinkSync(this.lock); } catch {}
+      throw new Error("Cannot load bridge state; refusing to discard history");
+    }
+    acquireAgentLock({
+      lockDir,
+      agentId: config.agentId,
+      runtime: "codex-bridge",
+    });
   }
   private save() {
-    const tmp = this.file + ".tmp";
-    writeFileSync(tmp, JSON.stringify(this.state), { mode: 0o600 }); renameSync(tmp, this.file);
+    const isTerminal = (status: Entry["status"]) =>
+      status === "sent" || status === "skipped" || status === "blocked";
+    let terminalCount = 0;
+    for (const entry of this.state.entries) {
+      if (isTerminal(entry.status)) terminalCount++;
+    }
+    if (terminalCount > MAX_BRIDGE_TERMINAL_ENTRIES) {
+      let dropRemaining = terminalCount - MAX_BRIDGE_TERMINAL_ENTRIES;
+      this.state.entries = this.state.entries.filter((entry) => {
+        if (dropRemaining > 0 && isTerminal(entry.status)) {
+          dropRemaining--;
+          return false;
+        }
+        return true;
+      });
+    }
+    const tmp = `${this.file}.tmp.${process.pid}.${Date.now()}`;
+    try {
+      writeFileSync(tmp, JSON.stringify(this.state), { mode: 0o600 });
+      renameSync(tmp, this.file);
+    } catch (err) {
+      try { unlinkSync(tmp); } catch {}
+      throw err;
+    }
   }
   accept(raw: unknown): boolean {
     if (this.stopped || !addressed(raw, this.config)) return false;
@@ -84,6 +111,8 @@ export class Bridge {
     const message: ChatMessage = { id: raw.id, channel_id: raw.channel_id, sender_id: raw.sender_id,
       ...(Array.isArray(raw.mentioned_ids) ? { mentioned_ids: raw.mentioned_ids.filter((id: unknown) => typeof id === "string") } : {}),
       ...(Array.isArray(raw.mentions) ? { mentions: raw.mentions.filter((id: unknown) => typeof id === "string") } : {}),
+      ...(!tick && typeof raw.parent_id === "string" && raw.parent_id.trim() ? { parent_id: raw.parent_id.trim() } : {}),
+      ...(!tick && typeof raw.reply_to === "string" && raw.reply_to.trim() ? { reply_to: raw.reply_to.trim() } : {}),
       content: tick ? "Authorized scheduled loop" : this.redact(raw.content),
       ...(tick ? { meta: { kind: "loop_tick", loop_id: tick.loop_id, interval_ms: tick.interval_ms,
         next_tick_ms: tick.next_tick_ms, prompt: tick.prompt } as LoopTick } : {}) };

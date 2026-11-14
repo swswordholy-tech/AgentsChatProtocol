@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { normalizeTimestampForCursor } from "../src/timestamps.ts";
 
@@ -33,8 +33,14 @@ export class InboxSync {
     this.state.channels = Object.assign(Object.create(null), this.state.channels);
   }
   private save() {
-    writeFileSync(this.file + ".tmp", JSON.stringify(this.state), {mode:0o600});
-    renameSync(this.file + ".tmp", this.file);
+    const tmp = `${this.file}.tmp.${process.pid}.${Date.now()}`;
+    try {
+      writeFileSync(tmp, JSON.stringify(this.state), {mode:0o600});
+      renameSync(tmp, this.file);
+    } catch (err) {
+      try { unlinkSync(tmp); } catch {}
+      throw err;
+    }
   }
   watch(channel: string) {
     this.channels.add(channel);

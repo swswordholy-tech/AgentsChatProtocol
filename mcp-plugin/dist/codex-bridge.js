@@ -2079,6 +2079,7 @@ function releaseAgentLock(opts) {
 }
 
 // codex/bridge.ts
+var MAX_BRIDGE_TERMINAL_ENTRIES = 500;
 function permitted(m, c) {
   if (m.meta?.kind === "loop_tick")
     return authorizedLoopTick(m, c) !== null;
@@ -2130,7 +2131,7 @@ class Bridge {
     if (existsSync6(this.lock)) {
       try {
         const holderPid = Number(readFileSync9(this.lock, "utf8").trim());
-        if (holderPid > 0 && !isPidAlive(holderPid))
+        if (!Number.isInteger(holderPid) || holderPid <= 0 || !isPidAlive(holderPid))
           unlinkSync3(this.lock);
       } catch {}
     }
@@ -2142,11 +2143,7 @@ class Bridge {
       throw new Error(`Bridge already locked: ${this.lock}. If its process has exited, remove that lock manually.`);
     }
     const homeDir = process.env.HOME || process.env.USERPROFILE || ".";
-    acquireAgentLock({
-      lockDir: resolveLockDir(homeDir, process.env),
-      agentId: config.agentId,
-      runtime: "codex-bridge"
-    });
+    const lockDir = resolveLockDir(homeDir, process.env);
     try {
       this.state = existsSync6(this.file) ? JSON.parse(readFileSync9(this.file, "utf8")) : { version: 1, threads: {}, entries: [] };
       if (this.state.version !== 1 || !this.state.threads || !Array.isArray(this.state.entries))
@@ -2159,14 +2156,44 @@ class Bridge {
       }
       this.save();
     } catch {
-      unlinkSync3(this.lock);
+      try {
+        unlinkSync3(this.lock);
+      } catch {}
       throw new Error("Cannot load bridge state; refusing to discard history");
     }
+    acquireAgentLock({
+      lockDir,
+      agentId: config.agentId,
+      runtime: "codex-bridge"
+    });
   }
   save() {
-    const tmp = this.file + ".tmp";
-    writeFileSync4(tmp, JSON.stringify(this.state), { mode: 384 });
-    renameSync4(tmp, this.file);
+    const isTerminal = (status) => status === "sent" || status === "skipped" || status === "blocked";
+    let terminalCount = 0;
+    for (const entry of this.state.entries) {
+      if (isTerminal(entry.status))
+        terminalCount++;
+    }
+    if (terminalCount > MAX_BRIDGE_TERMINAL_ENTRIES) {
+      let dropRemaining = terminalCount - MAX_BRIDGE_TERMINAL_ENTRIES;
+      this.state.entries = this.state.entries.filter((entry) => {
+        if (dropRemaining > 0 && isTerminal(entry.status)) {
+          dropRemaining--;
+          return false;
+        }
+        return true;
+      });
+    }
+    const tmp = `${this.file}.tmp.${process.pid}.${Date.now()}`;
+    try {
+      writeFileSync4(tmp, JSON.stringify(this.state), { mode: 384 });
+      renameSync4(tmp, this.file);
+    } catch (err) {
+      try {
+        unlinkSync3(tmp);
+      } catch {}
+      throw err;
+    }
   }
   accept(raw) {
     if (this.stopped || !addressed(raw, this.config))
@@ -2186,6 +2213,8 @@ class Bridge {
       sender_id: raw.sender_id,
       ...Array.isArray(raw.mentioned_ids) ? { mentioned_ids: raw.mentioned_ids.filter((id) => typeof id === "string") } : {},
       ...Array.isArray(raw.mentions) ? { mentions: raw.mentions.filter((id) => typeof id === "string") } : {},
+      ...!tick && typeof raw.parent_id === "string" && raw.parent_id.trim() ? { parent_id: raw.parent_id.trim() } : {},
+      ...!tick && typeof raw.reply_to === "string" && raw.reply_to.trim() ? { reply_to: raw.reply_to.trim() } : {},
       content: tick ? "Authorized scheduled loop" : this.redact(raw.content),
       ...tick ? { meta: {
         kind: "loop_tick",
@@ -2434,9 +2463,12 @@ function computePleaseReconnectDelay(jitterMs, rand = Math.random) {
   const maxJitter = typeof jitterMs === "number" && Number.isFinite(jitterMs) && jitterMs > 0 ? Math.min(Math.floor(jitterMs), 1e4) : 2000;
   return 200 + Math.floor(rand() * maxJitter);
 }
+function resolveDrainReconnectDelay(frame, rand = Math.random) {
+  return computePleaseReconnectDelay(frame?.jitter_ms ?? frame?.within_ms, rand);
+}
 
 // codex/inbox-sync.ts
-import { existsSync as existsSync7, mkdirSync as mkdirSync7, readFileSync as readFileSync10, renameSync as renameSync5, writeFileSync as writeFileSync5 } from "node:fs";
+import { existsSync as existsSync7, mkdirSync as mkdirSync7, readFileSync as readFileSync10, renameSync as renameSync5, unlinkSync as unlinkSync4, writeFileSync as writeFileSync5 } from "node:fs";
 import { join as join10 } from "node:path";
 
 // src/timestamps.ts
@@ -2489,8 +2521,16 @@ class InboxSync {
     this.state.channels = Object.assign(Object.create(null), this.state.channels);
   }
   save() {
-    writeFileSync5(this.file + ".tmp", JSON.stringify(this.state), { mode: 384 });
-    renameSync5(this.file + ".tmp", this.file);
+    const tmp = `${this.file}.tmp.${process.pid}.${Date.now()}`;
+    try {
+      writeFileSync5(tmp, JSON.stringify(this.state), { mode: 384 });
+      renameSync5(tmp, this.file);
+    } catch (err) {
+      try {
+        unlinkSync4(tmp);
+      } catch {}
+      throw err;
+    }
   }
   watch(channel) {
     this.channels.add(channel);
@@ -2624,6 +2664,11 @@ class AgentsChatTransport {
     typingTimer.unref?.();
     this.typing.set(channel, typingTimer);
   }
+  clearTyping() {
+    for (const timer of this.typing.values())
+      clearInterval(timer);
+    this.typing.clear();
+  }
   rejectPending() {
     for (const p of this.pending.values()) {
       clearTimeout(p.timer);
@@ -2697,7 +2742,8 @@ class AgentsChatTransport {
       } catch {
         return;
       }
-      this.heartbeat?.receivedPong();
+      if (data.type !== "auth_error")
+        this.heartbeat?.receivedPong();
       if (data.type === "auth_ok") {
         this.authenticated = true;
         this.delay = 1000;
@@ -2737,9 +2783,13 @@ class AgentsChatTransport {
       else if (["message", "thread_reply"].includes(data.type))
         this.receive(data);
       else if (data.type === "shard_moved" || data.type === "please_reconnect") {
-        this.delay = computePleaseReconnectDelay(typeof data.within_ms === "number" ? data.within_ms : undefined);
+        this.delay = resolveDrainReconnectDelay(data);
         socket.terminate();
-      } else if (data.type === "auth_error" || data.type === "error")
+      } else if (data.type === "auth_error") {
+        this.log("AgentsChat authentication rejected; check profile token (backing off 30s)");
+        this.delay = 30000;
+        socket.close();
+      } else if (data.type === "error")
         this.log("AgentsChat returned an error; check account and channel permissions");
     });
     socket.on("error", () => this.log("AgentsChat socket error"));
@@ -2747,6 +2797,7 @@ class AgentsChatTransport {
       if (!current())
         return;
       this.authenticated = false;
+      this.clearTyping();
       this.rejectPending();
       this.heartbeat?.stop();
       this.log("AgentsChat disconnected; reconnecting with history reconciliation");
@@ -2756,9 +2807,7 @@ class AgentsChatTransport {
     });
   }
   stop() {
-    for (const timer of this.typing.values())
-      clearInterval(timer);
-    this.typing.clear();
+    this.clearTyping();
     this.closed = true;
     this.authenticated = false;
     this.rejectPending();

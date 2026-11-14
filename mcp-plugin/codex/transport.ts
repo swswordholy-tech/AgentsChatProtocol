@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import WebSocket from "ws";
 import type { BridgeConfig } from "./config.ts";
 import { HeartbeatMonitor } from "../src/heartbeat.ts";
-import { computePleaseReconnectDelay } from "../src/reconnect.ts";
+import { resolveDrainReconnectDelay } from "../src/reconnect.ts";
 import { InboxSync } from "./inbox-sync.ts";
 
 export class AgentsChatTransport {
@@ -42,6 +42,10 @@ export class AgentsChatTransport {
     const typingTimer = setInterval(pulse, 2000);
     typingTimer.unref?.();
     this.typing.set(channel, typingTimer);
+  }
+  private clearTyping() {
+    for (const timer of this.typing.values()) clearInterval(timer);
+    this.typing.clear();
   }
   private rejectPending() {
     for (const p of this.pending.values()) { clearTimeout(p.timer); p.reject(new Error("AgentsChat acknowledgement unavailable")); }
@@ -86,7 +90,7 @@ export class AgentsChatTransport {
     socket.on("message", raw => {
       if (!current()) return;
       let data: any; try { data = JSON.parse(String(raw)); } catch { return; }
-      this.heartbeat?.receivedPong();
+      if (data.type !== "auth_error") this.heartbeat?.receivedPong();
       if (data.type === "auth_ok") {
         this.authenticated = true; this.delay = 1000; this.log(`AgentsChat connected as ${this.config.agentId}`);
         if (this.inboxSync && !this.syncTimer) {
@@ -109,19 +113,22 @@ export class AgentsChatTransport {
       } else if (data.type === "channel_created" && typeof data.channel_id === "string") join(data.channel_id);
       else if (["message", "thread_reply"].includes(data.type)) this.receive(data);
       else if (data.type === "shard_moved" || data.type === "please_reconnect") {
-        this.delay = computePleaseReconnectDelay(typeof data.within_ms === "number" ? data.within_ms : undefined);
+        this.delay = resolveDrainReconnectDelay(data);
         socket.terminate();
-      }
-      else if (data.type === "auth_error" || data.type === "error") this.log("AgentsChat returned an error; check account and channel permissions");
+      } else if (data.type === "auth_error") {
+        this.log("AgentsChat authentication rejected; check profile token (backing off 30s)");
+        this.delay = 30_000;
+        socket.close();
+      } else if (data.type === "error") this.log("AgentsChat returned an error; check account and channel permissions");
     });
     socket.on("error", () => this.log("AgentsChat socket error"));
     socket.on("close", () => {
       if (!current()) return;
-      this.authenticated = false; this.rejectPending(); this.heartbeat?.stop(); this.log("AgentsChat disconnected; reconnecting with history reconciliation");
+      this.authenticated = false; this.clearTyping(); this.rejectPending(); this.heartbeat?.stop(); this.log("AgentsChat disconnected; reconnecting with history reconciliation");
       this.retry = setTimeout(() => this.start(), this.delay);
       this.retry.unref?.();
       this.delay = Math.min(this.delay * 2, 30_000);
     });
   }
-  stop() { for (const timer of this.typing.values()) clearInterval(timer); this.typing.clear(); this.closed = true; this.authenticated = false; this.rejectPending(); clearTimeout(this.retry); clearInterval(this.syncTimer); this.heartbeat?.stop(); this.socket?.terminate(); }
+  stop() { this.clearTyping(); this.closed = true; this.authenticated = false; this.rejectPending(); clearTimeout(this.retry); clearInterval(this.syncTimer); this.heartbeat?.stop(); this.socket?.terminate(); }
 }

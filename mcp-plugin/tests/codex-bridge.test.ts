@@ -4,15 +4,16 @@
  * Migration: retain with the Codex bridge; fake only the external hub and model process.
  */
 import { test, expect, afterEach } from "bun:test";
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, chmodSync, realpathSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, chmodSync, realpathSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer } from "node:http";
 import { WebSocketServer } from "ws";
 import { resolveConfig, type BridgeConfig, type PermissionMode } from "../codex/config.ts";
-import { addressed, Bridge } from "../codex/bridge.ts";
+import { addressed, Bridge, MAX_BRIDGE_TERMINAL_ENTRIES } from "../codex/bridge.ts";
 import { AppServer, ThreadBusyError } from "../codex/app-server.ts";
 import { AgentsChatTransport } from "../codex/transport.ts";
+import { lockFilePath, readAgentLock } from "../src/session-bind.ts";
 
 const roots: string[] = [];
 afterEach(() => { for (const r of roots.splice(0)) rmSync(r, { recursive: true, force: true }); });
@@ -577,10 +578,138 @@ test("server-resolved mentions survive durable inbox and reach the model", async
  const generator={thread:async()=>"t-mention",generate:async (_:string,p:string)=>{prompt=p;return "ok";}};
  const bridge=ownedBridge(f.c,generator,async()=>{},()=>{});
  try {
-  bridge.accept({...message("resolved-mention","welcome"),content:"@DisplayName hi",mentioned_ids:["project"]});
+  bridge.accept({...message("resolved-mention","welcome"),content:"@DisplayName hi",mentioned_ids:["project"],parent_id:"root-msg-1",reply_to:"parent-msg-2"});
   await bridge.drain();
   const state=JSON.parse(readFileSync(join(f.c.stateDir,"state.json"),"utf8"));
   expect(state.entries[0].message.mentioned_ids).toEqual(["project"]);
+  expect(state.entries[0].message.parent_id).toBe("root-msg-1");
+  expect(state.entries[0].message.reply_to).toBe("parent-msg-2");
   expect(prompt).toContain('"mentioned_ids":["project"]');
+  expect(prompt).toContain('"parent_id":"root-msg-1"');
+  expect(prompt).toContain('"reply_to":"parent-msg-2"');
  } finally {await bridge.stop();}
+});
+
+test("corrupt state.json never leaks agent lock and 0-byte bridge.lock is recovered", async () => {
+  const f = fixture();
+  const prevLockDir = process.env.AGENTSCHAT_LOCK_DIR;
+  const customLockDir = join(f.root, "locks");
+  process.env.AGENTSCHAT_LOCK_DIR = customLockDir;
+  const generator = { thread: async () => "t", generate: async () => "ok" };
+  try {
+    mkdirSync(f.c.stateDir, { recursive: true });
+    writeFileSync(join(f.c.stateDir, "state.json"), "{corrupt-json");
+    expect(() => ownedBridge(f.c, generator, async () => {}, () => {})).toThrow("Cannot load bridge state");
+    expect(existsSync(join(f.c.stateDir, "bridge.lock"))).toBe(false);
+    expect(readAgentLock(customLockDir, f.c.agentId)).toBeNull();
+    expect(existsSync(lockFilePath(customLockDir, f.c.agentId))).toBe(false);
+
+    // Fix state.json and plant a 0-byte / non-numeric stale bridge.lock from a crashed startup
+    rmSync(join(f.c.stateDir, "state.json"));
+    writeFileSync(join(f.c.stateDir, "bridge.lock"), "");
+    const bridge = ownedBridge(f.c, generator, async () => {}, () => {});
+    try {
+      expect(readAgentLock(customLockDir, f.c.agentId)?.pid).toBe(process.pid);
+    } finally {
+      await bridge.stop();
+    }
+    expect(readAgentLock(customLockDir, f.c.agentId)).toBeNull();
+  } finally {
+    if (prevLockDir === undefined) delete process.env.AGENTSCHAT_LOCK_DIR;
+    else process.env.AGENTSCHAT_LOCK_DIR = prevLockDir;
+  }
+});
+
+test("terminal entries are bounded while uncertain, failed and pending entries are preserved", async () => {
+  const f = fixture();
+  mkdirSync(f.c.stateDir, { recursive: true });
+  const seeded = [
+    { message: message("u-keep"), status: "uncertain", error: "ack lost" },
+    { message: message("f-keep"), status: "failed", error: "gen error" },
+    ...Array.from({ length: MAX_BRIDGE_TERMINAL_ENTRIES + 25 }, (_, i) => ({
+      message: message(`sent-${i}`),
+      status: i % 5 === 0 ? "skipped" : i % 7 === 0 ? "blocked" : "sent",
+    })),
+    { message: message("p-keep"), status: "pending" },
+  ];
+  writeFileSync(join(f.c.stateDir, "state.json"), JSON.stringify({ version: 1, threads: {}, entries: seeded }));
+  const generator = { thread: async () => "t", generate: async () => "ok" };
+  const bridge = ownedBridge(f.c, generator, async () => {}, () => {});
+  try {
+    const state = JSON.parse(readFileSync(join(f.c.stateDir, "state.json"), "utf8"));
+    const ids = state.entries.map((e: any) => e.message.id);
+    expect(ids).toContain("u-keep");
+    expect(ids).toContain("f-keep");
+    expect(ids).toContain("p-keep");
+    expect(ids).not.toContain("sent-0");
+    expect(ids).not.toContain("sent-24");
+    expect(ids).toContain("sent-25");
+    expect(ids).toContain(`sent-${MAX_BRIDGE_TERMINAL_ENTRIES + 24}`);
+    expect(state.entries).toHaveLength(MAX_BRIDGE_TERMINAL_ENTRIES + 3);
+  } finally {
+    await bridge.stop();
+  }
+});
+
+test("transport backs off 30s on auth_error, honors please_reconnect jitter_ms, and clears typing on close", async () => {
+  const { c } = fixture();
+  const http = createServer((_req, res) => res.end('{"channels":[]}'));
+  await new Promise<void>(r => http.listen(0, "127.0.0.1", r));
+  c.apiUrl = `http://127.0.0.1:${(http.address() as any).port}`;
+  c.wsUrl = c.apiUrl.replace("http", "ws");
+  const ws = new WebSocketServer({ server: http });
+  let mode: "auth_error" | "drain" = "auth_error";
+  let connects = 0;
+  ws.on("connection", socket => {
+    connects++;
+    socket.on("message", raw => {
+      const m = JSON.parse(String(raw));
+      if (m.type === "auth") {
+        if (mode === "auth_error") socket.send('{"type":"auth_error"}');
+        else {
+          socket.send('{"type":"auth_ok"}');
+          setTimeout(() => socket.send('{"type":"please_reconnect","jitter_ms":50}'), 20);
+        }
+      }
+    });
+  });
+  const logs: string[] = [];
+  let t = new AgentsChatTransport(c, () => {}, s => logs.push(s));
+  try {
+    t.start();
+    const waitLog = async (needle: string) => {
+      const deadline = Date.now() + 3000;
+      while (!logs.some(l => l.includes(needle))) {
+        if (Date.now() > deadline) throw new Error(`Missing log: ${needle}`);
+        await Bun.sleep(10);
+      }
+    };
+    await waitLog("authentication rejected");
+    await waitLog("disconnected");
+    // Must NOT reconnect rapidly within 300ms when auth_error set 30s backoff
+    await Bun.sleep(250);
+    expect(connects).toBe(1);
+    t.stop();
+
+    // Now verify please_reconnect with jitter_ms reconnects promptly (~200-250ms) and clears typing on close
+    logs.length = 0;
+    connects = 0;
+    mode = "drain";
+    t = new AgentsChatTransport(c, () => {}, s => logs.push(s));
+    t.start();
+    await waitLog("connected as");
+    t.setTyping("dm-owner", true);
+    expect((t as any).typing.size).toBe(1);
+    await waitLog("disconnected");
+    expect((t as any).typing.size).toBe(0);
+    const deadline = Date.now() + 2000;
+    while (connects < 2 && Date.now() < deadline) await Bun.sleep(15);
+    expect(connects).toBeGreaterThanOrEqual(2);
+  } finally {
+    t.stop();
+    for (const client of ws.clients) client.terminate();
+    ws.close();
+    http.closeAllConnections();
+    await new Promise<void>(r => http.close(() => r()));
+  }
 });
