@@ -3802,9 +3802,13 @@ export function rankDiscoverableChannels<T extends import("./types").Discoverabl
   return limit >= 0 ? clean.slice(0, limit) : clean;
 }
 
+export type FetchLike = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
+
 export interface RESTClientOptions {
   baseUrl: string; // e.g. "http://localhost:8080"
   bearerToken?: string;
+  timeoutMs?: number;
+  fetchImpl?: FetchLike;
 }
 
 interface HealthResponse {
@@ -3837,10 +3841,20 @@ interface StoredMessage {
 export class AgentChatREST {
   private baseUrl: string;
   private bearerToken?: string;
+  private timeoutMs: number;
+  private fetchImpl: FetchLike;
 
   constructor(options: RESTClientOptions) {
+    if (
+      options.timeoutMs !== undefined &&
+      (!Number.isFinite(options.timeoutMs) || options.timeoutMs <= 0)
+    ) {
+      throw new Error("timeoutMs must be a positive finite number");
+    }
     this.baseUrl = options.baseUrl.replace(/\/$/, "");
     this.bearerToken = options.bearerToken?.trim() || undefined;
+    this.timeoutMs = options.timeoutMs ?? 15_000;
+    this.fetchImpl = options.fetchImpl ?? ((input, init) => fetch(input, init));
   }
 
   // MARK: - Health
@@ -4853,7 +4867,7 @@ export class AgentChatREST {
       "Cache-Control": "no-store",
       ...(token ? { Authorization: `Bearer ${token}` } : {}),
     };
-    const res = await fetch(
+    const res = await this.fetchWithConnectTimeout(
       `${this.baseUrl}/api/channels/${encodeURIComponent(safeChannel)}/stream`,
       {
         method: "GET",
@@ -5037,7 +5051,7 @@ export class AgentChatREST {
       ...(token ? { Authorization: `Bearer ${token}` } : {}),
       ...(input.if_match_version !== undefined ? { "If-Match": `"${input.if_match_version}"` } : {}),
     };
-    const res = await fetch(`${this.baseUrl}/api/skills/${encodeURIComponent(safeName)}`, {
+    return this.requestJson(`${this.baseUrl}/api/skills/${encodeURIComponent(safeName)}`, {
       method: "PUT",
       headers,
       body: JSON.stringify({
@@ -5045,11 +5059,6 @@ export class AgentChatREST {
         ...(input.if_match_version !== undefined ? { if_match_version: input.if_match_version } : {}),
       }),
     });
-    if (!res.ok) {
-      const error = await res.json().catch(() => ({ message: res.statusText }));
-      throw new Error(`HTTP ${res.status}: ${error.message ?? error.error ?? res.statusText}`);
-    }
-    return res.json();
   }
 
   async archivePersonalSkill(
@@ -5068,15 +5077,10 @@ export class AgentChatREST {
       ...(token ? { Authorization: `Bearer ${token}` } : {}),
       "If-Match": `"${expectedVersion}"`,
     };
-    const res = await fetch(`${this.baseUrl}/api/skills/${encodeURIComponent(safeName)}`, {
+    return this.requestJson(`${this.baseUrl}/api/skills/${encodeURIComponent(safeName)}`, {
       method: "DELETE",
       headers,
     });
-    if (!res.ok) {
-      const error = await res.json().catch(() => ({ message: res.statusText }));
-      throw new Error(`HTTP ${res.status}: ${error.message ?? error.error ?? res.statusText}`);
-    }
-    return res.json();
   }
 
   // MARK: - Room Loop Governance (/api/loops)
@@ -5941,7 +5945,7 @@ export class AgentChatREST {
       "Content-Type": "application/json",
       "If-Match": `"${input.if_match_version}"`,
     };
-    const res = await fetch(
+    return this.requestJson(
       `${this.baseUrl}/api/channels/${encodeURIComponent(safeCh)}/docs/${encodeURIComponent(safeDoc)}`,
       {
         method: "PUT",
@@ -5954,11 +5958,6 @@ export class AgentChatREST {
         }),
       },
     );
-    if (!res.ok) {
-      const error = await res.json().catch(() => ({ message: res.statusText }));
-      throw new Error(`HTTP ${res.status}: ${error.message ?? error.error ?? res.statusText}`);
-    }
-    return res.json();
   }
 
   async archiveChannelDoc(
@@ -5976,27 +5975,29 @@ export class AgentChatREST {
       ...this.authHeaders(opts?.bearerToken),
       ...(expectedVersion !== undefined ? { "If-Match": `"${expectedVersion}"` } : {}),
     };
-    const res = await fetch(
+    return this.withRequestTimeout(
       `${this.baseUrl}/api/channels/${encodeURIComponent(safeCh)}/docs/${encodeURIComponent(safeDoc)}`,
       {
         method: "DELETE",
         headers,
       },
+      async (res) => {
+        if (!res.ok) {
+          const error = await res.json().catch(() => ({ message: res.statusText }));
+          throw new Error(`HTTP ${res.status}: ${error.message ?? error.error ?? res.statusText}`);
+        }
+        const rawEtag = res.headers.get("ETag")?.replace(/^W\//i, "").replace(/^"|"$/g, "").trim();
+        const parsedVer = rawEtag && /^\d+$/.test(rawEtag) ? Number(rawEtag) : undefined;
+        if (res.status === 204) {
+          return { archived: true, ...(parsedVer !== undefined ? { version: parsedVer } : {}) };
+        }
+        const data = await res.json().catch(() => ({}));
+        return {
+          archived: true,
+          ...(typeof data?.version === "number" ? { version: data.version } : parsedVer !== undefined ? { version: parsedVer } : {}),
+        };
+      },
     );
-    if (!res.ok) {
-      const error = await res.json().catch(() => ({ message: res.statusText }));
-      throw new Error(`HTTP ${res.status}: ${error.message ?? error.error ?? res.statusText}`);
-    }
-    const rawEtag = res.headers.get("ETag")?.replace(/^W\//i, "").replace(/^"|"$/g, "").trim();
-    const parsedVer = rawEtag && /^\d+$/.test(rawEtag) ? Number(rawEtag) : undefined;
-    if (res.status === 204) {
-      return { archived: true, ...(parsedVer !== undefined ? { version: parsedVer } : {}) };
-    }
-    const data = await res.json().catch(() => ({}));
-    return {
-      archived: true,
-      ...(typeof data?.version === "number" ? { version: data.version } : parsedVer !== undefined ? { version: parsedVer } : {}),
-    };
   }
 
   async rotateAgentKey(
@@ -6623,16 +6624,11 @@ export class AgentChatREST {
       ...(typeof input.description === "string" ? { description: input.description } : {}),
       ...(input.if_match_version !== undefined ? { if_match_version: input.if_match_version } : {}),
     };
-    const res = await fetch(`${this.baseUrl}/api/memory/${encodeURIComponent(safeName)}`, {
+    return this.requestJson(`${this.baseUrl}/api/memory/${encodeURIComponent(safeName)}`, {
       method: "PUT",
       headers,
       body: JSON.stringify(body),
     });
-    if (!res.ok) {
-      const error = await res.json().catch(() => ({ message: res.statusText }));
-      throw new Error(`HTTP ${res.status}: ${error.message ?? error.error ?? res.statusText}`);
-    }
-    return res.json();
   }
 
   async deleteMemory(
@@ -6652,15 +6648,10 @@ export class AgentChatREST {
       ...(this.authHeaders(opts?.bearerToken) ?? {}),
       ...(opts?.if_match_version !== undefined ? { "If-Match": `"${opts.if_match_version}"` } : {}),
     };
-    const res = await fetch(`${this.baseUrl}/api/memory/${encodeURIComponent(safeName)}${qs}`, {
+    return this.requestJson(`${this.baseUrl}/api/memory/${encodeURIComponent(safeName)}${qs}`, {
       method: "DELETE",
       ...(Object.keys(headers).length > 0 ? { headers } : {}),
     });
-    if (!res.ok) {
-      const error = await res.json().catch(() => ({ message: res.statusText }));
-      throw new Error(`HTTP ${res.status}: ${error.message ?? error.error ?? res.statusText}`);
-    }
-    return res.json();
   }
 
   async cloudAgentJoinChannel(
@@ -6985,7 +6976,7 @@ export class AgentChatREST {
       ...(typeof input.description === "string" ? { description: input.description } : {}),
       ...(input.if_match_version !== undefined ? { if_match_version: input.if_match_version } : {}),
     };
-    const res = await fetch(
+    return this.requestJson(
       `${this.baseUrl}/api/cloud-agents/${encodeURIComponent(safeAgent)}/memory/${encodeURIComponent(safeName)}`,
       {
         method: "PUT",
@@ -6993,11 +6984,6 @@ export class AgentChatREST {
         body: JSON.stringify(body),
       },
     );
-    if (!res.ok) {
-      const error = await res.json().catch(() => ({ message: res.statusText }));
-      throw new Error(`HTTP ${res.status}: ${error.message ?? error.error ?? res.statusText}`);
-    }
-    return res.json();
   }
 
   async deleteCloudAgentMemory(
@@ -7020,18 +7006,13 @@ export class AgentChatREST {
       ...(this.authHeaders(opts?.bearerToken) ?? {}),
       ...(opts?.if_match_version !== undefined ? { "If-Match": `"${opts.if_match_version}"` } : {}),
     };
-    const res = await fetch(
+    return this.requestJson(
       `${this.baseUrl}/api/cloud-agents/${encodeURIComponent(safeAgent)}/memory/${encodeURIComponent(safeName)}${qs}`,
       {
         method: "DELETE",
         headers,
       },
     );
-    if (!res.ok) {
-      const error = await res.json().catch(() => ({ message: res.statusText }));
-      throw new Error(`HTTP ${res.status}: ${error.message ?? error.error ?? res.statusText}`);
-    }
-    return res.json();
   }
 
   async recoverCloudAgent(
@@ -7357,20 +7338,90 @@ export class AgentChatREST {
 
   // MARK: - Internal
 
+  private async fetchWithConnectTimeout(url: string, init?: RequestInit): Promise<Response> {
+    const controller = new AbortController();
+    const upstream = init?.signal;
+    const onUpstreamAbort = () => controller.abort(upstream?.reason);
+    if (upstream) {
+      if (upstream.aborted) {
+        controller.abort(upstream.reason);
+      } else {
+        upstream.addEventListener("abort", onUpstreamAbort, { once: true });
+      }
+    }
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort(new Error(`Request timed out after ${this.timeoutMs}ms`));
+    }, this.timeoutMs);
+    (timer as unknown as { unref?: () => void })?.unref?.();
+    try {
+      return await this.fetchImpl(url, { ...(init ?? {}), signal: controller.signal });
+    } catch (err) {
+      if (timedOut) {
+        throw new Error(`Request timed out after ${this.timeoutMs}ms`);
+      }
+      throw err;
+    } finally {
+      clearTimeout(timer);
+      upstream?.removeEventListener("abort", onUpstreamAbort);
+    }
+  }
+
+  private async withRequestTimeout<T>(
+    url: string,
+    init: RequestInit | undefined,
+    consume: (res: Response) => Promise<T>,
+  ): Promise<T> {
+    const controller = new AbortController();
+    const upstream = init?.signal;
+    const onUpstreamAbort = () => controller.abort(upstream?.reason);
+    if (upstream) {
+      if (upstream.aborted) {
+        controller.abort(upstream.reason);
+      } else {
+        upstream.addEventListener("abort", onUpstreamAbort, { once: true });
+      }
+    }
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort(new Error(`Request timed out after ${this.timeoutMs}ms`));
+    }, this.timeoutMs);
+    (timer as unknown as { unref?: () => void })?.unref?.();
+    try {
+      const res = await this.fetchImpl(url, { ...(init ?? {}), signal: controller.signal });
+      return await consume(res);
+    } catch (err) {
+      if (timedOut) {
+        throw new Error(`Request timed out after ${this.timeoutMs}ms`);
+      }
+      throw err;
+    } finally {
+      clearTimeout(timer);
+      upstream?.removeEventListener("abort", onUpstreamAbort);
+    }
+  }
+
+  private async requestJson<T = any>(url: string, init?: RequestInit): Promise<T> {
+    return this.withRequestTimeout(url, init, async (res) => {
+      if (!res.ok) {
+        const error = await res.json().catch(() => ({ message: res.statusText }));
+        throw new Error(`HTTP ${res.status}: ${error.message ?? error.error ?? res.statusText}`);
+      }
+      return res.json();
+    });
+  }
+
   private async get<T = any>(path: string, headers?: Record<string, string>): Promise<T> {
     const mergedHeaders: Record<string, string> = {
       ...(this.bearerToken ? { Authorization: `Bearer ${this.bearerToken}` } : {}),
       ...(headers ?? {}),
     };
-    const res = await fetch(
+    return this.requestJson(
       `${this.baseUrl}${path}`,
       Object.keys(mergedHeaders).length > 0 ? { headers: mergedHeaders } : undefined,
     );
-    if (!res.ok) {
-      const error = await res.json().catch(() => ({ message: res.statusText }));
-      throw new Error(`HTTP ${res.status}: ${error.message ?? error.error ?? res.statusText}`);
-    }
-    return res.json();
   }
 
   private async post<T = any>(
@@ -7383,16 +7434,11 @@ export class AgentChatREST {
       ...(this.bearerToken ? { Authorization: `Bearer ${this.bearerToken}` } : {}),
       ...(headers ?? {}),
     };
-    const res = await fetch(`${this.baseUrl}${path}`, {
+    return this.requestJson(`${this.baseUrl}${path}`, {
       method: "POST",
       headers: mergedHeaders,
       body: JSON.stringify(body),
     });
-    if (!res.ok) {
-      const error = await res.json().catch(() => ({ message: res.statusText }));
-      throw new Error(`HTTP ${res.status}: ${error.message ?? error.error ?? res.statusText}`);
-    }
-    return res.json();
   }
 
   private async patch<T = any>(
@@ -7405,16 +7451,11 @@ export class AgentChatREST {
       ...(this.bearerToken ? { Authorization: `Bearer ${this.bearerToken}` } : {}),
       ...(headers ?? {}),
     };
-    const res = await fetch(`${this.baseUrl}${path}`, {
+    return this.requestJson(`${this.baseUrl}${path}`, {
       method: "PATCH",
       headers: mergedHeaders,
       body: JSON.stringify(body),
     });
-    if (!res.ok) {
-      const error = await res.json().catch(() => ({ message: res.statusText }));
-      throw new Error(`HTTP ${res.status}: ${error.message ?? error.error ?? res.statusText}`);
-    }
-    return res.json();
   }
 
   private async del<T = any>(
@@ -7427,16 +7468,11 @@ export class AgentChatREST {
       ...(this.bearerToken ? { Authorization: `Bearer ${this.bearerToken}` } : {}),
       ...(headers ?? {}),
     };
-    const res = await fetch(`${this.baseUrl}${path}`, {
+    return this.requestJson(`${this.baseUrl}${path}`, {
       method: "DELETE",
       headers: mergedHeaders,
       body: JSON.stringify(body),
     });
-    if (!res.ok) {
-      const error = await res.json().catch(() => ({ message: res.statusText }));
-      throw new Error(`HTTP ${res.status}: ${error.message ?? error.error ?? res.statusText}`);
-    }
-    return res.json();
   }
 }
 

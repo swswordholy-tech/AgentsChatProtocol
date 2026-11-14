@@ -54,6 +54,7 @@ export interface ClientOptions {
   capabilities?: string[];
   heartbeatInterval?: number;
   connectTimeoutMs?: number;
+  wsFactory?: (url: string) => WebSocket;
 }
 
 // New feature types
@@ -595,6 +596,7 @@ export type OkrUpdatedHandler = (data: OkrUpdatedMessage) => void | Promise<void
 export type TaskAssignedHandler = (data: TaskAssignedMessage) => void | Promise<void>;
 export type OkrThreadOpenedHandler = (data: OkrThreadOpenedMessage) => void | Promise<void>;
 export type ChannelDocUpdatedHandler = (data: ChannelDocUpdatedMessage) => void | Promise<void>;
+export type ReconnectNeededHandler = (info: { reason: "please_reconnect" | "shard_moved"; targetUrl?: string }) => void | Promise<void>;
 
 export interface ParsedSseFramesResult {
   events: Record<string, unknown>[];

@@ -30,6 +30,7 @@ import type {
   ReactionUpdate,
   ReadReceiptHandler,
   ReadReceiptUpdate,
+  ReconnectNeededHandler,
   SenderType,
   TaskAssignedHandler,
   TaskAssignedMessage,
@@ -65,8 +66,10 @@ export class AgentChatClient {
   private taskAssignedHandlers: TaskAssignedHandler[] = [];
   private okrThreadOpenedHandlers: OkrThreadOpenedHandler[] = [];
   private channelDocUpdatedHandlers: ChannelDocUpdatedHandler[] = [];
+  private reconnectNeededHandlers: ReconnectNeededHandler[] = [];
   private connectResolve: (() => void) | null = null;
   private connectReject: ((err: Error) => void) | null = null;
+  private readonly wsFactory: (url: string) => WebSocket;
 
   readonly url: string;
   readonly agentId: string;
@@ -82,6 +85,7 @@ export class AgentChatClient {
     this.capabilities = options.capabilities ?? [];
     this.heartbeatInterval = options.heartbeatInterval ?? 30_000;
     this.connectTimeoutMs = options.connectTimeoutMs ?? 15_000;
+    this.wsFactory = options.wsFactory ?? ((url: string) => new WebSocket(url));
   }
 
   // MARK: - Connection
@@ -103,7 +107,13 @@ export class AgentChatClient {
       this.connectResolve = resolve;
       this.connectReject = reject;
 
-      const socket = new WebSocket(this.url);
+      let socket: WebSocket;
+      try {
+        socket = this.wsFactory(this.url);
+      } catch (err) {
+        this.rejectConnect(err instanceof Error ? err : new Error(String(err)));
+        return;
+      }
       this.ws = socket;
       if (this.connectTimeoutMs > 0) {
         this.connectTimer = setTimeout(() => {
@@ -131,7 +141,14 @@ export class AgentChatClient {
       };
       socket.onerror = () => {
         if (this.ws !== socket) return;
-        this.rejectConnect(new Error("WebSocket error"));
+        if (!this.sessionId) {
+          this.stopHeartbeat();
+          this.ws = null;
+          this.rejectConnect(new Error("WebSocket error"));
+          try {
+            socket.close();
+          } catch {}
+        }
       };
     });
   }
@@ -399,6 +416,11 @@ export class AgentChatClient {
     return this;
   }
 
+  onReconnectNeeded(handler: ReconnectNeededHandler) {
+    this.reconnectNeededHandlers.push(handler);
+    return this;
+  }
+
   // MARK: - Internal
 
   private handleOpen() {
@@ -486,13 +508,50 @@ export class AgentChatClient {
 
       case "agent_online":
       case "agent_offline": {
+        const agentIdStr = String(data.agent_id ?? "");
         const presence: AgentPresence = {
           type: data.type,
-          agent_id: data.agent_id,
-          display_name: data.display_name,
-          capabilities: data.capabilities,
+          agent_id: agentIdStr,
+          display_name:
+            typeof data.display_name === "string" && data.display_name
+              ? data.display_name
+              : agentIdStr,
+          capabilities: Array.isArray(data.capabilities) ? data.capabilities : [],
         };
         this.invokeHandlers(this.presenceHandlers, presence);
+        break;
+      }
+
+      case "auth_error": {
+        const detail = String(data.message ?? data.reason ?? data.code ?? "unauthorized");
+        const codeNum = typeof data.code === "number" ? data.code : 401;
+        this.invokeHandlers(this.errorHandlers, codeNum, detail);
+        this.stopHeartbeat();
+        const prev = this.ws;
+        this.ws = null;
+        this.sessionId = null;
+        this.rejectConnect(new Error(`Auth failed: ${detail}`));
+        try {
+          prev?.close();
+        } catch {}
+        break;
+      }
+
+      case "please_reconnect":
+      case "shard_moved": {
+        const targetUrl = typeof data.target_url === "string" && data.target_url ? data.target_url : undefined;
+        this.stopHeartbeat();
+        const prev = this.ws;
+        this.ws = null;
+        this.sessionId = null;
+        this.rejectConnect(new Error(`Server requested reconnect (${data.type})`));
+        this.invokeHandlers(this.reconnectNeededHandlers, {
+          reason: data.type,
+          ...(targetUrl ? { targetUrl } : {}),
+        });
+        try {
+          prev?.close();
+        } catch {}
         break;
       }
 
@@ -512,13 +571,25 @@ export class AgentChatClient {
         this.invokeHandlers(this.reactionHandlers, data as ReactionUpdate);
         break;
 
-      case "thread_reply":
-        this.invokeHandlers(this.threadHandlers, data as ThreadReply);
+      case "thread_reply": {
+        const parentId = data.parent_id ?? data.thread_id;
+        if (typeof parentId !== "string" || !parentId) break;
+        this.invokeHandlers(this.threadHandlers, {
+          ...(data as ThreadReply),
+          parent_id: parentId,
+        });
         break;
+      }
 
-      case "thread_update":
-        this.invokeHandlers(this.threadHandlers, data as ThreadUpdate);
+      case "thread_update": {
+        const parentId = data.parent_id ?? data.thread_id;
+        if (typeof parentId !== "string" || !parentId) break;
+        this.invokeHandlers(this.threadHandlers, {
+          ...(data as ThreadUpdate),
+          parent_id: parentId,
+        });
         break;
+      }
 
       case "message_edited":
         this.invokeHandlers(this.editHandlers, data as MessageEdited);
@@ -581,10 +652,13 @@ export class AgentChatClient {
     }
   }
 
-  private invokeHandlers<T extends (...args: any[]) => void>(handlers: T[], ...args: Parameters<T>) {
+  private invokeHandlers<T extends (...args: any[]) => unknown>(handlers: T[], ...args: Parameters<T>) {
     for (const h of [...handlers]) {
       try {
-        h(...args);
+        const out = h(...args);
+        if (out && typeof (out as Promise<unknown>).catch === "function") {
+          (out as Promise<unknown>).catch(() => {});
+        }
       } catch {}
     }
   }
