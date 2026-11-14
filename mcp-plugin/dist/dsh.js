@@ -762,7 +762,8 @@ async function registerOnly(name, restUrl, profilePath = DSH_PROFILE_PATH) {
   const res = await fetch(`${restUrl.replace(/\/$/, "")}/api/account/register`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ name, type: "agent", capabilities: ["chat"] })
+    body: JSON.stringify({ name, type: "agent", capabilities: ["chat"] }),
+    signal: AbortSignal.timeout(15000)
   });
   if (!res.ok)
     throw new Error(`Registration failed: ${res.status} ${await res.text()}`);
@@ -788,24 +789,44 @@ async function runDshHeadlessResponder(prompt, opts = {}) {
     });
     let stdout = "";
     let stderr = "";
+    let killTimer;
+    const clearTimers = () => {
+      clearTimeout(timer);
+      if (killTimer) {
+        clearTimeout(killTimer);
+        killTimer = undefined;
+      }
+    };
     const timer = setTimeout(() => {
       try {
         child.kill("SIGTERM");
       } catch {}
+      killTimer = setTimeout(() => {
+        killTimer = undefined;
+        if (child.exitCode === null) {
+          try {
+            child.kill("SIGKILL");
+          } catch {}
+        }
+      }, 3000);
+      killTimer.unref?.();
     }, timeoutMs);
+    timer.unref?.();
     child.stdout.on("data", (chunk) => {
-      stdout += chunk.toString("utf8");
+      if (stdout.length < 2000000)
+        stdout += chunk.toString("utf8");
     });
     child.stderr.on("data", (chunk) => {
-      stderr += chunk.toString("utf8");
+      if (stderr.length < 65536)
+        stderr += chunk.toString("utf8");
     });
     child.on("error", (err) => {
-      clearTimeout(timer);
+      clearTimers();
       console.error(`[dsh] failed to spawn ${dshBin}: ${err.message}`);
       resolve(null);
     });
     child.on("close", (code) => {
-      clearTimeout(timer);
+      clearTimers();
       if (code !== 0) {
         console.error(`[dsh] exited with code ${code}: ${stderr.trim().slice(0, 300)}`);
         resolve(null);
@@ -919,7 +940,11 @@ DeepSeek Harness (dsh) integration for AgentsChat:
       for (const c of wakeChannels)
         primaryClient.joinChannel(c);
     }
+    let syncInFlight = false;
     const syncBoundDshClients = async () => {
+      if (syncInFlight)
+        return;
+      syncInFlight = true;
       try {
         const cfgDir = agentschatConfigDir();
         const binds = loadSessionBinds(cfgDir);
@@ -953,10 +978,13 @@ DeepSeek Harness (dsh) integration for AgentsChat:
             extraClient.joinChannel(c);
           console.log(`[dsh-wake] Connected bound session ${sid} -> ${profName} (${botAgentId})`);
         }
-      } catch {}
+      } catch {} finally {
+        syncInFlight = false;
+      }
     };
     await syncBoundDshClients();
     const bindTimer = setInterval(() => void syncBoundDshClients(), 3000);
+    bindTimer.unref?.();
     console.log(`DSH wake daemon listening on ${wakeChannels.join(", ") || "(no channels — pass --channel <id>)"}, queue=${queueFile}.`);
     await new Promise((resolve) => {
       const shutdown = () => {

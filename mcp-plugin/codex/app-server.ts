@@ -14,8 +14,10 @@ export class AppServer {
   onFatal?: () => void;
   private closed = false;
   private child?: ChildProcessWithoutNullStreams;
+  private rl?: ReturnType<typeof createInterface>;
+  private killTimer?: ReturnType<typeof setTimeout>;
   private nextId = 0;
-  private pending = new Map<number, { method: string; resolve: (v: any) => void; reject: (e: Error) => void }>();
+  private pending = new Map<number, { method: string; timer: ReturnType<typeof setTimeout>; resolve: (v: any) => void; reject: (e: Error) => void }>();
   private active?: { thread: string; turn?: string; items: Map<string, string>; early: any[];
     resolve: (s: string) => void; reject: (e: Error) => void };
   private threadPermissions = new Map<string, PermissionMode>();
@@ -24,7 +26,7 @@ export class AppServer {
   private diagnosticTail = "";
   private disabledMcp: Record<string, { enabled: boolean }> = {};
   // Keep the legacy positional argument for callers; turns have no time limit.
-  constructor(private bin = "codex", private args = ["app-server", "--listen", "stdio://"], _legacyTurnTimeoutMs?: number, private permissions: PermissionMode = "full-access", private runtime?: {home: string; legacyHome?: string}, private effort?: ReasoningEffort, private model?: string, private toolIdentity?: { profileFile: string; agentId: string; apiUrl: string; wsUrl: string }) {}
+  constructor(private bin = "codex", private args = ["app-server", "--listen", "stdio://"], _legacyTurnTimeoutMs?: number, private permissions: PermissionMode = "full-access", private runtime?: {home: string; legacyHome?: string}, private effort?: ReasoningEffort, private model?: string, private toolIdentity?: { profileFile: string; agentId: string; apiUrl: string; wsUrl: string }, private requestTimeoutMs = 30_000) {}
   get namespace() { return this.runtime?.home; }
   async start() {
     const env = Object.fromEntries(Object.entries(process.env).filter(([k]) => !/^AGENTS?CHAT_|^RELAY_/.test(k)));
@@ -69,11 +71,17 @@ export class AppServer {
     });
     this.child.stdin.on("error", () => this.fatal(new Error("Codex input pipe closed")));
     this.child.on("error", () => this.fatal(new Error("Could not start Codex app-server")));
-    this.child.on("exit", () => this.fatal(new Error(!this.initialized && this.readonlyFilesystemReported
-      ? "Codex app-server exited before initialization after reporting a read-only filesystem. CODEX_HOME must be writable (including installation_id); sqlite_home/log_dir overrides alone are insufficient. Use an authorized writable state_root and dedicated home; authentication is a separate step."
-      : "Codex app-server exited")));
-    createInterface({ input: this.child.stdout }).on("line", line => {
-      try { this.receive(JSON.parse(line)); } catch { this.fatal(new Error("Invalid app-server response")); }
+    this.child.on("exit", () => {
+      if (this.killTimer) { clearTimeout(this.killTimer); this.killTimer = undefined; }
+      this.fatal(new Error(!this.initialized && this.readonlyFilesystemReported
+        ? "Codex app-server exited before initialization after reporting a read-only filesystem. CODEX_HOME must be writable (including installation_id); sqlite_home/log_dir overrides alone are insufficient. Use an authorized writable state_root and dedicated home; authentication is a separate step."
+        : "Codex app-server exited"));
+    });
+    this.rl = createInterface({ input: this.child.stdout });
+    this.rl.on("line", line => {
+      let parsed: any;
+      try { parsed = JSON.parse(line); } catch { this.fatal(new Error("Invalid app-server response")); return; }
+      this.receive(parsed);
     });
     await this.request("initialize", { clientInfo: { name: "agentschat_bridge", version: "0.1.0" } });
     this.write({ method: "initialized" });
@@ -93,23 +101,30 @@ export class AppServer {
     if (this.closed || !this.child || this.child.exitCode !== null || this.child.stdin.destroyed) throw new Error("App-server unavailable");
     this.child.stdin.write(JSON.stringify(value) + "\n");
   }
-  request(method: string, params: unknown): Promise<any> {
+  request(method: string, params: unknown, timeoutMs = this.requestTimeoutMs): Promise<any> {
     return new Promise((resolve, reject) => {
       const id = ++this.nextId;
-      this.pending.set(id, { method, resolve, reject });
+      const timer = setTimeout(() => {
+        if (!this.pending.delete(id)) return;
+        const err = new Error(`App-server request timed out (${method})`);
+        this.fatal(err);
+        reject(err);
+      }, Math.max(50, timeoutMs));
+      timer.unref?.();
+      this.pending.set(id, { method, timer, resolve, reject });
       try { this.write({ id, method, params }); }
-      catch (e) { this.pending.delete(id); reject(e); }
+      catch (e) { clearTimeout(timer); this.pending.delete(id); reject(e); }
     });
   }
   private receive(message: any) {
     if (message.id !== undefined && message.method) {
       // Headless bridge never approves commands or answers interactive prompts.
-      this.write({ id: message.id, error: { code: -32601, message: "Interactive requests unsupported by bridge" } });
+      try { this.write({ id: message.id, error: { code: -32601, message: "Interactive requests unsupported by bridge" } }); } catch {}
       return;
     }
     if (message.id !== undefined) {
       const waiter = this.pending.get(message.id);
-      if (waiter) { this.pending.delete(message.id);
+      if (waiter) { clearTimeout(waiter.timer); this.pending.delete(message.id);
         if (message.error) {
           const detail = typeof message.error.message === "string" ? message.error.message : "";
           const error = waiter.method === "thread/resume" && /already has an active writer/i.test(detail)
@@ -125,7 +140,7 @@ export class AppServer {
     }
     const a = this.active, p = message.params;
     if (!a || p?.threadId !== a.thread) return;
-    if (!a.turn) { a.early.push(message); return; }
+    if (!a.turn) { if (a.early.length < 500) a.early.push(message); return; }
     if ((p.turnId ?? p.turn?.id) !== a.turn) return;
     if (message.method === "item/completed" && p.item?.type === "agentMessage" &&
       (!p.item.phase || p.item.phase === "final_answer")) a.items.set(p.item.id, p.item.text);
@@ -197,12 +212,32 @@ export class AppServer {
     } catch (e) { this.fail(e instanceof Error ? e : new Error("Generation failed")); throw e; }
   }
   private fail(error: Error) {
-    for (const p of this.pending.values()) p.reject(error); this.pending.clear();
+    for (const p of this.pending.values()) { clearTimeout(p.timer); p.reject(error); }
+    this.pending.clear();
     if (this.active) { this.active.reject(error); this.active = undefined; }
+  }
+  private terminateChild() {
+    try { this.rl?.close(); } catch {}
+    this.rl = undefined;
+    const child = this.child;
+    if (!child) return;
+    try { child.stdin.end(); } catch {}
+    if (child.exitCode === null) {
+      try { child.kill("SIGTERM"); } catch {}
+      if (!this.killTimer) {
+        this.killTimer = setTimeout(() => {
+          this.killTimer = undefined;
+          if (child.exitCode === null) {
+            try { child.kill("SIGKILL"); } catch {}
+          }
+        }, 2_000);
+        this.killTimer.unref?.();
+      }
+    }
   }
   private fatal(error: Error) {
     if (this.closed) return;
-    this.closed = true; this.fail(error); this.onFatal?.(); this.child?.kill();
+    this.closed = true; this.fail(error); this.onFatal?.(); this.terminateChild();
   }
-  close() { this.closed = true; this.fail(new Error("App-server stopped")); this.child?.kill(); }
+  close() { this.closed = true; this.fail(new Error("App-server stopped")); this.terminateChild(); }
 }

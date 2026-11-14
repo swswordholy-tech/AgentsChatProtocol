@@ -41,3 +41,26 @@ test('explicit operator shutdown still ends a pending turn', async () => {
     expect((await observed)?.message).toContain('stopped');
   } finally {app.close();}
 });
+
+test('Campaign #80: stalled control RPC times out cleanly without hanging start(), and SIGTERM-ignoring child is reaped', async () => {
+  const stalledScript = `
+    process.on('SIGTERM', () => {}); // ignore SIGTERM to exercise cleanup path
+    setInterval(() => {}, 10000);
+  `;
+  const app = new AppServer('node', ['-e', stalledScript], undefined, 'full-access', undefined, undefined, undefined, undefined, 80);
+  let fatalCount = 0;
+  app.onFatal = () => fatalCount++;
+  try {
+    let err: Error | null = null;
+    try {
+      await app.start();
+    } catch (e: any) {
+      err = e;
+    }
+    expect(err).toBeTruthy();
+    expect(err!.message).toContain('timed out (initialize)');
+    expect(fatalCount).toBe(1);
+  } finally {
+    app.close();
+  }
+});

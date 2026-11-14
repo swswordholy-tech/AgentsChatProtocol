@@ -1490,9 +1490,12 @@ class AppServer {
   effort;
   model;
   toolIdentity;
+  requestTimeoutMs;
   onFatal;
   closed = false;
   child;
+  rl;
+  killTimer;
   nextId = 0;
   pending = new Map;
   active;
@@ -1501,7 +1504,7 @@ class AppServer {
   readonlyFilesystemReported = false;
   diagnosticTail = "";
   disabledMcp = {};
-  constructor(bin = "codex", args = ["app-server", "--listen", "stdio://"], _legacyTurnTimeoutMs, permissions = "full-access", runtime, effort, model, toolIdentity) {
+  constructor(bin = "codex", args = ["app-server", "--listen", "stdio://"], _legacyTurnTimeoutMs, permissions = "full-access", runtime, effort, model, toolIdentity, requestTimeoutMs = 30000) {
     this.bin = bin;
     this.args = args;
     this.permissions = permissions;
@@ -1509,6 +1512,7 @@ class AppServer {
     this.effort = effort;
     this.model = model;
     this.toolIdentity = toolIdentity;
+    this.requestTimeoutMs = requestTimeoutMs;
   }
   get namespace() {
     return this.runtime?.home;
@@ -1552,13 +1556,23 @@ class AppServer {
     });
     this.child.stdin.on("error", () => this.fatal(new Error("Codex input pipe closed")));
     this.child.on("error", () => this.fatal(new Error("Could not start Codex app-server")));
-    this.child.on("exit", () => this.fatal(new Error(!this.initialized && this.readonlyFilesystemReported ? "Codex app-server exited before initialization after reporting a read-only filesystem. CODEX_HOME must be writable (including installation_id); sqlite_home/log_dir overrides alone are insufficient. Use an authorized writable state_root and dedicated home; authentication is a separate step." : "Codex app-server exited")));
-    createInterface({ input: this.child.stdout }).on("line", (line) => {
+    this.child.on("exit", () => {
+      if (this.killTimer) {
+        clearTimeout(this.killTimer);
+        this.killTimer = undefined;
+      }
+      this.fatal(new Error(!this.initialized && this.readonlyFilesystemReported ? "Codex app-server exited before initialization after reporting a read-only filesystem. CODEX_HOME must be writable (including installation_id); sqlite_home/log_dir overrides alone are insufficient. Use an authorized writable state_root and dedicated home; authentication is a separate step." : "Codex app-server exited"));
+    });
+    this.rl = createInterface({ input: this.child.stdout });
+    this.rl.on("line", (line) => {
+      let parsed;
       try {
-        this.receive(JSON.parse(line));
+        parsed = JSON.parse(line);
       } catch {
         this.fatal(new Error("Invalid app-server response"));
+        return;
       }
+      this.receive(parsed);
     });
     await this.request("initialize", { clientInfo: { name: "agentschat_bridge", version: "0.1.0" } });
     this.write({ method: "initialized" });
@@ -1583,13 +1597,22 @@ class AppServer {
     this.child.stdin.write(JSON.stringify(value) + `
 `);
   }
-  request(method, params) {
+  request(method, params, timeoutMs = this.requestTimeoutMs) {
     return new Promise((resolve4, reject) => {
       const id = ++this.nextId;
-      this.pending.set(id, { method, resolve: resolve4, reject });
+      const timer = setTimeout(() => {
+        if (!this.pending.delete(id))
+          return;
+        const err = new Error(`App-server request timed out (${method})`);
+        this.fatal(err);
+        reject(err);
+      }, Math.max(50, timeoutMs));
+      timer.unref?.();
+      this.pending.set(id, { method, timer, resolve: resolve4, reject });
       try {
         this.write({ id, method, params });
       } catch (e) {
+        clearTimeout(timer);
         this.pending.delete(id);
         reject(e);
       }
@@ -1597,12 +1620,15 @@ class AppServer {
   }
   receive(message) {
     if (message.id !== undefined && message.method) {
-      this.write({ id: message.id, error: { code: -32601, message: "Interactive requests unsupported by bridge" } });
+      try {
+        this.write({ id: message.id, error: { code: -32601, message: "Interactive requests unsupported by bridge" } });
+      } catch {}
       return;
     }
     if (message.id !== undefined) {
       const waiter = this.pending.get(message.id);
       if (waiter) {
+        clearTimeout(waiter.timer);
         this.pending.delete(message.id);
         if (message.error) {
           const detail = typeof message.error.message === "string" ? message.error.message : "";
@@ -1617,7 +1643,8 @@ class AppServer {
     if (!a || p?.threadId !== a.thread)
       return;
     if (!a.turn) {
-      a.early.push(message);
+      if (a.early.length < 500)
+        a.early.push(message);
       return;
     }
     if ((p.turnId ?? p.turn?.id) !== a.turn)
@@ -1711,12 +1738,42 @@ class AppServer {
     }
   }
   fail(error) {
-    for (const p of this.pending.values())
+    for (const p of this.pending.values()) {
+      clearTimeout(p.timer);
       p.reject(error);
+    }
     this.pending.clear();
     if (this.active) {
       this.active.reject(error);
       this.active = undefined;
+    }
+  }
+  terminateChild() {
+    try {
+      this.rl?.close();
+    } catch {}
+    this.rl = undefined;
+    const child = this.child;
+    if (!child)
+      return;
+    try {
+      child.stdin.end();
+    } catch {}
+    if (child.exitCode === null) {
+      try {
+        child.kill("SIGTERM");
+      } catch {}
+      if (!this.killTimer) {
+        this.killTimer = setTimeout(() => {
+          this.killTimer = undefined;
+          if (child.exitCode === null) {
+            try {
+              child.kill("SIGKILL");
+            } catch {}
+          }
+        }, 2000);
+        this.killTimer.unref?.();
+      }
     }
   }
   fatal(error) {
@@ -1725,12 +1782,12 @@ class AppServer {
     this.closed = true;
     this.fail(error);
     this.onFatal?.();
-    this.child?.kill();
+    this.terminateChild();
   }
   close() {
     this.closed = true;
     this.fail(new Error("App-server stopped"));
-    this.child?.kill();
+    this.terminateChild();
   }
 }
 
@@ -2372,6 +2429,12 @@ class HeartbeatMonitor {
   }
 }
 
+// src/reconnect.ts
+function computePleaseReconnectDelay(jitterMs, rand = Math.random) {
+  const maxJitter = typeof jitterMs === "number" && Number.isFinite(jitterMs) && jitterMs > 0 ? Math.min(Math.floor(jitterMs), 1e4) : 2000;
+  return 200 + Math.floor(rand() * maxJitter);
+}
+
 // codex/inbox-sync.ts
 import { existsSync as existsSync7, mkdirSync as mkdirSync7, readFileSync as readFileSync10, renameSync as renameSync5, writeFileSync as writeFileSync5 } from "node:fs";
 import { join as join10 } from "node:path";
@@ -2557,7 +2620,9 @@ class AgentsChatTransport {
         this.socket.send(JSON.stringify({ type: "typing", channel_id: channel, sender_id: this.config.agentId, cross_pod: true }));
     };
     pulse();
-    this.typing.set(channel, setInterval(pulse, 2000));
+    const typingTimer = setInterval(pulse, 2000);
+    typingTimer.unref?.();
+    this.typing.set(channel, typingTimer);
   }
   rejectPending() {
     for (const p of this.pending.values()) {
@@ -2574,6 +2639,7 @@ class AgentsChatTransport {
           this.pending.delete(id);
           reject(new Error("AgentsChat acknowledgement timed out"));
         }, 15000);
+        timer.unref?.();
         this.pending.set(id, { resolve: resolve4, reject, timer });
         this.socket.send(JSON.stringify({
           type: "message",
@@ -2636,10 +2702,12 @@ class AgentsChatTransport {
         this.authenticated = true;
         this.delay = 1000;
         this.log(`AgentsChat connected as ${this.config.agentId}`);
-        if (this.inboxSync && !this.syncTimer)
+        if (this.inboxSync && !this.syncTimer) {
           this.syncTimer = setInterval(() => {
             this.inboxSync.sync();
           }, this.syncIntervalMs);
+          this.syncTimer.unref?.();
+        }
         this.api("/api/channels/mine").then((body) => {
           if (!current())
             return;
@@ -2668,9 +2736,10 @@ class AgentsChatTransport {
         join11(data.channel_id);
       else if (["message", "thread_reply"].includes(data.type))
         this.receive(data);
-      else if (data.type === "shard_moved" || data.type === "please_reconnect")
+      else if (data.type === "shard_moved" || data.type === "please_reconnect") {
+        this.delay = computePleaseReconnectDelay(typeof data.within_ms === "number" ? data.within_ms : undefined);
         socket.terminate();
-      else if (data.type === "auth_error" || data.type === "error")
+      } else if (data.type === "auth_error" || data.type === "error")
         this.log("AgentsChat returned an error; check account and channel permissions");
     });
     socket.on("error", () => this.log("AgentsChat socket error"));
@@ -2682,6 +2751,7 @@ class AgentsChatTransport {
       this.heartbeat?.stop();
       this.log("AgentsChat disconnected; reconnecting with history reconciliation");
       this.retry = setTimeout(() => this.start(), this.delay);
+      this.retry.unref?.();
       this.delay = Math.min(this.delay * 2, 30000);
     });
   }
