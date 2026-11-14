@@ -60,3 +60,30 @@ test("stopAccount disconnects the client, clears state, and marks not-running", 
   assert.equal(captured[0].connected, false);
   assert.equal(typeof captured[0].lastStopAt, "number");
 });
+
+test("startAccount rejects immediately when abortSignal is already aborted and removes abort listener on exit", async () => {
+  const captured = [];
+  const ac = new AbortController();
+  ac.abort();
+
+  await assert.rejects(
+    () =>
+      agentChatGateway.startAccount({
+        accountId: "acc-gw-preaborted",
+        account: {
+          accountId: "acc-gw-preaborted",
+          agentId: "bot-preaborted",
+          wsUrl: "ws://127.0.0.1:1/ws",
+          token: "tok",
+          enabled: true,
+        },
+        abortSignal: ac.signal,
+        getStatus: () => ({}),
+        setStatus: (next) => captured.push(next),
+        log: { info() {}, warn() {}, error() {}, debug() {} },
+      }),
+    /aborted/i,
+  );
+  assert.equal(getGatewayState("acc-gw-preaborted"), undefined);
+  assert.equal(captured.at(-1)?.running, false);
+});

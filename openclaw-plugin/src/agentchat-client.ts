@@ -91,11 +91,30 @@ export class AgentChatClient {
   }
 
   connect(): Promise<void> {
+    this.clearConnectTimer();
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = null;
+    }
+    if (this.ws) {
+      const stale = this.ws;
+      this.ws = null;
+      try {
+        stale.close();
+      } catch {}
+    }
+    this.sessionId = null;
+
     return new Promise((resolve, reject) => {
       this.connectSettled = false;
       this.lifecycleSettled = false;
       this.transportError = null;
       this.explicitlyDisconnected = false;
+      this.fastReconnectPending = false;
       this.reconnectAttempt = 0;
       this.isReconnecting = false;
       this.connectResolve = resolve;
@@ -244,15 +263,19 @@ export class AgentChatClient {
   private handleError(error: Error) {
     this.debug("socket:error", { error: error.message });
     this.transportError = error;
-    // During a reconnect the initial-connect promise is already settled;
-    // we don't want to reject it again. The close handler will schedule
-    // the next backoff attempt.
+    // During a reconnect (or after an authenticated session is established while
+    // auto-reconnect is enabled), `waitUntilClosed()` must stay pending across
+    // transient socket errors (`onerror` fires before `onclose` sets `isReconnecting`)
+    // so `handleClose()` can schedule the next backoff reconnect without tearing
+    // down the host gateway or spawning an orphaned reconnect loop.
     if (this.isReconnecting) return;
     if (!this.sessionId) {
       this.rejectConnect(error);
       return;
     }
-    this.rejectLifecycle(error);
+    if (!this.reconnectEnabled && !this.explicitlyDisconnected) {
+      this.rejectLifecycle(error);
+    }
   }
 
   private handleMessage(raw: string) {

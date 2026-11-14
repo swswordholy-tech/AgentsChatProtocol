@@ -234,3 +234,92 @@ test("mentionCursors caps at 2000 entries (FIFO) and history fetch passes an Abo
     globalThis.fetch = origFetch;
   }
 });
+
+test("post-auth_ok socket error keeps waitUntilClosed() pending, reconnects cleanly, and leaves zero zombie timers on disconnect", async () => {
+  let connections = 0;
+  let reconnected = 0;
+  const sockets = [];
+  const srv = await startMockServer((ws) => {
+    connections += 1;
+    sockets.push(ws);
+    ws.on("message", (raw) => {
+      const parsed = JSON.parse(String(raw));
+      if (parsed.type === "auth") {
+        ws.send(JSON.stringify({ type: "auth_ok", session_id: `sess-err-${connections}` }));
+      }
+    });
+  });
+
+  const client = new AgentChatClient({
+    url: srv.url,
+    agentId: "bot-tcp-reset",
+    initialReconnectDelayMs: 25,
+    maxReconnectDelayMs: 50,
+    onReconnect: () => {
+      reconnected += 1;
+    },
+  });
+
+  try {
+    await client.connect();
+    let lifecycleSettled = false;
+    let lifecycleRejected = null;
+    const closedPromise = client
+      .waitUntilClosed()
+      .then(() => {
+        lifecycleSettled = true;
+      })
+      .catch((err) => {
+        lifecycleRejected = err;
+      });
+
+    // Simulate a live TCP socket error (`onerror` fires BEFORE `onclose` on the client socket)
+    client.ws.onerror?.(new Error("read ECONNRESET"));
+    sockets[0].terminate();
+
+    await new Promise((r) => setTimeout(r, 90));
+    assert.equal(lifecycleRejected, null, "waitUntilClosed() must not reject on transient post-auth socket error");
+    assert.equal(lifecycleSettled, false, "waitUntilClosed() must remain open while auto-reconnect recovers");
+    assert.equal(connections, 2, "client must reconnect after transient socket error");
+    assert.equal(reconnected, 1, "onReconnect callback must fire once re-authenticated");
+
+    client.disconnect();
+    await closedPromise;
+    assert.equal(lifecycleSettled, true);
+    await new Promise((r) => setTimeout(r, 70));
+    assert.equal(connections, 2, "disconnect() must stop all further reconnects");
+  } finally {
+    client.disconnect();
+    await srv.close();
+  }
+});
+
+test("post-auth_ok socket error rejects waitUntilClosed() when reconnect is explicitly disabled", async () => {
+  let serverSocket = null;
+  const srv = await startMockServer((ws) => {
+    serverSocket = ws;
+    ws.on("message", (raw) => {
+      const parsed = JSON.parse(String(raw));
+      if (parsed.type === "auth") {
+        ws.send(JSON.stringify({ type: "auth_ok", session_id: "sess-noreconnect" }));
+      }
+    });
+  });
+
+  const client = new AgentChatClient({
+    url: srv.url,
+    agentId: "bot-no-reconnect",
+    reconnect: false,
+  });
+
+  try {
+    await client.connect();
+    const waitPromise = client.waitUntilClosed();
+    client.ws.onerror?.(new Error("read ECONNRESET"));
+    serverSocket.terminate();
+    await assert.rejects(() => waitPromise, /WebSocket error/i);
+  } finally {
+    client.disconnect();
+    await srv.close();
+  }
+});

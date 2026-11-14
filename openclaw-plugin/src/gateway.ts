@@ -195,6 +195,15 @@ export const agentChatGateway: AgentChatGatewayAdapter = {
     const pending = pendingStarts.get(ctx.accountId);
     if (pending) return pending;
 
+    if (ctx.abortSignal?.aborted) {
+      setConnectedStatus(ctx, {
+        running: false,
+        connected: false,
+        lastStopAt: Date.now(),
+      });
+      throw new Error("AgentChat gateway start aborted");
+    }
+
     const startPromise: PendingStart = (async () => {
       // Forward-declared so onReconnect (defined inside createGatewayClient
       // below) can reference the client we're about to create. The client
@@ -272,10 +281,14 @@ export const agentChatGateway: AgentChatGatewayAdapter = {
         });
       };
 
-      ctx.abortSignal.addEventListener("abort", abortHandler, { once: true });
+      ctx.abortSignal?.addEventListener("abort", abortHandler, { once: true });
 
       try {
         await client.connect();
+        if (ctx.abortSignal?.aborted) {
+          abortHandler();
+          throw new Error("AgentChat gateway start aborted");
+        }
 
         if (ctx.account.defaultChannelId) {
           client.joinChannel(ctx.account.defaultChannelId);
@@ -307,7 +320,7 @@ export const agentChatGateway: AgentChatGatewayAdapter = {
         });
         return state;
       } catch (error) {
-        ctx.abortSignal.removeEventListener("abort", abortHandler);
+        client.disconnect();
         deleteGatewayState(ctx.accountId);
         setConnectedStatus(ctx, {
           running: false,
@@ -320,6 +333,7 @@ export const agentChatGateway: AgentChatGatewayAdapter = {
         });
         throw error;
       } finally {
+        ctx.abortSignal?.removeEventListener("abort", abortHandler);
         pendingStarts.delete(ctx.accountId);
       }
     })();
@@ -332,7 +346,7 @@ export const agentChatGateway: AgentChatGatewayAdapter = {
     const state = getGatewayState(ctx.accountId);
     if (!state) return;
 
-    ctx.abortSignal.removeEventListener("abort", state.abortHandler);
+    ctx.abortSignal?.removeEventListener("abort", state.abortHandler);
     state.client.disconnect();
     deleteGatewayState(ctx.accountId);
     setConnectedStatus(ctx, {
