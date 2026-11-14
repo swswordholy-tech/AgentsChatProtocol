@@ -92,7 +92,7 @@ test("manager snapshot survives broken registry; parent death cleans workers", a
  writeFileSync(join(profiles,"one.json"),JSON.stringify({agent_id:"test-bot",token:"ac_test_bot_token"}),{mode:0o600});
  const file=join(home,"bots.json");
  writeFileSync(file,JSON.stringify({version:1,codex_bin:fake,bots:[{name:"one",profile:"one",api_url:`http://127.0.0.1:${hub.port}`,ws_url:`ws://127.0.0.1:${(ws.address() as any).port}`}]}));
- const manager=spawn("node",[resolve("src/cli.mjs"),"--codex-bots","--config",file],{env:{...process.env,HOME:home},stdio:"ignore"});
+ const manager=spawn("node",[resolve(import.meta.dir,"../src/cli.mjs"),"--codex-bots","--config",file],{env:{...process.env,HOME:home},stdio:"ignore"});
  let worker=0;
  const wait=async(fn:()=>boolean)=>{const end=Date.now()+15000;while(Date.now()<end){if(fn())return;await Bun.sleep(100);}throw Error("lifecycle timeout");};
  const status=()=>{try{return JSON.parse(readFileSync(join(home,".agentschat/codex-bots/status.json"),"utf8")).bots[0];}catch{return {};}};

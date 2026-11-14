@@ -33,7 +33,7 @@ test("one-shot registration exits with private clickable claim link, without log
  }});
  const home=mkdtempSync(join(tmpdir(),"onboarding-once-"));
  try {
-  const child=Bun.spawn([process.execPath,resolve("src/server.ts"),"--name","test","--register-only","--url",`http://127.0.0.1:${hub.port}`],{
+  const child=Bun.spawn([process.execPath,resolve(import.meta.dir,"../src/server.ts"),"--name","test","--register-only","--url",`http://127.0.0.1:${hub.port}`],{
    env:{PATH:process.env.PATH,HOME:home,AGENTCHAT_REST_URL:`http://127.0.0.1:${hub.port}`,AGENTCHAT_NO_PROXY:"1",AGENTCHAT_URL:"ws://127.0.0.1:1/ws"},stdout:"pipe",stderr:"pipe"});
   const [code,out,err]=await Promise.all([child.exited,new Response(child.stdout).text(),new Response(child.stderr).text()]);
   expect(code).toBe(0);expect(calls).toBe(1);const result=JSON.parse(out);

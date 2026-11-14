@@ -1,6 +1,6 @@
 // Unit tests for the reconnect backoff (src/reconnect.ts). Run with `bun test`.
 import { test, expect } from "bun:test";
-import { computeReconnectDelay } from "../src/reconnect.ts";
+import { computePleaseReconnectDelay, computeReconnectDelay } from "../src/reconnect.ts";
 
 const noJitter = () => 0;
 
@@ -23,4 +23,11 @@ test("the 30s cap holds even under maximum jitter", () => {
   const d = computeReconnectDelay(1000, () => 0.999);
   expect(d).toBeGreaterThanOrEqual(30000);
   expect(d).toBeLessThan(33000);
+});
+
+test("computePleaseReconnectDelay clamps graceful drain jitter into [200ms, 10200ms]", () => {
+  expect(computePleaseReconnectDelay(undefined, () => 0)).toBe(200);
+  expect(computePleaseReconnectDelay(undefined, () => 0.5)).toBe(1200);
+  expect(computePleaseReconnectDelay(60000, () => 0.9999)).toBe(10199);
+  expect(computePleaseReconnectDelay(-5, () => 0.25)).toBe(700);
 });

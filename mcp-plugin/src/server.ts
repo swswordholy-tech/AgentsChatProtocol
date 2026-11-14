@@ -44,7 +44,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { isHumanPiiHandle, redactParticipantPii, redactSecrets } from "./redact.ts";
 import { matchesMention } from "./mentions.ts";
 import { messageDedupKey, MessageDedup } from "./dedup.ts";
-import { computeReconnectDelay } from "./reconnect.ts";
+import { computePleaseReconnectDelay, computeReconnectDelay } from "./reconnect.ts";
 import { normalizeTimestampForCursor } from "./timestamps.ts";
 import {
   CREATE_LOOP_MODES,
@@ -3600,8 +3600,9 @@ function createProfileSlot(opts: {
         ws = null;
         sessionId = null;
       }
-      slot.wsReconnectAttempt = 0;
-      scheduleReconnect(500, slot);
+      slot.wsReconnectAttempt++;
+      const delay = slot.wsReconnectAttempt === 1 ? 500 : computeReconnectDelay(slot.wsReconnectAttempt);
+      scheduleReconnect(delay, slot);
     },
     getReadyState: () => slot.ws?.readyState ?? WS_CLOSED,
   }, 15_000, 45_000, 30_000);
@@ -7227,6 +7228,7 @@ function recordOrSkipDeliveredMessage(data: any, slot: ProfileSlot | null = acti
 
 function scheduleReconnect(delayMs: number, slot: ProfileSlot | null = activeSlot) {
   if (shuttingDown || !slot) return; // don't resurrect the socket after shutdown
+  slot.heartbeat.stop();
   if (slot.reconnectTimer) clearTimeout(slot.reconnectTimer);
   slot.reconnectTimer = setTimeout(() => {
     slot.reconnectTimer = null;
@@ -7368,6 +7370,7 @@ function connectWS(slot: ProfileSlot | null = activeSlot) {
     socket = new WebSocket(WS_URL);
     slot.ws = socket;
     if (activeSlot === slot) ws = socket;
+    slot.heartbeat.start();
   } catch (e) {
     process.stderr.write(`[agentchat] WebSocket constructor failed: ${e}, retrying in 5s\n`);
     scheduleReconnect(5000, slot);
@@ -7710,6 +7713,15 @@ function connectWS(slot: ProfileSlot | null = activeSlot) {
       if (activeSlot === slot) { ws = null; sessionId = null; }
       slot!.wsReconnectAttempt = 0;
       scheduleReconnect(500, slot!);
+    } else if (data.type === "please_reconnect") {
+      const delay = computePleaseReconnectDelay(data.jitter_ms);
+      process.stderr.write(`[agentchat] Server draining (please_reconnect), reconnecting in ${delay}ms...\n`);
+      if (slot!.ws) { slot!.ws.onclose = null; try { slot!.ws.close(); } catch {} }
+      slot!.ws = null;
+      slot!.sessionId = null;
+      if (activeSlot === slot) { ws = null; sessionId = null; }
+      slot!.wsReconnectAttempt = 0;
+      scheduleReconnect(delay, slot!);
     } else if (data.type === "error") {
       process.stderr.write(`[agentchat] Error: ${data.message}\n`);
     }
@@ -7717,8 +7729,12 @@ function connectWS(slot: ProfileSlot | null = activeSlot) {
 
   socket.onclose = (event) => {
     if (slot.ws !== socket) return;
+    slot.ws = null;
     slot.sessionId = null;
-    if (activeSlot === slot) sessionId = null;
+    if (activeSlot === slot) {
+      ws = null;
+      sessionId = null;
+    }
     slot.heartbeat.resetReconnecting();
     slot.wsReconnectAttempt++;
     const delay = computeReconnectDelay(slot.wsReconnectAttempt);
