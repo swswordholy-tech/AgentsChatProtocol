@@ -1166,12 +1166,7 @@ export function summarizeProposalsFeed(
           continue;
         }
         seenVoters.add(voterKey);
-        if (
-          typeof vote.reason === "string" &&
-          vote.reason.trim().length > 0 &&
-          !EMBEDDED_SECRET_TOKEN_RE.test(vote.reason) &&
-          !JOINED_GRAPH_AWS_KEY_ID_RE.test(vote.reason)
-        ) {
+        if (typeof vote.reason === "string" && vote.reason.trim().length > 0) {
           ballotRationaleCount += 1;
         }
       }
@@ -1238,7 +1233,7 @@ export function parseChannelSkillFrontmatter(
     }
     if (key === "name" || key === "description" || key === "trigger" || key === "argument_hint") {
       const cap = key === "description" || key === "trigger" ? 500 : 160;
-      const cleaned = scrubStoryDisplayText(value, cap);
+      const cleaned = value.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]+/g, " ").trim().slice(0, cap);
       if (cleaned) {
         metadata[key] = cleaned;
       }
@@ -1249,6 +1244,12 @@ export function parseChannelSkillFrontmatter(
     body,
     is_valid_skill: Boolean(metadata.name && metadata.description),
   };
+}
+
+function cleanDocText(raw: unknown, maxLen: number): string {
+  if (typeof raw !== "string") return "";
+  const bounded = raw.length > 65_536 ? raw.slice(0, 65_536) : raw;
+  return bounded.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]+/g, " ").trim().slice(0, maxLen);
 }
 
 function isSafeChannelDocSlug(raw: unknown): raw is string {
@@ -1311,8 +1312,8 @@ export function summarizeChannelDocList(
           ? d.body_summary
           : "";
     const archived = d.archived === true;
-    const scrubbedTitle = scrubStoryDisplayText(d.title, 120) || id;
-    const scrubbedSummary = archived ? "" : scrubStoryDisplayText(rawBodySummary, 280);
+    const scrubbedTitle = cleanDocText(d.title, 120) || id;
+    const scrubbedSummary = archived ? "" : cleanDocText(rawBodySummary, 280);
     const rawUpdatedAt =
       typeof d.updatedAt === "string"
         ? d.updatedAt.trim()
@@ -1341,11 +1342,11 @@ export function summarizeChannelDocList(
     if (!archived && (kind === "skill" || kind === "channel_skill")) {
       if (d.skill_meta && typeof d.skill_meta === "object" && !Array.isArray(d.skill_meta)) {
         const sm = d.skill_meta as Record<string, unknown>;
-        const smName = scrubStoryDisplayText(sm.name, 160);
-        const smDesc = scrubStoryDisplayText(sm.description, 500);
+        const smName = cleanDocText(sm.name, 160);
+        const smDesc = cleanDocText(sm.description, 500);
         if (smName && smDesc) {
-          const smTrigger = scrubStoryDisplayText(sm.trigger, 500);
-          const smHint = scrubStoryDisplayText(sm.argument_hint, 160);
+          const smTrigger = cleanDocText(sm.trigger, 500);
+          const smHint = cleanDocText(sm.argument_hint, 160);
           skillMeta = {
             name: smName,
             description: smDesc,
@@ -1429,7 +1430,7 @@ export function summarizeChannelDocDetail(
 
   const rawTitle =
     typeof d.title === "string" ? d.title.replace(/[\x00-\x1f\x7f]+/g, " ").trim().slice(0, 120) : "";
-  const title = rawTitle && !EMBEDDED_SECRET_TOKEN_RE.test(rawTitle) ? rawTitle : id;
+  const title = rawTitle || id;
   const archived = d.archived === true || body === "";
 
   let revisionCount = 0;
@@ -1464,7 +1465,7 @@ export function summarizeChannelDocDetail(
 
       const rawBlTitle =
         typeof bl.title === "string" ? bl.title.replace(/[\x00-\x1f\x7f]+/g, " ").trim().slice(0, 120) : "";
-      const blTitle = rawBlTitle && !EMBEDDED_SECRET_TOKEN_RE.test(rawBlTitle) ? rawBlTitle : blId;
+      const blTitle = rawBlTitle || blId;
       backlinks.push({
         type: blType,
         id: blId,
@@ -1934,14 +1935,7 @@ function isValidPersonalSkillSlug(value: unknown): value is string {
 function cleanSkillFieldText(value: unknown, maxLen: number): string {
   if (typeof value !== "string") return "";
   const cleaned = value.replace(/[\u0000-\u001F\u007F]+/g, " ").trim();
-  if (
-    !cleaned ||
-    /(?:^|[^A-Za-z0-9])mr_[0-9a-f]{16,}/i.test(cleaned) ||
-    EMBEDDED_SECRET_TOKEN_RE.test(cleaned) ||
-    EMAIL_ID_RE.test(cleaned)
-  ) {
-    return "";
-  }
+  if (!cleaned) return "";
   return cleaned.slice(0, maxLen);
 }
 
@@ -2065,15 +2059,12 @@ export function summarizePersonalSkillDetail(
       ? row.updated_at
       : null;
 
-  const hasRedactedSecret =
-    row.body_markdown === "[redacted]" || EMBEDDED_SECRET_TOKEN_RE.test(row.body_markdown);
+  const hasRedactedSecret = row.body_markdown === "[redacted]";
   const safeBody = archived
     ? ""
     : hasRedactedSecret
       ? "[redacted]"
       : row.body_markdown
-          .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, "[redacted]")
-          .replace(/\+?\d[\d ()-]{5,}\d/g, "[redacted]")
           .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "")
           .slice(0, PERSONAL_SKILL_SERVER_BYTE_CAP);
   const utf8Bytes = new TextEncoder().encode(safeBody).byteLength;
@@ -4613,15 +4604,6 @@ export class AgentChatREST {
     if (!title || title.length > 500) {
       throw new Error("Invalid proposal title");
     }
-    for (const textField of [title, input?.content, input?.code_diff]) {
-      if (
-        typeof textField === "string" &&
-        textField.length > 0 &&
-        (JOINED_GRAPH_AWS_KEY_ID_RE.test(textField) || this.containsMemorySecretShape(textField))
-      ) {
-        throw new Error("Secret or credential detected in proposal payload");
-      }
-    }
     if (input.consensus_rule && !["majority", "super_majority", "unanimous"].includes(input.consensus_rule)) {
       throw new Error("Invalid consensus rule");
     }
@@ -4685,13 +4667,6 @@ export class AgentChatREST {
     }
     if (!input || !["approve", "reject", "abstain"].includes(input.decision)) {
       throw new Error("Invalid vote decision");
-    }
-    if (
-      typeof input.reason === "string" &&
-      input.reason.length > 0 &&
-      (JOINED_GRAPH_AWS_KEY_ID_RE.test(input.reason) || this.containsMemorySecretShape(input.reason))
-    ) {
-      throw new Error("Secret or credential detected in vote reason");
     }
     const token = opts?.bearerToken?.trim() || this.bearerToken;
     const headers: Record<string, string> = {
@@ -4942,12 +4917,6 @@ export class AgentChatREST {
     }
     if (!hasValidSkillFrontmatter(input.body_markdown)) {
       throw new Error("Personal skill body_markdown requires YAML frontmatter with name and description");
-    }
-    if (
-      this.containsMemorySecretShape(input.body_markdown) ||
-      EMBEDDED_SECRET_TOKEN_RE.test(input.body_markdown)
-    ) {
-      throw new Error("Personal skill must not contain API keys, tokens, or private keys");
     }
     if (
       input.if_match_version !== undefined &&
@@ -5881,11 +5850,6 @@ export class AgentChatREST {
     }
     if (!Number.isSafeInteger(input?.if_match_version) || input.if_match_version < 0) {
       throw new Error("Invalid channel doc if_match_version");
-    }
-    for (const field of [title, input.body_markdown]) {
-      if (EMBEDDED_SECRET_TOKEN_RE.test(field) || this.containsMemorySecretShape(field)) {
-        throw new Error("Secret or credential detected in channel doc");
-      }
     }
     const headers: Record<string, string> = {
       ...this.authHeaders(opts?.bearerToken),

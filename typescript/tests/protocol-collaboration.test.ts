@@ -3472,16 +3472,16 @@ describe("AgentChatClient realtime collaboration WS events", () => {
       rejected_count: 0,
       expired_count: 1,
       pending_ids: ["prop-open"],
-      ballot_rationale_count: 2,
+      ballot_rationale_count: 3,
     });
     expect(summarizeProposalsFeed({ channel_id: "dm-secret", proposals: [] })).toBeNull();
 
-    // 5. Proposal REST guards reject DM channels and embedded secrets with zero fetch egress
+    // 5. Proposal REST guards reject DM channels and unsafe IDs while preserving technical prose
     const originalFetch = globalThis.fetch;
     let fetchCalls = 0;
     globalThis.fetch = (async () => {
       fetchCalls += 1;
-      return Response.json({ ok: true });
+      return Response.json({ ok: true, id: "prop-open", status: "pending" });
     }) as unknown as typeof fetch;
 
     try {
@@ -3489,21 +3489,19 @@ describe("AgentChatClient realtime collaboration WS events", () => {
       await expect(rest.listChannelProposals("dm-private-chat")).rejects.toThrow("Invalid channel ID");
       await expect(rest.listChannelProposals("room_sk-proj-1234567890abcdef")).rejects.toThrow("Invalid channel ID");
       await expect(
-        rest.createChannelProposal("room-dev", {
-          title: "Deploy token sk-proj-1234567890abcdef",
-          consensus_rule: "majority",
-        }),
-      ).rejects.toThrow("Secret or credential detected");
-      await expect(
-        rest.voteChannelProposal("room-dev", "prop-open", {
-          decision: "approve",
-          reason: "Using ghp_1234567890abcdef token",
-        }),
-      ).rejects.toThrow("Secret or credential detected");
-      await expect(
         rest.voteChannelProposal("room-dev", "prop_ac_secret_987654321", { decision: "approve" }),
       ).rejects.toThrow("Invalid proposal ID");
       expect(fetchCalls).toBe(0);
+
+      await rest.createChannelProposal("room-dev", {
+        title: "Deploy token sk-proj-1234567890abcdef",
+        consensus_rule: "majority",
+      });
+      await rest.voteChannelProposal("room-dev", "prop-open", {
+        decision: "approve",
+        reason: "Using ghp_1234567890abcdef token",
+      });
+      expect(fetchCalls).toBe(2);
     } finally {
       globalThis.fetch = originalFetch;
     }
@@ -3547,7 +3545,7 @@ describe("AgentChatClient realtime collaboration WS events", () => {
       task_backlink_ids: ["task_l3_1"],
       backlinks: [
         { type: "objective", id: "obj_root_1", title: "Root Objective", relation: "linked_channel_docs" },
-        { type: "key_result", id: "kr_l2_1", title: "kr_l2_1", relation: "linked_channel_docs" },
+        { type: "key_result", id: "kr_l2_1", title: "L2 KR ghp_1234567890abcdef", relation: "linked_channel_docs" },
         { type: "task", id: "task_l3_1", title: "L3 Leaf Task", relation: "linked_channel_docs" },
       ],
     });
@@ -3574,6 +3572,8 @@ describe("AgentChatClient realtime collaboration WS events", () => {
       return Response.json({
         channel_id: "room-dev",
         pinned_messages: ["msg_valid_1", "msg_sk-proj-1234567890abcdef", "ac_secret_987654321", "msg_valid_1"],
+        id: "arch-spec",
+        version: 2,
       });
     }) as unknown as typeof fetch;
 
@@ -3582,21 +3582,19 @@ describe("AgentChatClient realtime collaboration WS events", () => {
       await expect(rest.listChannelDocs("dm-private")).rejects.toThrow("Invalid channel ID");
       await expect(rest.getChannelDoc("direct:alice:bob", "arch-spec")).rejects.toThrow("Invalid channel ID");
       await expect(rest.getChannelDoc("room-dev", "doc_ac_secret_987654321")).rejects.toThrow("Invalid channel doc ID");
-      await expect(
-        rest.saveChannelDoc("room-dev", "arch-spec", {
-          title: "Safe Title",
-          kind: "deep_dive",
-          level: 3,
-          body_markdown: "Leaked token sk-proj-1234567890abcdef inside markdown",
-          if_match_version: 1,
-        }),
-      ).rejects.toThrow("Secret or credential detected");
       await expect(rest.getChannelPins("dm-private")).rejects.toThrow("Invalid channel ID");
       await expect(rest.getChannelPins("room_ghp_1234567890abcdef")).rejects.toThrow("Invalid channel ID");
       expect(fetchCalls).toBe(0);
 
+      await rest.saveChannelDoc("room-dev", "arch-spec", {
+        title: "Safe Title",
+        kind: "deep_dive",
+        level: 3,
+        body_markdown: "Technical fixture sk-proj-1234567890abcdef inside markdown",
+        if_match_version: 1,
+      });
       const pins = await rest.getChannelPins("room-dev");
-      expect(fetchCalls).toBe(1);
+      expect(fetchCalls).toBe(2);
       expect(pins).toEqual({
         channel_id: "room-dev",
         pinned_messages: ["msg_valid_1"],
@@ -3806,8 +3804,8 @@ describe("AgentChatClient realtime collaboration WS events", () => {
       items: [
         {
           name: "SwiftAudit.check",
-          title: "SwiftAudit.check",
-          description: "",
+          title: "Leak owner@example.com",
+          description: "Token my_ac_secret_1234567890",
           trigger: "/swift-audit",
           argument_hint: null,
           version: 2,
@@ -3862,12 +3860,12 @@ describe("AgentChatClient realtime collaboration WS events", () => {
           body_markdown: "# Missing frontmatter",
         }),
       ).rejects.toThrow("YAML frontmatter");
-      await expect(
-        rest.savePersonalSkill("deploy-v2.1", {
-          body_markdown: "---\nname: deploy\ndescription: leak\n---\nenv_ac_secret_1234567890abcdef",
-        }),
-      ).rejects.toThrow("must not contain API keys");
       expect(seenPaths).toHaveLength(2);
+
+      await rest.savePersonalSkill("deploy-v2.1", {
+        body_markdown: "---\nname: deploy\ndescription: fixture\n---\nenv_ac_secret_1234567890abcdef",
+      });
+      expect(seenPaths).toHaveLength(3);
     } finally {
       globalThis.fetch = originalFetch;
     }
@@ -4579,10 +4577,11 @@ describe("AgentChatClient realtime collaboration WS events", () => {
     expect(listSummary!.docs[0]?.bodySummary).toBe("");
     expect(listSummary!.docs[0]?.updatedBy).toBe("unknown");
     expect(listSummary!.docs[1]?.updatedBy).toBe("unknown");
-    const dumped = JSON.stringify(listSummary);
-    for (const secret of ["mcp_at_", "glpat-", "ASIAIOSFODNN7EXAMPLE", "ac_ABCDEFGHIJKLMNOP", "owner@example.com"]) {
-      expect(dumped).not.toContain(secret);
-    }
+    expect(listSummary!.docs[2]?.updatedBy).toBe("codex-staff-engineer-ca7590");
+    expect(listSummary!.docs[2]?.title).toBe("Deploy SOP mcp_at_1234567890abcdef");
+    expect(listSummary!.docs[2]?.bodySummary).toBe("Run checks with env_glpat-1234567890abcdef and owner@example.com");
+    expect(listSummary!.docs[2]?.skill_meta?.description).toBe("Verify release without ASIAIOSFODNN7EXAMPLE");
+    expect(JSON.stringify(listSummary)).not.toContain("ac_ABCDEFGHIJKLMNOP");
 
     expect(summarizeChannelDocList({ channel_id: "room-53", docs: [] }, "other-room")).toBeNull();
     expect(summarizeChannelDocList({ channel_id: "__proto__", docs: [] })).toBeNull();
@@ -4599,14 +4598,14 @@ describe("AgentChatClient realtime collaboration WS events", () => {
       await expect(rest.archiveChannelDoc("room-53", badDoc, 1)).rejects.toThrow("Invalid channel doc ID");
     }
     await expect(
-      rest.saveChannelDoc("room-53", "runbook", {
+      rest.saveChannelDoc("room-53", "doc_mcp_at_1234567890", {
         title: "Runbook",
         kind: "context",
         level: 3,
         body_markdown: "Token ac_ABCDEFGHIJKLMNOP+/== and mcp_rt_1234567890abcdef",
         if_match_version: 0,
       }),
-    ).rejects.toThrow("Secret or credential detected in channel doc");
+    ).rejects.toThrow("Invalid channel doc ID");
   });
 
   test("summarizeChannelBriefReadiness & summarizeChannelBriefSkills preserve runtime:<type> specialties, 11-runtime wake attention, deduplicate skills, and block prototype/credential shapes", async () => {
@@ -4755,9 +4754,7 @@ describe("AgentChatClient realtime collaboration WS events", () => {
     expect(detail!.trigger).toBe("/release");
     expect(detail!.argument_hint).toBe("<env>");
     expect(detail!.has_redacted_secret).toBe(false);
-    expect(detail!.body_markdown).toContain("[redacted]");
-    expect(detail!.body_markdown).not.toContain("owner@example.com");
-    expect(detail!.body_markdown).not.toContain("555-0199");
+    expect(detail!.body_markdown).toBe(cleanMd);
     expect(detail!.utf8_bytes).toBeGreaterThan(50);
     expect(detail!.web_editor_remaining_bytes).toBe(48_000 - detail!.utf8_bytes);
     expect(detail!.server_remaining_bytes).toBe(100_000 - detail!.utf8_bytes);
@@ -4771,14 +4768,22 @@ describe("AgentChatClient realtime collaboration WS events", () => {
       })?.name,
     ).toBe("eyj-notes");
 
-    // Legacy stored secret marks has_redacted_secret=true and replaces body with [redacted]
-    const leaked = summarizePersonalSkillDetail({
+    // Explicit literal "[redacted]" sentinel marks has_redacted_secret=true while normal prose stays intact
+    const technical = summarizePersonalSkillDetail({
       name: "legacy-secret",
       version: 2,
-      body_markdown: "---\nname: legacy\ndescription: Leak\n---\n\naws=AKIAIOSFODNN7EXAMPLE\n",
+      body_markdown: "---\nname: legacy\ndescription: Fixture\n---\n\naws=AKIAIOSFODNN7EXAMPLE\n",
     });
-    expect(leaked?.has_redacted_secret).toBe(true);
-    expect(leaked?.body_markdown).toBe("[redacted]");
+    expect(technical?.has_redacted_secret).toBe(false);
+    expect(technical?.body_markdown).toContain("AKIAIOSFODNN7EXAMPLE");
+
+    const redactedSentinel = summarizePersonalSkillDetail({
+      name: "redacted-skill",
+      version: 2,
+      body_markdown: "[redacted]",
+    });
+    expect(redactedSentinel?.has_redacted_secret).toBe(true);
+    expect(redactedSentinel?.body_markdown).toBe("[redacted]");
 
     // Prototype & credential names rejected across detail, library, and REST methods
     for (const badSlug of ["__proto__", "constructor", "prototype", "mcp_at_1234567890", "skill_rk_live_1234567890abcd"]) {
@@ -5172,7 +5177,7 @@ describe("AgentChatClient realtime collaboration WS events", () => {
     expect(summary).not.toBeNull();
     expect(summary?.total_proposals).toBe(1);
     expect(summary?.pending_ids).toEqual(["aiza-guide-handbook"]);
-    expect(summary?.ballot_rationale_count).toBe(1);
+    expect(summary?.ballot_rationale_count).toBe(2);
 
     const originalFetch = globalThis.fetch;
     let calls = 0;
@@ -5228,25 +5233,23 @@ describe("AgentChatClient realtime collaboration WS events", () => {
         }),
       ).rejects.toThrow("Invalid proposal sender_id");
       await expect(
-        rest.createChannelProposal("room-asia-pacific", {
-          title: "ship",
-          content: "key ASIAIOSFODNN7EXAMPLE",
-        }),
-      ).rejects.toThrow("Secret or credential detected");
-      await expect(
         rest.voteChannelProposal("room-asia-pacific", "aiza-guide-handbook", {
           voter_id: "mr_" + "b".repeat(64),
           decision: "approve",
         }),
       ).rejects.toThrow("Invalid proposal voter_id");
-      await expect(
-        rest.voteChannelProposal("room-asia-pacific", "aiza-guide-handbook", {
-          voter_id: "eyj-notes",
-          decision: "approve",
-          reason: "token ASIAIOSFODNN7EXAMPLE",
-        }),
-      ).rejects.toThrow("Secret or credential detected");
       expect(calls).toBe(4);
+
+      await rest.createChannelProposal("room-asia-pacific", {
+        title: "ship",
+        content: "fixture ASIAIOSFODNN7EXAMPLE",
+      });
+      await rest.voteChannelProposal("room-asia-pacific", "aiza-guide-handbook", {
+        voter_id: "eyj-notes",
+        decision: "approve",
+        reason: "fixture ASIAIOSFODNN7EXAMPLE",
+      });
+      expect(calls).toBe(6);
     } finally {
       globalThis.fetch = originalFetch;
     }
@@ -5843,7 +5846,7 @@ describe("AgentChatClient realtime collaboration WS events", () => {
     expect(parsed.is_valid_skill).toBe(true);
     expect(parsed.metadata).toEqual({
       name: "deploy-release",
-      description: "Ship Cloud Run cleanly to [redacted]",
+      description: "Ship Cloud Run cleanly to ops@example.invalid",
       trigger: "/deploy",
       argument_hint: "[service]",
     });
@@ -6144,5 +6147,41 @@ describe("AgentChatClient realtime collaboration WS events", () => {
       pending_ids: ["eyj-prop-2"],
       ballot_rationale_count: 1,
     });
+  });
+
+  test("Campaign #70: O(1) technical prose preservation across Docs, Proposals, and Personal Skills while masking structured principals and rejecting unsafe slugs", async () => {
+    const skillMd =
+      "---\nname: jwt-runbook\ndescription: Inspect eyJhbGciOiJIUzI1NiJ9 headers & ops@example.com alerts\ntrigger: /jwt-debug\n---\n\n```sh\nexport OPENAI_API_KEY=sk-proj-test1234567890abcdef\n```\n";
+    const parsed = parseChannelSkillFrontmatter(skillMd);
+    expect(parsed.is_valid_skill).toBe(true);
+    expect(parsed.metadata.description).toBe("Inspect eyJhbGciOiJIUzI1NiJ9 headers & ops@example.com alerts");
+
+    const docSummary = summarizeChannelDocList({
+      channel_id: "room-70",
+      docs: [
+        {
+          id: "jwt-runbook",
+          title: "Debug sk-proj-test1234567890abcdef & JWTs",
+          kind: "channel_skill",
+          level: 2,
+          bodyMarkdown: skillMd,
+          bodySummary: "export OPENAI_API_KEY=sk-proj-test1234567890abcdef",
+          version: 1,
+          updatedAt: "2026-11-14T09:00:00Z",
+          updatedBy: "alice@example.com",
+        },
+      ],
+    });
+    expect(docSummary?.docs[0]?.updatedBy).toBe("unknown");
+    expect(docSummary?.docs[0]?.title).toContain("sk-proj-test1234567890abcdef");
+    expect(docSummary?.docs[0]?.bodySummary).toContain("sk-proj-test1234567890abcdef");
+
+    const skillDetail = summarizePersonalSkillDetail({
+      name: "jwt-runbook",
+      version: 1,
+      body_markdown: skillMd,
+    });
+    expect(skillDetail?.has_redacted_secret).toBe(false);
+    expect(skillDetail?.body_markdown).toBe(skillMd);
   });
 });
