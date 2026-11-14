@@ -41,14 +41,15 @@ function validIdentityId(value: unknown): value is string {
 }
 
 /** Validate the whole candidate set before exposing any credentials or replacing state. */
-function validateIdentities(identities: readonly Identity[]): void {
+function validateIdentities(identities: readonly Identity[], allowEmptyCredentials = false): void {
   const bots = new Set<string>();
   const agents = new Set<string>();
   for (const id of identities) {
     if (!id || !validIdentityId(id.botId) || !validIdentityId(id.agentId)) {
       throw new Error("invalid identity botId or agentId");
     }
-    if ([id.token, id.gatewayId, id.secret].some(value => typeof value !== "string" || !value.trim())) {
+    if ([id.token, id.gatewayId, id.secret].some(value =>
+      typeof value !== "string" || (!value.trim() && !(allowEmptyCredentials && value === "")))) {
       throw new Error("missing identity credentials");
     }
     if (bots.has(id.botId.trim()) || agents.has(id.agentId.trim())) {
@@ -62,8 +63,11 @@ function validateIdentities(identities: readonly Identity[]): void {
 export class IdentityTable {
   private readonly byBot = new Map<string, Identity>();
 
-  constructor(identities: Identity[]) {
-    this.replace(identities);
+  constructor(identities: Identity[], opts?: { allowEmptyCredentials?: boolean }) {
+    // Legacy embedding uses an empty-credential placeholder only at construction.
+    // Replacements and platform credential lookups always retain strict validation.
+    validateIdentities(identities, opts?.allowEmptyCredentials === true);
+    this.install(identities);
   }
 
   /** The identity fronting `botId`, or null when unregistered (fail closed). */
@@ -89,6 +93,10 @@ export class IdentityTable {
    */
   replace(identities: Identity[]): void {
     validateIdentities(identities);
+    this.install(identities);
+  }
+
+  private install(identities: Identity[]): void {
     const next = new Map<string, Identity>();
     for (const id of identities) {
       if (next.has(id.botId)) {

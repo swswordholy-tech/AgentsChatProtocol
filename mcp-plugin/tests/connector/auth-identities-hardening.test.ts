@@ -3,6 +3,7 @@ import { createHmac } from "node:crypto";
 import { makeToken, sign, verifySignature, verifyToken } from "../../connector/auth.ts";
 import { IdentityTable, requireIdentity, type Identity } from "../../connector/identities.ts";
 import { buildDescriptor } from "../../connector/descriptor.ts";
+import { startConnector } from "../../connector/server.ts";
 
 const secret = "fixture-secret";
 const identity: Identity = { botId: "bot-a", agentId: "agent-a", token: "ac_fixture", gatewayId: "gateway-a", secret };
@@ -71,6 +72,53 @@ test("duplicate bot and agent keys cannot shadow identities or partially reload"
   expect(table.forBot("__proto__")).toBeNull();
   expect(table.forBot(" bot-a ")).toBeNull();
   expect(requireIdentity([identity], "bot-a")).toBe(identity);
+});
+
+test("legacy empty-credential opt-in applies only to construction", () => {
+  const placeholder = { botId: "default", agentId: "default", token: "", gatewayId: "", secret: "" };
+  const table = new IdentityTable([placeholder], { allowEmptyCredentials: true });
+  expect(table.forBot("default")).toEqual(placeholder);
+  expect(Object.isFrozen(table.forBot("default"))).toBe(true);
+  expect(() => new IdentityTable([placeholder], { allowEmptyCredentials: false })).toThrow();
+  for (const field of ["token", "gatewayId", "secret"] as const) {
+    expect(() => new IdentityTable([{ ...placeholder, [field]: " \n" }], { allowEmptyCredentials: true })).toThrow();
+    expect(() => new IdentityTable([{ ...placeholder, [field]: null } as unknown as Identity], { allowEmptyCredentials: true })).toThrow();
+    expect(() => table.replace([{ ...identity, [field]: "" }])).toThrow();
+    expect(table.forBot("default")).toEqual(placeholder);
+  }
+  expect(() => new IdentityTable([{ ...placeholder, botId: "__proto__" }], { allowEmptyCredentials: true })).toThrow();
+  expect(() => new IdentityTable([placeholder, placeholder], { allowEmptyCredentials: true })).toThrow();
+  expect(() => requireIdentity([placeholder], "default")).toThrow();
+  table.replace([identity]);
+  expect(table.forBot("default")).toBeNull();
+  expect(table.forBot(identity.botId)).toEqual(identity);
+  expect(() => table.replace([placeholder])).toThrow();
+  expect(table.forBot(identity.botId)).toEqual(identity);
+});
+
+test("connector legacy placeholder cannot weaken configured identities or reload validation", async () => {
+  const config = {
+    port: 0,
+    secrets: { "gateway-a": [secret] },
+    agentschat: {
+      async sendMessage() { return { id: "fixture-message" }; },
+      async getChatInfo() { return { name: "fixture", type: "group" }; },
+    },
+  };
+  const server = startConnector(config);
+  try {
+    for (const field of ["token", "gatewayId", "secret"] as const) {
+      const bad = { ...identity, [field]: "" };
+      expect(() => startConnector({ ...config, identities: [bad] })).toThrow();
+      expect(() => server.reloadIdentities([bad])).toThrow();
+      expect(config.secrets).toEqual({ "gateway-a": [secret] });
+    }
+    expect(() => server.reloadIdentities([identity])).not.toThrow();
+    expect(() => server.reloadIdentities([{ ...identity, secret: "" }])).toThrow();
+    expect(config.secrets).toEqual({ "gateway-a": [secret] });
+  } finally {
+    await server.stop();
+  }
 });
 
 test("table snapshots cannot be mutated into another identity", () => {

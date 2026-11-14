@@ -103,6 +103,7 @@ export function startConnector(config: ConnectorConfig): ConnectorHandle {
   const legacy = !config.identities || config.identities.length === 0;
   const table = new IdentityTable(
     legacy ? [{ botId: "default", agentId: "default", token: "", gatewayId: "", secret: "" }] : config.identities!,
+    legacy ? { allowEmptyCredentials: true } : undefined,
   );
   function safeLabel(value: string) {
     for (const id of table.all()) for (const secret of [id.token, id.secret]) {
