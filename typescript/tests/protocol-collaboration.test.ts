@@ -4389,4 +4389,110 @@ describe("AgentChatClient realtime collaboration WS events", () => {
       }),
     ).rejects.toThrow("Invalid story qr_target");
   });
+
+  test("summarizeCloudAgentAuditFeed and hardened getCloudAgentAuditLogs / proposal sender_id & voter_id guards", async () => {
+    const { summarizeCloudAgentAuditFeed } = await import("../src/index");
+    const pem = "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgSecret==\n-----END PRIVATE KEY-----";
+    const summary = summarizeCloudAgentAuditFeed(
+      {
+        agent_id: "claude-cloud-52",
+        observation_only: true,
+        entries: [
+          {
+            id: "aud_1",
+            ts: "2026-11-14T03:15:00.000Z",
+            actor: "owner@example.com",
+            target: "claude-cloud-52",
+            channel: "room-52",
+            method: "POST",
+            path: "/oauth/token?secret=glpat-1234567890abcdef",
+            status: 401,
+            result: "denied",
+            action: "oauth_refresh_replay_revoked",
+            credential_kind: "oauth_delegate",
+            reason: `Replay with rk_live_1234567890abcdef AKIAIOSFODNN7EXAMPLE and ${pem}`,
+          },
+          {
+            id: "aud_1", // duplicate ignored
+            ts: "2026-11-14T03:15:00.000Z",
+            actor: "claude-cloud-52",
+            target: "claude-cloud-52",
+            channel: "room-52",
+            method: "POST",
+            path: "/mcp",
+            status: 200,
+            result: "ok",
+          },
+          {
+            id: "aud_2",
+            ts: "2026-11-14T03:16:00.000Z",
+            actor: "claude-cloud-52",
+            target: "room-52",
+            channel: "room-52",
+            method: "POST",
+            path: "/mcp",
+            status: 200,
+            result: "ok",
+            tool: "agentschat_send_message",
+            credential_kind: "agent_key",
+          },
+        ],
+      },
+      "claude-cloud-52",
+    );
+
+    expect(summary).not.toBeNull();
+    expect(summary!.total_entries).toBe(2);
+    expect(summary!.ok_count).toBe(1);
+    expect(summary!.denied_count).toBe(1);
+    expect(summary!.error_count).toBe(0);
+    expect(summary!.replay_revocation_count).toBe(1);
+    expect(summary!.oauth_delegate_count).toBe(1);
+    expect(summary!.agent_key_count).toBe(1);
+    expect(summary!.latest_ts).toBe("2026-11-14T03:16:00.000Z");
+    expect(summary!.entries[0]?.path).toBe("/oauth/token");
+    expect(summary!.entries[0]?.is_replay_revocation).toBe(true);
+    const dumped = JSON.stringify(summary);
+    for (const secret of ["owner@example.com", "glpat-", "rk_live_", "AKIAIOSFODNN7EXAMPLE", "MIIEvQIBADANBgSecret"]) {
+      expect(dumped).not.toContain(secret);
+    }
+
+    // Rejects mismatched agent_id, non-observation_only, prototype keys, or embedded secrets
+    expect(
+      summarizeCloudAgentAuditFeed({ agent_id: "claude-cloud-52", observation_only: true, entries: [] }, "other-agent"),
+    ).toBeNull();
+    expect(
+      summarizeCloudAgentAuditFeed({ agent_id: "__proto__", observation_only: true, entries: [] }),
+    ).toBeNull();
+    expect(
+      summarizeCloudAgentAuditFeed({ agent_id: "bot_ac_SecretToken12345", observation_only: true, entries: [] }),
+    ).toBeNull();
+    expect(
+      summarizeCloudAgentAuditFeed({ agent_id: "claude-cloud-52", observation_only: false, entries: [] }),
+    ).toBeNull();
+
+    const rest = new AgentChatREST({ baseUrl: "https://agents-chat.com", bearerToken: "jwt_owner_52" });
+    for (const badId of ["__proto__", "agent..1", "glpat-Secret123456", "bot_ac_Secret123456", "12345678"]) {
+      await expect(rest.getCloudAgentAuditLogs(badId)).rejects.toThrow("Invalid cloud agent ID");
+    }
+    await expect(rest.listChannelProposals("__proto__")).rejects.toThrow("Invalid channel ID");
+    await expect(
+      rest.createChannelProposal("room-52", {
+        title: "Clean plan",
+        sender_id: "bot_ac_Secret123456",
+      }),
+    ).rejects.toThrow("Invalid proposal sender_id");
+    await expect(
+      rest.createChannelProposal("room-52", {
+        title: "Clean plan",
+        id: "__proto__",
+      }),
+    ).rejects.toThrow("Invalid proposal ID");
+    await expect(
+      rest.voteChannelProposal("room-52", "prop-1", {
+        decision: "approve",
+        voter_id: "__proto__",
+      }),
+    ).rejects.toThrow("Invalid proposal voter_id");
+  });
 });

@@ -651,6 +651,124 @@ export function summarizeStoryArtifactBundle(
   };
 }
 
+function isSafeCloudAuditAgentId(id: unknown): id is string {
+  return (
+    typeof id === "string" &&
+    /^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/.test(id) &&
+    !id.includes("..") &&
+    !PROTOTYPE_POISON_KEYS.has(id.toLowerCase()) &&
+    !/^\d{6,}$/.test(id) &&
+    !CREDENTIAL_PREFIX_RE.test(id) &&
+    !EMBEDDED_SECRET_TOKEN_RE.test(id) &&
+    !EMAIL_ID_RE.test(id)
+  );
+}
+
+export function summarizeCloudAgentAuditFeed(
+  raw: unknown,
+  expectedAgentId?: string,
+): import("./types").CloudAgentAuditSummary | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const feed = raw as Record<string, unknown>;
+  if (feed.observation_only !== true || !Array.isArray(feed.entries) || feed.entries.length > 200) {
+    return null;
+  }
+  const agentId = typeof feed.agent_id === "string" ? feed.agent_id.trim() : "";
+  if (!isSafeCloudAuditAgentId(agentId)) return null;
+  if (expectedAgentId !== undefined && agentId !== expectedAgentId) return null;
+
+  const entries: Array<import("./types").CloudAgentAuditEntry & { is_replay_revocation: boolean }> = [];
+  const seenIds = new Set<string>();
+  let okCount = 0;
+  let deniedCount = 0;
+  let errorCount = 0;
+  let replayRevocationCount = 0;
+  let oauthDelegateCount = 0;
+  let agentKeyCount = 0;
+  let latestMs = -Infinity;
+  let latestTs: string | null = null;
+
+  for (const item of feed.entries) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    const row = item as Record<string, unknown>;
+    const id = scrubStoryDisplayText(row.id, 96).replace(/\s+/g, " ").trim();
+    if (!id || PROTOTYPE_POISON_KEYS.has(id.toLowerCase()) || seenIds.has(id)) continue;
+    const result = row.result;
+    if (result !== "ok" && result !== "denied" && result !== "error") continue;
+    seenIds.add(id);
+
+    const status =
+      typeof row.status === "number" && Number.isInteger(row.status) && row.status >= 100 && row.status <= 599
+        ? row.status
+        : 500;
+    const rawTs = typeof row.ts === "string" ? row.ts.trim() : "";
+    let ts = "";
+    if (rawTs.length <= 64 && /^\d{4}-\d{2}-\d{2}T/.test(rawTs) && Number.isFinite(Date.parse(rawTs))) {
+      const ms = Date.parse(rawTs);
+      ts = new Date(ms).toISOString();
+      if (ms > latestMs) {
+        latestMs = ms;
+        latestTs = ts;
+      }
+    }
+    const rawPath = typeof row.path === "string" ? row.path.split("?")[0] ?? "/" : "/";
+    const path = scrubStoryDisplayText(rawPath, 160).replace(/\s+/g, " ").trim() || "/";
+    const method = scrubStoryDisplayText(row.method, 16).replace(/\s+/g, " ").trim() || "POST";
+    const actor = scrubStoryDisplayText(row.actor, 96).replace(/\s+/g, " ").trim();
+    const target = scrubStoryDisplayText(row.target, 96).replace(/\s+/g, " ").trim();
+    const channel = scrubStoryDisplayText(row.channel, 96).replace(/\s+/g, " ").trim();
+    const action = typeof row.action === "string" ? scrubStoryDisplayText(row.action, 96).replace(/\s+/g, " ").trim() : undefined;
+    const tool = typeof row.tool === "string" ? scrubStoryDisplayText(row.tool, 96).replace(/\s+/g, " ").trim() : undefined;
+    const reason = typeof row.reason === "string" ? scrubStoryDisplayText(row.reason, 200).replace(/\s+/g, " ").trim() : undefined;
+    const credentialKind =
+      row.credential_kind === "oauth_delegate" || row.credential_kind === "agent_key" || row.credential_kind === "unknown"
+        ? row.credential_kind
+        : undefined;
+
+    const isReplayRevocation =
+      action === "oauth_refresh_replay_revoked" || (typeof reason === "string" && /replay_revoked/i.test(reason));
+
+    if (result === "ok") okCount += 1;
+    else if (result === "denied") deniedCount += 1;
+    else errorCount += 1;
+    if (isReplayRevocation) replayRevocationCount += 1;
+    if (credentialKind === "oauth_delegate") oauthDelegateCount += 1;
+    else if (credentialKind === "agent_key") agentKeyCount += 1;
+
+    entries.push({
+      id,
+      ts,
+      actor,
+      target,
+      channel,
+      method,
+      path,
+      status,
+      result,
+      ...(action ? { action } : {}),
+      ...(tool ? { tool } : {}),
+      ...(credentialKind ? { credential_kind: credentialKind } : {}),
+      ...(reason ? { reason } : {}),
+      is_replay_revocation: isReplayRevocation,
+    });
+    if (entries.length >= 50) break;
+  }
+
+  return {
+    agent_id: agentId,
+    observation_only: true,
+    total_entries: entries.length,
+    ok_count: okCount,
+    denied_count: deniedCount,
+    error_count: errorCount,
+    replay_revocation_count: replayRevocationCount,
+    oauth_delegate_count: oauthDelegateCount,
+    agent_key_count: agentKeyCount,
+    latest_ts: latestTs,
+    entries,
+  };
+}
+
 function safeNonDmChannelId(value: unknown): value is string {
   return (
     typeof value === "string" &&
@@ -2607,7 +2725,7 @@ export class AgentChatREST {
     agentId: string,
     opts?: { limit?: number; result?: CloudAgentAuditResult; bearerToken?: string },
   ): Promise<CloudAgentAuditFeed> {
-    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/.test(agentId) || /^ac_/i.test(agentId)) {
+    if (!isSafeCloudAuditAgentId(agentId) || this.containsMemorySecretShape(agentId)) {
       throw new Error("Invalid cloud agent ID");
     }
     const params = new URLSearchParams();
@@ -2794,7 +2912,11 @@ export class AgentChatREST {
     channelId: string,
     opts?: { limit?: number; bearerToken?: string },
   ): Promise<import("./types").ChannelProposalsFeed> {
-    if (!safeNonDmChannelId(channelId) || this.containsMemorySecretShape(channelId)) {
+    if (
+      !safeNonDmChannelId(channelId) ||
+      PROTOTYPE_POISON_KEYS.has(channelId.toLowerCase()) ||
+      this.containsMemorySecretShape(channelId)
+    ) {
       throw new Error("Invalid channel ID");
     }
     const params = new URLSearchParams();
@@ -2820,14 +2942,30 @@ export class AgentChatREST {
     input: import("./types").CreateChannelProposalInput,
     opts?: { bearerToken?: string },
   ): Promise<import("./types").CreateChannelProposalResponse> {
-    if (!safeNonDmChannelId(channelId) || this.containsMemorySecretShape(channelId)) {
+    if (
+      !safeNonDmChannelId(channelId) ||
+      PROTOTYPE_POISON_KEYS.has(channelId.toLowerCase()) ||
+      this.containsMemorySecretShape(channelId)
+    ) {
       throw new Error("Invalid channel ID");
     }
     if (
       input?.id !== undefined &&
-      (!safeGraphId(input.id) || EMBEDDED_SECRET_TOKEN_RE.test(input.id) || this.containsMemorySecretShape(input.id))
+      (!safeGraphId(input.id) ||
+        PROTOTYPE_POISON_KEYS.has(input.id.toLowerCase()) ||
+        EMBEDDED_SECRET_TOKEN_RE.test(input.id) ||
+        this.containsMemorySecretShape(input.id))
     ) {
       throw new Error("Invalid proposal ID");
+    }
+    if (
+      input?.sender_id !== undefined &&
+      (!isSafeCollaborationAgentId(input.sender_id) ||
+        PROTOTYPE_POISON_KEYS.has(input.sender_id.toLowerCase()) ||
+        EMBEDDED_SECRET_TOKEN_RE.test(input.sender_id) ||
+        this.containsMemorySecretShape(input.sender_id))
+    ) {
+      throw new Error("Invalid proposal sender_id");
     }
     const title = input?.title?.trim() ?? "";
     if (!title || title.length > 500) {
@@ -2876,15 +3014,29 @@ export class AgentChatREST {
     input: import("./types").VoteChannelProposalInput,
     opts?: { bearerToken?: string },
   ): Promise<import("./types").VoteChannelProposalResponse> {
-    if (!safeNonDmChannelId(channelId) || this.containsMemorySecretShape(channelId)) {
+    if (
+      !safeNonDmChannelId(channelId) ||
+      PROTOTYPE_POISON_KEYS.has(channelId.toLowerCase()) ||
+      this.containsMemorySecretShape(channelId)
+    ) {
       throw new Error("Invalid channel ID");
     }
     if (
       !safeGraphId(proposalId) ||
+      PROTOTYPE_POISON_KEYS.has(proposalId.toLowerCase()) ||
       EMBEDDED_SECRET_TOKEN_RE.test(proposalId) ||
       this.containsMemorySecretShape(proposalId)
     ) {
       throw new Error("Invalid proposal ID");
+    }
+    if (
+      input?.voter_id !== undefined &&
+      (!isSafeCollaborationAgentId(input.voter_id) ||
+        PROTOTYPE_POISON_KEYS.has(input.voter_id.toLowerCase()) ||
+        EMBEDDED_SECRET_TOKEN_RE.test(input.voter_id) ||
+        this.containsMemorySecretShape(input.voter_id))
+    ) {
+      throw new Error("Invalid proposal voter_id");
     }
     if (!input || !["approve", "reject", "abstain"].includes(input.decision)) {
       throw new Error("Invalid vote decision");

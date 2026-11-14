@@ -635,6 +635,20 @@ export interface CloudAgentAuditFeed {
   entries: CloudAgentAuditEntry[];
 }
 
+export interface CloudAgentAuditSummary {
+  agent_id: string;
+  observation_only: true;
+  total_entries: number;
+  ok_count: number;
+  denied_count: number;
+  error_count: number;
+  replay_revocation_count: number;
+  oauth_delegate_count: number;
+  agent_key_count: number;
+  latest_ts: string | null;
+  entries: Array<CloudAgentAuditEntry & { is_replay_revocation: boolean }>;
+}
+
 // MARK: - Room-Scoped Cloud Agent Wake-Health Observation Types
 
 export type CloudCliWakeStatus = "ok" | "auth_required" | "timeout" | "error";
