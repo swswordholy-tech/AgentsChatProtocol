@@ -565,6 +565,8 @@ function loadCursor(file, warn) {
     }
     const entries = [];
     for (const [k, v] of Object.entries(parsed)) {
+      if (k === "__proto__" || k === "constructor" || k === "prototype")
+        continue;
       if (typeof v !== "string") {
         throw new Error(`cursor value for ${k} must be a string`);
       }

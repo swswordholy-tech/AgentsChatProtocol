@@ -16,11 +16,11 @@
  *    any message arriving at/after `__init_ts__` is delivered immediately without
  *    being swallowed by cold-start seeding.
  */
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { matchesMention } from "./mentions.ts";
 import { safeWriteProfile } from "./profile-store.ts";
-import { loadCursor, persistCursor, type Warn } from "./read-cursor.ts";
+import { cursorFileForAgent, loadCursor, persistCursor, safeAgentCursorSlug, type Warn } from "./read-cursor.ts";
 import { redactParticipantPii, redactSecrets } from "./redact.ts";
 import { normalizeTimestampForCursor } from "./timestamps.ts";
 import { buildWakePrompt, formatWakeAttachments } from "./wake.ts";
@@ -60,6 +60,7 @@ export function parseMaxIdleMs(raw: string | number | undefined): number | undef
   return undefined;
 }
 const MAX_SSE_STREAMS = 3;
+const MAX_SSE_LINE_CHARS = 512 * 1024;
 const MAX_SEEN_IDS = 200;
 const DEFAULT_HTTP_TIMEOUT_MS = 15_000;
 
@@ -126,6 +127,7 @@ export interface SendMessageResult {
   ok: boolean;
   status: number;
   id?: string;
+  timestamp?: string;
   agent_id: string;
   channel_id: string;
   in_reply_to?: string;
@@ -206,7 +208,7 @@ export function advanceChannelReadCursor(opts: {
   const warn = opts.warn ?? ((m: string) => process.stderr.write(m));
   mkdirSync(configDir, { recursive: true });
 
-  const lastSeenFile = join(configDir, `last-seen-msg-ts-${agentId}.json`);
+  const lastSeenFile = cursorFileForAgent(configDir, agentId);
   const cursor = loadCursor(lastSeenFile, warn);
   const prev = cursor.get(channelId) || "";
   const nextNorm = normalizeTimestampForCursor(timestamp, "after") || timestamp;
@@ -273,7 +275,7 @@ export async function joinChannelRest(opts: {
       status: res.status,
       agent_id: opts.agentId,
       channel_id: opts.channelId,
-      error: String(data.error ?? data.message ?? `HTTP ${res.status}`),
+      error: redactSecrets(String(data.error ?? data.message ?? `HTTP ${res.status}`)),
     };
   } catch (e: any) {
     return {
@@ -281,7 +283,7 @@ export async function joinChannelRest(opts: {
       status: 0,
       agent_id: opts.agentId,
       channel_id: opts.channelId,
-      error: String(e?.message || e),
+      error: redactSecrets(String(e?.message || e)),
     };
   }
 }
@@ -326,11 +328,16 @@ export async function sendRestMessage(opts: {
     );
     const data = (await res.json().catch(() => ({}))) as Record<string, unknown>;
     if (res.ok) {
+      const serverTs =
+        typeof data.timestamp === "string" && data.timestamp.trim()
+          ? data.timestamp.trim()
+          : undefined;
+      const cursorTs = serverTs ?? new Date().toISOString();
       advanceChannelReadCursor({
         configDir: opts.configDir,
         agentId: opts.agentId,
         channelId: opts.channelId,
-        timestamp: new Date().toISOString(),
+        timestamp: cursorTs,
         maxIdleMs: opts.maxIdleMs,
         warn: opts.warn,
       });
@@ -338,6 +345,7 @@ export async function sendRestMessage(opts: {
         ok: true,
         status: res.status,
         id: typeof data.id === "string" ? data.id : undefined,
+        ...(serverTs ? { timestamp: serverTs } : {}),
         agent_id: opts.agentId,
         channel_id: opts.channelId,
         ...(opts.replyTo ? { in_reply_to: opts.replyTo } : {}),
@@ -348,7 +356,7 @@ export async function sendRestMessage(opts: {
       status: res.status,
       agent_id: opts.agentId,
       channel_id: opts.channelId,
-      error: String(data.error ?? data.message ?? `HTTP ${res.status}`),
+      error: redactSecrets(String(data.error ?? data.message ?? `HTTP ${res.status}`)),
     };
   } catch (e: any) {
     return {
@@ -356,7 +364,7 @@ export async function sendRestMessage(opts: {
       status: 0,
       agent_id: opts.agentId,
       channel_id: opts.channelId,
-      error: String(e?.message || e),
+      error: redactSecrets(String(e?.message || e)),
     };
   }
 }
@@ -411,16 +419,24 @@ export async function wakeOnce(opts: {
   const nowIso = opts.nowIso ?? (() => new Date().toISOString());
   const baseUrl = opts.restUrl.replace(/\/$/, "");
   const { configDir, agentId, displayName, token } = opts;
-  const timeoutMs = opts.timeoutMs ?? 240_000;
-  const requestTimeoutMs = opts.requestTimeoutMs ?? DEFAULT_HTTP_TIMEOUT_MS;
-  const pollIntervalMs = opts.pollIntervalMs ?? 15_000;
+  const timeoutMs = opts.timeoutMs !== undefined && Number.isFinite(opts.timeoutMs) ? opts.timeoutMs : 240_000;
+  const requestTimeoutMs =
+    opts.requestTimeoutMs !== undefined && Number.isFinite(opts.requestTimeoutMs) && opts.requestTimeoutMs >= 0
+      ? opts.requestTimeoutMs
+      : DEFAULT_HTTP_TIMEOUT_MS;
+  const pollIntervalMs =
+    opts.pollIntervalMs !== undefined && Number.isFinite(opts.pollIntervalMs) && opts.pollIntervalMs >= 10
+      ? Math.floor(opts.pollIntervalMs)
+      : 15_000;
   const enableSse = opts.enableSse ?? true;
 
   mkdirSync(configDir, { recursive: true });
-  const lastSeenFile = join(configDir, `last-seen-msg-ts-${agentId}.json`);
-  const seenIdsFile = join(configDir, `wake-seen-ids-${agentId}.json`);
+  const safeSlug = safeAgentCursorSlug(agentId);
+  const lastSeenFile = cursorFileForAgent(configDir, agentId);
+  const seenIdsFile = join(configDir, `wake-seen-ids-${safeSlug}.json`);
   const mentionTsFile = join(configDir, "mention-timestamps.json");
-  const wakePidFile = join(configDir, `wake-once-${agentId}.pid`);
+  const wakePidFile = join(configDir, `wake-once-${safeSlug}.pid`);
+  let wrotePidFile = false;
 
   // When running against live network (not unit test mock fetch), ensure at most one wake-once listener per agent
   if (!opts.fetchImpl) {
@@ -434,6 +450,7 @@ export async function wakeOnce(opts: {
         }
       }
       writeFileSync(wakePidFile, `${process.pid}\n`, { mode: 0o600 });
+      wrotePidFile = true;
     } catch {}
   }
 
@@ -605,6 +622,7 @@ export async function wakeOnce(opts: {
       // Any addressed message at/after `__init_ts__` (e.g. first DM after claiming!) is live and must fire.
       const liveBatch: any[] = [];
       let newestPreExisting = "";
+      let newestPreExistingNorm = "";
       for (const m of list) {
         const msgId = String(m.id || "");
         if (msgId && seenSet.has(msgId)) continue;
@@ -612,13 +630,17 @@ export async function wakeOnce(opts: {
         const msgTsNorm = normalizeTimestampForCursor(msgTs, "after") || msgTs;
         if (msgTsNorm && msgTsNorm < initTsNorm) {
           if (msgId) seenSet.add(msgId);
-          if (msgTs > newestPreExisting) newestPreExisting = msgTs;
+          if (msgTsNorm > newestPreExistingNorm) {
+            newestPreExisting = msgTs;
+            newestPreExistingNorm = msgTsNorm;
+          }
           continue;
         }
         if (isMessageAddressedToAgent({ ...m, channel_id: channelId }, agentId, displayName)) {
           liveBatch.push({ ...m, channel_id: channelId });
-        } else if (msgTs > newestPreExisting) {
+        } else if (msgTsNorm && msgTsNorm > newestPreExistingNorm) {
           newestPreExisting = msgTs;
+          newestPreExistingNorm = msgTsNorm;
         }
       }
       if (liveBatch.length > 0) {
@@ -672,6 +694,13 @@ export async function wakeOnce(opts: {
       resolved = true;
       if (pollTimer) clearInterval(pollTimer);
       if (timeoutTimer) clearTimeout(timeoutTimer);
+      if (wrotePidFile) {
+        try {
+          if (existsSync(wakePidFile) && readFileSync(wakePidFile, "utf-8").trim() === String(process.pid)) {
+            unlinkSync(wakePidFile);
+          }
+        } catch {}
+      }
       try {
         abortCtrl.abort();
       } catch {}
@@ -692,9 +721,28 @@ export async function wakeOnce(opts: {
                 signal: abortCtrl.signal,
               },
             );
-            if (!res.ok || !res.body) break;
+            if (!res.ok || !res.body) {
+              try {
+                await res.body?.cancel();
+              } catch {}
+              if (res.status === 429 || res.status >= 500) {
+                sseConnectedChannels.delete(channelId);
+                if (resolved) return;
+                await sleepAbortable(2000, abortCtrl.signal);
+                continue;
+              }
+              break;
+            }
             sseConnectedChannels.add(channelId);
             const reader = res.body.getReader();
+            const onAbortCancel = () => {
+              void reader.cancel().catch(() => {});
+            };
+            if (abortCtrl.signal.aborted) {
+              onAbortCancel();
+            } else {
+              abortCtrl.signal.addEventListener("abort", onAbortCancel, { once: true });
+            }
             try {
               const decoder = new TextDecoder();
               let buf = "";
@@ -708,6 +756,10 @@ export async function wakeOnce(opts: {
                   if (chunk.startsWith("\uFEFF")) chunk = chunk.slice(1);
                 }
                 buf += chunk;
+                if (buf.length > MAX_SSE_LINE_CHARS && !buf.includes("\n")) {
+                  buf = "";
+                  continue;
+                }
                 const lines = buf.split(/\r?\n/);
                 buf = lines.pop() || "";
                 for (const line of lines) {
@@ -725,6 +777,10 @@ export async function wakeOnce(opts: {
                 }
               }
             } finally {
+              abortCtrl.signal.removeEventListener("abort", onAbortCancel);
+              try {
+                await reader.cancel();
+              } catch {}
               try {
                 reader.releaseLock();
               } catch {}

@@ -166,7 +166,7 @@ import {
   type IdentityGuardRecord,
 } from "./identity-guard.ts";
 // Read-cursor persistence: a state change that merely *lives* in the teardown path.
-import { flushCursor, loadCursor, persistCursor } from "./read-cursor.ts";
+import { cursorFileForAgent, flushCursor, loadCursor, persistCursor } from "./read-cursor.ts";
 import { CURSOR_INIT_KEY, joinChannelRest, parseMaxIdleMs, sendRestMessage, wakeOnce } from "./rest-cli.ts";
 import { randomUUID } from "crypto";
 
@@ -947,7 +947,7 @@ if (TOKEN && TOKEN !== "dev-token") {
   if (cliArgs.registerOnly) {
     try {
       mkdirSync(configDir, { recursive: true });
-      const lastSeenFile = join(configDir, `last-seen-msg-ts-${AGENT_ID}.json`);
+      const lastSeenFile = cursorFileForAgent(configDir, AGENT_ID);
       const cursor = loadCursor(lastSeenFile, (m) => process.stderr.write(m));
       if (!cursor.get(CURSOR_INIT_KEY)) {
         cursor.set(CURSOR_INIT_KEY, new Date().toISOString());
@@ -3571,7 +3571,7 @@ function createProfileSlot(opts: {
   capabilities: string[];
   runtimeSession: DetectedSession | null;
 }): ProfileSlot {
-  const lastSeenFile = join(configDir, `last-seen-msg-ts-${opts.agentId}.json`);
+  const lastSeenFile = cursorFileForAgent(configDir, opts.agentId);
   const slot: ProfileSlot = {
     profileName: opts.profileName,
     profileFile: opts.profileFile,

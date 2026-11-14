@@ -15,10 +15,29 @@
  * So: the write reports success, and the dirty flag is cleared ONLY once it lands.
  */
 import { readFileSync, renameSync, unlinkSync, writeFileSync } from "fs";
+import { join } from "path";
 
 export type Warn = (message: string) => void;
 
 let tmpCounter = 0;
+
+/**
+ * Sanitize an agent_id into a cross-platform safe filename slug (no `/`, `\`, `..`,
+ * or Windows NTFS invalid chars like `:`), while keeping standard `[A-Za-z0-9._-]+`
+ * agent IDs 100% unchanged so existing cursor files continue to match.
+ */
+export function safeAgentCursorSlug(agentId: string): string {
+  const cleaned = String(agentId || "")
+    .trim()
+    .replace(/[^A-Za-z0-9._-]/g, "_")
+    .slice(0, 128);
+  if (!cleaned || cleaned === "." || cleaned === "..") return "_";
+  return cleaned;
+}
+
+export function cursorFileForAgent(configDir: string, agentId: string): string {
+  return join(configDir, `last-seen-msg-ts-${safeAgentCursorSlug(agentId)}.json`);
+}
 
 /**
  * Read a persisted channel→timestamp map.
@@ -35,6 +54,7 @@ export function loadCursor(file: string, warn: Warn): Map<string, string> {
     }
     const entries: Array<[string, string]> = [];
     for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+      if (k === "__proto__" || k === "constructor" || k === "prototype") continue;
       if (typeof v !== "string") {
         throw new Error(`cursor value for ${k} must be a string`);
       }

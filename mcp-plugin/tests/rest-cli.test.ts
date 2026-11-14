@@ -11,7 +11,7 @@ import {
   sendRestMessage,
   wakeOnce,
 } from "../src/rest-cli.ts";
-import { loadCursor } from "../src/read-cursor.ts";
+import { cursorFileForAgent, loadCursor, safeAgentCursorSlug } from "../src/read-cursor.ts";
 
 describe("rest-cli (--join, --send, --wake-once) & unified per-channel cursor", () => {
   test("joinChannelRest posts to /api/channels/:id/join with sender_id", async () => {
@@ -559,6 +559,104 @@ describe("rest-cli (--join, --send, --wake-once) & unified per-channel cursor", 
       expect(ev.event).toBe("idle_timeout");
       expect(ev.should_rearm).toBe(true);
       expect(ev.max_idle_ms).toBe(0);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("Campaign #92: cold-start mixed-precision timestamp seeding, authoritative server timestamp cursor, error secret redaction, SSE stream cancel, and safe agent cursor filenames", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "rest-cli-c92-"));
+    try {
+      expect(safeAgentCursorSlug("spinning-midnight-tunicate")).toBe("spinning-midnight-tunicate");
+      expect(safeAgentCursorSlug("../../etc/passwd")).toBe(".._.._etc_passwd");
+      expect(safeAgentCursorSlug("user:alice@example.com")).toBe("user_alice_example.com");
+      expect(safeAgentCursorSlug("..")).toBe("_");
+
+      // 1. sendRestMessage uses authoritative server timestamp over local clock & redacts secrets in errors
+      const sendOk = await sendRestMessage({
+        restUrl: "https://agents-chat.com",
+        configDir: dir,
+        agentId: "bot-c92",
+        token: "ac_secret_token_9999999999",
+        channelId: "dm-clock",
+        text: "ok",
+        fetchImpl: (async () =>
+          Response.json(
+            { ok: true, id: "msg-srv-1", timestamp: "2026-11-14T15:00:00.123456789Z" },
+            { status: 201 },
+          )) as any,
+      });
+      expect(sendOk.ok).toBe(true);
+      expect(sendOk.timestamp).toBe("2026-11-14T15:00:00.123456789Z");
+      const sendCursor = loadCursor(cursorFileForAgent(dir, "bot-c92"), () => {});
+      expect(sendCursor.get("dm-clock")).toBe("2026-11-14T15:00:00.123456789Z");
+
+      const joinErr = await joinChannelRest({
+        restUrl: "https://agents-chat.com",
+        agentId: "bot-c92",
+        token: "ac_secret_token_9999999999",
+        channelId: "welcome",
+        fetchImpl: (async () =>
+          Response.json({ error: "Upstream rejected key ac_secret_token_9999999999" }, { status: 502 })) as any,
+      });
+      expect(joinErr.ok).toBe(false);
+      expect(joinErr.error).not.toContain("ac_secret_token_9999999999");
+
+      // 2. Cold-start seeding compares normalized timestamps so 00.500Z beats 00Z despite '.' < 'Z',
+      //    and SSE reader.cancel() cancels the underlying ReadableStream when wakeOnce resolves
+      let streamCancelled = false;
+      const ev = await wakeOnce({
+        restUrl: "https://agents-chat.com",
+        configDir: dir,
+        agentId: "user:bot@c92",
+        token: "ac_test_token_123456",
+        timeoutMs: 80,
+        pollIntervalMs: 30,
+        enableSse: true,
+        nowIso: () => "2026-11-14T15:00:01.000Z",
+        fetchImpl: (async (url: any) => {
+          const u = String(url);
+          if (u.endsWith("/api/channels/mine")) {
+            return Response.json({
+              channels: [{ id: "general", last_message_at: "2026-11-14T15:00:00.500Z" }],
+            });
+          }
+          if (u.includes("/api/channels/general/stream")) {
+            const stream = new ReadableStream<Uint8Array>({
+              start() {},
+              cancel() {
+                streamCancelled = true;
+              },
+            });
+            return new Response(stream, { status: 200 });
+          }
+          if (u.includes("/api/channels/general/messages")) {
+            return Response.json({
+              messages: [
+                {
+                  id: "pre-whole-sec",
+                  sender_id: "peer-1",
+                  content: "whole second",
+                  timestamp: "2026-11-14T15:00:00Z",
+                },
+                {
+                  id: "pre-half-sec",
+                  sender_id: "peer-2",
+                  content: "half second later",
+                  timestamp: "2026-11-14T15:00:00.500Z",
+                },
+              ],
+            });
+          }
+          return Response.json({ messages: [] });
+        }) as any,
+      });
+      expect(ev.event).toBe("idle_timeout");
+      await new Promise((r) => setTimeout(r, 10));
+      expect(streamCancelled).toBe(true);
+
+      const seeded = loadCursor(cursorFileForAgent(dir, "user:bot@c92"), () => {});
+      expect(seeded.get("general")).toBe("2026-11-14T15:00:00.500Z");
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

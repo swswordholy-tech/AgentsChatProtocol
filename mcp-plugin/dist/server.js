@@ -3635,7 +3635,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { readFileSync as readFileSync12, existsSync as existsSync9, writeFileSync as writeFileSync6, mkdirSync as mkdirSync4, readdirSync as readdirSync5 } from "fs";
 import { homedir as homedir5 } from "os";
-import { join as join10, dirname as dirname2 } from "path";
+import { join as join12, dirname as dirname2 } from "path";
 import { fileURLToPath } from "url";
 
 // src/profile-store.ts
@@ -3834,7 +3834,17 @@ function expectedAgentIdViolation(expected, liveAgentId) {
 
 // src/read-cursor.ts
 import { readFileSync as readFileSync9, renameSync as renameSync3, unlinkSync as unlinkSync5, writeFileSync as writeFileSync3 } from "fs";
+import { join as join8 } from "path";
 var tmpCounter = 0;
+function safeAgentCursorSlug(agentId) {
+  const cleaned = String(agentId || "").trim().replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 128);
+  if (!cleaned || cleaned === "." || cleaned === "..")
+    return "_";
+  return cleaned;
+}
+function cursorFileForAgent(configDir, agentId) {
+  return join8(configDir, `last-seen-msg-ts-${safeAgentCursorSlug(agentId)}.json`);
+}
 function loadCursor(file, warn) {
   try {
     const parsed = JSON.parse(readFileSync9(file, "utf-8"));
@@ -3843,6 +3853,8 @@ function loadCursor(file, warn) {
     }
     const entries = [];
     for (const [k, v] of Object.entries(parsed)) {
+      if (k === "__proto__" || k === "constructor" || k === "prototype")
+        continue;
       if (typeof v !== "string") {
         throw new Error(`cursor value for ${k} must be a string`);
       }
@@ -3882,8 +3894,8 @@ function flushCursor(state, persist) {
 }
 
 // src/rest-cli.ts
-import { existsSync as existsSync8, mkdirSync as mkdirSync3, readFileSync as readFileSync11, writeFileSync as writeFileSync5 } from "node:fs";
-import { dirname, join as join9 } from "node:path";
+import { existsSync as existsSync8, mkdirSync as mkdirSync3, readFileSync as readFileSync11, unlinkSync as unlinkSync7, writeFileSync as writeFileSync5 } from "node:fs";
+import { dirname, join as join11 } from "node:path";
 
 // src/mentions.ts
 function matchesMention2(content, agentId) {
@@ -3898,7 +3910,17 @@ function matchesMention2(content, agentId) {
 
 // src/read-cursor.ts
 import { readFileSync as readFileSync10, renameSync as renameSync4, unlinkSync as unlinkSync6, writeFileSync as writeFileSync4 } from "fs";
+import { join as join9 } from "path";
 var tmpCounter2 = 0;
+function safeAgentCursorSlug2(agentId) {
+  const cleaned = String(agentId || "").trim().replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 128);
+  if (!cleaned || cleaned === "." || cleaned === "..")
+    return "_";
+  return cleaned;
+}
+function cursorFileForAgent2(configDir, agentId) {
+  return join9(configDir, `last-seen-msg-ts-${safeAgentCursorSlug2(agentId)}.json`);
+}
 function loadCursor2(file, warn) {
   try {
     const parsed = JSON.parse(readFileSync10(file, "utf-8"));
@@ -3907,6 +3929,8 @@ function loadCursor2(file, warn) {
     }
     const entries = [];
     for (const [k, v] of Object.entries(parsed)) {
+      if (k === "__proto__" || k === "constructor" || k === "prototype")
+        continue;
       if (typeof v !== "string") {
         throw new Error(`cursor value for ${k} must be a string`);
       }
@@ -3958,7 +3982,7 @@ function normalizeTimestampForCursor2(ts, mode) {
 
 // src/wake.ts
 import { homedir as homedir4 } from "node:os";
-import { join as join8, win32 as pathWin322 } from "node:path";
+import { join as join10, win32 as pathWin322 } from "node:path";
 var NATIVE_WAKE_CONTENT_MAX2 = 4000;
 function formatWakeAttachments2(attachments) {
   if (!Array.isArray(attachments) || attachments.length === 0)
@@ -3983,7 +4007,7 @@ function formatWakeAttachments2(attachments) {
   return lines.length > 0 ? ` [附件: ${lines.join("; ")}]` : "";
 }
 var GROK_GATEWAY_PATH_CANDIDATES2 = [
-  join8(process.env.HOME || process.env.USERPROFILE || homedir4(), ".grok", "gateway.json"),
+  join10(process.env.HOME || process.env.USERPROFILE || homedir4(), ".grok", "gateway.json"),
   "/home/box/sand-data/gateway.json"
 ];
 function buildWakePrompt2(msg, contextPrefix = "") {
@@ -4043,6 +4067,7 @@ function parseMaxIdleMs(raw) {
   return;
 }
 var MAX_SSE_STREAMS = 3;
+var MAX_SSE_LINE_CHARS = 512 * 1024;
 var MAX_SEEN_IDS = 200;
 var DEFAULT_HTTP_TIMEOUT_MS = 15000;
 async function fetchWithDeadline(f, url, init, timeoutMs, parentSignal) {
@@ -4128,7 +4153,7 @@ function advanceChannelReadCursor(opts) {
     return;
   const warn = opts.warn ?? ((m) => process.stderr.write(m));
   mkdirSync3(configDir, { recursive: true });
-  const lastSeenFile = join9(configDir, `last-seen-msg-ts-${agentId}.json`);
+  const lastSeenFile = cursorFileForAgent2(configDir, agentId);
   const cursor = loadCursor2(lastSeenFile, warn);
   const prev = cursor.get(channelId) || "";
   const nextNorm = normalizeTimestampForCursor2(timestamp, "after") || timestamp;
@@ -4141,7 +4166,7 @@ function advanceChannelReadCursor(opts) {
     cursor.set(channelId, timestamp);
   }
   persistCursor2(lastSeenFile, cursor, warn);
-  const readCursorsFile = join9(configDir, "read-cursors.json");
+  const readCursorsFile = join11(configDir, "read-cursors.json");
   const readCursors = loadJsonMap(readCursorsFile);
   const scopedKey = `${agentId}:${channelId}`;
   const prevRead = readCursors[scopedKey] || readCursors[channelId] || "";
@@ -4180,7 +4205,7 @@ async function joinChannelRest(opts) {
       status: res.status,
       agent_id: opts.agentId,
       channel_id: opts.channelId,
-      error: String(data.error ?? data.message ?? `HTTP ${res.status}`)
+      error: redactSecrets2(String(data.error ?? data.message ?? `HTTP ${res.status}`))
     };
   } catch (e) {
     return {
@@ -4188,7 +4213,7 @@ async function joinChannelRest(opts) {
       status: 0,
       agent_id: opts.agentId,
       channel_id: opts.channelId,
-      error: String(e?.message || e)
+      error: redactSecrets2(String(e?.message || e))
     };
   }
 }
@@ -4214,11 +4239,13 @@ async function sendRestMessage(opts) {
     }, opts.timeoutMs ?? DEFAULT_HTTP_TIMEOUT_MS);
     const data = await res.json().catch(() => ({}));
     if (res.ok) {
+      const serverTs = typeof data.timestamp === "string" && data.timestamp.trim() ? data.timestamp.trim() : undefined;
+      const cursorTs = serverTs ?? new Date().toISOString();
       advanceChannelReadCursor({
         configDir: opts.configDir,
         agentId: opts.agentId,
         channelId: opts.channelId,
-        timestamp: new Date().toISOString(),
+        timestamp: cursorTs,
         maxIdleMs: opts.maxIdleMs,
         warn: opts.warn
       });
@@ -4226,6 +4253,7 @@ async function sendRestMessage(opts) {
         ok: true,
         status: res.status,
         id: typeof data.id === "string" ? data.id : undefined,
+        ...serverTs ? { timestamp: serverTs } : {},
         agent_id: opts.agentId,
         channel_id: opts.channelId,
         ...opts.replyTo ? { in_reply_to: opts.replyTo } : {}
@@ -4236,7 +4264,7 @@ async function sendRestMessage(opts) {
       status: res.status,
       agent_id: opts.agentId,
       channel_id: opts.channelId,
-      error: String(data.error ?? data.message ?? `HTTP ${res.status}`)
+      error: redactSecrets2(String(data.error ?? data.message ?? `HTTP ${res.status}`))
     };
   } catch (e) {
     return {
@@ -4244,7 +4272,7 @@ async function sendRestMessage(opts) {
       status: 0,
       agent_id: opts.agentId,
       channel_id: opts.channelId,
-      error: String(e?.message || e)
+      error: redactSecrets2(String(e?.message || e))
     };
   }
 }
@@ -4280,15 +4308,17 @@ async function wakeOnce(opts) {
   const nowIso = opts.nowIso ?? (() => new Date().toISOString());
   const baseUrl = opts.restUrl.replace(/\/$/, "");
   const { configDir, agentId, displayName, token } = opts;
-  const timeoutMs = opts.timeoutMs ?? 240000;
-  const requestTimeoutMs = opts.requestTimeoutMs ?? DEFAULT_HTTP_TIMEOUT_MS;
-  const pollIntervalMs = opts.pollIntervalMs ?? 15000;
+  const timeoutMs = opts.timeoutMs !== undefined && Number.isFinite(opts.timeoutMs) ? opts.timeoutMs : 240000;
+  const requestTimeoutMs = opts.requestTimeoutMs !== undefined && Number.isFinite(opts.requestTimeoutMs) && opts.requestTimeoutMs >= 0 ? opts.requestTimeoutMs : DEFAULT_HTTP_TIMEOUT_MS;
+  const pollIntervalMs = opts.pollIntervalMs !== undefined && Number.isFinite(opts.pollIntervalMs) && opts.pollIntervalMs >= 10 ? Math.floor(opts.pollIntervalMs) : 15000;
   const enableSse = opts.enableSse ?? true;
   mkdirSync3(configDir, { recursive: true });
-  const lastSeenFile = join9(configDir, `last-seen-msg-ts-${agentId}.json`);
-  const seenIdsFile = join9(configDir, `wake-seen-ids-${agentId}.json`);
-  const mentionTsFile = join9(configDir, "mention-timestamps.json");
-  const wakePidFile = join9(configDir, `wake-once-${agentId}.pid`);
+  const safeSlug = safeAgentCursorSlug2(agentId);
+  const lastSeenFile = cursorFileForAgent2(configDir, agentId);
+  const seenIdsFile = join11(configDir, `wake-seen-ids-${safeSlug}.json`);
+  const mentionTsFile = join11(configDir, "mention-timestamps.json");
+  const wakePidFile = join11(configDir, `wake-once-${safeSlug}.pid`);
+  let wrotePidFile = false;
   if (!opts.fetchImpl) {
     try {
       if (existsSync8(wakePidFile)) {
@@ -4301,6 +4331,7 @@ async function wakeOnce(opts) {
       }
       writeFileSync5(wakePidFile, `${process.pid}
 `, { mode: 384 });
+      wrotePidFile = true;
     } catch {}
   }
   const cursor = loadCursor2(lastSeenFile, warn);
@@ -4437,6 +4468,7 @@ ${context}
     if (!existingAfter) {
       const liveBatch = [];
       let newestPreExisting = "";
+      let newestPreExistingNorm = "";
       for (const m of list) {
         const msgId = String(m.id || "");
         if (msgId && seenSet.has(msgId))
@@ -4446,14 +4478,17 @@ ${context}
         if (msgTsNorm && msgTsNorm < initTsNorm) {
           if (msgId)
             seenSet.add(msgId);
-          if (msgTs > newestPreExisting)
+          if (msgTsNorm > newestPreExistingNorm) {
             newestPreExisting = msgTs;
+            newestPreExistingNorm = msgTsNorm;
+          }
           continue;
         }
         if (isMessageAddressedToAgent({ ...m, channel_id: channelId }, agentId, displayName)) {
           liveBatch.push({ ...m, channel_id: channelId });
-        } else if (msgTs > newestPreExisting) {
+        } else if (msgTsNorm && msgTsNorm > newestPreExistingNorm) {
           newestPreExisting = msgTs;
+          newestPreExistingNorm = msgTsNorm;
         }
       }
       if (liveBatch.length > 0) {
@@ -4505,6 +4540,13 @@ ${context}
         clearInterval(pollTimer);
       if (timeoutTimer)
         clearTimeout(timeoutTimer);
+      if (wrotePidFile) {
+        try {
+          if (existsSync8(wakePidFile) && readFileSync11(wakePidFile, "utf-8").trim() === String(process.pid)) {
+            unlinkSync7(wakePidFile);
+          }
+        } catch {}
+      }
       try {
         abortCtrl.abort();
       } catch {}
@@ -4523,10 +4565,29 @@ ${context}
               headers: { Authorization: `Bearer ${token}` },
               signal: abortCtrl.signal
             });
-            if (!res.ok || !res.body)
+            if (!res.ok || !res.body) {
+              try {
+                await res.body?.cancel();
+              } catch {}
+              if (res.status === 429 || res.status >= 500) {
+                sseConnectedChannels.delete(channelId);
+                if (resolved)
+                  return;
+                await sleepAbortable(2000, abortCtrl.signal);
+                continue;
+              }
               break;
+            }
             sseConnectedChannels.add(channelId);
             const reader = res.body.getReader();
+            const onAbortCancel = () => {
+              reader.cancel().catch(() => {});
+            };
+            if (abortCtrl.signal.aborted) {
+              onAbortCancel();
+            } else {
+              abortCtrl.signal.addEventListener("abort", onAbortCancel, { once: true });
+            }
             try {
               const decoder = new TextDecoder;
               let buf = "";
@@ -4542,6 +4603,11 @@ ${context}
                     chunk = chunk.slice(1);
                 }
                 buf += chunk;
+                if (buf.length > MAX_SSE_LINE_CHARS && !buf.includes(`
+`)) {
+                  buf = "";
+                  continue;
+                }
                 const lines = buf.split(/\r?\n/);
                 buf = lines.pop() || "";
                 for (const line of lines) {
@@ -4561,6 +4627,10 @@ ${context}
                 }
               }
             } finally {
+              abortCtrl.signal.removeEventListener("abort", onAbortCancel);
+              try {
+                await reader.cancel();
+              } catch {}
               try {
                 reader.releaseLock();
               } catch {}
@@ -4747,7 +4817,7 @@ function parseArgs() {
 var cliArgs = parseArgs();
 var isOneShotCli = Boolean(cliArgs.registerOnly || cliArgs.join || cliArgs.send || cliArgs.wakeOnce);
 if (process.argv.includes("--help") || process.argv.includes("-h")) {
-  const localOnboardingPath = join10(dirname2(fileURLToPath(import.meta.url)), "..", "skills", "onboarding.md");
+  const localOnboardingPath = join12(dirname2(fileURLToPath(import.meta.url)), "..", "skills", "onboarding.md");
   console.log(`agentschat-mcp v${package_default.version} \u2014 AgentsChat MCP and host bridges
 
 Usage: claude mcp add agentschat -- npx -y agentschat-mcp@latest --profile <Bot> [options]
@@ -4834,8 +4904,8 @@ if (codexIdentity) {
   process.env.AGENTSCHAT_EXPECT_AGENT_ID = codexIdentity.agentId;
 }
 var homeDir = process.env.HOME || process.env.USERPROFILE || homedir5() || ".";
-var configDir = join10(homeDir, ".agentschat");
-var legacyConfigDir = join10(homeDir, ".agentchat");
+var configDir = join12(homeDir, ".agentschat");
+var legacyConfigDir = join12(homeDir, ".agentchat");
 var profileDirs = [configDir, legacyConfigDir];
 var lockDir = resolveLockDir(homeDir, process.env);
 var lockOwnerPid = Number(process.env.AGENTSCHAT_LOCK_OWNER_PID) || null;
@@ -4852,16 +4922,16 @@ function ensureRuntimeSession() {
 var dshRouteWarned = false;
 function profileNameToPaths(name) {
   if (name.startsWith("~/"))
-    return [join10(homeDir, name.slice(2))];
+    return [join12(homeDir, name.slice(2))];
   if (name.includes("/") || name.includes("\\"))
     return [name];
   name = name.replace(/\.json$/, "");
   const safeName = name.replace(/[^a-zA-Z0-9_-]/g, "_");
-  return profileDirs.map((dir) => join10(dir, `${safeName}.json`));
+  return profileDirs.map((dir) => join12(dir, `${safeName}.json`));
 }
 function nameToPath(name) {
   const candidates = profileNameToPaths(name);
-  const nested = join10(configDir, "profiles", name.replace(/\.json$/, "") + ".json");
+  const nested = join12(configDir, "profiles", name.replace(/\.json$/, "") + ".json");
   if (!name.includes("/") && !name.includes("\\") && existsSync9(nested))
     return nested;
   return candidates.find((path) => existsSync9(path)) || candidates[0];
@@ -4869,7 +4939,7 @@ function nameToPath(name) {
 function listProfileFiles() {
   const seen = new Set;
   const profiles = [];
-  for (const dir of [join10(configDir, "profiles"), ...profileDirs]) {
+  for (const dir of [join12(configDir, "profiles"), ...profileDirs]) {
     let files = [];
     try {
       files = readdirSync5(dir).filter((f) => f.endsWith(".json"));
@@ -4881,7 +4951,7 @@ function listProfileFiles() {
       if (seen.has(name))
         continue;
       seen.add(name);
-      profiles.push({ name, path: join10(dir, file) });
+      profiles.push({ name, path: join12(dir, file) });
     }
   }
   return profiles;
@@ -5245,7 +5315,7 @@ if (!anonymousMode && AGENT_ID && !isOneShotCli && !toolOnlyMode) {
   }
 }
 var identityGateMessage = "";
-var identityGuardFile = join10(configDir, IDENTITY_GUARD_FILENAME);
+var identityGuardFile = join12(configDir, IDENTITY_GUARD_FILENAME);
 function persistGuardRecord(rec) {
   try {
     mkdirSync4(configDir, { recursive: true });
@@ -5377,7 +5447,7 @@ if (TOKEN && TOKEN !== "dev-token") {
   if (cliArgs.registerOnly) {
     try {
       mkdirSync4(configDir, { recursive: true });
-      const lastSeenFile = join10(configDir, `last-seen-msg-ts-${AGENT_ID}.json`);
+      const lastSeenFile = cursorFileForAgent(configDir, AGENT_ID);
       const cursor = loadCursor(lastSeenFile, (m) => process.stderr.write(m));
       if (!cursor.get(CURSOR_INIT_KEY)) {
         cursor.set(CURSOR_INIT_KEY, new Date().toISOString());
@@ -7885,7 +7955,7 @@ function scheduleSlotLastSeenMessageTsSave(slot) {
   slot.lastSeenMessageTsTimer.unref?.();
 }
 function createProfileSlot(opts) {
-  const lastSeenFile = join10(configDir, `last-seen-msg-ts-${opts.agentId}.json`);
+  const lastSeenFile = cursorFileForAgent(configDir, opts.agentId);
   const slot = {
     profileName: opts.profileName,
     profileFile: opts.profileFile,
@@ -8958,7 +9028,7 @@ ${idx}` }] };
     if (name === "sync_skill") {
       const a = args || {};
       const home = process.env.HOME || process.env.USERPROFILE || homedir5() || ".";
-      const cacheDir = a.dir && String(a.dir).trim() || join10(home, ".agentchat", "skills");
+      const cacheDir = a.dir && String(a.dir).trim() || join12(home, ".agentchat", "skills");
       const safe = (s) => String(s).replace(/[^A-Za-z0-9_.-]/g, "_");
       if (a.name && !a.chat_id) {
         const slugCheck = validatePersonalSkillSlugInput(a.name, "sync_skill");
@@ -8966,7 +9036,7 @@ ${idx}` }] };
           return { content: [{ type: "text", text: slugCheck.error }], isError: true };
         }
         const pSlug = slugCheck.value;
-        const pBase = join10(cacheDir, `personal__${safe(pSlug)}`);
+        const pBase = join12(cacheDir, `personal__${safe(pSlug)}`);
         const pMd = `${pBase}.md`;
         const pMeta = `${pBase}.json`;
         try {
@@ -10933,7 +11003,7 @@ ${list}` }] };
   }
 };
 server.setRequestHandler(CallToolRequestSchema, (request) => serializeCall(() => handleToolCall(request)));
-var mentionTsFile = join10(configDir, `mention-ts-${AGENT_ID}.json`);
+var mentionTsFile = join12(configDir, `mention-ts-${AGENT_ID}.json`);
 function loadMentionTimestamps() {
   return loadCursor(mentionTsFile, safeStderrWrite);
 }
