@@ -30,12 +30,18 @@ import type { ChatMessage, ClientOptions, MessageHandler } from "./agentchat-pro
  * keeps the host-level gateway lifecycle running through network blips,
  * which is exactly what we want for a long-lived chat bot.
  */
+const MAX_WS_PAYLOAD_BYTES = 2 * 1024 * 1024;
+const DRAIN_MIN_DELAY_MS = 200;
+const DRAIN_JITTER_MS = 2_000;
+
 export class AgentChatClient {
   private ws: WebSocket | null = null;
   private sessionId: string | null = null;
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private connectTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly messageHandlers: MessageHandler[] = [];
+  private readonly joinedChannels = new Set<string>();
   private connectResolve: (() => void) | null = null;
   private connectReject: ((err: Error) => void) | null = null;
   private lifecyclePromise: Promise<void> | null = null;
@@ -44,6 +50,7 @@ export class AgentChatClient {
   private transportError: Error | null = null;
   private connectSettled = false;
   private lifecycleSettled = false;
+  private fastReconnectPending = false;
   /** Cumulative count of reconnect attempts since the last successful
    *  auth_ok. Reset to 0 on each successful handshake. Drives the
    *  exponential-backoff delay. */
@@ -62,6 +69,7 @@ export class AgentChatClient {
   readonly token: string;
   readonly capabilities: string[];
   readonly heartbeatInterval: number;
+  readonly connectTimeoutMs: number;
   readonly reconnectEnabled: boolean;
   readonly initialReconnectDelayMs: number;
   readonly maxReconnectDelayMs: number;
@@ -74,6 +82,7 @@ export class AgentChatClient {
     this.token = options.token ?? "dev-token";
     this.capabilities = options.capabilities ?? [];
     this.heartbeatInterval = options.heartbeatInterval ?? 30_000;
+    this.connectTimeoutMs = options.connectTimeoutMs ?? 15_000;
     this.reconnectEnabled = options.reconnect ?? true;
     this.initialReconnectDelayMs = options.initialReconnectDelayMs ?? 1_000;
     this.maxReconnectDelayMs = options.maxReconnectDelayMs ?? 60_000;
@@ -104,6 +113,8 @@ export class AgentChatClient {
   disconnect() {
     this.debug("disconnect", { hadSession: Boolean(this.sessionId) });
     this.explicitlyDisconnected = true;
+    this.fastReconnectPending = false;
+    this.clearConnectTimer();
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
@@ -125,8 +136,26 @@ export class AgentChatClient {
     return this.lifecyclePromise ?? Promise.resolve();
   }
 
-  sendMessage(channelId: string, content: string) {
-    this.debug("send:message", { channelId, length: content.length });
+  sendMessage(channelId: string, content: string, threadId?: string | number) {
+    const normalizedThread =
+      threadId !== undefined && threadId !== null && String(threadId).trim().length > 0
+        ? String(threadId).trim()
+        : undefined;
+    this.debug("send:message", { channelId, length: content.length, ...(normalizedThread ? { threadId: normalizedThread } : {}) });
+    if (normalizedThread) {
+      this.send({
+        type: "thread_reply",
+        id: crypto.randomUUID(),
+        channel_id: channelId,
+        parent_id: normalizedThread,
+        sender_id: this.agentId,
+        sender_type: "agent",
+        content,
+        content_type: "text",
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
     this.send({
       type: "message",
       id: crypto.randomUUID(),
@@ -140,8 +169,21 @@ export class AgentChatClient {
   }
 
   joinChannel(channelId: string) {
+    if (!channelId) return;
+    this.joinedChannels.add(channelId);
     this.debug("send:join_channel", { channelId });
     this.send({ type: "join_channel", channel_id: channelId, agent_id: this.agentId });
+  }
+
+  leaveChannel(channelId: string) {
+    if (!channelId) return;
+    this.joinedChannels.delete(channelId);
+    this.debug("send:leave_channel", { channelId });
+    this.send({ type: "leave_channel", channel_id: channelId, agent_id: this.agentId });
+  }
+
+  getJoinedChannels(): string[] {
+    return Array.from(this.joinedChannels);
   }
 
   onMessage(handler: MessageHandler) {
@@ -150,11 +192,43 @@ export class AgentChatClient {
   }
 
   private openSocket() {
-    this.ws = new WebSocket(this.url);
-    this.ws.onopen = () => this.handleOpen();
-    this.ws.onmessage = (event) => this.handleMessage(String(event.data));
-    this.ws.onclose = () => this.handleClose();
-    this.ws.onerror = () => this.handleError(new Error("WebSocket error"));
+    this.clearConnectTimer();
+    const socket = new WebSocket(this.url, { maxPayload: MAX_WS_PAYLOAD_BYTES });
+    this.ws = socket;
+    if (this.connectTimeoutMs > 0) {
+      this.connectTimer = setTimeout(() => {
+        this.connectTimer = null;
+        if (this.ws !== socket || this.sessionId) return;
+        const timeoutErr = new Error(`WebSocket connect timed out after ${this.connectTimeoutMs}ms`);
+        this.transportError = timeoutErr;
+        this.debug("connect:timeout", { timeoutMs: this.connectTimeoutMs, isReconnecting: this.isReconnecting });
+        if (!this.isReconnecting) {
+          this.rejectConnect(timeoutErr);
+        }
+        try {
+          socket.terminate();
+        } catch {
+          socket.close();
+        }
+      }, this.connectTimeoutMs);
+      this.connectTimer.unref?.();
+    }
+    socket.onopen = () => {
+      if (this.ws !== socket) return;
+      this.handleOpen();
+    };
+    socket.onmessage = (event) => {
+      if (this.ws !== socket) return;
+      this.handleMessage(String(event.data));
+    };
+    socket.onclose = () => {
+      if (this.ws !== socket && this.ws !== null) return;
+      this.handleClose();
+    };
+    socket.onerror = () => {
+      if (this.ws !== socket) return;
+      this.handleError(new Error("WebSocket error"));
+    };
   }
 
   private handleOpen() {
@@ -182,21 +256,27 @@ export class AgentChatClient {
   }
 
   private handleMessage(raw: string) {
-    const data = JSON.parse(raw) as Record<string, unknown>;
+    let data: Record<string, unknown>;
+    try {
+      const parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed !== "object") {
+        this.debug("recv:invalid_json");
+        return;
+      }
+      data = parsed as Record<string, unknown>;
+    } catch {
+      this.debug("recv:invalid_json");
+      return;
+    }
     this.debug("recv", { type: String(data.type ?? "unknown") });
 
     switch (data.type) {
       case "auth_ok":
+        this.clearConnectTimer();
         this.sessionId = String(data.session_id ?? "");
         this.debug("auth:ok", { sessionId: this.sessionId, wasReconnect: this.isReconnecting });
         this.startHeartbeat();
         if (this.isReconnecting) {
-          // Reconnect handshake completed. Reset the backoff counter
-          // (so the NEXT drop starts from 1s again, not wherever we
-          // gave up) and let the caller re-subscribe to channels — the
-          // host-level `startAccount` only joined `defaultChannelId`
-          // once at startup, so without this the bot would be auth'd
-          // but silent.
           this.reconnectAttempt = 0;
           this.isReconnecting = false;
           try { this.onReconnect?.(); }
@@ -205,23 +285,77 @@ export class AgentChatClient {
           this.resolveConnect();
         }
         break;
-      case "message":
-        for (const handler of this.messageHandlers) {
-          handler({
-            type: "message",
-            id: String(data.id ?? ""),
-            channel_id: String(data.channel_id ?? ""),
-            sender_id: String(data.sender_id ?? ""),
-            sender_type: data.sender_type === "human" ? "human" : "agent",
-            content: String(data.content ?? ""),
-            content_type: data.content_type === "code" || data.content_type === "proposal" ? data.content_type : "text",
-            timestamp: String(data.timestamp ?? new Date().toISOString()),
-          });
+      case "auth_error": {
+        this.clearConnectTimer();
+        const reason = String(data.message ?? data.error ?? "authentication rejected");
+        const authErr = new Error(`Auth failed: ${reason}`);
+        this.debug("auth:error", { message: reason });
+        // Terminal credential rejection — stop reconnect loops immediately.
+        this.explicitlyDisconnected = true;
+        this.fastReconnectPending = false;
+        if (this.reconnectTimer) {
+          clearTimeout(this.reconnectTimer);
+          this.reconnectTimer = null;
+        }
+        if (this.heartbeatTimer) {
+          clearInterval(this.heartbeatTimer);
+          this.heartbeatTimer = null;
+        }
+        if (!this.connectSettled) {
+          this.rejectConnect(authErr);
+        }
+        this.ws?.close();
+        this.ws = null;
+        this.sessionId = null;
+        this.resolveLifecycle();
+        break;
+      }
+      case "channel_created":
+        if (typeof data.channel_id === "string" && data.channel_id.length > 0) {
+          this.joinedChannels.add(data.channel_id);
         }
         break;
+      case "please_reconnect":
+      case "shard_moved":
+        this.debug("server:drain", { type: String(data.type) });
+        if (!this.explicitlyDisconnected && this.reconnectEnabled) {
+          this.fastReconnectPending = true;
+          this.ws?.close();
+        }
+        break;
+      case "message":
+      case "thread_reply": {
+        const rawThreadId = data.thread_id ?? data.parent_id ?? data.in_reply_to;
+        const threadId =
+          (typeof rawThreadId === "string" && rawThreadId.length > 0) || typeof rawThreadId === "number"
+            ? rawThreadId
+            : undefined;
+        const normalized: ChatMessage = {
+          type: "message",
+          id: String(data.id ?? ""),
+          channel_id: String(data.channel_id ?? ""),
+          sender_id: String(data.sender_id ?? ""),
+          sender_type: data.sender_type === "human" ? "human" : "agent",
+          content: String(data.content ?? ""),
+          content_type: data.content_type === "code" || data.content_type === "proposal" ? data.content_type : "text",
+          timestamp: String(data.timestamp ?? new Date().toISOString()),
+          ...(threadId !== undefined ? { thread_id: threadId } : {}),
+        };
+        for (const handler of this.messageHandlers) {
+          try {
+            Promise.resolve(handler(normalized)).catch((err) => {
+              this.debug("messageHandler:rejected", { error: err instanceof Error ? err.message : String(err) });
+            });
+          } catch (err) {
+            this.debug("messageHandler:threw", { error: err instanceof Error ? err.message : String(err) });
+          }
+        }
+        break;
+      }
       case "error":
         this.debug("server:error", { message: String(data.message ?? "unknown error") });
         if (this.connectReject && !this.sessionId) {
+          this.clearConnectTimer();
           this.rejectConnect(new Error(`Auth failed: ${String(data.message ?? "unknown error")}`));
         }
         break;
@@ -232,6 +366,7 @@ export class AgentChatClient {
   }
 
   private handleClose() {
+    this.clearConnectTimer();
     const hadSession = Boolean(this.sessionId);
     this.debug("socket:close", {
       hadSession,
@@ -285,11 +420,21 @@ export class AgentChatClient {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
     }
-    this.reconnectAttempt += 1;
-    // Exponential backoff: initial × 2^(attempt-1), capped at max.
-    // 1s, 2s, 4s, 8s, 16s, 32s, 60s, 60s, 60s, …
-    const raw = this.initialReconnectDelayMs * Math.pow(2, this.reconnectAttempt - 1);
-    const delay = Math.min(raw, this.maxReconnectDelayMs);
+    let delay: number;
+    if (this.fastReconnectPending) {
+      this.fastReconnectPending = false;
+      this.reconnectAttempt = 0;
+      delay = Math.min(
+        DRAIN_MIN_DELAY_MS + Math.floor(Math.random() * DRAIN_JITTER_MS),
+        this.maxReconnectDelayMs,
+      );
+    } else {
+      this.reconnectAttempt += 1;
+      // Exponential backoff: initial × 2^(attempt-1), capped at max.
+      // 1s, 2s, 4s, 8s, 16s, 32s, 60s, 60s, 60s, …
+      const raw = this.initialReconnectDelayMs * Math.pow(2, this.reconnectAttempt - 1);
+      delay = Math.min(raw, this.maxReconnectDelayMs);
+    }
     this.debug("reconnect:scheduled", { attempt: this.reconnectAttempt, delayMs: delay });
     this.isReconnecting = true;
     this.reconnectTimer = setTimeout(() => {
@@ -298,6 +443,7 @@ export class AgentChatClient {
       this.debug("reconnect:start", { attempt: this.reconnectAttempt });
       this.openSocket();
     }, delay);
+    this.reconnectTimer.unref?.();
   }
 
   private startHeartbeat() {
@@ -305,6 +451,14 @@ export class AgentChatClient {
     this.heartbeatTimer = setInterval(() => {
       this.send({ type: "ping", timestamp: new Date().toISOString() });
     }, this.heartbeatInterval);
+    this.heartbeatTimer.unref?.();
+  }
+
+  private clearConnectTimer() {
+    if (this.connectTimer) {
+      clearTimeout(this.connectTimer);
+      this.connectTimer = null;
+    }
   }
 
   private send(data: Record<string, unknown>) {

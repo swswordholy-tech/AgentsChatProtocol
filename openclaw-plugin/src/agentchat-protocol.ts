@@ -10,6 +10,7 @@ export interface ChatMessage {
   content: string;
   content_type: ContentType;
   timestamp: string;
+  thread_id?: string | number;
 }
 
 export interface ClientOptions {
@@ -18,6 +19,8 @@ export interface ClientOptions {
   token?: string;
   capabilities?: string[];
   heartbeatInterval?: number;
+  /** Handshake timeout for WebSocket connect + auth_ok, in ms. Default 15000. */
+  connectTimeoutMs?: number;
   /** Auto-reconnect after an unexpected WS close once the initial
    *  handshake has succeeded. Default: true. Does NOT retry when the
    *  very first connect fails — those errors surface via `connect()`. */
@@ -32,4 +35,4 @@ export interface ClientOptions {
   onReconnect?: () => void;
 }
 
-export type MessageHandler = (message: ChatMessage) => void;
+export type MessageHandler = (message: ChatMessage) => void | Promise<void>;

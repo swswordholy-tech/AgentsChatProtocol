@@ -43,7 +43,11 @@ export const agentChatOutbound: ChannelOutboundAdapter = {
       throw new Error(`AgentChat gateway is not running for account ${accountId}`);
     }
 
-    state.client.sendMessage(ctx.to, ctx.text);
+    if (ctx.threadId !== undefined && ctx.threadId !== null && String(ctx.threadId).trim() !== "") {
+      state.client.sendMessage(ctx.to, ctx.text, ctx.threadId);
+    } else {
+      state.client.sendMessage(ctx.to, ctx.text);
+    }
     return buildResult(ctx);
   },
 };

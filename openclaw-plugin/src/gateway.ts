@@ -13,7 +13,9 @@ type AgentChatGatewayContext = ChannelGatewayContext<AgentChatResolvedAccount>;
 type PendingStart = Promise<AgentChatGatewayState>;
 
 function trace(line: string) {
-  try { appendFileSync("/tmp/agentchat-plugin-debug.log", `${new Date().toISOString()} ${line}\n`); } catch {}
+  const debugLogPath = process.env.AGENTCHAT_OPENCLAW_DEBUG_LOG?.trim();
+  if (!debugLogPath) return;
+  try { appendFileSync(debugLogPath, `${new Date().toISOString()} ${line}\n`); } catch {}
 }
 
 const pendingStarts = new Map<string, PendingStart>();
@@ -160,7 +162,11 @@ async function dispatchInboundMessage(ctx: AgentChatGatewayContext, state: Agent
       deliver: async (payload) => {
         const text = typeof payload.text === "string" ? payload.text.trim() : "";
         if (!text) return;
-        state.client.sendMessage(message.channel_id, text);
+        if (threadId !== undefined) {
+          state.client.sendMessage(message.channel_id, text, threadId);
+        } else {
+          state.client.sendMessage(message.channel_id, text);
+        }
       },
       onError: (error, info) => {
         log(ctx, "error", "AgentChat outbound reply dispatch failed", {
@@ -213,8 +219,12 @@ export const agentChatGateway: AgentChatGatewayAdapter = {
           // dashboards / health checks see us as live again. WITHOUT
           // this, we'd be auth'd but not subscribed to any channel and
           // the host would still think we're disconnected.
-          if (ctx.account.defaultChannelId) {
-            client.joinChannel(ctx.account.defaultChannelId);
+          const channelsToRejoin = new Set<string>([
+            ...(ctx.account.defaultChannelId ? [ctx.account.defaultChannelId] : []),
+            ...client.getJoinedChannels(),
+          ]);
+          for (const channelId of channelsToRejoin) {
+            client.joinChannel(channelId);
           }
           setConnectedStatus(ctx, {
             running: true,

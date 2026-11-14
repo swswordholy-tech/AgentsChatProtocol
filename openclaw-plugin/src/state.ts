@@ -2,6 +2,7 @@ import { AgentChatClient } from "./agentchat-client";
 
 import type { AgentChatGatewayState, AgentChatResolvedAccount } from "./types";
 
+const MAX_MENTION_CURSORS = 2_000;
 const gatewayStates = new Map<string, AgentChatGatewayState>();
 const mentionCursors = new Map<string, string>();
 
@@ -26,7 +27,14 @@ export function getMentionCursor(accountId: string, conversationId: string) {
 }
 
 export function setMentionCursor(accountId: string, conversationId: string, timestamp: string) {
-  mentionCursors.set(mentionCursorKey(accountId, conversationId), timestamp);
+  const key = mentionCursorKey(accountId, conversationId);
+  if (mentionCursors.has(key)) {
+    mentionCursors.delete(key);
+  } else if (mentionCursors.size >= MAX_MENTION_CURSORS) {
+    const oldest = mentionCursors.keys().next().value;
+    if (oldest !== undefined) mentionCursors.delete(oldest);
+  }
+  mentionCursors.set(key, timestamp);
 }
 
 export function createGatewayClient(

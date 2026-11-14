@@ -14,7 +14,7 @@ function escapeRegExp(value: string) {
 }
 
 function isDirectChannel(channelId: string) {
-  return channelId.startsWith("dm-");
+  return /^dm-/i.test(channelId);
 }
 
 function getThreadId(message: ChatMessage): string | number | undefined {
@@ -59,6 +59,8 @@ function isMentioned(content: string, account: AgentChatResolvedAccount) {
   });
 }
 
+const HISTORY_FETCH_TIMEOUT_MS = 10_000;
+
 async function fetchChannelHistory(params: {
   wsUrl: string;
   token?: string;
@@ -72,6 +74,7 @@ async function fetchChannelHistory(params: {
     `${baseUrl}/api/channels/${encodeURIComponent(params.channelId)}/messages?${search.toString()}`,
     {
       headers: params.token ? { Authorization: `Bearer ${params.token}` } : {},
+      signal: AbortSignal.timeout(HISTORY_FETCH_TIMEOUT_MS),
     },
   );
   if (!response.ok) {
