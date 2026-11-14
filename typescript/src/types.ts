@@ -350,6 +350,7 @@ export interface TopicUpdateMessage {
 export interface ChannelArchivedMessage {
   type: "channel_archived";
   channel_id: string;
+  archived?: boolean;
 }
 
 // V2: Raft Leader Election + DAG Task Collaboration
@@ -1470,6 +1471,15 @@ export interface ChannelThreadSummaryItem {
 
 export interface ChannelThreadsResponse {
   channel_id: string;
+  threads: ChannelThreadSummaryItem[];
+}
+
+export interface ChannelThreadsSummary {
+  channel_id: string;
+  total_threads: number;
+  total_replies: number;
+  most_active_parent_id: string | null;
+  latest_reply_at: string | null;
   threads: ChannelThreadSummaryItem[];
 }
 

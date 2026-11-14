@@ -7,6 +7,7 @@ import {
   isValidCollaborationRoster,
   resolveInheritedObjectiveChannel,
   summarizeChannelOkrSnapshot,
+  summarizeChannelThreads,
   summarizeProposalsFeed,
   summarizeWorkspaceGraphHierarchy,
   summarizeWorkspaceGraphReadiness,
@@ -3574,6 +3575,57 @@ describe("AgentChatClient realtime collaboration WS events", () => {
         channel_id: "room-dev",
         pinned_messages: ["msg_valid_1"],
       });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("summarizeChannelThreads, ChannelArchivedMessage.archived, and thread/webhook zero-egress guards", async () => {
+    const summary = summarizeChannelThreads({
+      channel_id: "room-dev",
+      threads: [
+        { parent_id: "msg_old", reply_count: 2, last_reply_at: "2026-11-14T00:05:00.000Z" },
+        { parent_id: "msg_latest", reply_count: 5, last_reply_at: "2026-11-14T01:02:00.000Z" },
+        { parent_id: "msg_old", reply_count: 2, last_reply_at: "2026-11-14T00:05:00.000Z" },
+        { parent_id: "msg_sk-proj-1234567890abcdef", reply_count: 99, last_reply_at: "2026-11-14T02:00:00.000Z" },
+      ],
+    });
+    expect(summary).toEqual({
+      channel_id: "room-dev",
+      total_threads: 2,
+      total_replies: 7,
+      most_active_parent_id: "msg_latest",
+      latest_reply_at: "2026-11-14T01:02:00.000Z",
+      threads: [
+        { parent_id: "msg_latest", reply_count: 5, last_reply_at: "2026-11-14T01:02:00.000Z" },
+        { parent_id: "msg_old", reply_count: 2, last_reply_at: "2026-11-14T00:05:00.000Z" },
+      ],
+    });
+    expect(summarizeChannelThreads({ channel_id: "dm-private", threads: [] })).toBeNull();
+    expect(summarizeChannelThreads({ channel_id: "room_ac_secret_987654321", threads: [] })).toBeNull();
+
+    const archiveFrame: import("../src/index.ts").ChannelArchivedMessage = {
+      type: "channel_archived",
+      channel_id: "room-dev",
+      archived: false,
+    };
+    expect(archiveFrame.archived).toBe(false);
+
+    const originalFetch = globalThis.fetch;
+    let fetchCalls = 0;
+    globalThis.fetch = (async () => {
+      fetchCalls += 1;
+      return Response.json({ channel_id: "room-dev", threads: [] });
+    }) as unknown as typeof fetch;
+
+    try {
+      const rest = new AgentChatREST({ baseUrl: "https://agents-chat.com", bearerToken: "tok_44" });
+      await expect(rest.getChannelThreads("dm-private")).rejects.toThrow("Invalid channel ID");
+      await expect(rest.getChannelThreads("room_sk-proj-1234567890abcdef")).rejects.toThrow("Invalid channel ID");
+      await expect(rest.registerWebhook("dm-private", "https://hooks.example.com/notify")).rejects.toThrow("Invalid channel ID");
+      await expect(rest.registerWebhook("room-dev", "https://hooks.example.com/sk-proj-1234567890abcdef")).rejects.toThrow("Webhook URL must not contain secrets");
+      await expect(rest.removeWebhook("direct:alice:bob", "https://hooks.example.com/notify")).rejects.toThrow("Invalid channel ID");
+      expect(fetchCalls).toBe(0);
     } finally {
       globalThis.fetch = originalFetch;
     }

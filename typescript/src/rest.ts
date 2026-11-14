@@ -699,6 +699,70 @@ export function summarizeChannelDocDetail(
   };
 }
 
+export function summarizeChannelThreads(
+  raw: unknown,
+): import("./types").ChannelThreadsSummary | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const feed = raw as Record<string, unknown>;
+  if (!safeNonDmChannelId(feed.channel_id) || !Array.isArray(feed.threads) || feed.threads.length > 500) {
+    return null;
+  }
+  const channelId = feed.channel_id;
+  const seen = new Set<string>();
+  const threads: import("./types").ChannelThreadSummaryItem[] = [];
+  let totalReplies = 0;
+
+  for (const item of feed.threads) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    const rec = item as Record<string, unknown>;
+    const parentId = typeof rec.parent_id === "string" ? rec.parent_id.trim() : "";
+    if (!safeGraphId(parentId) || EMBEDDED_SECRET_TOKEN_RE.test(parentId) || seen.has(parentId)) continue;
+    const replyCount =
+      typeof rec.reply_count === "number" && Number.isFinite(rec.reply_count)
+        ? Math.trunc(rec.reply_count)
+        : 0;
+    if (replyCount <= 0) continue;
+    const parsedTs =
+      typeof rec.last_reply_at === "string" && rec.last_reply_at.trim()
+        ? Date.parse(rec.last_reply_at)
+        : NaN;
+    const lastReplyAt = Number.isFinite(parsedTs) ? new Date(parsedTs).toISOString() : "";
+    const boundedCount = Math.min(replyCount, 100_000);
+    seen.add(parentId);
+    totalReplies += boundedCount;
+    threads.push({
+      parent_id: parentId,
+      reply_count: boundedCount,
+      last_reply_at: lastReplyAt,
+    });
+  }
+
+  threads.sort(
+    (a, b) =>
+      b.last_reply_at.localeCompare(a.last_reply_at) ||
+      b.reply_count - a.reply_count ||
+      a.parent_id.localeCompare(b.parent_id),
+  );
+
+  let mostActiveParentId: string | null = null;
+  let mostActiveReplies = 0;
+  for (const th of threads) {
+    if (th.reply_count > mostActiveReplies) {
+      mostActiveReplies = th.reply_count;
+      mostActiveParentId = th.parent_id;
+    }
+  }
+
+  return {
+    channel_id: channelId,
+    total_threads: threads.length,
+    total_replies: totalReplies,
+    most_active_parent_id: mostActiveParentId,
+    latest_reply_at: threads[0]?.last_reply_at ? threads[0].last_reply_at : null,
+    threads,
+  };
+}
+
 export function resolveInheritedObjectiveChannel(
   objectiveId: string,
   objectives: ReadonlyArray<import("./types").InheritableObjectiveChannelNode>,
@@ -1267,14 +1331,20 @@ export class AgentChatREST {
 
   private assertWebhookTarget(channelId: string, rawUrl: string): { channelId: string; url: string } {
     const safeChannel = channelId?.trim() ?? "";
-    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(safeChannel) || /^(?:ac_|sk[-_])/i.test(safeChannel)) {
+    if (
+      !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(safeChannel) ||
+      safeChannel.includes("..") ||
+      DM_OR_DIRECT_CHANNEL_RE.test(safeChannel) ||
+      CREDENTIAL_PREFIX_RE.test(safeChannel) ||
+      EMBEDDED_SECRET_TOKEN_RE.test(safeChannel)
+    ) {
       throw new Error("Invalid channel ID");
     }
     const trimmedUrl = rawUrl?.trim() ?? "";
     if (!trimmedUrl || trimmedUrl.length > 1024 || /[\u0000-\u001F]/.test(trimmedUrl)) {
       throw new Error("Invalid webhook URL");
     }
-    if (this.containsMemorySecretShape(trimmedUrl)) {
+    if (EMBEDDED_SECRET_TOKEN_RE.test(trimmedUrl) || this.containsMemorySecretShape(trimmedUrl)) {
       throw new Error("Webhook URL must not contain secrets");
     }
     let parsed: URL;
@@ -3156,7 +3226,13 @@ export class AgentChatREST {
     opts?: { bearerToken?: string },
   ): Promise<import("./types").ChannelThreadsResponse> {
     const safeChannel = channelId?.trim() ?? "";
-    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(safeChannel) || /^(?:ac_|sk[-_])/i.test(safeChannel)) {
+    if (
+      !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(safeChannel) ||
+      safeChannel.includes("..") ||
+      DM_OR_DIRECT_CHANNEL_RE.test(safeChannel) ||
+      CREDENTIAL_PREFIX_RE.test(safeChannel) ||
+      EMBEDDED_SECRET_TOKEN_RE.test(safeChannel)
+    ) {
       throw new Error("Invalid channel ID");
     }
     const raw = await this.get<{ channel_id?: unknown; threads?: unknown }>(
@@ -3170,7 +3246,15 @@ export class AgentChatREST {
         if (!item || typeof item !== "object") continue;
         const rec = item as Record<string, unknown>;
         const parentId = typeof rec.parent_id === "string" ? rec.parent_id.trim() : "";
-        if (!parentId || /[\x00-\x1f\x7f]/.test(parentId) || seen.has(parentId)) continue;
+        if (
+          !parentId ||
+          /[\x00-\x1f\x7f]/.test(parentId) ||
+          CREDENTIAL_PREFIX_RE.test(parentId) ||
+          EMBEDDED_SECRET_TOKEN_RE.test(parentId) ||
+          seen.has(parentId)
+        ) {
+          continue;
+        }
         const replyCount =
           typeof rec.reply_count === "number" && Number.isFinite(rec.reply_count) && rec.reply_count >= 0
             ? Math.trunc(rec.reply_count)
